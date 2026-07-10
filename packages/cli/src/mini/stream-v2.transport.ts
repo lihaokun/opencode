@@ -1,4 +1,5 @@
 import type { EventSubscribeOutput, OpenCodeClient } from "@opencode-ai/client/promise"
+import { readFile } from "node:fs/promises"
 import type {
   PermissionRequest,
   QuestionRequest,
@@ -183,7 +184,7 @@ async function prepareFile(file: RunFilePart) {
   if (file.mime !== "text/plain") return { attachment: { uri: file.url, name: file.filename } }
   const content = file.url.startsWith("data:")
     ? Buffer.from(file.url.slice(file.url.indexOf(",") + 1), "base64").toString("utf8")
-    : await Bun.file(new URL(file.url)).text()
+    : await readFile(new URL(file.url), "utf8")
   return { text: `<file name="${file.filename}">\n${content}\n</file>` }
 }
 

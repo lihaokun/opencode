@@ -4,6 +4,7 @@ import { Service } from "@opencode-ai/client/effect"
 import { Effect, FileSystem, Schema } from "effect"
 import { randomBytes } from "crypto"
 import path from "path"
+import { selfCommand } from "../util/process"
 
 // The CLI's service configuration file, plus the Service.Options binding that
 // points the client package's service operations at this CLI: which
@@ -39,13 +40,10 @@ const env = Effect.gen(function* () {
 
 export const options = Effect.fnUntraced(function* () {
   const { file } = yield* env
-  const compiled = path.basename(process.execPath).replace(/\.exe$/, "") !== "bun"
-  const entrypoint = compiled ? undefined : process.argv[1]
-  if (!compiled && entrypoint === undefined) return yield* Effect.fail(new Error("Failed to resolve CLI entrypoint"))
   return {
     file,
     version: InstallationVersion,
-    command: [process.execPath, ...(entrypoint ? [entrypoint] : []), "serve", "--service"],
+    command: [...selfCommand(), "serve", "--service"],
   }
 })
 

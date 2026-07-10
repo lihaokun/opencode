@@ -5,6 +5,7 @@ import { Model } from "@opencode-ai/schema/model"
 import type { ToolPart } from "@opencode-ai/sdk/v2"
 import { open } from "node:fs/promises"
 import path from "node:path"
+import { readStdin } from "../util/io"
 import { Server } from "../services/server"
 import { loadRunAgents, waitForCatalogReady } from "./catalog.shared"
 import { runNonInteractivePrompt } from "./noninteractive"
@@ -48,7 +49,7 @@ async function run(input: RunCommandInput) {
   if (input.fork && !input.continue && !input.session) fail("--fork requires --continue or --session")
   const root = process.env.PWD ?? process.cwd()
   const directory = localDirectory(root)
-  const message = mergeInput(formatMessage(input.message), process.stdin.isTTY ? undefined : await Bun.stdin.text())
+  const message = mergeInput(formatMessage(input.message), process.stdin.isTTY ? undefined : await readStdin())
   if (!message?.trim()) fail("You must provide a message")
   const files = await Promise.all(input.file.map((file) => prepareFile(file, root)))
   const prepared = { directory, message, files }
@@ -73,8 +74,7 @@ async function execute(input: RunCommandInput, prepared: Prepared, endpoint: Ser
           .then((result) => (result.data ? { providerID: result.data.providerID, modelID: result.data.id } : undefined))
       : undefined
   const model = pickRunModel(explicitModel, variant, sessionModel, defaultModel)
-  if (variant && !model)
-    return reportError(input, "Cannot select a variant before selecting a model", session?.id)
+  if (variant && !model) return reportError(input, "Cannot select a variant before selecting a model", session?.id)
   if (model) {
     await waitForCatalogReady({ sdk: client, directory: cwd, workspace, model })
     const available = await client.model.list({ location: { directory: cwd, workspace } })
