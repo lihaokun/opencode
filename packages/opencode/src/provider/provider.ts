@@ -24,7 +24,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { EffectPromise } from "@/effect/promise"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { isRecord } from "@/util/record"
-import { optional } from "@opencode-ai/core/schema"
+import { optional, PositiveInt } from "@opencode-ai/core/schema"
 import { ProviderTransform } from "./transform"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -1020,10 +1020,25 @@ const ProviderCost = Schema.Struct({
   ),
 })
 
+const ProviderReasoningLimit = Schema.Struct({
+  min: optional(PositiveInt),
+  max: optional(PositiveInt),
+}).check(
+  Schema.makeFilter((value) => {
+    if (value.min === undefined && value.max === undefined) {
+      return "At least one reasoning budget bound is required"
+    }
+    if (value.min !== undefined && value.max !== undefined && value.min > value.max) {
+      return { path: ["max"], issue: "Reasoning budget maximum must be greater than or equal to the minimum" }
+    }
+  }),
+)
+
 const ProviderLimit = Schema.Struct({
   context: Schema.Finite,
   input: optional(Schema.Finite),
   output: Schema.Finite,
+  reasoning: optional(ProviderReasoningLimit),
 })
 
 export const Model = Schema.Struct({
@@ -1042,6 +1057,27 @@ export const Model = Schema.Struct({
   variants: optional(Schema.Record(Schema.String, Schema.Record(Schema.String, Schema.Any))),
 }).annotate({ identifier: "Model" })
 export type Model = Types.DeepMutable<Schema.Schema.Type<typeof Model>>
+
+function validReasoningLimit(value: unknown): Model["limit"]["reasoning"] {
+  if (!Schema.is(ProviderReasoningLimit)(value)) return
+  return { ...value }
+}
+
+function mergeModelVariants(
+  base: NonNullable<Model["variants"]>,
+  configured: Record<string, Record<string, any>> | undefined,
+  reasoning: Model["limit"]["reasoning"],
+): NonNullable<Model["variants"]> {
+  const merged = mergeDeep(base, configured ?? {})
+  const result = mapValues(
+    pickBy(merged, (variant) => !variant.disabled),
+    (variant) => omit(variant, ["disabled"]),
+  ) as NonNullable<Model["variants"]>
+
+  const maximum = reasoning?.max
+  if (maximum === undefined) return result
+  return mapValues(result, (variant) => ProviderTransform.clampReasoningBudgetMaximum(variant, maximum))
+}
 
 export const Info = Schema.Struct({
   id: ProviderV2.ID,
@@ -1221,6 +1257,7 @@ function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model
       context: model.limit.context,
       input: model.limit.input,
       output: model.limit.output,
+      reasoning: ProviderTransform.reasoningLimit(model),
     },
     capabilities: {
       temperature: model.temperature ?? false,
@@ -1408,6 +1445,10 @@ const layer = Layer.effect(
                   ...model,
                   id: ModelV2.ID.make(id),
                   providerID,
+                  limit: {
+                    ...model.limit,
+                    reasoning: validReasoningLimit((model.limit as Model["limit"]).reasoning),
+                  },
                 },
               ]),
             )
@@ -1498,15 +1539,16 @@ const layer = Layer.effect(
               release_date: model.release_date ?? existingModel?.release_date ?? "",
               variants: {},
             }
+            const sameEndpoint =
+              existingModel?.providerID === parsedModel.providerID &&
+              existingModel.api.id === parsedModel.api.id &&
+              existingModel.api.url === parsedModel.api.url
+            parsedModel.limit.reasoning = sameEndpoint ? validReasoningLimit(existingModel?.limit.reasoning) : undefined
             const variants =
               existingModel?.api.npm === parsedModel.api.npm
                 ? (existingModel.variants ?? ProviderTransform.variants(parsedModel))
                 : ProviderTransform.variants(parsedModel)
-            const merged = mergeDeep(variants, model.variants ?? {})
-            parsedModel.variants = mapValues(
-              pickBy(merged, (v) => !v.disabled),
-              (v) => omit(v, ["disabled"]),
-            )
+            parsedModel.variants = mergeModelVariants(variants, model.variants, parsedModel.limit.reasoning)
             parsed.models[modelID] = parsedModel
           }
           database[providerID] = parsed
@@ -1636,11 +1678,7 @@ const layer = Layer.effect(
 
             const configVariants = configProvider?.models?.[modelID]?.variants
             if (configVariants && model.variants) {
-              const merged = mergeDeep(model.variants, configVariants)
-              model.variants = mapValues(
-                pickBy(merged, (v) => !v.disabled),
-                (v) => omit(v, ["disabled"]),
-              )
+              model.variants = mergeModelVariants(model.variants, configVariants, model.limit.reasoning)
             }
           }
 

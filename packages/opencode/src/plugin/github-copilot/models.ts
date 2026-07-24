@@ -73,8 +73,14 @@ type SelectableItem = Item & {
   }
 }
 type CopilotEndpoint = "chat" | "responses" | "messages"
-type CopilotModel = Omit<Model, "api"> & {
+type CopilotModel = Omit<Model, "api" | "limit"> & {
   api: Model["api"] & { endpoint?: CopilotEndpoint }
+  limit: Model["limit"] & {
+    reasoning?: {
+      min?: number
+      max?: number
+    }
+  }
 }
 const decodeModels = Schema.decodeUnknownSync(schema)
 const decodeItem = Schema.decodeUnknownOption(item)
@@ -100,6 +106,23 @@ function build(key: string, remote: SelectableItem, url: string, prev?: Model): 
   const prices = remote.billing?.token_prices
   // Copilot prices are AIC per billing batch; OpenCode stores USD per million tokens.
   const usdPerMillion = prices && prices.batch_size > 0 ? 10_000 / prices.batch_size : 0
+  const rawMinimum = remote.capabilities.supports.min_thinking_budget
+  const rawMaximum = remote.capabilities.supports.max_thinking_budget
+  const minimum =
+    rawMinimum === undefined || !Number.isFinite(rawMinimum) ? undefined : Math.max(1, Math.ceil(rawMinimum))
+  // Copilot advertises an exclusive upper bound.
+  const maximum = rawMaximum === undefined || !Number.isFinite(rawMaximum) ? undefined : Math.floor(rawMaximum) - 1
+  const invalidReasoningLimit =
+    (rawMinimum !== undefined && minimum === undefined) ||
+    (rawMaximum !== undefined && (maximum === undefined || maximum <= 0)) ||
+    (minimum !== undefined && maximum !== undefined && minimum > maximum)
+  const reasoningLimit =
+    !invalidReasoningLimit && (minimum !== undefined || maximum !== undefined)
+      ? {
+          ...(minimum === undefined ? {} : { min: minimum }),
+          ...(maximum === undefined ? {} : { max: maximum }),
+        }
+      : undefined
 
   const model: CopilotModel = {
     id: key,
@@ -116,6 +139,7 @@ function build(key: string, remote: SelectableItem, url: string, prev?: Model): 
       context: remote.capabilities.limits.max_context_window_tokens ?? remote.capabilities.limits.max_prompt_tokens,
       input: remote.capabilities.limits.max_prompt_tokens,
       output: remote.capabilities.limits.max_output_tokens,
+      ...(reasoningLimit ? { reasoning: reasoningLimit } : {}),
     },
     capabilities: {
       temperature: prev?.capabilities.temperature ?? true,
@@ -178,19 +202,22 @@ function build(key: string, remote: SelectableItem, url: string, prev?: Model): 
           effort,
         }
       })
-    } else if (remote.capabilities.supports.max_thinking_budget) {
-      const max = remote.capabilities.supports.max_thinking_budget
-      variants["max"] = {
-        thinking: {
-          type: "enabled",
-          budgetTokens: max - 1,
-        },
-      }
-      variants["high"] = {
-        thinking: {
-          type: "enabled",
-          budgetTokens: Math.floor(max / 2),
-        },
+    } else if (reasoningLimit?.max !== undefined) {
+      const discoveredCap = reasoningLimit.max
+      const discoveredMin = reasoningLimit.min ?? 1
+      if (discoveredCap >= discoveredMin) {
+        variants["max"] = {
+          thinking: {
+            type: "enabled",
+            budgetTokens: discoveredCap,
+          },
+        }
+        variants["high"] = {
+          thinking: {
+            type: "enabled",
+            budgetTokens: Math.min(discoveredCap, Math.max(discoveredMin, Math.floor((discoveredCap + 1) / 2))),
+          },
+        }
       }
     }
   }

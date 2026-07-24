@@ -646,6 +646,13 @@ function googleThinkingBudgetMax(apiId: string) {
   return 24_576
 }
 
+function googleThinkingBudgetMin(apiId: string) {
+  const id = apiId.toLowerCase()
+  if (id.includes("flash-lite")) return 512
+  if (id.includes("pro") && !id.includes("flash")) return 128
+  return 1
+}
+
 // SAP's Zod schema drops unknown top-level keys; reasoning controls survive
 // only via `modelParams` (catchall), forwarded verbatim by the SAP SDKs.
 function wrapInSapModelParams(variants: Record<string, Record<string, any>>): Record<string, Record<string, any>> {
@@ -674,6 +681,7 @@ export function variants(model: Provider.Model): Record<string, Record<string, a
   if (!model.capabilities.reasoning) return {}
 
   const id = model.id.toLowerCase()
+  const catalogOutput = model.limit.output > 0 ? model.limit.output : OUTPUT_TOKEN_MAX
   const glm52 = ["glm-5.2", "glm-5-2", "glm-5p2"].some(
     (name) => id.includes(name) || model.api.id.toLowerCase().includes(name),
   )
@@ -945,13 +953,13 @@ export function variants(model: Provider.Model): Record<string, Record<string, a
         high: {
           thinking: {
             type: "enabled",
-            budgetTokens: Math.min(16_000, Math.floor(model.limit.output / 2 - 1)),
+            budgetTokens: Math.min(16_000, Math.floor(catalogOutput / 2 - 1)),
           },
         },
         max: {
           thinking: {
             type: "enabled",
-            budgetTokens: Math.min(31_999, model.limit.output - 1),
+            budgetTokens: Math.min(31_999, catalogOutput - 1),
           },
         },
       }
@@ -1344,8 +1352,233 @@ export function providerOptions(model: Provider.Model, options: { [x: string]: a
   return { [key]: normalized }
 }
 
-export function maxOutputTokens(model: Provider.Model, outputTokenMax = OUTPUT_TOKEN_MAX): number {
-  return Math.min(model.limit.output, outputTokenMax) || outputTokenMax
+export function maxOutputTokens(model: Provider.Model, outputTokenMax?: number): number {
+  if (model.limit.output === 0) return outputTokenMax ?? OUTPUT_TOKEN_MAX
+  if (outputTokenMax !== undefined) return Math.min(model.limit.output, outputTokenMax)
+  if (model.capabilities.reasoning) return model.limit.output
+  return Math.min(model.limit.output, OUTPUT_TOKEN_MAX)
+}
+
+const NUMERIC_REASONING_BUDGET_PATHS = [
+  ["thinking", "budgetTokens"],
+  ["thinking", "budget_tokens"],
+  ["thinkingConfig", "thinkingBudget"],
+  ["reasoningConfig", "budgetTokens"],
+  ["modelParams", "thinking", "budget_tokens"],
+  ["modelParams", "thinkingConfig", "thinkingBudget"],
+] as const
+
+function getPath(input: Record<string, any>, path: readonly string[]) {
+  let current: unknown = input
+  for (const key of path) {
+    if (!isPlainObject(current)) return undefined
+    current = current[key]
+  }
+  return current
+}
+
+function setPath(input: Record<string, any>, path: readonly string[], value: number) {
+  const result = { ...input }
+  let source: Record<string, unknown> = input
+  let target: Record<string, unknown> = result
+
+  for (const key of path.slice(0, -1)) {
+    const next = isPlainObject(source[key]) ? source[key] : {}
+    const cloned = { ...next }
+    target[key] = cloned
+    source = next
+    target = cloned
+  }
+  target[path[path.length - 1]] = value
+  return result
+}
+
+export function clampReasoningBudgetMaximum(options: Record<string, any>, maximum: number): Record<string, any> {
+  let result = { ...options }
+  for (const path of NUMERIC_REASONING_BUDGET_PATHS) {
+    const existing = getPath(options, path)
+    if (typeof existing !== "number" || !Number.isFinite(existing) || existing <= maximum) continue
+    result = setPath(result, path, maximum)
+  }
+  return result
+}
+
+function reasoningBudgetBounds(model: Provider.Model) {
+  const id = `${model.id} ${model.api.id}`.toLowerCase()
+  const dynamic = model.limit.reasoning
+  if (dynamic) {
+    return {
+      kind: "known" as const,
+      minimum: dynamic.min,
+      maximum: dynamic.max,
+    }
+  }
+
+  const anthropic =
+    model.api.npm === "@ai-sdk/anthropic" ||
+    model.api.npm === "@ai-sdk/google-vertex/anthropic" ||
+    (model.api.npm === "@ai-sdk/gateway" && id.includes("anthropic")) ||
+    (model.api.npm === "@ai-sdk/amazon-bedrock" && id.includes("anthropic")) ||
+    (model.api.npm === "@jerome-benoit/sap-ai-provider-v2" && id.includes("anthropic"))
+  if (anthropic) {
+    return {
+      kind: "known" as const,
+      minimum: 1_024,
+      maximum: undefined,
+    }
+  }
+
+  if (id.includes("gemini") && id.includes("2.5")) {
+    return {
+      kind: "known" as const,
+      minimum: googleThinkingBudgetMin(id),
+      maximum: googleThinkingBudgetMax(id),
+    }
+  }
+
+  return {
+    kind: "unknown" as const,
+    minimum: undefined,
+    maximum: undefined,
+  }
+}
+
+function usesAnthropicMessagesTransport(model: Provider.Model) {
+  return model.api.npm === "@ai-sdk/anthropic" || model.api.npm === "@ai-sdk/google-vertex/anthropic"
+}
+
+function reasoningBudgetError(input: {
+  model: Provider.Model
+  variant: string | undefined
+  maxOutputTokens: number
+  minimum: number | undefined
+  maximum: number | undefined
+  reason: string
+}) {
+  return new Error(
+    [
+      "Invalid numeric reasoning budget:",
+      `provider=${input.model.providerID}`,
+      `model=${input.model.id}`,
+      `variant=${input.variant ?? "none"}`,
+      `maxOutputTokens=${input.maxOutputTokens}`,
+      `minimum=${input.minimum ?? "unknown"}`,
+      `maximum=${input.maximum ?? "unknown"}`,
+      input.reason,
+    ].join(" "),
+  )
+}
+
+export function normalizeReasoningBudget(input: {
+  model: Provider.Model
+  variant: string | undefined
+  options: Record<string, any>
+  maxOutputTokens: number
+}): Record<string, any> {
+  const bounds = reasoningBudgetBounds(input.model)
+  const minimum = bounds.minimum
+  const maximum = bounds.maximum
+  const fail = (reason: string): never => {
+    throw reasoningBudgetError({
+      model: input.model,
+      variant: input.variant,
+      maxOutputTokens: input.maxOutputTokens,
+      minimum,
+      maximum,
+      reason,
+    })
+  }
+
+  if (!Number.isInteger(input.maxOutputTokens) || input.maxOutputTokens <= 0) {
+    fail("the output envelope must be a positive integer")
+  }
+  if (minimum !== undefined && maximum !== undefined && maximum < minimum) {
+    fail("the provider reasoning bounds are contradictory")
+  }
+
+  const reserve = Math.max(4_096, Math.ceil(input.maxOutputTokens * 0.1))
+  const safeCap = input.maxOutputTokens - reserve
+  const wireCap = Math.min(input.maxOutputTokens - 1, maximum ?? Number.POSITIVE_INFINITY)
+  let result = { ...input.options }
+
+  for (const path of NUMERIC_REASONING_BUDGET_PATHS) {
+    const existing = getPath(input.options, path)
+    if (typeof existing !== "number") continue
+    if (!Number.isFinite(existing) || !Number.isInteger(existing) || existing <= 0) {
+      fail(`the value at ${path.join(".")} must be a positive integer`)
+    }
+
+    if (wireCap < (minimum ?? 1)) {
+      fail("the output envelope cannot contain a legal reasoning budget and a visible token")
+    }
+
+    if (bounds.kind === "known" && input.variant === "max") {
+      if (minimum === undefined && maximum !== undefined) {
+        if (maximum > safeCap || maximum >= input.maxOutputTokens) {
+          fail("the request envelope would require lowering the provider maximum without a known minimum")
+        }
+        result = setPath(result, path, maximum)
+        continue
+      }
+      const target = safeCap >= (minimum ?? 1) ? Math.min(safeCap, wireCap) : Math.min(minimum ?? 1, wireCap)
+      result = setPath(result, path, target)
+      continue
+    }
+
+    if (minimum !== undefined && existing < minimum) {
+      fail(`the existing value at ${path.join(".")} is below the provider minimum`)
+    }
+
+    const boundedExisting = Math.min(existing, maximum ?? Number.POSITIVE_INFINITY)
+    if (minimum === undefined && maximum !== undefined && boundedExisting > safeCap) {
+      fail("the request envelope would require lowering the reasoning budget without a known minimum")
+    }
+    const safeUpper = safeCap >= (minimum ?? 1) ? Math.min(safeCap, wireCap) : Math.min(minimum ?? 1, wireCap)
+    const normalized = Math.min(boundedExisting, safeUpper)
+    if (normalized <= 0 || normalized >= input.maxOutputTokens || (minimum !== undefined && normalized < minimum)) {
+      fail(`the existing value at ${path.join(".")} cannot be made legal by clamping downward`)
+    }
+    result = setPath(result, path, normalized)
+  }
+
+  if (
+    usesAnthropicMessagesTransport(input.model) &&
+    input.options.thinking?.type === "enabled" &&
+    input.options.thinking.budgetTokens === undefined &&
+    input.maxOutputTokens <= 1_024
+  ) {
+    fail("the output envelope cannot contain the Anthropic SDK implicit reasoning budget and a visible token")
+  }
+
+  return result
+}
+
+export function transportMaxOutputTokens(input: {
+  model: Provider.Model
+  options: Record<string, any>
+  maxOutputTokens: number
+}): number {
+  const anthropicBudget = usesAnthropicMessagesTransport(input.model)
+    ? input.options.thinking?.type === "enabled" && typeof input.options.thinking.budgetTokens === "number"
+      ? input.options.thinking.budgetTokens
+      : input.options.thinking?.type === "enabled" && input.options.thinking.budgetTokens === undefined
+        ? 1_024
+        : undefined
+    : undefined
+  const bedrockBudget =
+    input.model.api.npm === "@ai-sdk/amazon-bedrock" &&
+    input.model.api.id.toLowerCase().includes("anthropic") &&
+    input.options.reasoningConfig?.type === "enabled" &&
+    typeof input.options.reasoningConfig.budgetTokens === "number"
+      ? input.options.reasoningConfig.budgetTokens
+      : undefined
+  const budget = anthropicBudget ?? bedrockBudget
+  if (budget === undefined) return input.maxOutputTokens
+
+  // These AI SDK transports add the numeric thinking budget to their standardized
+  // maxOutputTokens input before writing max_tokens/maxTokens. Subtract it here so
+  // the provider's final total stays inside the core output envelope.
+  return input.maxOutputTokens - budget
 }
 
 type JsonRecord = Record<string, unknown>
@@ -1580,21 +1813,44 @@ export function schema(model: Provider.Model, schema: JSONSchema7): JSONSchema7 
   return schema
 }
 
+export function reasoningLimit(model: ModelsDev.Model): Provider.Model["limit"]["reasoning"] {
+  const budget = model.reasoning_options?.find((option) => option.type === "budget_tokens")
+  if (!budget) return
+
+  const hasMin = budget.min !== undefined
+  const hasMax = budget.max !== undefined
+  if (!hasMin && !hasMax) return
+  if (hasMin && (typeof budget.min !== "number" || !Number.isFinite(budget.min))) return
+  if (hasMax && (typeof budget.max !== "number" || !Number.isFinite(budget.max))) return
+
+  const min = budget.min === undefined ? undefined : Math.max(1, Math.ceil(budget.min))
+  const max = budget.max === undefined ? undefined : Math.floor(budget.max)
+  if (max !== undefined && max <= 0) return
+  if (min !== undefined && max !== undefined && min > max) return
+  return {
+    ...(min === undefined ? {} : { min }),
+    ...(max === undefined ? {} : { max }),
+  }
+}
+
 export function reasoningVariants(model: ModelsDev.Model, target: Provider.Model): Provider.Model["variants"] {
   const options = model.reasoning_options
   if (options === undefined) return
   if (options.length === 0) return {}
 
+  const budget = options.find((option) => option.type === "budget_tokens")
+  const bounds = reasoningLimit(model)
+  if (budget && (budget.min !== undefined || budget.max !== undefined) && !bounds) return {}
+
   const effort = options.find((option) => option.type === "effort")
   if (effort) return nonEmptyVariants(effortVariants(target, effort.values))
 
   const toggle = options.some((option) => option.type === "toggle")
-  const budget = options.find((option) => option.type === "budget_tokens")
   if (!budget) return toggle ? nonEmptyVariants(reasoningToggle(target)) : undefined
 
   return nonEmptyVariants({
     ...(toggle ? reasoningToggle(target) : {}),
-    ...budgetVariants(target, budget.min, budget.max),
+    ...budgetVariants(target, bounds?.min, bounds?.max),
   })
 }
 
@@ -1613,7 +1869,8 @@ function effortVariants(model: Provider.Model, values: readonly unknown[]) {
 }
 
 function budgetVariants(model: Provider.Model, min?: number, max?: number) {
-  const maximum = Math.min(max ?? OUTPUT_TOKEN_MAX - 1, model.limit.output - 1, OUTPUT_TOKEN_MAX - 1)
+  const catalogOutput = model.limit.output > 0 ? model.limit.output : OUTPUT_TOKEN_MAX
+  const maximum = Math.min(max ?? OUTPUT_TOKEN_MAX - 1, catalogOutput - 1, OUTPUT_TOKEN_MAX - 1)
   if (maximum <= 0) return {}
   const high = Math.min(Math.max(min ?? 0, Math.floor((maximum + 1) / 2)), maximum)
   return Object.fromEntries(
