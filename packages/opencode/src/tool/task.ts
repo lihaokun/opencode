@@ -111,11 +111,15 @@ function boundTaskMarkupText(value: string, limits: { maxLines: number; maxBytes
   }
 }
 
-function visibleText(result: SessionV1.WithParts) {
+function allVisibleText(result: SessionV1.WithParts) {
   return result.parts
     .filter((part): part is SessionV1.TextPart => part.type === "text")
     .map((part) => part.text)
     .join("\n\n")
+}
+
+function lastVisibleText(result: SessionV1.WithParts) {
+  return result.parts.findLast((part) => part.type === "text")?.text ?? ""
 }
 
 function formatOutputLengthFailure(
@@ -123,7 +127,7 @@ function formatOutputLengthFailure(
   sessionID: SessionID,
   limits: { maxLines: number; maxBytes: number },
 ) {
-  const text = visibleText(result)
+  const text = allVisibleText(result)
   const output = [
     "Subagent task failed: MessageOutputLengthError",
     `Child session: ${sessionID}`,
@@ -307,7 +311,6 @@ export const TaskTool = Tool.define(
           return yield* Effect.fail(new Error("Task prompt returned a non-assistant result"))
         }
 
-        const text = visibleText(result)
         if (result.info.error?.name === "MessageAbortedError") return yield* Effect.interrupt
         const limits = yield* truncate.limits()
         if (result.info.error || result.info.finish === "length") {
@@ -315,7 +318,7 @@ export const TaskTool = Tool.define(
             new Error(formatAssistantFailure({ info: result.info, parts: result.parts }, nextSession.id, limits)),
           )
         }
-        return text
+        return lastVisibleText(result)
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
@@ -430,7 +433,14 @@ export const TaskTool = Tool.define(
               background.waitForPromotion(nextSession.id),
             )
             if (result?.metadata?.background === true) return backgroundResult()
-            if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
+            if (result?.status === "error") {
+              const output = renderOutput({
+                sessionID: nextSession.id,
+                state: "error",
+                text: result.error ?? "Task failed",
+              })
+              return yield* Effect.fail(new Error(output))
+            }
             if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
             return {
               title: params.description,
