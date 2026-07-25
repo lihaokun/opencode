@@ -23,6 +23,7 @@ import { InstanceStore } from "@/project/instance-store"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderTest } from "../fake/provider"
 
 const originalEnv = new Map<string, string | undefined>()
 
@@ -86,6 +87,61 @@ const languageBaseURL = (language: unknown) => (language as { config: { baseURL:
 
 const it = testEffect(LayerNode.compile(LayerNode.group([Provider.node, Env.node, Plugin.node])))
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
+const copilotModel = () =>
+  ProviderTest.model({
+    id: ModelV2.ID.make("claude-numeric"),
+    providerID: ProviderV2.ID.githubCopilot,
+    api: {
+      id: "claude-numeric",
+      url: "https://api.githubcopilot.com/v1",
+      npm: "@ai-sdk/anthropic",
+    },
+    capabilities: {
+      ...ProviderTest.model().capabilities,
+      reasoning: true,
+    },
+    limit: {
+      context: 100_000,
+      input: 80_000,
+      output: 64_000,
+      reasoning: { min: 1_024, max: 30_000 },
+    },
+    variants: {
+      high: { thinking: { type: "enabled", budgetTokens: 15_000 } },
+      max: { thinking: { type: "enabled", budgetTokens: 30_000 } },
+    },
+  })
+const copilotPlugin = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    trigger: (_name, _input, output) => Effect.succeed(output),
+    init: () => Effect.void,
+    list: () =>
+      Effect.succeed([
+        {
+          provider: {
+            id: "github-copilot",
+            models: async () => ({ "claude-numeric": copilotModel() }),
+          },
+        } as never,
+      ]),
+  }),
+)
+const copilot = testEffect(
+  LayerNode.compile(
+    LayerNode.group([
+      Provider.node,
+      FSUtil.node,
+      Env.node,
+      Config.node,
+      Auth.node,
+      Plugin.node,
+      ModelsDev.node,
+      RuntimeFlags.node,
+    ]),
+    [[Plugin.node, copilotPlugin]],
+  ),
+)
 
 const alphaProviderConfig = {
   provider: {
@@ -570,6 +626,7 @@ it.instance(
     const model = providers[ProviderV2.ID.openai].models["custom-gpt-chat"]
     expect(model.name).toBe("Custom GPT Chat")
     expect(model.variants).toEqual({})
+    expect(model.limit.reasoning).toBeUndefined()
   }),
   {
     config: {
@@ -588,6 +645,7 @@ it.instance(
     const model = providers[ProviderV2.ID.anthropic].models["claude-sonnet-4-6"]
     expect(model.variants?.low).toEqual({ reasoningEffort: "low" })
     expect(model.variants?.max).toBeUndefined()
+    expect(model.limit.reasoning).toEqual({ min: 1_024 })
   }),
   {
     config: {
@@ -1498,6 +1556,29 @@ test("models.dev reasoning options replace generated variants and unsupported op
         reasoning_options: [],
         limit: { context: 128_000, output: 64_000 },
       },
+      missing: {
+        id: "claude-sonnet-4",
+        name: "Missing",
+        reasoning: true,
+        provider: { npm: "@ai-sdk/anthropic" },
+        limit: { context: 200_000, output: 128_000 },
+      },
+      bounded: {
+        id: "claude-sonnet-4",
+        name: "Bounded",
+        reasoning: true,
+        reasoning_options: [{ type: "budget_tokens", min: 1_024, max: 64_000 }],
+        provider: { npm: "@ai-sdk/anthropic" },
+        limit: { context: 200_000, output: 128_000 },
+      },
+      contradictory: {
+        id: "claude-sonnet-4",
+        name: "Contradictory",
+        reasoning: true,
+        reasoning_options: [{ type: "budget_tokens", min: 64_000, max: 1_024 }],
+        provider: { npm: "@ai-sdk/anthropic" },
+        limit: { context: 200_000, output: 128_000 },
+      },
       fallback: {
         id: "gpt-5.4",
         name: "Fallback",
@@ -1526,6 +1607,15 @@ test("models.dev reasoning options replace generated variants and unsupported op
     },
   })
   expect(models.empty.variants).toEqual({})
+  expect(models.empty.limit.reasoning).toBeUndefined()
+  expect(models.missing.variants).toEqual({
+    high: { thinking: { type: "enabled", budgetTokens: 16_000 } },
+    max: { thinking: { type: "enabled", budgetTokens: 31_999 } },
+  })
+  expect(models.missing.limit.reasoning).toBeUndefined()
+  expect(models.bounded.limit.reasoning).toEqual({ min: 1_024, max: 64_000 })
+  expect(models.contradictory.limit.reasoning).toBeUndefined()
+  expect(models.contradictory.variants).toEqual({})
   expect(Object.keys(models.fallback.variants ?? {})).toEqual(["none", "low", "medium", "high", "xhigh"])
   expect(models.override.variants).toEqual({
     high: { thinkingConfig: { includeThoughts: true, thinkingLevel: "high" } },
@@ -1552,11 +1642,21 @@ test("public provider info omits invalid models", () => {
     id: ModelV2.ID.make("invalid"),
     cost: { ...provider.models.valid.cost, input: Number.NaN },
   }
+  provider.models.valid.limit.reasoning = { min: 1_024, max: 16_000 }
+  provider.models.invalidBounds = {
+    ...provider.models.valid,
+    id: ModelV2.ID.make("invalid-bounds"),
+    limit: {
+      ...provider.models.valid.limit,
+      reasoning: { min: 16_000, max: 1_024 },
+    },
+  }
 
   const result = Provider.toPublicInfo(provider)
 
-  expect(result.models.valid).toBeDefined()
+  expect(result.models.valid.limit.reasoning).toEqual({ min: 1_024, max: 16_000 })
   expect(result.models.invalid).toBeUndefined()
+  expect(result.models.invalidBounds).toBeUndefined()
 })
 
 it.instance("model variants are generated for reasoning models", () =>
@@ -1569,6 +1669,63 @@ it.instance("model variants are generated for reasoning models", () =>
     expect(model.variants).toBeDefined()
     expect(Object.keys(model.variants!).length).toBeGreaterThan(0)
   }),
+)
+
+copilot.instance(
+  "trusted reasoning bounds survive variant config without becoming a preset",
+  Effect.gen(function* () {
+    const providers = yield* list
+    const model = providers[ProviderV2.ID.githubCopilot].models["claude-numeric"]
+
+    expect(model.limit.reasoning).toEqual({ min: 1_024, max: 30_000 })
+    expect(model.variants?.max).toBeUndefined()
+    expect(model.variants?.high.thinking.budgetTokens).toBe(30_000)
+    expect(model.variants?.custom.thinking.budgetTokens).toBe(30_000)
+    expect(model.variants?.fixed.thinking.budgetTokens).toBe(8_000)
+  }),
+  {
+    config: {
+      provider: {
+        "github-copilot": {
+          models: {
+            "claude-numeric": {
+              variants: {
+                max: { disabled: true, thinking: { type: "enabled", budgetTokens: 60_000 } },
+                high: { thinking: { type: "enabled", budgetTokens: 50_000 } },
+                custom: { thinking: { type: "enabled", budgetTokens: 45_000 } },
+                fixed: { thinking: { type: "enabled", budgetTokens: 8_000 } },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+)
+
+copilot.instance(
+  "changing the endpoint invalidates discovered reasoning bounds",
+  Effect.gen(function* () {
+    const providers = yield* list
+    const model = providers[ProviderV2.ID.githubCopilot].models["claude-numeric"]
+
+    expect(model.api.url).toBe("https://copilot-proxy.example.com/v1")
+    expect(model.limit.reasoning).toBeUndefined()
+  }),
+  {
+    config: {
+      provider: {
+        "github-copilot": {
+          api: "https://copilot-proxy.example.com/v1",
+          models: {
+            "claude-numeric": {
+              name: "Claude through proxy",
+            },
+          },
+        },
+      },
+    },
+  },
 )
 
 it.instance(

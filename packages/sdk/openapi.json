@@ -21756,6 +21756,20 @@
               },
               "output": {
                 "type": "number"
+              },
+              "reasoning": {
+                "type": "object",
+                "properties": {
+                  "min": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  },
+                  "max": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  }
+                },
+                "additionalProperties": false
               }
             },
             "required": ["context", "output"],
