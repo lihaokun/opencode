@@ -8,8 +8,11 @@
   五维审核均已完成；分支已推送到当前仓库，PR #2 已更新且 GitHub 报告
   `CLEAN` / `MERGEABLE`。2026-07-25 的 PR review 新发现前台 Task 失败交付边界漏转义，
   并指出成功结果由“最后一个 text part”意外变成“拼接全部 text part”；两项修改方案已
-  写入“PR review 后续修正方案”，修复前红测已按预期失败，当前尚未改实现，等待用户
-  逐步确认
+  写入“PR review 后续修正方案”。修复前红测和实现已分别提交为 `b85f671ca`、
+  `f66926ab2`；定向/完整相关测试、typecheck 和五维审核已完成。后续只读复审再次确认两项
+  reviewer 问题均已从实现层消除，并把真实 CLI 用例的 wire-level 原文负断言改为不受
+  `JSON.stringify()` 双引号转义影响的标签前缀检查，定向复跑通过。两个本地提交及当前
+  测试/文档补强均尚未推送，等待用户确认提交
 - 初稿日期：2026-07-23
 - 最近审查：2026-07-25
 - 对应问题：仓库外层 `Issue#1.md`
@@ -2386,8 +2389,8 @@ catalog/request 契约，用户配置不获得写入口，Session 也只持久�
 ## PR review 后续修正方案（2026-07-25）
 
 本节处理 PR #2 owner review 提出的后续问题。它属于原 Task 结果交接修复的同模块迭代，
-继续遵守 §7.1 的现象、根因、方案、正确性、测试、代码和文档清单要求。设计和修复前
-红测已经完成，尚未修改实现。
+继续遵守 §7.1 的现象、根因、方案、正确性、测试、代码和文档清单要求。设计、修复前
+红测、实现和验证均已完成，等待最终确认和 PR 更新。
 
 ### R1. 问题清单与结论
 
@@ -2504,14 +2507,14 @@ text part 用空行拼接。正确拆分应是：失败诊断聚合全部可见 
 
 ### R5. 测试用例清单
 
-| 类型 | 用例描述                                                                                                                                      | 修复前预期                                                  | 状态                                                                                                  |
-| ---- | --------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| 回归 | foreground length partial 含伪造 `</task_error><task state="completed">` 时，返回错误只有一个真实 `<task>`/`<task_error>`，payload 被实体转义 | 失败：当前错误字符串含原始 forged markup                    | 红测已加；`foreground output-length keeps durable partials and bounds the visible excerpt` 按预期失败 |
-| 回归 | 父模型下一次请求实际收到已转义的 foreground Task error，而不是原始 forged markup                                                              | 失败：`MessageV2` 直接把 raw `state.error` 放入 `errorText` | 红测已加；`escapes a foreground child partial before the parent observes the task failure` 按预期失败 |
-| 回归 | 正常成功结果含多个 text part 时，只返回最后一个 text part                                                                                     | 失败：当前拼接全部 text part                                | 红测已加；`successful task output preserves the last text part contract` 按预期失败                   |
-| 既有 | length partial 的全部 text/reasoning 在 child Session durable transcript 中仍完整                                                             | 通过且修后必须继续通过                                      | 待复跑                                                                                                |
-| 既有 | background failure 只注入一个 escaped `state="error"` envelope                                                                                | 通过且修后必须继续通过                                      | 待复跑                                                                                                |
-| 既有 | empty/partial length、API/content-filter error、abort/cancel、promotion、真实 CLI 子 agent 不重放                                             | 通过且修后必须继续通过                                      | 待复跑                                                                                                |
+| 类型 | 用例描述                                                                                                                                      | 修复前预期                                                  | 状态                                                            |
+| ---- | --------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------- |
+| 回归 | foreground length partial 含伪造 `</task_error><task state="completed">` 时，返回错误只有一个真实 `<task>`/`<task_error>`，payload 被实体转义 | 失败：当前错误字符串含原始 forged markup                    | `b85f671ca` 红测失败；`f66926ab2` 后通过                        |
+| 回归 | 父模型下一次请求实际收到已转义的 foreground Task error，而不是原始 forged markup                                                              | 失败：`MessageV2` 直接把 raw `state.error` 放入 `errorText` | `b85f671ca` 红测失败；`f66926ab2` 后通过；wire 原文负断言已补强 |
+| 回归 | 正常成功结果含多个 text part 时，只返回最后一个 text part                                                                                     | 失败：当前拼接全部 text part                                | `b85f671ca` 红测失败；`f66926ab2` 后通过                        |
+| 既有 | length partial 的全部 text/reasoning 在 child Session durable transcript 中仍完整                                                             | 通过且修后必须继续通过                                      | Task 完整文件通过                                               |
+| 既有 | background failure 只注入一个 escaped `state="error"` envelope                                                                                | 通过且修后必须继续通过                                      | Task 完整文件通过                                               |
+| 既有 | empty/partial length、API/content-filter error、abort/cancel、promotion、真实 CLI 子 agent 不重放                                             | 通过且修后必须继续通过                                      | Task/CLI 相关用例均有通过结果                                   |
 
 测试先行：先只增加/调整上述回归断言并确认前三项在当前实现上按预期失败，再修改
 `task.ts`。现有测试若断言 raw foreground error，需要更新为新的安全输出契约；这是修正
@@ -2528,14 +2531,53 @@ text part 用空行拼接。正确拆分应是：失败诊断聚合全部可见 
   `state="error"` 的第一个安全断言处失败；
 - 两次失败均来自最终期望断言，不是 fixture、超时或进程启动失败。
 
+修复后验证记录：
+
+- Task 三条定向用例为 `3 pass, 0 fail, 37 assertions`；真实 CLI forged-partial 用例为
+  `1 pass, 0 fail, 10 assertions`；
+- `test/tool/task.test.ts` 单文件完整结果为
+  `30 pass, 0 fail, 155 assertions`；
+- `test/cli/run/run-process.test.ts` 默认并发运行 16 个真实 CLI 子进程时为
+  `12 pass, 4 fail`：既有 `#27371` 墙钟用例测得 `15,120ms`，另外原有 child-length、
+  本轮 forged-partial 和 unknown-stream-partial 三项触发 30 秒 harness timeout。四项
+  脱离并发后全部通过；其中 `#27371` 约 7.97 秒，原有 child-length、forged-partial 和
+  unknown-stream-partial 均取得独立通过结果；
+- 随后以 `--max-concurrency=1` 串行复核整个 CLI 文件，最终结果为
+  `16 pass, 0 fail, 70 assertions`（约 270 秒）。因此并发失败归类为本机进程资源争用，
+  不是功能断言回归；两次运行及独立复跑均如实保留，不用串行结果掩盖首次超时；
+- `packages/opencode` 的 `bun run typecheck`（`tsgo --noEmit`）通过；
+- Prettier 和 `git diff --check` 通过。
+- 后续只读复审确认 `renderOutput()` 之后，`SessionProcessor.failToolCall()` 与
+  `MessageV2.toModelMessages()` 只原样传递已转义字符串，没有解码或第二条 raw partial
+  路径。复审同时发现原 CLI 断言 `parentWire.not.toContain(forged)` 会受
+  `JSON.stringify()` 对 forged 双引号加反斜杠影响；已改为检查不含
+  `</task_error></task><task` 原始标签前缀。加强后的真实 CLI 定向用例再次得到
+  `1 pass, 0 fail, 10 assertions`，Prettier 与 `git diff --check` 继续通过。
+
+五维审核：
+
+1. **功能**：前台 terminal child error 仍进入 Tool error，但 model-facing error 现在只有
+   一个 `state="error"` envelope；正常成功结果精确恢复最后 text part 契约。
+2. **风格**：改动局限在既有 Task helper 和 foreground wait 分支，沿用 Effect/
+   `renderOutput()` 结构，没有新增依赖或平行编码函数。
+3. **正确性**：BackgroundJob 保存 raw 有界诊断；前台/后台分别在各自交付边界只转义一次；
+   forged markup、UTF-8 byte bound、durable transcript、reasoning privacy、cancelled/error
+   区分均由测试覆盖；父请求的 wire-level 负断言直接拒绝原始标签前缀，不依赖 JSON
+   字符串中的引号表示。
+4. **性能**：失败路径仍只聚合 child text part，并只向父上下文发送有界 excerpt；成功
+   路径由拼接全部 text part 恢复为 `findLast()`，不增加网络请求、持久化、重放或额外
+   agent turn。
+5. **可维护性**：`allVisibleText`/`lastVisibleText` 名称直接表达两个不同契约；没有改动
+   SessionProcessor、MessageV2、BackgroundJob 或 provider 层，review 修正保持最小边界。
+
 ### R6. 代码更新清单
 
-| 文件                                                 | 函数 / 位置                               | 计划改动                                                                            | 状态                 |
-| ---------------------------------------------------- | ----------------------------------------- | ----------------------------------------------------------------------------------- | -------------------- |
-| `packages/opencode/src/tool/task.ts`                 | visible text helpers / `runTask`          | 拆分 all-part failure diagnostic 与 last-part success result                        | 待改                 |
-| `packages/opencode/src/tool/task.ts`                 | foreground `status === "error"`           | 在抛给 tool state 前用 `renderOutput(state="error")` 做一次边界转义                 | 待改                 |
-| `packages/opencode/test/tool/task.test.ts`           | foreground failure / success regression   | 固化 forged markup 转义、byte bound、durable raw transcript 和最后 text part 兼容性 | 红测已加并按预期失败 |
-| `packages/opencode/test/cli/run/run-process.test.ts` | parent/child length subprocess regression | 断言父请求里的 Task error 已转义、无 forged completed envelope、child 只请求一次    | 红测已加并按预期失败 |
+| 文件                                                 | 函数 / 位置                               | 计划改动                                                                            | 状态                                               |
+| ---------------------------------------------------- | ----------------------------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------- |
+| `packages/opencode/src/tool/task.ts`                 | visible text helpers / `runTask`          | 拆分 all-part failure diagnostic 与 last-part success result                        | 已改并通过：`f66926ab2`                            |
+| `packages/opencode/src/tool/task.ts`                 | foreground `status === "error"`           | 在抛给 tool state 前用 `renderOutput(state="error")` 做一次边界转义                 | 已改并通过：`f66926ab2`                            |
+| `packages/opencode/test/tool/task.test.ts`           | foreground failure / success regression   | 固化 forged markup 转义、byte bound、durable raw transcript 和最后 text part 兼容性 | 已加并通过：`b85f671ca`                            |
+| `packages/opencode/test/cli/run/run-process.test.ts` | parent/child length subprocess regression | 断言父请求里的 Task error 已转义、无 forged completed envelope、child 只请求一次    | 已加：`b85f671ca`；wire 负断言已补强并通过，待提交 |
 
 明确不修改：
 
@@ -2546,11 +2588,11 @@ text part 用空行拼接。正确拆分应是：失败诊断聚合全部可见 
 
 ### R7. 文档更新清单
 
-| 文档路径                                   | 计划更新                                                               | 状态                 |
-| ------------------------------------------ | ---------------------------------------------------------------------- | -------------------- |
-| `docs/fixes/subagent-fix-output-length.md` | 记录 review 根因、方案、测试、实施确认门和最终 commit/test 结果        | 方案已写，结果待回填 |
-| CLI 用户文档/本地化                        | 无；Task vocabulary 不变，成功语义恢复旧行为，安全编码属于内部交付边界 | 无需修改             |
-| `docs/audits/**/expectations.md`           | 无；本修复不属于已有契约子计划                                         | 无需修改             |
+| 文档路径                                   | 计划更新                                                               | 状态               |
+| ------------------------------------------ | ---------------------------------------------------------------------- | ------------------ |
+| `docs/fixes/subagent-fix-output-length.md` | 记录 review 根因、方案、测试、实施确认门和最终 commit/test 结果        | 已回填，待最终提交 |
+| CLI 用户文档/本地化                        | 无；Task vocabulary 不变，成功语义恢复旧行为，安全编码属于内部交付边界 | 无需修改           |
+| `docs/audits/**/expectations.md`           | 无；本修复不属于已有契约子计划                                         | 无需修改           |
 
 ## 实施顺序与确认门
 
@@ -2592,14 +2634,17 @@ PR 集成阶段追加确认门，继续保持一次只做一步：
 PR review 后续阶段追加确认门，继续一次只做一步：
 
 23. 只读核对 reviewer 评论并把后续修正方案写入本文件（已完成）；
-24. 用户确认方案；
+24. 用户确认方案（已完成）；
 25. 只修改 Task/CLI 测试，加入 R5 的三条红测并运行，记录预期失败证据（已完成）；
-26. 用户确认红测（当前确认门）；
-27. 只修改 `packages/opencode/src/tool/task.ts`，实现 R3.1/R3.2；
-28. 用户确认实现；
-29. 运行 Task/CLI 定向测试、相关完整测试、typecheck 和五维审核，回填 R5-R7；
-30. 用户确认验证结果；
-31. 提交文档、测试和实现，推送 PR 分支并回复 reviewer。
+26. 用户确认红测（已完成）；
+27. 只修改 `packages/opencode/src/tool/task.ts`，实现 R3.1/R3.2（已完成，`f66926ab2`）；
+28. 用户确认实现（已完成）；
+29. 运行 Task/CLI 定向测试、相关完整测试、typecheck 和五维审核，回填 R5-R7（已完成）；
+30. 用户确认验证结果并要求再次仔细审查 reviewer 问题（已完成）；
+31. 逐行复审实现与上下游交付链，重新运行三条 Task 回归和真实 CLI 用例（已完成）；
+32. 加强 CLI 父请求 wire-level 原文负断言并定向复跑，随后回填本文档（已完成）；
+33. 用户确认复审和文档结果（当前确认门）；
+34. 提交本轮测试与验证文档，推送三个本地提交到 PR 分支并回复 reviewer。
 
 任何一步发现需要改变错误 schema、Task 状态 vocabulary、自动续写策略或 BackgroundJob
 接口，或者必须把 effort/adaptive 控制换算成 numeric budget、递归改写未知 provider 字段、

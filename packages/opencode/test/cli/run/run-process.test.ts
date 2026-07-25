@@ -231,7 +231,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(taskError).toContain(escaped)
         expect(taskError).not.toContain(forged)
         expect(parentWire).toContain(escaped)
-        expect(parentWire).not.toContain(forged)
+        expect(parentWire).not.toContain("</task_error></task><task")
         expect(childInputs).toHaveLength(1)
         expect(yield* llm.pending).toBe(0)
       }),
