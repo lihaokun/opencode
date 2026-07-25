@@ -696,7 +696,9 @@ it.instance("loop preserves partial text and reasoning on length without replay"
       noReply: true,
       parts: [{ type: "text", text: "truncate with partial" }],
     })
-    yield* llm.push(reply().reason("unfinished reasoning").text("partial answer").usage({ input: 12, output: 8 }).length())
+    yield* llm.push(
+      reply().reason("unfinished reasoning").text("partial answer").usage({ input: 12, output: 8 }).length(),
+    )
 
     const result = yield* prompt.loop({ sessionID: chat.id })
     const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: result.info.id })

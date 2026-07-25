@@ -4,7 +4,8 @@
   （`333c5e63b`）；模块二（Task 前后台失败传播）已提交（`d3733f66d`）；Provider
   集成红测与模块三实现分别提交为 `57a497040`、`8d5061a77`；CLI 文档和 17 个本地化版本
   已提交（`ab3da4bf5`）并通过生产构建。上游 reasoning metadata/variant 契约冲突已按本文
-  设计解决；生成产物、全量受影响测试和最终五维审核仍按确认门单独执行，尚未 push
+  设计解决；确认门第 21 步的根生成、全量受影响测试、全仓 typecheck、Web 构建和最终
+  五维审核均已完成，尚未 push，等待用户确认后更新 PR
 - 初稿日期：2026-07-23
 - 最近审查：2026-07-25
 - 对应问题：仓库外层 `Issue#1.md`
@@ -2112,7 +2113,7 @@ I24: providerID/api.id/api.url 改变
 | 集成新增 | `test/provider/provider.test.ts`：public reasoning bounds contract                          | `toPublicInfo()` 保留合法 optional bounds；非正整数或 `min > max` 不能作为合法 Provider model 公开                                                 | 已加并通过，红测 `57a497040`、实现 `8d5061a77`                                                   |
 | 集成新增 | config schema / trusted-bounds merge review                                                 | legacy provider config 只能改变 variants，不能创建、删除或放大 `limit.reasoning`                                                                   | schema 无写入口；trusted-bounds 配置用例已通过                                                   |
 | 集成新增 | transform + `test/session/llm.test.ts`：trusted/untrusted request                           | normalizer 只从 `limit.reasoning` 读取动态 cap；通用 LLM request 仍按同一 core envelope 发送                                                       | 未新增 Copilot 专用 Session fixture；由两层既有用例组合覆盖并通过                                |
-| 生成检查 | `bun ./script/generate.ts`                                                                  | OpenAPI 和 SDK v2 legacy `Model` 同步 optional `limit.reasoning`；`ModelV2Info`、冻结的 SDK root `src/gen/**` 不变                                 | 待运行；确认门第 21 步                                                                           |
+| 生成检查 | `bun ./script/generate.ts`                                                                  | OpenAPI 和 SDK v2 legacy `Model` 同步 optional `limit.reasoning`；`ModelV2Info`、冻结的 SDK root `src/gen/**` 不变                                 | 已运行并核对；只产生预期契约 diff 和两处确定性格式化                                             |
 
 计划验证命令均从 package 目录执行：
 
@@ -2244,8 +2245,41 @@ CLI fixture 为每个测试 home 显式设置隔离的 `OPENCODE_DB`，使同一
   `git diff --check` 通过；
 - CLI 文档提交 `ab3da4bf5` 覆盖英文和全部 17 个现有本地化页面；在集成基线上重新执行
   `packages/web` 的 `bun run build` 通过；
-- 上述结果只记录截至确认门第 20 步的 Provider 定向/直接回归。根目录生成流程、全部受影响
-  测试和最终五维审核保留给第 21 步，不能用原源码基线的 `687 pass` 代替。
+- 确认门第 21 步执行根目录 `bun ./script/generate.ts` 成功。生成器在
+  `packages/sdk/openapi.json` 和 `packages/sdk/js/src/v2/gen/types.gen.ts` 中同步
+  optional `Model.limit.reasoning.{min,max}`，并确定性格式化
+  `packages/opencode/src/session/prompt.ts` 与对应测试；未修改 `ModelV2Info`、
+  `packages/sdk/js/src/gen/**`、用户配置 limit、Session 持久化或其他声明为不变的边界；
+- rebase 后首次有效的 OpenAI Responses 定向运行暴露本机 `node_modules` 仍为
+  `@ai-sdk/openai 3.0.53`，而 `package.json`/`bun.lock` 已锁定 `3.0.84`。旧 SDK 会静默
+  丢弃上游新增的 `reasoningMode`。执行 `bun install --frozen-lockfile` 后版本同步为
+  `3.0.84`，该用例由 `0 pass, 1 fail` 转为 `1 pass, 0 fail`；这属于 rebase 后的本地依赖
+  状态问题，没有为通过测试修改源码或用例；
+- 12 个受影响测试文件在允许本机临时监听端口的环境中最终为
+  `746 pass, 2 skip, 0 fail, 1,864 assertions`，共运行 748 个测试。沙箱内的尝试因
+  禁止 `Bun.serve({ port: 0 })` 统一表现为 `EADDRINUSE`，不计入产品结果；
+- 根目录 `bun run typecheck` 为 `30 successful, 30 total`，覆盖包含 opencode、SDK 和
+  LLM 在内的全部配置了 typecheck 的 workspace task；
+- `packages/web` 的 `bun run build` 成功，Pagefind 发现 18 种语言并索引 648 页；
+  Wrangler 对沙箱外日志目录打印只读警告，但构建最终退出码为 0，服务端、客户端、页面、
+  图片和索引阶段全部完成；
+- 全仓 oxlint 为 `0 error, 4,688 warnings`；只审变更的 21 个 TypeScript 文件为
+  `0 error, 443 warnings`。这些 warning 按仓库现行 warning-only 基线记录，本修复未扩展
+  范围清理；全部 41 个最终变更文件通过 Prettier check，`git diff --check` 通过；
+- 最终五维审核通过：
+  1. **一致性**：Session error 生产、Prompt 终止、Task 失败传播、Provider envelope、
+     plugin 最终覆盖和生成的公开契约均与本文规约及 CLI 文档一致；
+  2. **风格**：职责内 helper、Effect 错误路径、测试组织和本地化结构沿用仓库惯例，
+     Prettier 全部通过且 lint 无 error；
+  3. **正确性**：length 只生产一个 durable terminal error，不重放 provider/tool；
+     Task 保持取消分类、隐藏 reasoning 文本并按转义后的 UTF-8/行数限制诊断；numeric
+     budget 只消费可信 bounds/固定静态规则，已知 SDK add-back transport 保持 `S+B=E`；
+  4. **性能**：没有新增网络请求、自动续写或工具重放；request normalization 最多扫描
+     六条固定字段路径，父 Session 诊断有界，运行时额外计算为常数级或受 excerpt 上限约束；
+  5. **可维护性**：Provider 负责 capability/variant，Transform 负责纯归一化，
+     Request 负责 hook 前编排，Session/Task 分别负责 durable 终态和父子传播；生成契约和
+     回归测试与各自 owner 同处，未引入并行 schema 或隐藏推断源。
+     审核无 unresolved 项，原源码基线的 `687 pass` 不再作为当前集成结果。
 
 ## 第七部分：代码更新清单
 
@@ -2257,7 +2291,7 @@ CLI fixture 为每个测试 home 显式设置隔离的 `OPENCODE_DB`，使同一
 | `packages/opencode/src/provider/transform.ts`                 | `variants` / `maxOutputTokens` / `normalizeReasoningBudget` / `transportMaxOutputTokens` | `output=0` catalog fallback；reasoning 默认模型上限；numeric max 按 headroom/bounds 归一化；已知 SDK add-back transport 使用 `E-B` | 已改并通过，提交 `8d5061a77`                                                                                              |
 | `packages/opencode/src/provider/provider.ts`                  | `ProviderLimit` / config variant merge                                                   | 保留上游 transport-aware/empty variant 语义；新增可信 `limit.reasoning`；merge helper 显式接收 bounds                              | 已按当前 `dev` 适配并通过，提交 `8d5061a77`                                                                               |
 | `packages/opencode/src/plugin/github-copilot/models.ts`       | remote numeric variants                                                                  | 使用远端 min/max 生成合法 high/max 和 `limit.reasoning`；bounds 矛盾时两者都不暴露                                                 | 已按可信 bounds 契约适配并通过，提交 `8d5061a77`                                                                          |
-| `packages/sdk/openapi.json`、`packages/sdk/js/src/v2/gen/**`  | generated Provider model contract                                                        | 由根目录 `bun ./script/generate.ts` 同步 optional `limit.reasoning`，只提交生成器实际产生的 diff                                   | 待生成；确认门第 21 步                                                                                                    |
+| `packages/sdk/openapi.json`、`packages/sdk/js/src/v2/gen/**`  | generated Provider model contract                                                        | 由根目录 `bun ./script/generate.ts` 同步 optional `limit.reasoning`，只提交生成器实际产生的 diff                                   | 已生成并核对边界；确认门第 21 步收尾提交                                                                                  |
 | `packages/opencode/src/session/llm/request.ts`                | merged options / `chat.params`                                                           | core `E` 只计算一次；以 Effect 捕获配置失败；hook 前完成 numeric normalization 和 transport `S` 适配                               | 已改并通过，提交 `8d5061a77`                                                                                              |
 | `packages/opencode/test/lib/llm-server.ts`                    | `Reply` / usage fixture                                                                  | 增加测试用 `length()` finish helper；支持可选 reasoning usage 明细                                                                 | `length()` 已改并通过，提交 `333c5e63b`；模块三未需要扩展共享 usage fixture，真实 wire 用例使用局部 Anthropic SSE fixture |
 | `packages/opencode/test/session/processor-effect.test.ts`     | processor regression                                                                     | 覆盖共享 length normalization、事件投递和后续 secondary failure 不覆盖                                                             | 已改并通过，提交 `333c5e63b`                                                                                              |
@@ -2274,8 +2308,8 @@ CLI fixture 为每个测试 home 显式设置隔离的 `OPENCODE_DB`，使同一
 | `packages/opencode/test/plugin/codex.test.ts`                 | Codex override test                                                                      | 补 `chat.params` 删除 maxOutputTokens 的直接断言                                                                                   | 已改并通过，提交 `8d5061a77`                                                                                              |
 | `packages/opencode/test/plugin/github-copilot-models.test.ts` | Copilot override/bounds test                                                             | 补 maxOutputTokens override；远端 min/max 生成合法 variant，矛盾 bounds 不生成 numeric variant，min 不被误报为 request metadata    | 已改并通过，提交 `8d5061a77`                                                                                              |
 
-源码清单已按 rebase 后的实现提交逐项回填。只有生成产物、全量受影响测试和最终审核仍保留到
-确认门第 21 步；这些项目完成前不能把原源码基线的最终回归数字当作当前集成结果。
+源码清单已按 rebase 后的实现提交逐项回填。生成产物、全量受影响测试和最终审核已在确认门
+第 21 步完成；当前集成结果以本节记录的 `746 pass, 2 skip, 0 fail` 为准。
 
 明确不计划修改：
 
@@ -2301,7 +2335,7 @@ catalog/request 契约，用户配置不获得写入口，Session 也只持久�
 
 | 文档路径                                   | 要改什么                                                                                                                                         | 状态                                                           |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------- |
-| `docs/fixes/subagent-fix-output-length.md` | 修复后回填测试、代码、文档状态及偏差决策                                                                                                         | 模块一至三提交和最终测试/构建/五维审核均已回填，已完成         |
+| `docs/fixes/subagent-fix-output-length.md` | 修复后回填测试、代码、文档状态及偏差决策                                                                                                         | 第 21 步生成、测试、构建、环境偏差和五维审核均已回填，已完成   |
 | `packages/web/src/content/docs/cli.mdx`    | 澄清环境变量覆盖 core default；reasoning 默认模型上限；numeric `max` 的配置级 headroom/最小值降级；compaction、延迟、quota 风险；plugin 最终覆盖 | 已同步并通过 Astro 生产构建                                    |
 | 现有本地化 `cli.mdx`                       | 按 `.opencode/command/translate.md` 同步英文改动，保留变量名和技术术语                                                                           | 17 个现有 locale 已按各自 glossary 同步，18 种语言生产构建通过 |
 
@@ -2337,8 +2371,8 @@ catalog/request 契约，用户配置不获得写入口，Session 也只持久�
 - `{}` 表示明确无 variants，`undefined` 表示可以启发式生成；
 - npm 改变时重建 variants；providerID/api.id/api.url 改变时不继承旧动态 bounds；
 - 用户 variant 配置不能创建、删除或放大可信 bounds；
-- 暴露面审查确认该 optional 字段会进入 `/provider`、`/config/providers`、公开 OpenAPI
-  和 SDK v2 中的 legacy `Model`；实现时必须运行根目录生成流程；
+- 暴露面审查和实际生成确认该 optional 字段进入 `/provider`、`/config/providers`、公开
+  OpenAPI 和 SDK v2 中的 legacy `Model`；根目录生成流程已运行并只产生预期契约 diff；
 - current `ModelV2.Info`/`GET /api/model`、用户配置 limit、Session 持久化和冻结的 SDK
   root `src/gen/**` 不属于本次字段契约，不随之修改。
 
@@ -2379,7 +2413,7 @@ PR 集成阶段追加确认门，继续保持一次只做一步：
 19. 实现 `limit.reasoning`、transport-aware merge 和 request bounds 消费（已完成，提交
     `8d5061a77`）；
 20. 用户确认（已完成；CLI/设计文档提交也已在 rebase 尾部重放并复核）；
-21. 运行受影响完整测试、typecheck、必要生成检查和五维审核；
+21. 运行受影响完整测试、typecheck、必要生成检查和五维审核（已完成）；
 22. 用户确认后更新 PR。
 
 任何一步发现需要改变错误 schema、Task 状态 vocabulary、自动续写策略或 BackgroundJob

@@ -1285,10 +1285,7 @@ const layer = Layer.effect(
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
 
-            if (
-              handle.message.error?.name === "MessageOutputLengthError" ||
-              handle.message.finish === "length"
-            ) {
+            if (handle.message.error?.name === "MessageOutputLengthError" || handle.message.finish === "length") {
               return "break" as const
             }
 
