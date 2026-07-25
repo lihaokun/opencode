@@ -1,13 +1,16 @@
 # Subagent 输出截断误报成功修正方案
 
-- 状态：实施完成；模块一（Session 截断终态）已提交（`0d75454b2`）；模块二（Task
-  前后台失败传播）已提交（`4dada962e`）；模块三（Provider reasoning envelope）已提交
-  （`77e509e81`）；CLI 文档和 17 个本地化版本已同步并通过生产构建
+- 状态：修复已集成到 `dev@05c3e40a4e64`。模块一（Session 截断终态）已提交
+  （`333c5e63b`）；模块二（Task 前后台失败传播）已提交（`d3733f66d`）；Provider
+  集成红测与模块三实现分别提交为 `57a497040`、`8d5061a77`；CLI 文档和 17 个本地化版本
+  已提交（`ab3da4bf5`）并通过生产构建。上游 reasoning metadata/variant 契约冲突已按本文
+  设计解决；生成产物、全量受影响测试和最终五维审核仍按确认门单独执行，尚未 push
 - 初稿日期：2026-07-23
 - 最近审查：2026-07-25
 - 对应问题：仓库外层 `Issue#1.md`
 - 影响模块：Provider 输出/reasoning 预算、Session 终态、Task 前后台结果交接
-- 源码基线：`34e58090595d`（`packages/opencode/package.json` 版本 `1.17.18`）
+- 原实现源码基线：`34e58090595d`（`packages/opencode/package.json` 版本 `1.17.18`）
+- 当前集成基线：`05c3e40a4e64`（仓库 `dev`；与原基线相隔 93 个提交）
 
 ## 第一部分：现象与复现
 
@@ -886,7 +889,8 @@ catalogOutput = model.limit.output > 0 ? model.limit.output : OUTPUT_TOKEN_MAX
 
 1. 已知 provider 上名为 `max` 的 numeric variant 使用 `effectiveNumericMax`，可以相对旧的
    31,999 自动提高，也可以在显式输出 cap 较小时向下调整；这是 variant 名称的请求时契约，
-   不依赖无法保留到 request 阶段的“内建/用户覆盖”来源信息；
+   provider 边界只从独立的可信 `limit.reasoning` 或静态规则读取，不从该 variant 当前数值
+   反推；
 2. `high`、用户自定义 numeric budget 不自动提高，只在超过
    `safeNumericBudgetCap/providerNumericMax` 时向下 clamp；非法低值本地失败；
 3. 显式 `outputTokenMax` 决定 `E`，优先于 numeric budget 偏好；
@@ -907,18 +911,18 @@ catalogOutput = model.limit.output > 0 ? model.limit.output : OUTPUT_TOKEN_MAX
 
 当前 `ProviderTransform.variants()` 和 GitHub Copilot 动态模型目录产生的关键结构如下：
 
-| provider/model                           | 控制形状                             | 本次规则                                                                                                     |
-| ---------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
-| 旧式 Anthropic direct / Vertex / Gateway | `thinking.budgetTokens`              | `max` 使用安全 envelope；minimum 1,024；direct/Vertex transport 传 `E-B`，Gateway 保持自己的标准化语义       |
-| Anthropic on Bedrock                     | `reasoningConfig.budgetTokens`       | 同上；SDK 入参传 `E-B`，序列化加回后总上限为 `E`                                                             |
-| Anthropic on SAP                         | `modelParams.thinking.budget_tokens` | 同上，保留 SAP 包装                                                                                          |
-| Gemini 2.5                               | `thinkingConfig.thinkingBudget`      | 安全 envelope 后再 clamp 到模型范围；Pro 128..32,768，Flash active numeric 1..24,576，Flash-Lite 512..24,576 |
-| GitHub Copilot numeric model             | `thinking.budgetTokens`              | 以动态目录已编码的 `max` variant 值作为请求时上界；不从 `limit.output` 猜 cap                                |
-| OpenAI-compatible / GLM 5.2              | `reasoningEffort`                    | 原样保留，不换算 token                                                                                       |
-| 新版 Claude                              | adaptive thinking + `effort`         | 原样保留                                                                                                     |
-| Gemini 3                                 | `thinkingLevel`                      | 原样保留                                                                                                     |
-| Amazon Nova                              | `maxReasoningEffort`                 | 原样保留                                                                                                     |
-| 未知 custom numeric shape                | 已有 numeric value                   | 不提高；能识别安全上界时只向下 clamp                                                                         |
+| provider/model                           | 控制形状                             | 本次规则                                                                                                         |
+| ---------------------------------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| 旧式 Anthropic direct / Vertex / Gateway | `thinking.budgetTokens`              | `max` 使用安全 envelope；minimum 1,024；direct/Vertex transport 传 `E-B`，Gateway 保持自己的标准化语义           |
+| Anthropic on Bedrock                     | `reasoningConfig.budgetTokens`       | 同上；SDK 入参传 `E-B`，序列化加回后总上限为 `E`                                                                 |
+| Anthropic on SAP                         | `modelParams.thinking.budget_tokens` | 同上，保留 SAP 包装                                                                                              |
+| Gemini 2.5                               | `thinkingConfig.thinkingBudget`      | 安全 envelope 后再 clamp 到模型范围；Pro 128..32,768，Flash active numeric 1..24,576，Flash-Lite 512..24,576     |
+| GitHub Copilot numeric model             | `thinking.budgetTokens`              | 以可信目录/动态发现写入 `limit.reasoning` 的 bounds 为请求时上界；不再从 `variants.max` 或 `limit.output` 猜 cap |
+| OpenAI-compatible / GLM 5.2              | `reasoningEffort`                    | 原样保留，不换算 token                                                                                           |
+| 新版 Claude                              | adaptive thinking + `effort`         | 原样保留                                                                                                         |
+| Gemini 3                                 | `thinkingLevel`                      | 原样保留                                                                                                         |
+| Amazon Nova                              | `maxReasoningEffort`                 | 原样保留                                                                                                         |
+| 未知 custom numeric shape                | 已有 numeric value                   | 不提高；能识别安全上界时只向下 clamp                                                                             |
 
 支持的 numeric 路径至少包括：
 
@@ -933,11 +937,64 @@ modelParams.thinkingConfig.thinkingBudget
 
 不递归改写任意名为 `budget` 的未知字段，避免碰到计费、task budget 或 provider 私有参数。
 
+`providerNumericMin/providerNumericMax` 不再从 variant 反推，而是使用独立的可信模型
+bounds。新增可选数据结构：
+
+```text
+数据结构：ProviderReasoningLimit
+
+字段：
+  - min?: number — provider 允许的最小 active numeric reasoning budget
+  - max?: number — provider 允许的最大 active numeric reasoning budget
+
+类型不变量：
+  - min/max 若存在，均为正整数
+  - min 与 max 同时存在时 min <= max
+  - 字段值已经由 source adapter 归一化为当前协议下可直接比较的合法边界；
+    source 自身的 inclusive/exclusive 语义不能泄漏给 request helper
+
+生命周期：
+  - 创建：只允许由可信 catalog metadata、provider 实时发现或内置静态规则创建
+  - 继承：模型 providerID/api.id/api.url 未改变时可以继承；transport npm 改变只要求
+    重建 variants，不自动使 endpoint-level bounds 失效
+  - 失效：模型 API ID、URL 或 provider identity 改变时清除并重新发现
+  - 配置：当前用户配置不能直接创建或放大该字段
+
+跨模块共享性：
+  - Provider catalog/config merge 生产
+  - ProviderTransform request normalization 消费
+```
+
+该结构作为 `ProviderLimit` 的可选字段保存：
+
+```ts
+limit: {
+  context: number
+  input?: number
+  output: number
+  reasoning?: {
+    min?: number
+    max?: number
+  }
+}
+```
+
+`model.variants` 与 `model.limit.reasoning` 的职责严格分离：
+
+```text
+model.variants
+  = 可选择、可由用户定制的 request option presets
+
+model.limit.reasoning
+  = 不可由用户伪造或放大的可信 provider numeric capability bounds
+```
+
 `providerNumericMax` 的来源优先级固定为：
 
-1. provider 实时模型能力；GitHub Copilot 的远端 `max_thinking_budget` 当前在
-   `plugin/github-copilot/models.ts` 中被编码为所选 `max` variant 的
-   `thinking.budgetTokens`，request 阶段以这个已有值作为保守上界；
+1. `model.limit.reasoning` 中已经归一化的可信 bounds：
+   - GitHub Copilot `/models` 的 `max_thinking_budget/min_thinking_budget`；
+   - 当前 `dev` 已引入的 `models.dev.reasoning_options` 中
+     `budget_tokens { min, max }`；
 2. 官方公布且能按 API model ID 稳定匹配的静态范围，例如 Gemini 2.5 Pro
    128..32,768、Flash 0..24,576、Flash-Lite 512..24,576；本方案的 active numeric
    variant 仍要求正整数，因此 Flash 的 active 下限按 1 处理，`0` 的“禁用 thinking”语义
@@ -947,38 +1004,87 @@ modelParams.thinkingConfig.thinkingBudget
    [Claude extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking)
    和
    [Amazon Bedrock extended thinking](https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-extended-thinking.html)；
-4. 无可靠来源时不得从 `model.limit.output` 猜出独立 provider cap，也不得自动提高。
+4. 无可靠来源时不得从 `model.limit.output`、任意 `variants.max` 或用户配置猜出独立
+   provider cap，也不得自动提高。
 
-Copilot 远端的 `min_thinking_budget` 当前没有保存在通用 `Provider.Model` 中，本次不为此
-扩展 models.dev 或公共模型 schema。因此不能在 request 阶段声称仍持有远端 minimum：
-动态目录生成 `max/high` 时仍必须使用当次远端 min/max：
+Copilot 动态目录仍按远端 source 的 exclusive 语义生成合法值：
 
 ```text
-discoveredCap = floor(max_thinking_budget) - 1
+discoveredMax = floor(max_thinking_budget) - 1
 discoveredMin = max(1, ceil(min_thinking_budget ?? 1))
 
-若 discoveredCap < discoveredMin：
+若 discoveredMax < discoveredMin：
+  不设置 limit.reasoning
   不暴露 numeric high/max variant
 
 否则：
-  max  = discoveredCap
-  high = clamp(floor(max_thinking_budget / 2), discoveredMin, discoveredCap)
+  limit.reasoning = { min: discoveredMin, max: discoveredMax }
+  variants.max  = discoveredMax
+  variants.high = clamp(floor(max_thinking_budget / 2), discoveredMin, discoveredMax)
 ```
 
-这样 remote min 在丢失前已经保证 catalog 初值合法。若显式 `E` 迫使 request helper 把
-它继续降到一个无法证明满足 remote min 的范围，则本地报告配置不兼容，而不是猜测
-minimum 或等待远端 400。
+`models.dev.reasoning_options` 的 min/max 由独立 adapter 按该 metadata 的边界定义归一化；
+不能无条件套用 Copilot 的 `-1`。request 阶段还会统一应用 `budget < E`，因此最终
+`wireNumericMax = min(limit.reasoning.max ?? +∞, E - 1)`。
 
-`Provider` 当前会把用户配置的 variants 深度合并到 Copilot 动态目录，若不加保护，用户可
-在合并时覆盖并丢失远端 max。为避免新增模型字段，合并 Copilot 配置前先读取动态目录原始
-`variants.max.thinking.budgetTokens`，合并后：
+`Provider` 把用户 variants 合并到可信目录时：
 
-1. 恢复 `max` variant 的该值，使 request 阶段仍能把它当作可信远端 cap；
-2. 所有用户 `high`/custom numeric variant 最多 clamp 到这个 cap；
-3. 固定的较小预算必须使用非 `max` 名称；`max` 名称始终表示动态最大策略。
+1. `max` variant 可以按普通配置语义被定制或禁用，但不能删除或放大独立的可信 bounds；
+2. `high`/custom numeric variant 最多 clamp 到 `limit.reasoning.max`；
+3. 固定的较小预算仍使用非 `max` 名称；
+4. bounds 独立存在，因此即使 variant 被禁用，request normalizer 也不会丢失 provider
+   capability；未选 numeric variant 时 bounds 不主动合成请求字段。
 
-这项保护只应用于已由 Copilot 远端目录提供可信 max 的模型，不改变其他 provider 的通用
-variant merge 语义。
+##### `dev` 集成时的冲突与契约漂移
+
+PR 分支以 `34e58090595d` 为共同祖先；集成时仓库 `dev` 已前进到 `05c3e40a4e64`。两边共有
+六个文件同时变化，其中四个可自动合并，`provider.ts` 的 variant merge 和
+`test/plugin/codex.test.ts` 的同位置测试插入产生内容冲突。本节只讨论前者。
+
+共同祖先始终使用 `ProviderTransform.variants(parsedModel)`；本分支改为：
+
+```text
+GitHub Copilot 且 existingModel.variants 存在
+  → 使用 existing variants 并把 variants.max 当作动态 cap
+否则
+  → 重新生成 variants
+```
+
+上游 `a8062ea31` 改为：
+
+```text
+existingModel.api.npm == parsedModel.api.npm
+  → 保留 existingModel.variants；undefined 才启发式生成
+否则
+  → 为新 transport 重新生成 variants
+```
+
+上游规则保护两个新契约：
+
+- `variants === {}` 表示 metadata 明确声明无 variant，不能与 `undefined` 的“未知，可启发式
+  生成”混为一谈；
+- variant option 形状属于 transport，`thinking.budgetTokens` 不能在 npm 切换后直接带到
+  只接受 `reasoningEffort` 的 SDK。
+
+只选择本分支会破坏上述两个契约；只选择上游会允许用户删除 Copilot `max` 并把
+`high/custom` 放大到实时 cap 以上。把两段代码机械拼接也不充分：当前
+`mergeModelVariants()` 和 `reasoningBudgetBounds()` 只要看到
+`providerID=github-copilot + variants.max.thinking.budgetTokens` 就声称它是远端 cap，
+但该值也可能来自 transport 切换后的启发式生成或用户配置。
+
+最终实现采用以下顺序：
+
+```text
+1. 按 npm 是否相同选择 transport-compatible base variants
+2. 按 providerID/api.id/api.url 是否相同继承可信 limit.reasoning
+3. 合并用户 variants
+4. 使用独立 bounds 对仍存在的 max/high/custom numeric preset 做 validation/clamp
+5. request 阶段只从 limit.reasoning/静态规则读取 provider bounds
+```
+
+这一调整同时修正文档原先“通用 models.dev 只有 reasoning boolean/limit.output”的过时
+前提。集成基线已经提供 `reasoning_options`，但 raw metadata 不直接进入 request；
+catalog 阶段只保留规范化后的 variants 和可验证 numeric bounds。
 
 ##### 具体计算示例
 
@@ -997,11 +1103,12 @@ variant merge 语义。
 `max_tokens` 分别为 131,072、32,768 和 32,000。Gemini transport 不执行该加法，所以
 仍直接传 `S=E`。
 
-GitHub Copilot 是当前自动发现 numeric thinking bounds 的已知实例：
-`max_thinking_budget/min_thinking_budget` 来自远端模型能力，但当前只有 max 被编码进
-variant 并可作为 request-time cap；Gemini 2.5 的范围来自静态 model family 规则；通用
-`models.dev` 目前只有 `reasoning: boolean` 和 `limit.output`，没有统一
-`maxThinkingBudget`。因此本次不声称能为每个模型自动发现准确数字。
+GitHub Copilot 是当前实时发现 numeric thinking bounds 的已知实例；
+`max_thinking_budget/min_thinking_budget` 来自远端模型能力。当前 `dev` 的
+`models.dev.reasoning_options` 还能为部分模型提供 catalog 级 effort/toggle/budget
+metadata；Gemini 2.5 的范围也可来自静态 model family 规则。三类来源都必须先规范化为
+可信 bounds，不能把任意用户 variant 数值升级为 provider capability。没有上述可靠来源的
+模型仍不能自动得到准确数字。
 
 ##### 运行成本、配额与稳定性
 
@@ -1428,6 +1535,11 @@ body 使用新的 max token 值，并验证现有 plugin override 不变。
 `high/max` 静态初值，保证目录中不产生负数或零 budget。这里不读取 RuntimeFlags，也不负责
 最终请求 envelope。
 
+同时扩展 `ProviderLimit`，以可选 `limit.reasoning.{min,max}` 保存 catalog/provider
+已经验证的 numeric bounds。`fromModelsDevModel()` 从 `reasoning_options` 生成 variants
+时同步提取合法 budget bounds；GitHub Copilot 动态目录从远端 min/max 写入同一字段。
+用户配置当前不能直接设置该字段，避免把偏好值冒充 provider capability。
+
 随后在 `packages/opencode/src/provider/transform.ts` 增加确定性 helper
 `normalizeReasoningBudget()`，由 `packages/opencode/src/session/llm/request.ts` 在所有
 base/model/agent/variant options 合并完成后调用：
@@ -1447,6 +1559,7 @@ Requires:
 Ensures:
   - 返回新 options，不修改输入及 model/agent catalog
   - effort/adaptive/thinkingLevel/maxReasoningEffort 值不变
+  - provider bounds 只来自 model.limit.reasoning 或已确认的静态 provider 规则
   - provider minimum 允许时，已知 numeric `max` 不超过 safe cap 和 provider cap
   - provider minimum 不允许目标 headroom、但仍存在合法值时，使用 minimum 并接受目标降级
   - high/custom 的合法 numeric budget 不会被自动提高
@@ -1533,12 +1646,14 @@ safeCap        = maxOutputTokens - desiredReserve
 
 ```text
 已知 provider 且 selected variant == "max":
-  若 safeCap >= providerNumericMin：
+  若 providerNumericMin 已知且 safeCap >= providerNumericMin：
     min(safeCap, providerNumericMax ?? safeCap)
-  否则若 providerNumericMin < maxOutputTokens：
+  否则若 providerNumericMin 已知且 providerNumericMin < maxOutputTokens：
     providerNumericMin  // configured headroom 目标降级
+  否则若只知道 providerNumericMax，且该 maximum 可直接放入 safeCap：
+    providerNumericMax
   否则：
-    配置失败
+    配置失败  // 不在 minimum 未知时猜测可向下调整的范围
 
 selected variant != "max":
   先验证 existingNumericBudget > 0 且不低于已知 providerNumericMin
@@ -1553,7 +1668,7 @@ budget。`activeVariant == undefined` 时 helper 绝不能进入 numeric `max` �
 
 只有已知 manual Anthropic family 可以在名为 `max` 的 variant 下突破旧的 31,999；
 Gemini 2.5 使用按 Pro/Flash/Flash-Lite 区分的静态 provider minimum/maximum；GitHub
-Copilot 以动态模型目录已经编码到 variant 的 max 值作为保守 cap。未知 custom numeric
+Copilot 使用 `limit.reasoning` 中由目录/实时发现写入的可信 bounds。未知 custom numeric
 协议只向下 clamp，不自动提高；缺少 minimum 元数据且向下调整可能越过 minimum 时本地
 失败，不猜测也不等待 provider 校验。
 
@@ -1573,6 +1688,165 @@ maxReasoningEffort
 
 这意味着原始 GLM 5.2 仍只发送 `reasoningEffort="max"`；本模块不声称能把该定性值限制为
 90% token。
+
+#### 4.4.3 上游 variant 契约集成
+
+`provider.ts` 中 config model 的合并按两个互相独立的兼容性条件处理：
+
+```text
+sameTransport =
+  existingModel.api.npm == parsedModel.api.npm
+
+sameEndpoint =
+  existingModel.providerID == parsedModel.providerID
+  && existingModel.api.id == parsedModel.api.id
+  && existingModel.api.url == parsedModel.api.url
+```
+
+variant 选择：
+
+```text
+若 sameTransport：
+  baseVariants = existingModel.variants ?? ProviderTransform.variants(parsedModel)
+否则：
+  baseVariants = ProviderTransform.variants(parsedModel)
+```
+
+这里必须使用 nullish 语义，显式 `{}` 原样保留。bounds 选择：
+
+```text
+若 sameEndpoint：
+  reasoningBounds = existingModel.limit.reasoning
+否则：
+  reasoningBounds = undefined，并由新 endpoint 的可信 metadata 重新建立
+```
+
+transport 改变时 variants 必须重建，但 endpoint-level bounds 可以继续约束新 transport
+已经能够表达的 numeric option；若新 transport 只表达 effort，则 normalizer 找不到
+numeric path，bounds 不会合成额外字段。
+
+`mergeModelVariants()` 改为显式接收 bounds：
+
+```text
+函数：mergeModelVariants(base, configured, reasoningBounds?)
+
+Requires:
+  - base 与当前 parsedModel transport 兼容
+  - reasoningBounds 若存在，已满足 ProviderReasoningLimit 不变量
+
+Ensures:
+  - 深度合并 configured，移除 disabled 控制字段
+  - reasoningBounds 不存在时，不把任意 variants.max 推断为 provider cap
+  - reasoningBounds.max 存在时，numeric high/custom 不超过该值
+  - configured max 可以被禁用，但该操作不删除独立 reasoningBounds
+  - configured max 若保留且为 numeric，不超过可信 maximum
+  - 显式空 base 在无配置时仍为空
+  - 不修改 base/configured/reasoningBounds
+```
+
+`reasoningBudgetBounds()` 随后只读取 `model.limit.reasoning` 和已确认的静态规则，删除
+“GitHub Copilot 一律从 `model.variants.max` 反推 maximum”的分支。这样：
+
+- variant 是 request preset，可以禁用、改名或定制；
+- bound 是 provider capability，不能被 variant merge 意外删除；
+- 同一个 numeric `max` 不会因来源不同而被错误升级成硬上限；
+- 没有可信 bound 的 numeric max 使用通用安全 envelope，不触发
+  “无法降低 discovered Copilot maximum”的误报。
+
+raw `reasoning_options` 不重新暴露到 `Provider.Model`，只保留 request 所需的规范化
+min/max。
+
+##### `Provider.Model/ProviderLimit` 契约暴露面审查
+
+本审查以目标 `dev@05c3e40a4e64` 为准，沿实际类型、运行时返回值和生成流程核对，而不是只看
+`ProviderLimit` 的局部声明。结论是：`limit.reasoning` 一旦加入 `Provider.Model`，就是
+**additive、optional、公开可读但不可由用户配置写入**的旧 Provider model 契约，不是纯内部
+字段。
+
+完整暴露链如下：
+
+```text
+ProviderLimit
+  → Provider.Model.limit
+  → Provider.Info.models[*]
+  → Provider.toPublicInfo()
+      ├─ GET /provider
+      │    → Provider.ListResult
+      ├─ GET /config/providers
+      │    → Provider.ConfigProvidersResult
+      └─ plugin provider/auth/small-model hooks
+  → Server.openapi()
+  → packages/sdk/openapi.json
+  → packages/sdk/js/src/v2/gen/types.gen.ts 中的 Model/Provider
+```
+
+`Provider.toPublicInfo()` 会先用 `Schema.is(Provider.Model)` 过滤非法模型，再对完整模型做 JSON
+序列化；它没有字段级 allowlist。因此合法的 `limit.reasoning` 会出现在两个 HTTP 响应和
+plugin runtime input 中，非法 bounds 不能以合法 `Provider.Model` 混入公开结果。实现时
+schema 至少验证：
+
+- `min/max` 若存在，都是正整数；
+- 两者同时存在时 `min <= max`；
+- `undefined` 表示没有可信 numeric bound，不能编码成空的伪能力；
+- `{ min }`、`{ max }` 或 `{ min, max }` 都只表示 adapter 已验证的已知子集。
+
+公开面审查结果：
+
+| 暴露面                                          | 实际关系                                                                                                 | 本次决策                                                    |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `/provider`                                     | success schema 是 `Provider.ListResult`，handler 返回 `Provider.toPublicInfo()`                          | 新字段随模型公开；保持 optional，旧客户端可忽略             |
+| `/config/providers`                             | success schema 是 `Provider.ConfigProvidersResult`，同样返回 `toPublicInfo()`                            | 与 `/provider` 保持同一 Provider model shape                |
+| `packages/sdk/openapi.json`                     | 保存上述 legacy/experimental HTTP API 的公开 OpenAPI snapshot                                            | 必须由生成流程更新                                          |
+| `packages/sdk/js/src/v2/gen/types.gen.ts`       | 同时包含 legacy `Model`/`Provider` 与 current `ModelV2Info`/`ProviderV2Info`                             | 只给其中 legacy `Model.limit` 增加 optional `reasoning`     |
+| `@opencode-ai/plugin` provider hooks            | `Provider as ProviderV2`、`Model as ModelV2` 是从 SDK v2 导入的 legacy 类型别名，不是 `ModelV2Info`      | 生成后 provider model discovery 可以类型安全地返回 bounds   |
+| `chat.params` / auth loader compatibility types | 仍从冻结的 SDK root `src/gen` 取 legacy 类型；运行时可收到完整对象，但该生成面早已不覆盖 Provider 新字段 | 不手改冻结产物；core 在 hook 前消费 bounds，plugin 无需写它 |
+| App/TUI                                         | 通过 provider list 消费 legacy `Model`，当前只读取 `limit.context` 等既有字段                            | optional 新字段被保留但忽略，无 UI 改动                     |
+
+仓库生成入口是根目录的 `bun ./script/generate.ts`。它先运行
+`packages/sdk/js/script/build.ts` 生成 SDK v2，再把 `Server.openapi()` 写入
+`packages/sdk/openapi.json` 并统一格式化。generated 文件禁止手工编辑；实施后必须审查
+生成 diff，预期至少包含 OpenAPI 中 `Model.limit.reasoning` 和 SDK v2 中 legacy
+`Model.limit.reasoning?`。旧的 `packages/sdk/js/src/gen/**` 当前不再由该 codegen 更新，
+且已经缺少多个现有 `Provider.Model` 字段，所以本修复不单独手工补它。
+
+以下三个相邻契约保持不变：
+
+1. **current `ModelV2.Info` 保持不变。** `packages/schema/src/model.ts`、core `Catalog` 和
+   `GET /api/model` 是一条独立的新架构链；它从 `models.dev` 单独建模，不与 legacy
+   `Provider.Model` 相互转换。本次 Session/LLM request 仍消费 legacy `Provider.Model`，
+   因此同步 `ModelV2.Info.limit` 会扩大范围，却不能帮助当前修复。如果 current Session
+   runner 后续需要相同策略，应另开契约变更并覆盖其 catalog/request 链。
+2. **用户配置 schema 保持不变。** `ConfigProviderV1.Model.limit` 和
+   `ConfigProvider.Model.Limit` 都只接受 context/input/output。这样用户配置可以修改
+   variants preset，却不能创建、删除或放大可信 bounds；公开可读不等于配置可写。
+3. **持久化 schema 保持不变。** legacy user message 和 Session 数据库只保存
+   providerID/modelID/variant（或等价 model ref），不保存完整 `Provider.Model`；因此没有
+   数据迁移、历史回填或旧行兼容问题。
+
+据此，实施边界固定为：
+
+```text
+修改：
+  legacy ProviderLimit / Provider.Model
+  catalog/Copilot trusted-source adapters
+  legacy Provider merge 与 request consumer
+  Provider public-schema tests
+  OpenAPI + SDK v2 generated artifacts
+
+不修改：
+  packages/schema/src/model.ts 的 ModelV2.Info
+  /api/model
+  ConfigProviderV1 / ConfigProvider limit schema
+  session/database schema
+  packages/sdk/js/src/gen/**
+  App/TUI 展示
+```
+
+兼容性上，这是响应对象新增 optional 子字段，旧消费者继续工作；新消费者可以读取但不能通过
+配置回写。安全边界不依赖“字段不可见”，而依赖 source adapter、schema validation、
+endpoint identity invalidation 和 config schema 不提供写入口。第三方 plugin 本身是本地可执行
+代码，拥有比修改该字段更高的权限；它返回的 bounds 仍必须经过相同 schema/normalization
+验证，不能仅因来自 plugin 就自动升级为可信 capability。
 
 ### 4.5 修复后的最小复现路径
 
@@ -1686,6 +1960,23 @@ I19: Task XML-like serialization
      ⇒ 动态 attribute/element 内容均经过上下文转义
      ∧ 动态内容不能伪造 task/summary/task_result/task_error 标签或 completed 状态
      ∧ visible excerpt 的转义后 UTF-8 表示仍满足配置上限
+
+I20: model.variants === {}
+     ⇒ catalog 明确声明无 variants
+     ∧ config/normalization 不因对象为空而启发式重新生成
+
+I21: existingModel.api.npm != parsedModel.api.npm
+     ⇒ 最终 base variants 不包含旧 transport 的 option shape
+
+I22: model.limit.reasoning 存在
+     ⇒ min/max 来自可信 catalog/provider adapter
+     ∧ 用户 variant 配置不能放大或删除该 capability
+
+I23: model.limit.reasoning 不存在
+     ⇒ 任意 variants.max 数值都不能被推断为 provider numeric maximum
+
+I24: providerID/api.id/api.url 改变
+     ⇒ 不继承旧 endpoint 的动态 reasoning bounds
 ```
 
 ### 5.3 模块保持论证
@@ -1720,6 +2011,9 @@ I19: Task XML-like serialization
 - numeric `max` 按同一个 core max output 配置 10%/4,096 的 headroom 目标；
 - provider minimum 不允许目标 headroom 时使用确定的降级/失败规则，不发送已知非法请求；
 - 合法 `high`/custom 不提高，非法低值本地失败，effort/adaptive/thinking-level 不做数字换算；
+- variants 只表达 transport-specific request preset，可信 numeric bounds 独立保存在
+  `limit.reasoning`；显式空 variants 与 undefined 保持不同语义；
+- transport 改变时重建 variant shape，endpoint identity 改变时不继承旧动态 bounds；
 - `output=0` 的内置 variant catalog 使用正数 fallback；
 - max-output、budget 与 transport adapter 都无副作用；已知会自动加回 budget 的 SDK 收到
   `E-B`，加回后的候选 total 为 `E`，后续 SDK/provider cap 只允许继续向下；
@@ -1749,7 +2043,9 @@ I19: Task XML-like serialization
 - 不迁移或回填修复前已经存入数据库的历史 `finish=length ∧ error=undefined` 消息；
 - 不把 process-local BackgroundJob 改造成 durable job registry；
 - 不把 effort/adaptive/thinking-level 自动换算为 token；
-- 不为通用 `models.dev` 新增尚不可靠的 `maxThinkingBudget` 字段；
+- 不把 raw `models.dev.reasoning_options` 重新暴露到 `Provider.Model`；只保存已验证的可选
+  `limit.reasoning.{min,max}`；
+- 不允许用户配置创建或放大可信 reasoning bounds；
 - 不通过真实计费请求探测 provider 的 numeric thinking 上限；
 - 不递归改写未知 provider 私有 budget 字段。
 
@@ -1757,56 +2053,66 @@ I19: Task XML-like serialization
 
 | 类型     | 文件 / 用例                                                                                 | 验证内容                                                                                                                                           | 状态                                                                                             |
 | -------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| 回归     | `test/cli/run/run-process.test.ts`：subagent length without text                            | 真实 CLI/SSE/DB 全链路；wire max token 正确；child 持久化 length error；父 Task 非 completed；不自动重放 child 请求                                | 已加并通过，提交 `4dada962e`                                                                     |
-| 回归     | `test/session/prompt.test.ts`：length without text                                          | processor 同步持久化 finish/error；error event 恰好一次；只发一个 LLM 请求                                                                         | 已加并通过，提交 `0d75454b2`                                                                     |
-| 回归     | `test/tool/task.test.ts`：foreground length without text                                    | 不产生空 `completed`；Task/BackgroundJob 失败                                                                                                      | 已加并通过，提交 `4dada962e`                                                                     |
-| 回归     | `test/tool/task.test.ts`：foreground length with partial text                               | 失败；完整内容可由子 Session 定位；错误带有界 incomplete excerpt                                                                                   | 已加并通过，提交 `4dada962e`                                                                     |
-| 回归     | `test/tool/task.test.ts`：background length                                                 | 后台通知使用 `state="error"`，不使用 completed                                                                                                     | 已加并通过，提交 `4dada962e`                                                                     |
-| 新增     | `test/session/processor-effect.test.ts`：length terminal normalization                      | 直接输入共享 LLM `step-finish(reason="length")`；返回 stop；正常路径事件恰好一次；既有 terminal error 不覆盖/不重复发布                            | 已加并通过，提交 `0d75454b2`                                                                     |
-| 新增     | `test/session/processor-effect.test.ts`：length then secondary processor failure            | length error 落库后模拟 snapshot/part/cleanup 失败；`halt()` 保留原终态、只记录 secondary failure、不重复发事件                                    | 已加并通过（snapshot failure 同时覆盖 cleanup；part failure 走同一 halt seam），提交 `0d75454b2` |
-| 新增     | `test/cli/run/run-process.test.ts`：top-level length                                        | 顶层 Session 产生 error event；partial 仍输出/落库；CLI 非零退出且不自动续写                                                                       | 已加并通过（CLI 可观察项；落库由同组 processor/prompt 用例断言），提交 `0d75454b2`               |
-| 新增     | `test/session/prompt.test.ts`：length with partial text/reasoning                           | error 与 parts 同时保留；事件一次；不重放请求                                                                                                      | 已加并通过，提交 `0d75454b2`                                                                     |
-| 新增     | `test/session/prompt.test.ts`：length after a tool completed in the previous provider round | round 1 文件追加一次并持久化 tool result；round 2 报告被截断；文件仍只有一行；不发 child round 3                                                   | 已加并通过，提交 `0d75454b2`                                                                     |
-| 新增     | `test/session/prompt.test.ts`：length after StructuredOutput success                        | 通过可控 processor/tool seam 同时建立 structured value 与 length；structured 快捷路径不能绕过 length error                                         | 已加并通过，提交 `0d75454b2`                                                                     |
-| 新增     | `test/session/compaction.test.ts`：length summary                                           | summary 带 OutputLengthError，不进入 completed compaction，不发布成功 compact event                                                                | 已加并通过，提交 `0d75454b2`                                                                     |
-| 新增     | `test/tool/task.test.ts`：content-filter/API assistant error                                | 非 length assistant error 同样不会成为 completed；只取安全 message，不复制 responseBody/headers/metadata                                           | 已加并通过，提交 `4dada962e`                                                                     |
-| 新增     | `test/tool/task.test.ts`：existing error plus finish length                                 | aborted 优先为 cancelled；其他已有错误保留原分类；defensive length 仅在无 error 时生效                                                             | 已加并通过，提交 `4dada962e`                                                                     |
-| 新增     | `test/tool/task.test.ts`：non-assistant result                                              | `TaskPromptOps.prompt()` 违反 assistant 结果契约时 Task/BackgroundJob 失败                                                                         | 已加并通过，提交 `4dada962e`                                                                     |
-| 新增     | `test/tool/task.test.ts`：aborted assistant foreground/background                           | runTask interrupt-only；BackgroundJob cancelled；前台 `Task cancelled`；后台不注入 completed/error 通知                                            | 已加并通过，提交 `4dada962e`                                                                     |
-| 新增     | `test/tool/task.test.ts`：multiple text parts                                               | 按顺序形成 visible excerpt，不只取最后 part                                                                                                        | 已加并通过，提交 `4dada962e`                                                                     |
-| 新增     | `test/tool/task.test.ts`：large/unicode partial output                                      | excerpt 按完整 code point 满足 line/UTF-8 byte 上限并包含 Session ID；全文只存在于已持久化子 Session                                               | 已加并通过，提交 `4dada962e`                                                                     |
-| 新增     | `test/tool/task.test.ts`：reasoning privacy                                                 | 错误包含 reasoning token count，但不包含 reasoning part 文本                                                                                       | 已加并通过，提交 `4dada962e`                                                                     |
-| 新增     | `test/tool/task.test.ts`：task markup injection                                             | text/error/summary 含闭合标签和 `state="completed"` 时全部转义；转义后 excerpt 仍满足 UTF-8 byte/line 上限                                         | 已加并通过，提交 `4dada962e`                                                                     |
-| 新增     | `test/tool/task.test.ts`：promotion then length                                             | foreground 被提升为 background 后仍注入 `state="error"`                                                                                            | 已加并通过，提交 `4dada962e`                                                                     |
-| 既有回归 | `test/tool/task.test.ts`：normal stop/resume/background completion                          | 正常 completed 行为不变                                                                                                                            | 已全量通过（Task 文件 29 个用例），提交 `4dada962e`                                              |
-| 新增     | `test/provider/transform.test.ts`：reasoning 131072, no override                            | 返回 131072                                                                                                                                        | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：non-reasoning 131072                                     | 返回 32000                                                                                                                                         | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：reasoning + explicit 64000                               | 返回 64000                                                                                                                                         | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：override > model limit                                   | 返回 model limit                                                                                                                                   | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：model output=0 fallback                                  | max output 保持正数 fallback；内置 Anthropic high/max catalog budget 也均为正数                                                                    | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：reasoning capability + no variant                        | 仍按 capability 使用模型输出上限，不依赖 variant                                                                                                   | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：Anthropic numeric max envelope                           | `E=131072 → 117964`；`E=32768 → 28672`；camelCase/snake_case/SAP/Bedrock shape 都正确                                                              | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：Gemini 2.5 provider bounds                               | 65,536 输出下 Pro/Flash clamp 32,768/24,576；小 `E` 使用 Pro 128、Flash-Lite 512 minimum；`E<=minimum` 本地失败                                    | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：high/custom numeric policy                               | 合法既有值不提高；超过 safe cap 时向下 clamp；低于已知 minimum 时本地失败；未知字段不递归改写                                                      | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：small output/provider minimum                            | Anthropic `E=4000 → budget=1024` 并接受 headroom 目标降级；`E=1024` 和非法 custom 值均本地失败                                                     | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：max variant name contract                                | `variants.max` 遵守动态 max 契约；high/custom 固定值不提高且只向下 clamp                                                                           | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：Copilot encoded cap                                      | request-time cap 取动态目录已编码的 max variant；不能证明远端 minimum 的下调本地失败                                                               | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：effort/adaptive identity                                 | effort、adaptive、thinking level、maxReasoningEffort 结构和值保持不变                                                                              | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：numeric normalization immutability                       | 返回新对象；输入 options 和 model catalog 均不变                                                                                                   | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：numeric normalization determinism                        | 相同 model/variant/options/E/bounds 产生相同 options 或相同配置错误                                                                                | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/transform.test.ts`：transport max adaptation                                 | Anthropic/Bedrock 使用 `E-B`；Anthropic enabled 缺省 budget 按 SDK 隐式 1,024；Google 等不加回的 transport 保持 `E`                                | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/session/llm.test.ts`：reasoning request body                                          | Anthropic SDK 入参 13,108 + budget 117,964，真实 wire `max_tokens=131,072`                                                                         | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/session/llm.test.ts`：reasoning request + explicit RuntimeFlags cap                   | request 参数使用 `S=4,096`、budget 27,904，总 envelope 为显式 32,000                                                                               | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/session/llm.test.ts`：effort-only request                                             | GLM `reasoningEffort=max` 保持原样，不由 normalizer 新增 numeric thinking 字段                                                                     | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/session/llm.test.ts`：small request with user max variant                             | active variant 为 undefined；沿用 small options，不合成或提高 numeric max budget                                                                   | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/session/llm.test.ts`：normalized plugin input/final override                          | `chat.params` 先看到 normalized options 和 transport-ready `S`，并仍可同时替换两者                                                                 | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/session/compaction.test.ts`：reasoning without input limit                            | usable 使用 `context - core_max_output`                                                                                                            | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/session/compaction.test.ts`：reasoning with input limit                               | usable 保持 `input - min(20k, core_max_output)`                                                                                                    | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/acp/service-session.test.ts`：output length stop reason                               | 持久化 MessageOutputLengthError 后 ACP 返回 `stopReason=max_tokens`                                                                                | 已加并通过，提交 `0d75454b2`                                                                     |
+| 回归     | `test/cli/run/run-process.test.ts`：subagent length without text                            | 真实 CLI/SSE/DB 全链路；wire max token 正确；child 持久化 length error；父 Task 非 completed；不自动重放 child 请求                                | 已加并通过，提交 `d3733f66d`                                                                     |
+| 回归     | `test/session/prompt.test.ts`：length without text                                          | processor 同步持久化 finish/error；error event 恰好一次；只发一个 LLM 请求                                                                         | 已加并通过，提交 `333c5e63b`                                                                     |
+| 回归     | `test/tool/task.test.ts`：foreground length without text                                    | 不产生空 `completed`；Task/BackgroundJob 失败                                                                                                      | 已加并通过，提交 `d3733f66d`                                                                     |
+| 回归     | `test/tool/task.test.ts`：foreground length with partial text                               | 失败；完整内容可由子 Session 定位；错误带有界 incomplete excerpt                                                                                   | 已加并通过，提交 `d3733f66d`                                                                     |
+| 回归     | `test/tool/task.test.ts`：background length                                                 | 后台通知使用 `state="error"`，不使用 completed                                                                                                     | 已加并通过，提交 `d3733f66d`                                                                     |
+| 新增     | `test/session/processor-effect.test.ts`：length terminal normalization                      | 直接输入共享 LLM `step-finish(reason="length")`；返回 stop；正常路径事件恰好一次；既有 terminal error 不覆盖/不重复发布                            | 已加并通过，提交 `333c5e63b`                                                                     |
+| 新增     | `test/session/processor-effect.test.ts`：length then secondary processor failure            | length error 落库后模拟 snapshot/part/cleanup 失败；`halt()` 保留原终态、只记录 secondary failure、不重复发事件                                    | 已加并通过（snapshot failure 同时覆盖 cleanup；part failure 走同一 halt seam），提交 `333c5e63b` |
+| 新增     | `test/cli/run/run-process.test.ts`：top-level length                                        | 顶层 Session 产生 error event；partial 仍输出/落库；CLI 非零退出且不自动续写                                                                       | 已加并通过（CLI 可观察项；落库由同组 processor/prompt 用例断言），提交 `333c5e63b`               |
+| 新增     | `test/session/prompt.test.ts`：length with partial text/reasoning                           | error 与 parts 同时保留；事件一次；不重放请求                                                                                                      | 已加并通过，提交 `333c5e63b`                                                                     |
+| 新增     | `test/session/prompt.test.ts`：length after a tool completed in the previous provider round | round 1 文件追加一次并持久化 tool result；round 2 报告被截断；文件仍只有一行；不发 child round 3                                                   | 已加并通过，提交 `333c5e63b`                                                                     |
+| 新增     | `test/session/prompt.test.ts`：length after StructuredOutput success                        | 通过可控 processor/tool seam 同时建立 structured value 与 length；structured 快捷路径不能绕过 length error                                         | 已加并通过，提交 `333c5e63b`                                                                     |
+| 新增     | `test/session/compaction.test.ts`：length summary                                           | summary 带 OutputLengthError，不进入 completed compaction，不发布成功 compact event                                                                | 已加并通过，提交 `333c5e63b`                                                                     |
+| 新增     | `test/tool/task.test.ts`：content-filter/API assistant error                                | 非 length assistant error 同样不会成为 completed；只取安全 message，不复制 responseBody/headers/metadata                                           | 已加并通过，提交 `d3733f66d`                                                                     |
+| 新增     | `test/tool/task.test.ts`：existing error plus finish length                                 | aborted 优先为 cancelled；其他已有错误保留原分类；defensive length 仅在无 error 时生效                                                             | 已加并通过，提交 `d3733f66d`                                                                     |
+| 新增     | `test/tool/task.test.ts`：non-assistant result                                              | `TaskPromptOps.prompt()` 违反 assistant 结果契约时 Task/BackgroundJob 失败                                                                         | 已加并通过，提交 `d3733f66d`                                                                     |
+| 新增     | `test/tool/task.test.ts`：aborted assistant foreground/background                           | runTask interrupt-only；BackgroundJob cancelled；前台 `Task cancelled`；后台不注入 completed/error 通知                                            | 已加并通过，提交 `d3733f66d`                                                                     |
+| 新增     | `test/tool/task.test.ts`：multiple text parts                                               | 按顺序形成 visible excerpt，不只取最后 part                                                                                                        | 已加并通过，提交 `d3733f66d`                                                                     |
+| 新增     | `test/tool/task.test.ts`：large/unicode partial output                                      | excerpt 按完整 code point 满足 line/UTF-8 byte 上限并包含 Session ID；全文只存在于已持久化子 Session                                               | 已加并通过，提交 `d3733f66d`                                                                     |
+| 新增     | `test/tool/task.test.ts`：reasoning privacy                                                 | 错误包含 reasoning token count，但不包含 reasoning part 文本                                                                                       | 已加并通过，提交 `d3733f66d`                                                                     |
+| 新增     | `test/tool/task.test.ts`：task markup injection                                             | text/error/summary 含闭合标签和 `state="completed"` 时全部转义；转义后 excerpt 仍满足 UTF-8 byte/line 上限                                         | 已加并通过，提交 `d3733f66d`                                                                     |
+| 新增     | `test/tool/task.test.ts`：promotion then length                                             | foreground 被提升为 background 后仍注入 `state="error"`                                                                                            | 已加并通过，提交 `d3733f66d`                                                                     |
+| 既有回归 | `test/tool/task.test.ts`：normal stop/resume/background completion                          | 正常 completed 行为不变                                                                                                                            | 已全量通过（Task 文件 29 个用例），提交 `d3733f66d`                                              |
+| 新增     | `test/provider/transform.test.ts`：reasoning 131072, no override                            | 返回 131072                                                                                                                                        | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：non-reasoning 131072                                     | 返回 32000                                                                                                                                         | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：reasoning + explicit 64000                               | 返回 64000                                                                                                                                         | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：override > model limit                                   | 返回 model limit                                                                                                                                   | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：model output=0 fallback                                  | max output 保持正数 fallback；内置 Anthropic high/max catalog budget 也均为正数                                                                    | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：reasoning capability + no variant                        | 仍按 capability 使用模型输出上限，不依赖 variant                                                                                                   | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：Anthropic numeric max envelope                           | `E=131072 → 117964`；`E=32768 → 28672`；camelCase/snake_case/SAP/Bedrock shape 都正确                                                              | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：Gemini 2.5 provider bounds                               | 65,536 输出下 Pro/Flash clamp 32,768/24,576；小 `E` 使用 Pro 128、Flash-Lite 512 minimum；`E<=minimum` 本地失败                                    | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：high/custom numeric policy                               | 合法既有值不提高；超过 safe cap 时向下 clamp；低于已知 minimum 时本地失败；未知字段不递归改写                                                      | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：small output/provider minimum                            | Anthropic `E=4000 → budget=1024` 并接受 headroom 目标降级；`E=1024` 和非法 custom 值均本地失败                                                     | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：max variant name contract                                | `variants.max` 遵守动态 max 契约；high/custom 固定值不提高且只向下 clamp                                                                           | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：Copilot trusted/untrusted bounds                         | request-time cap 只从 `limit.reasoning` 读取；非可信 max preset 不升级为 capability；可信 bounds 可在较小 envelope 下继续安全 clamp                | 已按集成语义更新并通过，红测 `57a497040`、实现 `8d5061a77`                                       |
+| 新增     | `test/provider/transform.test.ts`：effort/adaptive identity                                 | effort、adaptive、thinking level、maxReasoningEffort 结构和值保持不变                                                                              | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：numeric normalization immutability                       | 返回新对象；输入 options 和 model catalog 均不变                                                                                                   | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：numeric normalization determinism                        | 相同 model/variant/options/E/bounds 产生相同 options 或相同配置错误                                                                                | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/transform.test.ts`：transport max adaptation                                 | Anthropic/Bedrock 使用 `E-B`；Anthropic enabled 缺省 budget 按 SDK 隐式 1,024；Google 等不加回的 transport 保持 `E`                                | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/session/llm.test.ts`：reasoning request body                                          | Anthropic SDK 入参 13,108 + budget 117,964，真实 wire `max_tokens=131,072`                                                                         | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/session/llm.test.ts`：reasoning request + explicit RuntimeFlags cap                   | request 参数使用 `S=4,096`、budget 27,904，总 envelope 为显式 32,000                                                                               | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/session/llm.test.ts`：effort-only request                                             | GLM `reasoningEffort=max` 保持原样，不由 normalizer 新增 numeric thinking 字段                                                                     | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/session/llm.test.ts`：small request with user max variant                             | active variant 为 undefined；沿用 small options，不合成或提高 numeric max budget                                                                   | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/session/llm.test.ts`：normalized plugin input/final override                          | `chat.params` 先看到 normalized options 和 transport-ready `S`，并仍可同时替换两者                                                                 | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/session/compaction.test.ts`：reasoning without input limit                            | usable 使用 `context - core_max_output`                                                                                                            | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/session/compaction.test.ts`：reasoning with input limit                               | usable 保持 `input - min(20k, core_max_output)`                                                                                                    | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/acp/service-session.test.ts`：output length stop reason                               | 持久化 MessageOutputLengthError 后 ACP 返回 `stopReason=max_tokens`                                                                                | 已加并通过，提交 `333c5e63b`                                                                     |
 | 既有回归 | `test/plugin/cloudflare.test.ts`：max output override                                       | Cloudflare 仍可删除/保留 transport-ready maxOutputTokens                                                                                           | 已全量通过（4 pass，模块三）                                                                     |
-| 新增     | `test/plugin/codex.test.ts`：max output override                                            | OpenAI Codex `chat.params` 仍删除 maxOutputTokens                                                                                                  | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/plugin/github-copilot-models.test.ts`：max output/budget discovery                    | Copilot GPT 删除、非 GPT 保留 maxOutputTokens；远端 min/max 生成合法 high/max；矛盾 bounds 不暴露 numeric variant；min 不被误当成 request metadata | 已加并通过，提交 `77e509e81`                                                                     |
-| 新增     | `test/provider/provider.test.ts`：Copilot config variant merge                              | 用户不能覆盖或禁用动态 max；high/custom numeric clamp 到发现的 cap；其他 provider merge 语义不变                                                   | 已加并通过，提交 `77e509e81`                                                                     |
+| 新增     | `test/plugin/codex.test.ts`：max output override                                            | OpenAI Codex `chat.params` 仍删除 maxOutputTokens                                                                                                  | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/plugin/github-copilot-models.test.ts`：max output/budget discovery                    | Copilot GPT 删除、非 GPT 保留 maxOutputTokens；远端 min/max 生成合法 high/max；矛盾 bounds 不暴露 numeric variant；min 不被误当成 request metadata | 已加并通过，提交 `8d5061a77`                                                                     |
+| 新增     | `test/provider/provider.test.ts`：Copilot config variant merge                              | 用户可以按普通 preset 语义定制或禁用 max；独立 bounds 不丢失、不放大；high/custom numeric clamp 到可信 cap                                         | 已按集成语义更新并通过，红测 `57a497040`、实现 `8d5061a77`                                       |
+| 集成新增 | `test/provider/provider.test.ts`：explicit empty metadata variants                          | `reasoning_options=[]` 派生的 `{}` 在同 transport 配置覆盖后仍为空，不退回启发式 variants                                                          | 已加并通过，红测 `57a497040`、实现 `8d5061a77`                                                   |
+| 集成新增 | `test/provider/provider.test.ts`：provider package override                                 | npm 改变时重建 transport-compatible variants，不携带旧 SDK option shape                                                                            | 上游既有用例保留并通过；实现 `8d5061a77`                                                         |
+| 集成新增 | `test/provider/provider.test.ts`：trusted bounds survive config merge                       | Copilot/catalog bounds 独立于 max variant；用户禁用/放大 max 或 custom 时 capability 不丢失、不放大                                                | 已加并通过，红测 `57a497040`、实现 `8d5061a77`                                                   |
+| 集成新增 | `test/provider/provider.test.ts`：endpoint identity invalidates bounds                      | providerID/api.id/api.url 改变时不继承旧 endpoint 动态 bounds                                                                                      | 已加并通过，红测 `57a497040`、实现 `8d5061a77`                                                   |
+| 集成新增 | `test/provider/transform.test.ts`：untrusted max is not a provider cap                      | 没有 `limit.reasoning` 时，启发式/用户 numeric max 使用通用 clamp，不触发 Copilot discovered-cap 专用失败                                          | 已加并通过，红测 `57a497040`、实现 `8d5061a77`                                                   |
+| 集成新增 | `test/provider/provider.test.ts`、Copilot plugin 测试：normalized reasoning bounds          | catalog/Copilot source adapter 生成正整数 min/max，处理 exclusive 边界与矛盾范围                                                                   | 已加并通过，红测 `57a497040`、实现 `8d5061a77`                                                   |
+| 集成新增 | `test/provider/provider.test.ts`：public reasoning bounds contract                          | `toPublicInfo()` 保留合法 optional bounds；非正整数或 `min > max` 不能作为合法 Provider model 公开                                                 | 已加并通过，红测 `57a497040`、实现 `8d5061a77`                                                   |
+| 集成新增 | config schema / trusted-bounds merge review                                                 | legacy provider config 只能改变 variants，不能创建、删除或放大 `limit.reasoning`                                                                   | schema 无写入口；trusted-bounds 配置用例已通过                                                   |
+| 集成新增 | transform + `test/session/llm.test.ts`：trusted/untrusted request                           | normalizer 只从 `limit.reasoning` 读取动态 cap；通用 LLM request 仍按同一 core envelope 发送                                                       | 未新增 Copilot 专用 Session fixture；由两层既有用例组合覆盖并通过                                |
+| 生成检查 | `bun ./script/generate.ts`                                                                  | OpenAPI 和 SDK v2 legacy `Model` 同步 optional `limit.reasoning`；`ModelV2Info`、冻结的 SDK root `src/gen/**` 不变                                 | 待运行；确认门第 21 步                                                                           |
 
 计划验证命令均从 package 目录执行：
 
@@ -1825,6 +2131,10 @@ bun test test/plugin/codex.test.ts
 bun test test/plugin/github-copilot-models.test.ts
 bun test test/provider/provider.test.ts
 bun typecheck
+
+cd ../..
+bun ./script/generate.ts
+git diff --check
 
 cd ../web
 bun run build
@@ -1875,7 +2185,7 @@ CLI fixture 为每个测试 home 显式设置隔离的 `OPENCODE_DB`，使同一
 `opencode run` 与 `opencode db` 子进程稳定读取同一个临时数据库。该改动只影响测试环境，
 不改变生产数据库路径解析。
 
-模块三实际验证记录：
+原源码基线上的模块三验证记录：
 
 - 按测试先行执行：旧实现下 transform 新增用例为 `4 pass, 15 fail`，暴露 reasoning
   默认值仍为 32k、`output=0` catalog 产生 `-1`、normalizer 不存在；compaction、
@@ -1897,9 +2207,9 @@ CLI fixture 为每个测试 home 显式设置隔离的 `OPENCODE_DB`，使同一
   `532 pass, 1 skip, 0 fail, 1,134 assertions`；
 - `packages/opencode` 的 `bun run typecheck` 通过；10 个模块三 TypeScript 文件已执行
   Prettier；`git diff --check` 通过；全仓 oxlint 为 `0 error`（仓库当前仍有既有 warning，
-  本轮未顺带清理）；模块三代码、测试及当时的方案回填已提交为 `77e509e81`。
+  本轮未顺带清理）；对应实现经本轮集成后提交为 `8d5061a77`。
 
-最终文档与全修复回归记录：
+原源码基线上的最终文档与全修复回归记录：
 
 - 英文 `packages/web/src/content/docs/cli.mdx` 已新增 output token limit 说明，明确
   `limit.output=0` 的 32,000 fallback、reasoning 默认模型上限、显式环境变量 cap、
@@ -1921,47 +2231,71 @@ CLI fixture 为每个测试 home 显式设置隔离的 `OPENCODE_DB`，使同一
   numeric normalization 最多遍历六条固定路径；Session/Task/Provider 职责边界和 plugin
   最终覆盖点保持清晰。审核中发现并修正文档对 `limit.output=0` sentinel 的歧义。
 
+当前 `dev` 集成验证记录：
+
+- Provider 集成红测提交 `57a497040`：实现前定向结果为 Provider `2 pass, 4 fail`、
+  Transform `0 pass, 2 fail`，分别证明 transport/empty 契约已由上游提供，而可信 bounds
+  的存储、合并、公开过滤与 request 消费尚未实现；
+- 实现提交 `8d5061a77` 后，`test/provider/provider.test.ts` 全量
+  `101 pass, 0 fail`，`test/provider/transform.test.ts` 全量 `369 pass, 0 fail`；
+  随后新增的“矛盾 budget metadata 优先拒绝”定向用例为 `1 pass, 0 fail`；
+  Codex 与 GitHub Copilot plugin 文件分别为 `18/8 pass, 0 fail`；
+- `packages/opencode` 的 `bun run typecheck` 通过；Provider 相关文件已执行 Prettier，
+  `git diff --check` 通过；
+- CLI 文档提交 `ab3da4bf5` 覆盖英文和全部 17 个现有本地化页面；在集成基线上重新执行
+  `packages/web` 的 `bun run build` 通过；
+- 上述结果只记录截至确认门第 20 步的 Provider 定向/直接回归。根目录生成流程、全部受影响
+  测试和最终五维审核保留给第 21 步，不能用原源码基线的 `687 pass` 代替。
+
 ## 第七部分：代码更新清单
 
 | 文件                                                          | 函数 / 位置                                                                              | 改动概述                                                                                                                           | 状态                                                                                                                      |
 | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `packages/opencode/src/session/processor.ts`                  | `step-finish` / `halt`                                                                   | 在同一次 message 更新中生产 OutputLengthError；后续 processor failure 不覆盖已有终态或重复发事件                                   | 已改并通过，提交 `0d75454b2`                                                                                              |
-| `packages/opencode/src/session/prompt.ts`                     | process 后终态优先级                                                                     | length error 早于 structured success；只消费错误，不重复发布                                                                       | 已改并通过，提交 `0d75454b2`                                                                                              |
-| `packages/opencode/src/tool/task.ts`                          | `runTask` / failure formatter / `renderOutput`                                           | 固定终态优先级；length 诊断与有界 visible excerpt；不泄漏 reasoning；统一转义 XML-like 动态内容                                    | 已改并通过，提交 `4dada962e`                                                                                              |
-| `packages/opencode/src/provider/transform.ts`                 | `variants` / `maxOutputTokens` / `normalizeReasoningBudget` / `transportMaxOutputTokens` | `output=0` catalog fallback；reasoning 默认模型上限；numeric max 按 headroom/bounds 归一化；已知 SDK add-back transport 使用 `E-B` | 已改并通过，提交 `77e509e81`                                                                                              |
-| `packages/opencode/src/provider/provider.ts`                  | Copilot config variant merge                                                             | 合并前保留动态远端 max；合并后恢复不可覆盖/禁用的 max contract，并 clamp custom numeric variant 到远端 cap                         | 已改并通过，提交 `77e509e81`                                                                                              |
-| `packages/opencode/src/plugin/github-copilot/models.ts`       | remote numeric variants                                                                  | 使用远端 min/max 生成合法 high/max；bounds 矛盾时不暴露 numeric variant；max cap 供后续 merge/request 使用                         | 已改并通过，提交 `77e509e81`                                                                                              |
-| `packages/opencode/src/session/llm/request.ts`                | merged options / `chat.params`                                                           | core `E` 只计算一次；以 Effect 捕获配置失败；hook 前完成 numeric normalization 和 transport `S` 适配                               | 已改并通过，提交 `77e509e81`                                                                                              |
-| `packages/opencode/test/lib/llm-server.ts`                    | `Reply` / usage fixture                                                                  | 增加测试用 `length()` finish helper；支持可选 reasoning usage 明细                                                                 | `length()` 已改并通过，提交 `0d75454b2`；模块三未需要扩展共享 usage fixture，真实 wire 用例使用局部 Anthropic SSE fixture |
-| `packages/opencode/test/session/processor-effect.test.ts`     | processor regression                                                                     | 覆盖共享 length normalization、事件投递和后续 secondary failure 不覆盖                                                             | 已改并通过，提交 `0d75454b2`                                                                                              |
-| `packages/opencode/test/session/prompt.test.ts`               | session regression tests                                                                 | 覆盖无 text、partial、上一轮已完成 tool、StructuredOutput 优先级和不重放                                                           | 已改并通过，提交 `0d75454b2`                                                                                              |
-| `packages/opencode/test/session/compaction.test.ts`           | compaction/overflow tests                                                                | 覆盖 length summary 和两种 context reservation 公式                                                                                | length summary 提交 `0d75454b2`；overflow 公式提交 `77e509e81`                                                            |
-| `packages/opencode/test/tool/task.test.ts`                    | Task regression tests                                                                    | 覆盖错误优先级、取消、前后台、promotion、durable partial bounds/privacy、markup 注入和正常完成                                     | 已改并通过，提交 `4dada962e`                                                                                              |
-| `packages/opencode/test/provider/transform.test.ts`           | max output/budget tests                                                                  | 覆盖 fallback、numeric shapes、min/max/小 E/Copilot/high-custom/identity/immutability/determinism/transport add-back               | 已改并通过，提交 `77e509e81`                                                                                              |
-| `packages/opencode/test/provider/provider.test.ts`            | Copilot variant merge test                                                               | 验证动态远端 max 不被用户覆盖或禁用，high/custom 不越 cap，其他 provider merge 不变                                                | 已改并通过，提交 `77e509e81`                                                                                              |
-| `packages/opencode/test/session/llm.test.ts`                  | request body tests                                                                       | 验证 SDK 入参 `S` + numeric budget = core `E`、真实 wire total、配置失败、effort identity 和 plugin override                       | 已改并通过，提交 `77e509e81`                                                                                              |
-| `packages/opencode/test/cli/run/run-process.test.ts`          | CLI subprocess regression                                                                | 固化真实 provider/child Session/Task/parent/DB 全链路和顶层 length 行为                                                            | 顶层 length 已提交（`0d75454b2`）；subagent 全链路已提交（`4dada962e`）                                                   |
-| `packages/opencode/test/lib/cli-process.ts`                   | isolated CLI fixture environment                                                         | 为同一 fixture 的 run/db 子进程固定共享的临时 `OPENCODE_DB`，保持测试间隔离                                                        | 已改并通过，提交 `4dada962e`                                                                                              |
-| `packages/opencode/test/acp/service-session.test.ts`          | ACP stop reason regression                                                               | 验证 OutputLengthError 激活既有 `max_tokens` 映射                                                                                  | 已改并通过，提交 `0d75454b2`                                                                                              |
+| `packages/opencode/src/session/processor.ts`                  | `step-finish` / `halt`                                                                   | 在同一次 message 更新中生产 OutputLengthError；后续 processor failure 不覆盖已有终态或重复发事件                                   | 已改并通过，提交 `333c5e63b`                                                                                              |
+| `packages/opencode/src/session/prompt.ts`                     | process 后终态优先级                                                                     | length error 早于 structured success；只消费错误，不重复发布                                                                       | 已改并通过，提交 `333c5e63b`                                                                                              |
+| `packages/opencode/src/tool/task.ts`                          | `runTask` / failure formatter / `renderOutput`                                           | 固定终态优先级；length 诊断与有界 visible excerpt；不泄漏 reasoning；统一转义 XML-like 动态内容                                    | 已改并通过，提交 `d3733f66d`                                                                                              |
+| `packages/opencode/src/provider/transform.ts`                 | `variants` / `maxOutputTokens` / `normalizeReasoningBudget` / `transportMaxOutputTokens` | `output=0` catalog fallback；reasoning 默认模型上限；numeric max 按 headroom/bounds 归一化；已知 SDK add-back transport 使用 `E-B` | 已改并通过，提交 `8d5061a77`                                                                                              |
+| `packages/opencode/src/provider/provider.ts`                  | `ProviderLimit` / config variant merge                                                   | 保留上游 transport-aware/empty variant 语义；新增可信 `limit.reasoning`；merge helper 显式接收 bounds                              | 已按当前 `dev` 适配并通过，提交 `8d5061a77`                                                                               |
+| `packages/opencode/src/plugin/github-copilot/models.ts`       | remote numeric variants                                                                  | 使用远端 min/max 生成合法 high/max 和 `limit.reasoning`；bounds 矛盾时两者都不暴露                                                 | 已按可信 bounds 契约适配并通过，提交 `8d5061a77`                                                                          |
+| `packages/sdk/openapi.json`、`packages/sdk/js/src/v2/gen/**`  | generated Provider model contract                                                        | 由根目录 `bun ./script/generate.ts` 同步 optional `limit.reasoning`，只提交生成器实际产生的 diff                                   | 待生成；确认门第 21 步                                                                                                    |
+| `packages/opencode/src/session/llm/request.ts`                | merged options / `chat.params`                                                           | core `E` 只计算一次；以 Effect 捕获配置失败；hook 前完成 numeric normalization 和 transport `S` 适配                               | 已改并通过，提交 `8d5061a77`                                                                                              |
+| `packages/opencode/test/lib/llm-server.ts`                    | `Reply` / usage fixture                                                                  | 增加测试用 `length()` finish helper；支持可选 reasoning usage 明细                                                                 | `length()` 已改并通过，提交 `333c5e63b`；模块三未需要扩展共享 usage fixture，真实 wire 用例使用局部 Anthropic SSE fixture |
+| `packages/opencode/test/session/processor-effect.test.ts`     | processor regression                                                                     | 覆盖共享 length normalization、事件投递和后续 secondary failure 不覆盖                                                             | 已改并通过，提交 `333c5e63b`                                                                                              |
+| `packages/opencode/test/session/prompt.test.ts`               | session regression tests                                                                 | 覆盖无 text、partial、上一轮已完成 tool、StructuredOutput 优先级和不重放                                                           | 已改并通过，提交 `333c5e63b`                                                                                              |
+| `packages/opencode/test/session/compaction.test.ts`           | compaction/overflow tests                                                                | 覆盖 length summary 和两种 context reservation 公式                                                                                | length summary 提交 `333c5e63b`；overflow 公式提交 `8d5061a77`                                                            |
+| `packages/opencode/test/tool/task.test.ts`                    | Task regression tests                                                                    | 覆盖错误优先级、取消、前后台、promotion、durable partial bounds/privacy、markup 注入和正常完成                                     | 已改并通过，提交 `d3733f66d`                                                                                              |
+| `packages/opencode/test/provider/transform.test.ts`           | max output/budget/bounds tests                                                           | 保留既有覆盖；新增可信/非可信 bounds、metadata 归一化和无错误 cap 推断用例                                                         | 集成红测 `57a497040`；实现后通过 `8d5061a77`                                                                              |
+| `packages/opencode/test/provider/provider.test.ts`            | variant merge/bounds tests                                                               | 保留上游 empty/npm 契约；新增 endpoint 失效、公开 bounds 和 bounds 不受配置放大用例                                                | 集成红测 `57a497040`；实现后全量通过 `8d5061a77`                                                                          |
+| `packages/opencode/test/session/llm.test.ts`                  | request body tests                                                                       | 验证 SDK 入参 `S` + numeric budget = core `E`、真实 wire total、配置失败、effort identity 和 plugin override                       | 已改并通过，提交 `8d5061a77`                                                                                              |
+| `packages/opencode/test/cli/run/run-process.test.ts`          | CLI subprocess regression                                                                | 固化真实 provider/child Session/Task/parent/DB 全链路和顶层 length 行为                                                            | 顶层 length 已提交（`333c5e63b`）；subagent 全链路已提交（`d3733f66d`）                                                   |
+| `packages/opencode/test/lib/cli-process.ts`                   | isolated CLI fixture environment                                                         | 为同一 fixture 的 run/db 子进程固定共享的临时 `OPENCODE_DB`，保持测试间隔离                                                        | 已改并通过，提交 `d3733f66d`                                                                                              |
+| `packages/opencode/test/acp/service-session.test.ts`          | ACP stop reason regression                                                               | 验证 OutputLengthError 激活既有 `max_tokens` 映射                                                                                  | 已改并通过，提交 `333c5e63b`                                                                                              |
 | `packages/opencode/test/plugin/cloudflare.test.ts`            | existing override tests                                                                  | 运行既有 maxOutputTokens 删除/保留断言                                                                                             | 已全量通过（4 pass，模块三）                                                                                              |
-| `packages/opencode/test/plugin/codex.test.ts`                 | Codex override test                                                                      | 补 `chat.params` 删除 maxOutputTokens 的直接断言                                                                                   | 已改并通过，提交 `77e509e81`                                                                                              |
-| `packages/opencode/test/plugin/github-copilot-models.test.ts` | Copilot override/bounds test                                                             | 补 maxOutputTokens override；远端 min/max 生成合法 variant，矛盾 bounds 不生成 numeric variant，min 不被误报为 request metadata    | 已改并通过，提交 `77e509e81`                                                                                              |
+| `packages/opencode/test/plugin/codex.test.ts`                 | Codex override test                                                                      | 补 `chat.params` 删除 maxOutputTokens 的直接断言                                                                                   | 已改并通过，提交 `8d5061a77`                                                                                              |
+| `packages/opencode/test/plugin/github-copilot-models.test.ts` | Copilot override/bounds test                                                             | 补 maxOutputTokens override；远端 min/max 生成合法 variant，矛盾 bounds 不生成 numeric variant，min 不被误报为 request metadata    | 已改并通过，提交 `8d5061a77`                                                                                              |
 
-以上清单已按三个实现提交逐项回填；最终 CLI 文档、本地化和本文件回填已完成并纳入本轮
-文档提交。
+源码清单已按 rebase 后的实现提交逐项回填。只有生成产物、全量受影响测试和最终审核仍保留到
+确认门第 21 步；这些项目完成前不能把原源码基线的最终回归数字当作当前集成结果。
 
 明确不计划修改：
 
 - `packages/core/src/v1/session.ts`
 - `packages/schema/src/v1/session.ts`
-- generated SDK 文件
 - `packages/core/src/background-job.ts`
 - `packages/opencode/src/session/compaction.ts`
+- `packages/schema/src/model.ts` 的 current `ModelV2.Info`
+- `packages/core/src/v1/config/provider.ts` 和 `packages/core/src/config/provider.ts` 的用户配置
+  limit schema
+- `packages/core/src/session/sql.ts` 及其他持久化 schema
+- `packages/sdk/js/src/gen/**` 冻结的 SDK root 产物
+- App/TUI 的 model limit 展示
 
 理由：所需错误类型、BackgroundJob 状态机和 compaction 的
-`processor.message.error → stop`/`!error` 过滤已经存在；numeric budget 通过 request-local
-normalization 复用既有 provider option 形状，不新增 session schema，也不改写
-effort/adaptive 协议。
+`processor.message.error → stop`/`!error` 过滤已经存在；numeric budget 继续通过
+request-local normalization 复用既有 provider option 形状，不新增 session schema，也不
+改写 effort/adaptive 协议。暴露面审查已经确认 `limit.reasoning` 进入 legacy Provider
+OpenAPI/SDK，因此只由仓库生成流程同步现代 SDK v2 产物；current `ModelV2.Info` 是独立
+catalog/request 契约，用户配置不获得写入口，Session 也只持久化 model ref。
 
 ## 第八部分：文档更新清单
 
@@ -1993,6 +2327,21 @@ effort/adaptive 协议。
 - chat.params plugin 仍是 max output 和 provider options 的最终覆盖层，core 只保证 hook
   输入的 options 已 normalization，且 maxOutputTokens 已完成 transport 适配。
 
+当前 `dev` 集成新增契约：
+
+- `models.dev.reasoning_options` 已成为 catalog variant/bounds 的输入，原文“只有 reasoning
+  boolean”的假设作废；
+- `ProviderLimit.reasoning` 是 additive、optional 的可信 numeric bounds；raw
+  `reasoning_options` 不进入 `Provider.Model`；
+- `variants` 是 transport-specific request preset，不再兼任 provider capability 存储；
+- `{}` 表示明确无 variants，`undefined` 表示可以启发式生成；
+- npm 改变时重建 variants；providerID/api.id/api.url 改变时不继承旧动态 bounds；
+- 用户 variant 配置不能创建、删除或放大可信 bounds；
+- 暴露面审查确认该 optional 字段会进入 `/provider`、`/config/providers`、公开 OpenAPI
+  和 SDK v2 中的 legacy `Model`；实现时必须运行根目录生成流程；
+- current `ModelV2.Info`/`GET /api/model`、用户配置 limit、Session 持久化和冻结的 SDK
+  root `src/gen/**` 不属于本次字段契约，不随之修改。
+
 本修复不属于已有带 `expectations.md` 的子计划，未发现需要同步的
 `docs/audits/<subplan-id>/expectations.md`。
 
@@ -2011,7 +2360,29 @@ effort/adaptive 协议。
 7. 文档及本地化同步、相关测试、opencode typecheck、web build、五维代码审核；
 8. 回填本文件第六、七、八部分。
 
+PR 集成阶段追加确认门，继续保持一次只做一步：
+
+9. 本文件补充当前 `dev` variant/bounds 契约与冲突处理设计（已完成）；
+10. 用户确认（已完成）；
+11. 只读审查 `Provider.Model/ProviderLimit` 的 OpenAPI、SDK、plugin、配置、持久化和 UI
+    暴露面，并把 `limit.reasoning` 的实际契约影响回填本文件（已完成）；
+12. 用户确认（已完成）；
+13. 提交本轮集成设计文档（已完成）；
+14. 用户确认（已完成）；
+15. 在保留可恢复备份的前提下，按审查结果执行用户确认的 rebase/cherry-pick 集成策略：
+    先把非 Provider 语义提交移动到当前 `dev`，在 Provider 适配点停止（已完成；备份分支
+    `issue1-pre-integration` 保留）；
+16. 用户确认（已完成）；
+17. 先补上游集成红测：empty/undefined、npm 切换、可信 bounds、endpoint 失效、非可信 max
+    （已完成，提交 `57a497040`）；
+18. 用户确认（已完成）；
+19. 实现 `limit.reasoning`、transport-aware merge 和 request bounds 消费（已完成，提交
+    `8d5061a77`）；
+20. 用户确认（已完成；CLI/设计文档提交也已在 rebase 尾部重放并复核）；
+21. 运行受影响完整测试、typecheck、必要生成检查和五维审核；
+22. 用户确认后更新 PR。
+
 任何一步发现需要改变错误 schema、Task 状态 vocabulary、自动续写策略或 BackgroundJob
 接口，或者必须把 effort/adaptive 控制换算成 numeric budget、递归改写未知 provider 字段、
-新增通用模型 reasoning-bound schema 或产品级 hard cap，必须暂停并先更新本方案文档，
-不能直接扩大实现范围。
+新增计划外的通用模型字段或产品级 hard cap，必须暂停并先更新本方案文档，不能直接扩大
+实现范围。
