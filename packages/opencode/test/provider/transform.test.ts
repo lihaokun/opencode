@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
+import { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { LLMRequestPrep } from "@/session/llm/request"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -4969,6 +4970,60 @@ describe("ProviderTransform.variants", () => {
         high: { reasoningEffort: "high" },
       })
     })
+  })
+})
+
+describe("ProviderTransform.normalizeReasoningBudget trusted bounds", () => {
+  const model = (reasoning?: { min?: number; max?: number }) =>
+    ({
+      id: "github-copilot/claude-numeric",
+      providerID: "github-copilot",
+      api: {
+        id: "claude-numeric",
+        url: "https://api.githubcopilot.com/v1",
+        npm: "@ai-sdk/anthropic",
+      },
+      name: "Claude Numeric",
+      capabilities: {
+        temperature: true,
+        reasoning: true,
+        attachment: true,
+        toolcall: true,
+        input: { text: true, audio: false, image: false, video: false, pdf: false },
+        output: { text: true, audio: false, image: false, video: false, pdf: false },
+        interleaved: false,
+      },
+      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+      limit: {
+        context: 100_000,
+        output: 64_000,
+        ...(reasoning ? { reasoning } : {}),
+      },
+      status: "active",
+      options: {},
+      headers: {},
+      release_date: "2026-01-01",
+      variants: {
+        max: { thinking: { type: "enabled", budgetTokens: 60_000 } },
+      },
+    }) as Provider.Model
+
+  const normalize = (mdl: Provider.Model, budgetTokens: number, maxOutputTokens: number) =>
+    ProviderTransform.normalizeReasoningBudget({
+      model: mdl,
+      variant: "max",
+      options: { thinking: { type: "enabled", budgetTokens } },
+      maxOutputTokens,
+    }).thinking.budgetTokens
+
+  test("does not infer a provider cap from an untrusted max preset", () => {
+    expect(normalize(model(), 30_000, 32_000)).toBe(27_904)
+  })
+
+  test("uses independent trusted bounds and can clamp below their maximum", () => {
+    const bounded = model({ min: 1_024, max: 30_000 })
+    expect(normalize(bounded, 60_000, 64_000)).toBe(30_000)
+    expect(normalize(bounded, 60_000, 32_000)).toBe(27_904)
   })
 })
 
