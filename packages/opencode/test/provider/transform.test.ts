@@ -3279,6 +3279,66 @@ describe("ProviderTransform.reasoningVariants", () => {
     })
   })
 
+  test.each([
+    [
+      "Anthropic",
+      "@ai-sdk/anthropic",
+      "claude-opus-4-5",
+      {
+        thinking: { type: "enabled", budgetTokens: 15_999 },
+        effort: "high",
+      },
+    ],
+    [
+      "Vertex Anthropic",
+      "@ai-sdk/google-vertex/anthropic",
+      "claude-opus-4-5@20251101",
+      {
+        thinking: { type: "enabled", budgetTokens: 15_999 },
+        effort: "high",
+      },
+    ],
+    [
+      "Bedrock",
+      "@ai-sdk/amazon-bedrock",
+      "us.anthropic.claude-opus-4-5-20251101-v1:0",
+      {
+        reasoningConfig: {
+          type: "enabled",
+          budgetTokens: 15_999,
+          maxReasoningEffort: "high",
+        },
+      },
+    ],
+  ])("%s Opus 4.5 effort uses the catalog output fallback", (_name, npm, id, expected) => {
+    const mdl = target(npm, id)
+    mdl.limit.output = 0
+    const options = ProviderTransform.reasoningVariants(model([{ type: "effort", values: ["high"] }]), mdl)?.high
+    if (!options) throw new Error("expected a high reasoning variant")
+    const maxOutputTokens = ProviderTransform.maxOutputTokens(mdl)
+
+    expect(options).toEqual(expected)
+    expect(maxOutputTokens).toBe(32_000)
+
+    const normalized = ProviderTransform.normalizeReasoningBudget({
+      model: mdl,
+      variant: "high",
+      options,
+      maxOutputTokens,
+    })
+    const budget =
+      npm === "@ai-sdk/amazon-bedrock" ? normalized.reasoningConfig.budgetTokens : normalized.thinking.budgetTokens
+    const transportMaxOutputTokens = ProviderTransform.transportMaxOutputTokens({
+      model: mdl,
+      options: normalized,
+      maxOutputTokens,
+    })
+
+    expect(budget).toBe(15_999)
+    expect(transportMaxOutputTokens).toBe(16_001)
+    expect(transportMaxOutputTokens + budget).toBe(maxOutputTokens)
+  })
+
   test("uses explicit effort metadata for Anthropic-compatible models", () => {
     expect(
       ProviderTransform.reasoningVariants(
@@ -3570,6 +3630,32 @@ describe("ProviderTransform.variants", () => {
     })
     const result = ProviderTransform.variants(model)
     expect(result).toEqual({})
+  })
+
+  test.each([
+    ["Anthropic", "@ai-sdk/anthropic", "anthropic"],
+    ["Vertex Anthropic", "@ai-sdk/google-vertex/anthropic", "google-vertex-anthropic"],
+  ])("%s Opus 4.5 variants use the catalog output fallback", (_name, npm, providerID) => {
+    const result = ProviderTransform.variants(
+      createMockModel({
+        id: `${providerID}/claude-opus-4-5`,
+        providerID,
+        api: {
+          id: "claude-opus-4-5",
+          url: "https://api.example.com",
+          npm,
+        },
+        limit: {
+          context: 200_000,
+          output: 0,
+        },
+      }),
+    )
+
+    expect(result.high).toEqual({
+      thinking: { type: "enabled", budgetTokens: 15_999 },
+      effort: "high",
+    })
   })
 
   test("deepseek returns empty object", () => {

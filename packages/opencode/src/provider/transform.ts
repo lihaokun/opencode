@@ -718,7 +718,7 @@ export function variants(model: Provider.Model): Record<string, Record<string, a
   if (!model.capabilities.reasoning) return {}
 
   const id = model.id.toLowerCase()
-  const catalogOutput = model.limit.output > 0 ? model.limit.output : OUTPUT_TOKEN_MAX
+  const catalogOutput = catalogOutputLimit(model)
   const glm52 = ["glm-5.2", "glm-5-2", "glm-5p2"].some(
     (name) => id.includes(name) || model.api.id.toLowerCase().includes(name),
   )
@@ -1917,7 +1917,7 @@ function effortVariants(model: Provider.Model, values: readonly unknown[]) {
 }
 
 function budgetVariants(model: Provider.Model, min?: number, max?: number) {
-  const catalogOutput = model.limit.output > 0 ? model.limit.output : OUTPUT_TOKEN_MAX
+  const catalogOutput = catalogOutputLimit(model)
   const maximum = Math.min(max ?? OUTPUT_TOKEN_MAX - 1, catalogOutput - 1, OUTPUT_TOKEN_MAX - 1)
   if (maximum <= 0) return {}
   const high = Math.min(Math.max(min ?? 0, Math.floor((maximum + 1) / 2)), maximum)
@@ -1973,7 +1973,7 @@ function reasoningEffort(model: Provider.Model, effort: string) {
         return {
           reasoningConfig: {
             type: "enabled",
-            budgetTokens: Math.min(16_000, Math.floor(model.limit.output / 2 - 1)),
+            budgetTokens: anthropicOpus45Budget(model),
             maxReasoningEffort: effort,
           },
         }
@@ -2034,10 +2034,19 @@ function anthropicOpus45Effort(model: Provider.Model, effort: string) {
   return {
     thinking: {
       type: "enabled",
-      budgetTokens: Math.min(16_000, Math.floor(model.limit.output / 2 - 1)),
+      budgetTokens: anthropicOpus45Budget(model),
     },
     effort,
   }
+}
+
+function anthropicOpus45Budget(model: Provider.Model) {
+  const output = catalogOutputLimit(model)
+  return Math.min(16_000, Math.floor(output / 2 - 1))
+}
+
+function catalogOutputLimit(model: Provider.Model) {
+  return model.limit.output > 0 ? model.limit.output : OUTPUT_TOKEN_MAX
 }
 
 function reasoningBudget(model: Provider.Model, budget: number) {
