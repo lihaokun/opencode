@@ -52,7 +52,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -303,6 +303,37 @@ function providerCfg(url: string) {
   }
 }
 
+function toolWithoutFinish(name: string, input: unknown) {
+  const chunk = (delta: Record<string, unknown>) => ({
+    id: "chatcmpl-test",
+    object: "chat.completion.chunk",
+    choices: [{ delta }],
+  })
+  return raw({
+    chunks: [
+      chunk({ role: "assistant" }),
+      chunk({
+        tool_calls: [
+          {
+            index: 0,
+            id: "call_incomplete",
+            type: "function",
+            function: { name, arguments: "" },
+          },
+        ],
+      }),
+      chunk({
+        tool_calls: [
+          {
+            index: 0,
+            function: { arguments: JSON.stringify(input) },
+          },
+        ],
+      }),
+    ],
+  })
+}
+
 const writeText = Effect.fn("test.writeText")(function* (file: string, text: string) {
   const fs = yield* FSUtil.Service
   yield* fs.writeWithDirs(file, text)
@@ -486,6 +517,64 @@ it.instance("loop exits without an LLM request for interrupted orphan tool calls
     const result = yield* prompt.loop({ sessionID: chat.id })
     expect(result.info.id).toBe(seeded.assistant.id)
     expect(yield* llm.hits).toHaveLength(0)
+  }),
+)
+
+it.instance("loop does not replay a persisted assistant error with a completed tool", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const seeded = yield* seed(chat.id)
+    seeded.assistant.error = new NamedError.Unknown({ message: "persisted provider failure" }).toObject()
+    yield* sessions.updateMessage(seeded.assistant)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "completed-call",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: { filePath: "README.md" },
+        output: "done",
+        title: "README.md",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* llm.text("must not replay")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(result.info.id).toBe(seeded.assistant.id)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.error).toEqual(seeded.assistant.error)
+    }
+    expect(yield* llm.hits).toHaveLength(0)
+  }),
+)
+
+it.instance("loop allows a new user message after a persisted assistant error", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const seeded = yield* seed(chat.id)
+    seeded.assistant.error = new NamedError.Unknown({ message: "persisted provider failure" }).toObject()
+    yield* sessions.updateMessage(seeded.assistant)
+    yield* user(chat.id, "try again")
+    yield* llm.text("recovered")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(result.info.id).not.toBe(seeded.assistant.id)
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "recovered" }))
+    expect(yield* llm.hits).toHaveLength(1)
   }),
 )
 
@@ -723,6 +812,68 @@ it.instance("loop preserves partial text and reasoning on length without replay"
   }),
 )
 
+it.instance("loop preserves reasoning-only output and stops on a missing terminal finish", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "reason without a finish" }],
+    })
+    yield* llm.push(reply().reason("unfinished reasoning"))
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(yield* llm.hits).toHaveLength(1)
+    expect(yield* llm.pending).toBe(0)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("unknown")
+      expect(result.info.error).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Provider stream ended without a terminal finish event" },
+      })
+    }
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: "unfinished reasoning" }))
+  }),
+)
+
+it.instance("loop preserves partial text and stops on a missing terminal finish", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "text without a finish" }],
+    })
+    yield* llm.push(reply().text("partial answer"))
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(yield* llm.hits).toHaveLength(1)
+    expect(yield* llm.pending).toBe(0)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("unknown")
+      expect(result.info.error).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Provider stream ended without a terminal finish event" },
+      })
+    }
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial answer" }))
+  }),
+)
+
 unix("loop does not replay a completed tool after a later length finish", () =>
   Effect.gen(function* () {
     if (!(yield* hasBash)) return
@@ -759,6 +910,47 @@ unix("loop does not replay a completed tool after a later length finish", () =>
   }),
 )
 
+unix("loop does not replay a completed tool after a later missing terminal finish", () =>
+  Effect.gen(function* () {
+    if (!(yield* hasBash)) return
+    const { dir, llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const marker = path.join(dir, "incomplete-charged.txt")
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "run once then truncate" }],
+    })
+    yield* llm.push(
+      reply().tool("bash", {
+        command: `printf 'charged\\n' >> '${marker}'`,
+        description: "Append one marker",
+      }),
+      reply().reason("cut off after tool"),
+    )
+
+    const result = yield* withSh(() => prompt.loop({ sessionID: chat.id }))
+
+    expect(yield* llm.hits).toHaveLength(2)
+    expect(yield* llm.pending).toBe(0)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.error).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Provider stream ended without a terminal finish event" },
+      })
+    }
+    expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("charged\n")
+  }),
+)
+
 it.instance("length wins over a successful StructuredOutput tool result", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -791,6 +983,46 @@ it.instance("length wins over a successful StructuredOutput tool result", () =>
     if (result.info.role === "assistant") {
       expect(result.info.finish).toBe("length")
       expect(result.info.error?.name).toBe("MessageOutputLengthError")
+      expect(result.info.structured).toBeUndefined()
+    }
+  }),
+)
+
+it.instance("a missing terminal finish wins over a successful StructuredOutput tool result", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      format: new SessionV1.OutputFormatJsonSchema({
+        type: "json_schema",
+        schema: {
+          type: "object",
+          properties: { result: { type: "number" } },
+          required: ["result"],
+          additionalProperties: false,
+        },
+        retryCount: 0,
+      }),
+      parts: [{ type: "text", text: "return incomplete structured output" }],
+    })
+    yield* llm.push(toolWithoutFinish("StructuredOutput", { result: 2 }))
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(yield* llm.hits).toHaveLength(1)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("unknown")
+      expect(result.info.error).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Provider stream ended without a terminal finish event" },
+      })
       expect(result.info.structured).toBeUndefined()
     }
   }),

@@ -1,6 +1,6 @@
 # Provider 流缺失终止帧误报成功修正方案
 
-- 状态：实施中；串行单元 2（SessionProcessor）已完成，等待单元 3 确认
+- 状态：实施中；串行单元 3（Prompt/Task）已完成，等待单元 4 确认
 - 初稿日期：2026-07-27
 - 重审日期：2026-07-28
 - 对应问题：[Issue #3](https://github.com/lihaokun/opencode/issues/3)
@@ -86,15 +86,15 @@ reasoning_content chunk
 
 修复前 E2E 观测：
 
-| 观测边界 | 实际值 |
-|---|---|
-| `opencode run` | `exitCode=0` |
-| Task part state | `"completed"` |
-| child assistant finish | `"unknown"` |
-| child assistant error | `undefined` |
-| child reasoning part | 已保存 `"unfinished child reasoning"` |
-| child text part | 不存在 |
-| child provider turn 数 | `1`，无自动重放 |
+| 观测边界               | 实际值                                |
+| ---------------------- | ------------------------------------- |
+| `opencode run`         | `exitCode=0`                          |
+| Task part state        | `"completed"`                         |
+| child assistant finish | `"unknown"`                           |
+| child assistant error  | `undefined`                           |
+| child reasoning part   | 已保存 `"unfinished child reasoning"` |
+| child text part        | 不存在                                |
+| child provider turn 数 | `1`，无自动重放                       |
 
 临时审计测试已经删除。实施阶段必须把同一父子链固化到
 `packages/opencode/test/cli/run/run-process.test.ts`，并把断言翻转为 Task error。
@@ -205,9 +205,9 @@ let finishReason = {
 schema，于是被压成 `"unknown"`。adapter 没有读取 SDK 已经提供的
 `event.rawFinishReason`，从而把以下状态合并：
 
-| 状态 | unified | raw | 语义 |
-|---|---|---|---|
-| 缺少终止帧 | `other` | `undefined` | 不完整，必须失败 |
+| 状态                  | unified | raw          | 语义                 |
+| --------------------- | ------- | ------------ | -------------------- |
+| 缺少终止帧            | `other` | `undefined`  | 不完整，必须失败     |
 | provider 自定义终止值 | `other` | 已定义字符串 | 有终止证据，语义未知 |
 
 这是首个不可逆信息丢失点，也是主要修复位置。
@@ -297,15 +297,15 @@ Task 只在 `assistant.error` 存在或 `finish === "length"` 时失败。`unkno
 本问题不是数值算法 bug，而是流协议状态机 bug。对照对象使用当前 lockfile 实际安装的
 AI SDK，以及仓库内已实现完成性检查的 `LLMClient.generate()`。
 
-| 步骤 | 输入 / 状态 | 当前实现 | 参考契约 | 首个差异 |
-|---|---|---|---|---|
-| 1 | stream 初始化 | opencode 尚未参与 | SDK 初始化 `unified=other, raw=undefined` | 否 |
-| 2 | 收到真实 `finish_reason` | opencode 尚未参与 | SDK 同时更新 unified 和 raw | 否 |
-| 3 | EOF/flush | SDK finish 被继续消费 | SDK 暴露最终 unified 和 raw | 否 |
-| 4 | `finish-step` 映射 | 只读取 unified，`other => unknown` | raw 仍可判定是否见过真实终止原因 | **是** |
-| 5 | stream consumer 完成性 | Session 正常 drain 即继续 | `LLMClient.generate()` 在 `LLMResponse.complete()` 为空时报 canonical provider error | 是 |
-| 6 | Session 终态 | unknown 无 error | 缺少协议终态必须是失败或 incomplete | 已由步骤 4/5 导致 |
-| 7 | Task 投影 | empty/partial completed | incomplete child 不可投影为 completed | 已由步骤 4/5 导致 |
+| 步骤 | 输入 / 状态              | 当前实现                           | 参考契约                                                                             | 首个差异          |
+| ---- | ------------------------ | ---------------------------------- | ------------------------------------------------------------------------------------ | ----------------- |
+| 1    | stream 初始化            | opencode 尚未参与                  | SDK 初始化 `unified=other, raw=undefined`                                            | 否                |
+| 2    | 收到真实 `finish_reason` | opencode 尚未参与                  | SDK 同时更新 unified 和 raw                                                          | 否                |
+| 3    | EOF/flush                | SDK finish 被继续消费              | SDK 暴露最终 unified 和 raw                                                          | 否                |
+| 4    | `finish-step` 映射       | 只读取 unified，`other => unknown` | raw 仍可判定是否见过真实终止原因                                                     | **是**            |
+| 5    | stream consumer 完成性   | Session 正常 drain 即继续          | `LLMClient.generate()` 在 `LLMResponse.complete()` 为空时报 canonical provider error | 是                |
+| 6    | Session 终态             | unknown 无 error                   | 缺少协议终态必须是失败或 incomplete                                                  | 已由步骤 4/5 导致 |
+| 7    | Task 投影                | empty/partial completed            | incomplete child 不可投影为 completed                                                | 已由步骤 4/5 导致 |
 
 参考实现来源：
 
@@ -815,48 +815,48 @@ raw-missing adapter 路径中，`step-finish` 必须先于 provider error 交付
 
 ## 六、测试用例清单
 
-| 类型 | 用例描述 | 状态（修复后回填） |
-|---|---|---|
-| 回归/Adapter | `finish-step(other, raw=undefined)` 严格产生 `[step-finish(unknown), provider-error(retryable=false)]` | 已通过 |
-| 顺序/Adapter | raw 缺失且已有 partial text/reasoning 时，partial events 位于 terminal error 之前 | 已通过 |
-| 终态/Adapter | raw-missing error 后的事件被抑制；final finish 重置 state，下一正常 stream 可复用 adapter | 已通过 |
-| 兼容/Adapter | `finish-step(other, raw="provider_custom_stop")` 只映射 unknown，不合成错误 | 已通过 |
-| 兼容/Adapter | `finish-step(stop, raw=undefined)` 保持 stop，不被 `"other"` 专用谓词误判 | 已通过 |
-| 回归/Processor | empty unknown 使用“unknown/no usable output”错误，发布一次 error、返回 stop | 已通过 |
-| 回归/Processor | 整个 stream 无 step-finish/error 时使用 settled-step 错误并持久化 `finish="error"` | 已通过 |
-| 契约/Processor | 只有 final finish、没有 step-finish 时仍按 no-step-settlement 失败 | 已通过 |
-| 多步/Processor | 第一步正常 finish、第二步 start 后 drain 时仍失败 | 已通过 |
-| 互斥/Processor | 早期 empty unknown、后一 step 未结算时只产生 no-step-settlement 和一次 error event | 已通过 |
-| 兼容/Processor | raw-defined unknown 且有 usable text/tool 时不被 empty-unknown fallback 拒绝 | 已通过 |
-| 优先级/Processor | 已有 provider/API error 不被 generic fallback 覆盖且只发布一次 error | 已通过 |
-| 优先级/Processor | length 仍产生 `MessageOutputLengthError`，不降级为 unknown | 已通过 |
-| 优先级/Processor | permission/question blocked turn 不被 generic fallback 改写为 provider error | 已通过 |
-| 隔离/Processor | retry attempt 重置 last finish/text/tool evidence，不读取前一 attempt 的状态 | 已通过 |
-| Plugin/Processor | `experimental.text.complete` 把 text 改空或补成非空时，usable-output 判定跟最终 part 一致 | 已通过 |
-| 恢复/Prompt | persisted error 即使带 completed tool part，在无新 user message 时也直接退出且不重放 provider | 待加 |
-| 恢复/Prompt | persisted error 后新增 user message 仍可正常生成下一 turn | 待加 |
-| 回归/Prompt | reasoning-only raw-missing 不重放、保留 reasoning、返回错误 | 待加 |
-| 回归/Prompt | partial text raw-missing 保留 text、返回错误 | 待加 |
-| 副作用/Prompt | 前一 step 完成 tool、后一 step 截断时 tool 只执行一次，检测后无第三次 provider request | 待加 |
-| StructuredOutput | raw-missing incomplete error 不能被 structured success 覆盖 | 待加 |
-| 回归/Task | empty unknown assistant 使前台 Task 失败并包含 child session ID | 待加 |
-| 回归/Task | missing finish 且无 usable output 使 Task 失败 | 待加 |
-| 边界/Task | whitespace text 与 pending-only tool part 均不算 usable output | 待加 |
-| 兼容/Task | unknown 加非空 text 或非-pending tool part 保持现有成功投影 | 待加 |
-| 隔离/Task | incomplete diagnostic 不泄露 reasoning text | 待加 |
-| 状态/Task | background job、notification 和 promotion 均传播 error | 待加 |
-| 安全/Task | 既有 assistant-error message 仍转义 task markup 并受大小限制；新 formatter 不读取 model text | 待加 |
-| E2E/CLI | 顶层 reasoning-only no-finish 非零退出，数据库保留 unknown/error/reasoning | 待加 |
-| E2E/CLI | 顶层 partial text no-finish 非零退出，partial text/JSON event 仍可观察 | 待加 |
-| E2E/Subagent | 真实 child reasoning-only no-finish 使 Task part 为 error，child transcript 可查且 child turn 仅一次 | 待加 |
-| E2E/Recovery | parent 收到 child Task error 后可生成恢复文本；父会话允许最终 exit 0 | 待加 |
-| 回归/CLI | 翻转现有 text unknown exit-0 compatibility lock，同时保留 partial stdout | 待改 |
-| 回归/CLI JSON | 翻转现有 JSON unknown exit-0 lock，保持 `partial → step_finish → error` 顺序且只有一个 error record | 待改 |
-| 回归/Compaction | summary stream 缺少 step settlement 时返回 stop，不发布 `Compacted` success | 已通过 |
-| 契约/Retry | canonical raw-missing `UnknownError` 不匹配 `SessionRetry.retryable()` | 已通过 |
-| 契约/LLM | `LLMClient.stream()` partial/no-terminal 既有测试保持不变 | 待验证 |
-| 全量 | 受影响测试文件全部通过 | 待跑 |
-| 静态 | `packages/opencode` typecheck 通过 | 单元 2 后已通过；最终单元待复跑 |
+| 类型             | 用例描述                                                                                               | 状态（修复后回填）              |
+| ---------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------- |
+| 回归/Adapter     | `finish-step(other, raw=undefined)` 严格产生 `[step-finish(unknown), provider-error(retryable=false)]` | 已通过                          |
+| 顺序/Adapter     | raw 缺失且已有 partial text/reasoning 时，partial events 位于 terminal error 之前                      | 已通过                          |
+| 终态/Adapter     | raw-missing error 后的事件被抑制；final finish 重置 state，下一正常 stream 可复用 adapter              | 已通过                          |
+| 兼容/Adapter     | `finish-step(other, raw="provider_custom_stop")` 只映射 unknown，不合成错误                            | 已通过                          |
+| 兼容/Adapter     | `finish-step(stop, raw=undefined)` 保持 stop，不被 `"other"` 专用谓词误判                              | 已通过                          |
+| 回归/Processor   | empty unknown 使用“unknown/no usable output”错误，发布一次 error、返回 stop                            | 已通过                          |
+| 回归/Processor   | 整个 stream 无 step-finish/error 时使用 settled-step 错误并持久化 `finish="error"`                     | 已通过                          |
+| 契约/Processor   | 只有 final finish、没有 step-finish 时仍按 no-step-settlement 失败                                     | 已通过                          |
+| 多步/Processor   | 第一步正常 finish、第二步 start 后 drain 时仍失败                                                      | 已通过                          |
+| 互斥/Processor   | 早期 empty unknown、后一 step 未结算时只产生 no-step-settlement 和一次 error event                     | 已通过                          |
+| 兼容/Processor   | raw-defined unknown 且有 usable text/tool 时不被 empty-unknown fallback 拒绝                           | 已通过                          |
+| 优先级/Processor | 已有 provider/API error 不被 generic fallback 覆盖且只发布一次 error                                   | 已通过                          |
+| 优先级/Processor | length 仍产生 `MessageOutputLengthError`，不降级为 unknown                                             | 已通过                          |
+| 优先级/Processor | permission/question blocked turn 不被 generic fallback 改写为 provider error                           | 已通过                          |
+| 隔离/Processor   | retry attempt 重置 last finish/text/tool evidence，不读取前一 attempt 的状态                           | 已通过                          |
+| Plugin/Processor | `experimental.text.complete` 把 text 改空或补成非空时，usable-output 判定跟最终 part 一致              | 已通过                          |
+| 恢复/Prompt      | persisted error 即使带 completed tool part，在无新 user message 时也直接退出且不重放 provider          | 已通过                          |
+| 恢复/Prompt      | persisted error 后新增 user message 仍可正常生成下一 turn                                              | 已通过                          |
+| 回归/Prompt      | reasoning-only raw-missing 不重放、保留 reasoning、返回错误                                            | 已通过                          |
+| 回归/Prompt      | partial text raw-missing 保留 text、返回错误                                                           | 已通过                          |
+| 副作用/Prompt    | 前一 step 完成 tool、后一 step 截断时 tool 只执行一次，检测后无第三次 provider request                 | 已通过                          |
+| StructuredOutput | raw-missing incomplete error 不能被 structured success 覆盖                                            | 已通过                          |
+| 回归/Task        | empty unknown assistant 使前台 Task 失败并包含 child session ID                                        | 已通过                          |
+| 回归/Task        | missing finish 且无 usable output 使 Task 失败                                                         | 已通过                          |
+| 边界/Task        | whitespace text 与 pending-only tool part 均不算 usable output                                         | 已通过                          |
+| 兼容/Task        | unknown 加非空 text 或非-pending tool part 保持现有成功投影                                            | 已通过                          |
+| 隔离/Task        | incomplete diagnostic 不泄露 reasoning text                                                            | 已通过                          |
+| 状态/Task        | background job、notification 和 promotion 均传播 error                                                 | 已通过                          |
+| 安全/Task        | 既有 assistant-error message 仍转义 task markup 并受大小限制；新 formatter 不读取 model text           | 已通过                          |
+| E2E/CLI          | 顶层 reasoning-only no-finish 非零退出，数据库保留 unknown/error/reasoning                             | 待加                            |
+| E2E/CLI          | 顶层 partial text no-finish 非零退出，partial text/JSON event 仍可观察                                 | 待加                            |
+| E2E/Subagent     | 真实 child reasoning-only no-finish 使 Task part 为 error，child transcript 可查且 child turn 仅一次   | 待加                            |
+| E2E/Recovery     | parent 收到 child Task error 后可生成恢复文本；父会话允许最终 exit 0                                   | 待加                            |
+| 回归/CLI         | 翻转现有 text unknown exit-0 compatibility lock，同时保留 partial stdout                               | 待改                            |
+| 回归/CLI JSON    | 翻转现有 JSON unknown exit-0 lock，保持 `partial → step_finish → error` 顺序且只有一个 error record    | 待改                            |
+| 回归/Compaction  | summary stream 缺少 step settlement 时返回 stop，不发布 `Compacted` success                            | 已通过                          |
+| 契约/Retry       | canonical raw-missing `UnknownError` 不匹配 `SessionRetry.retryable()`                                 | 已通过                          |
+| 契约/LLM         | `LLMClient.stream()` partial/no-terminal 既有测试保持不变                                              | 待验证                          |
+| 全量             | 受影响测试文件全部通过                                                                                 | 待跑                            |
+| 静态             | `packages/opencode` typecheck 通过                                                                     | 单元 3 后已通过；最终单元待复跑 |
 
 所有“不重放”测试必须按 request marker 或目标 tool side-effect 计数，排除并发 title 请求。
 
@@ -882,19 +882,19 @@ bun test test/provider/openai-chat.test.ts
 
 ## 七、代码更新清单
 
-| 文件 | 函数 / 行号 | 改动概述 | 状态（修复后回填） |
-|---|---|---|---|
-| `packages/opencode/src/session/llm/ai-sdk.ts` | `adapterState`/`toLLMEvents` | 使用 raw finish evidence 产生 canonical terminal error，并抑制 error 后的矛盾事件 | 已改 |
-| `packages/opencode/src/session/processor.ts` | `Context`/`handleEvent`/`process` | 跟踪 attempt-local step/output evidence，通过现有 cleanup 持久化两类 generic error | 已改 |
-| `packages/opencode/src/session/prompt.ts` | loop entry/post-process ordering | persisted error 先于 tool continuation；本轮 error 先于 structured success | 待改 |
-| `packages/opencode/src/tool/task.ts` | failure formatter/`runTask` | 增加独立 incomplete-response 防御；复用现有 BackgroundJob error settlement | 待改 |
-| `packages/opencode/test/session/llm.test.ts` | AI SDK adapter tests | 覆盖 raw 缺失/已定义、已知 reason、partial ordering 和 terminal suppression | 已加并通过 |
-| `packages/opencode/test/session/processor-effect.test.ts` | processor settlement tests | 覆盖两类 fallback、多 step、attempt/plugin 隔离、错误优先级和单次发布 | 已加并通过 |
-| `packages/opencode/test/session/prompt.test.ts` | prompt loop regressions | 覆盖 reasoning/text/tool/structured、partial 保留和 no replay | 待加 |
-| `packages/opencode/test/tool/task.test.ts` | Task foreground/background tests | 覆盖防御、promotion、转义和 reasoning 隔离 | 待加 |
-| `packages/opencode/test/cli/run/run-process.test.ts` | real CLI regressions | 固化顶层/child no-finish，翻转旧 exit-0 断言，验证 parent recovery | 待加/待改 |
-| `packages/opencode/test/session/compaction.test.ts` | summary settlement regression | 验证共用 processor 的 no-step-settlement error 阻止 `Compacted` success | 已加并通过 |
-| `packages/opencode/test/session/retry.test.ts` | incomplete retry contract | 固化 canonical raw-missing UnknownError 不可重试 | 已加并通过 |
+| 文件                                                      | 函数 / 行号                       | 改动概述                                                                           | 状态（修复后回填） |
+| --------------------------------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------- | ------------------ |
+| `packages/opencode/src/session/llm/ai-sdk.ts`             | `adapterState`/`toLLMEvents`      | 使用 raw finish evidence 产生 canonical terminal error，并抑制 error 后的矛盾事件  | 已改               |
+| `packages/opencode/src/session/processor.ts`              | `Context`/`handleEvent`/`process` | 跟踪 attempt-local step/output evidence，通过现有 cleanup 持久化两类 generic error | 已改               |
+| `packages/opencode/src/session/prompt.ts`                 | loop entry/post-process ordering  | persisted error 先于 tool continuation；本轮 error 先于 structured success         | 已改               |
+| `packages/opencode/src/tool/task.ts`                      | failure formatter/`runTask`       | 增加独立 incomplete-response 防御；复用现有 BackgroundJob error settlement         | 已改               |
+| `packages/opencode/test/session/llm.test.ts`              | AI SDK adapter tests              | 覆盖 raw 缺失/已定义、已知 reason、partial ordering 和 terminal suppression        | 已加并通过         |
+| `packages/opencode/test/session/processor-effect.test.ts` | processor settlement tests        | 覆盖两类 fallback、多 step、attempt/plugin 隔离、错误优先级和单次发布              | 已加并通过         |
+| `packages/opencode/test/session/prompt.test.ts`           | prompt loop regressions           | 覆盖 reasoning/text/tool/structured、partial 保留和 no replay                      | 已加并通过         |
+| `packages/opencode/test/tool/task.test.ts`                | Task foreground/background tests  | 覆盖防御、promotion、转义和 reasoning 隔离                                         | 已加并通过         |
+| `packages/opencode/test/cli/run/run-process.test.ts`      | real CLI regressions              | 固化顶层/child no-finish，翻转旧 exit-0 断言，验证 parent recovery                 | 待加/待改          |
+| `packages/opencode/test/session/compaction.test.ts`       | summary settlement regression     | 验证共用 processor 的 no-step-settlement error 阻止 `Compacted` success            | 已加并通过         |
+| `packages/opencode/test/session/retry.test.ts`            | incomplete retry contract         | 固化 canonical raw-missing UnknownError 不可重试                                   | 已加并通过         |
 
 Adapter 的 raw-defined/raw-undefined 分支直接调用已导出的 `LLMAISDK.toLLMEvents()` 测试；
 E2E raw-missing 使用现有 `reply().reason(...)` 且不调用 `.stop()`，无需扩展 test provider。
@@ -903,7 +903,7 @@ E2E raw-missing 使用现有 `reply().reason(...)` 且不调用 `.stop()`，无�
 
 1. [x] AI SDK adapter + adapter tests；
 2. [x] SessionProcessor + retry/processor/compaction tests；
-3. [ ] Prompt/Task + 对应单元测试；
+3. [x] Prompt/Task + 对应单元测试；
 4. [ ] CLI 父子 E2E、全量受影响回归、typecheck 和文档回填。
 
 单元 1 的测试先在未修改 adapter 时得到 `1 pass / 2 fail`，失败分别证明缺少
@@ -918,6 +918,16 @@ usable output 与 specific provider error 分支通过。compaction 的 no-step 
 `processor-effect.test.ts` 为 `27 pass / 0 fail`，`retry.test.ts` 为 `34 pass / 0 fail`，
 `compaction.test.ts` 为 `57 pass / 1 skip / 0 fail`，`packages/opencode` typecheck 通过。
 
+单元 3 的 Prompt 红测先得到 `4 pass / 2 fail`：失败分别证明 persisted assistant error 会因
+completed tool 被重放，以及 missing-terminal error 会被 StructuredOutput 成功提升覆盖。Task
+首次组合红测得到 `0 pass / 5 fail`，其中 foreground、promotion、background 三条直接断言为
+错误状态却收到成功状态，两条三案例测试触发默认 5 秒上限；随后单独运行确认 missing/empty
+边界断言在旧实现失败，而 usable-output 兼容用例在旧实现通过。实现后 Prompt 目标组为
+`6 pass / 0 fail`，Task 目标组为 `5 pass / 0 fail`；完整 `prompt.test.ts` 为
+`66 pass / 1 skip / 0 fail`，完整 `task.test.ts` 为 `37 pass / 0 fail`，
+`packages/opencode` typecheck 通过。四个代码/测试改动文件的 Prettier check 通过；定向 oxlint 为
+`0 error / 16 warning`，warning 均位于本单元未改动的既有代码行。
+
 明确不在本次清单中的文件：
 
 - `packages/core/src/session/runner/llm.ts`
@@ -928,10 +938,10 @@ usable output 与 specific provider error 分支通过。compaction 的 no-step 
 
 ## 八、文档更新清单
 
-| 文档路径 | 要改什么 | 状态（修复后回填） |
-|---|---|---|
-| `docs/fixes/session-fix-incomplete-provider-stream.md` | 记录当前基线、父子 E2E、根因、分布式契约、方案、证明和测试/代码状态 | 实施中；单元 2 已回填 |
-| `docs/fixes/subagent-fix-output-length.md` | 增加 Issue #3 follow-up，区分显式 `length` 与缺失终止帧 | 待改 |
+| 文档路径                                               | 要改什么                                                            | 状态（修复后回填）    |
+| ------------------------------------------------------ | ------------------------------------------------------------------- | --------------------- |
+| `docs/fixes/session-fix-incomplete-provider-stream.md` | 记录当前基线、父子 E2E、根因、分布式契约、方案、证明和测试/代码状态 | 实施中；单元 3 已回填 |
+| `docs/fixes/subagent-fix-output-length.md`             | 增加 Issue #3 follow-up，区分显式 `length` 与缺失终止帧             | 待改                  |
 
 不修改公共 API/SDK schema、CLI 参数或配置文档。用户可观察行为会从 silent success 变为明确
 失败，其契约、兼容边界和验证证据由本修复文档记录。

@@ -122,6 +122,23 @@ function lastVisibleText(result: SessionV1.WithParts) {
   return result.parts.findLast((part) => part.type === "text")?.text ?? ""
 }
 
+function hasUsableOutput(result: SessionV1.WithParts) {
+  return result.parts.some((part) => {
+    if (part.type === "text") return part.text.trim().length > 0
+    if (part.type === "tool") return part.state.status !== "pending"
+    return false
+  })
+}
+
+function formatIncompleteResponse(sessionID: SessionID, finish: "missing" | "unknown") {
+  return [
+    "Subagent task failed: IncompleteResponse",
+    `Child session: ${sessionID}`,
+    `finish_reason=${finish}`,
+    "No visible output or complete tool call was produced",
+  ].join("\n")
+}
+
 function formatOutputLengthFailure(
   result: SessionV1.WithParts & { info: SessionV1.Assistant },
   sessionID: SessionID,
@@ -331,6 +348,11 @@ export const TaskTool = Tool.define(
           return yield* Effect.fail(
             new Error(formatAssistantFailure({ info: result.info, parts: result.parts }, nextSession.id, limits)),
           )
+        }
+        const incompleteFinish =
+          result.info.finish === undefined ? "missing" : result.info.finish === "unknown" ? "unknown" : undefined
+        if (incompleteFinish && !hasUsableOutput(result)) {
+          return yield* Effect.fail(new Error(formatIncompleteResponse(nextSession.id, incompleteFinish)))
         }
         return lastVisibleText(result)
       })
