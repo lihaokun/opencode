@@ -45,6 +45,7 @@ const StoredMessage = Schema.Struct({
 })
 const StoredPart = Schema.Struct({
   type: Schema.optional(Schema.String),
+  text: Schema.optional(Schema.String),
 })
 
 describe("opencode run (non-interactive subprocess)", () => {
@@ -166,6 +167,105 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(childParts.some((part) => part.type === "text")).toBe(false)
         expect(childInputs).toHaveLength(1)
         expect(childInputs[0]?.max_tokens ?? childInputs[0]?.max_output_tokens).toBe(10_000)
+        expect(yield* llm.pending).toBe(0)
+      }),
+    60_000,
+  )
+
+  cliIt.concurrent(
+    "persists a child missing-finish error and lets the parent recover without replay",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const parentPrompt = "delegate a task whose stream will end early"
+        const childPrompt = "reason about the task before the stream ends"
+        const childReasoning = "unfinished private child reasoning"
+        const recovery = "parent recovered from the incomplete child"
+        const bodyIncludes = (body: Record<string, unknown>, value: string) => JSON.stringify(body).includes(value)
+        const hasUserText = (body: Record<string, unknown>, value: string) => {
+          if (!Array.isArray(body.messages)) return false
+          return body.messages.some((message) => {
+            if (!message || typeof message !== "object" || !("role" in message) || message.role !== "user") return false
+            return JSON.stringify("content" in message ? message.content : undefined).includes(value)
+          })
+        }
+
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, parentPrompt),
+          reply().tool("task", {
+            description: "trigger child incomplete stream",
+            prompt: childPrompt,
+            subagent_type: "general",
+          }),
+        )
+        yield* llm.pushMatch(({ body }) => hasUserText(body, childPrompt), reply().reason(childReasoning))
+        yield* llm.pushMatch(
+          ({ body }) => bodyIncludes(body, "Provider stream ended without a terminal finish event"),
+          reply().text(recovery).stop(),
+        )
+
+        const result = yield* opencode.run(parentPrompt, {
+          format: "json",
+          extraArgs: ["--dangerously-skip-permissions"],
+        })
+        opencode.expectExit(result, 0)
+
+        const events = opencode.parseJsonEvents(result.stdout)
+        const taskEvent = events.find((event) => {
+          if (event.type !== "tool_use") return false
+          const part = Schema.decodeUnknownSync(TaskEventPart)(event.part)
+          return part?.tool === "task"
+        })
+        const taskPart = taskEvent ? Schema.decodeUnknownSync(TaskEventPart)(taskEvent.part) : undefined
+        const childID = taskPart?.state?.metadata?.sessionId
+
+        expect(taskPart?.state?.status).toBe("error")
+        expect(taskPart?.state?.error).toContain("Subagent task failed: UnknownError")
+        expect(taskPart?.state?.error).toContain("Provider stream ended without a terminal finish event")
+        expect(taskPart?.state?.error).not.toContain(childReasoning)
+        expect(events.some((event) => event.type === "text" && JSON.stringify(event.part).includes(recovery))).toBe(
+          true,
+        )
+        expect(childID).toEqual(expect.any(String))
+        if (!childID) return
+
+        const escapedChildID = childID.replaceAll("'", "''")
+        const stored = yield* opencode.spawn([
+          "db",
+          `select id, data from message where session_id = '${escapedChildID}' order by time_created`,
+          "--format",
+          "json",
+        ])
+        opencode.expectExit(stored, 0, "query incomplete child transcript")
+        const rows = Schema.decodeUnknownSync(MessageRows)(JSON.parse(stored.stdout))
+        const messages = rows.map((row) => ({
+          id: row.id,
+          info: Schema.decodeUnknownSync(StoredMessage)(JSON.parse(row.data ?? "{}")),
+        }))
+        const storedParts = yield* opencode.spawn([
+          "db",
+          `select message_id, data from part where session_id = '${escapedChildID}'`,
+          "--format",
+          "json",
+        ])
+        opencode.expectExit(storedParts, 0, "query incomplete child parts")
+        const partRows = Schema.decodeUnknownSync(PartRows)(JSON.parse(storedParts.stdout))
+        const childAssistant = messages.find((message) => message.info.role === "assistant")
+        const childParts = partRows
+          .filter((row) => row.message_id === childAssistant?.id)
+          .map((row) => Schema.decodeUnknownSync(StoredPart)(JSON.parse(row.data ?? "{}")))
+        const inputs = yield* llm.inputs
+        const childInputs = inputs.filter((body) => hasUserText(body, childPrompt))
+        const recoveryInputs = inputs.filter((body) =>
+          bodyIncludes(body, "Provider stream ended without a terminal finish event"),
+        )
+
+        expect(childAssistant?.info.finish).toBe("unknown")
+        expect(childAssistant?.info.error?.name).toBe("UnknownError")
+        expect(childParts).toContainEqual(expect.objectContaining({ type: "reasoning", text: childReasoning }))
+        expect(childParts.some((part) => part.type === "text")).toBe(false)
+        expect(childInputs).toHaveLength(1)
+        expect(recoveryInputs).toHaveLength(1)
+        expect(JSON.stringify(recoveryInputs[0])).not.toContain(childReasoning)
         expect(yield* llm.pending).toBe(0)
       }),
     60_000,
@@ -296,24 +396,79 @@ describe("opencode run (non-interactive subprocess)", () => {
     30_000,
   )
 
-  // The test provider's SSE error item is interpreted by the SDK as an unknown
-  // finish, not a fatal provider/session error. Lock that distinction in so it
-  // is not accidentally used as the failure compatibility oracle.
   cliIt.concurrent(
-    "unknown stream finish preserves partial output and exits 0",
+    "missing terminal finish preserves partial text and exits nonzero",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
-        yield* llm.push(
-          reply().text("partial response").tool("bash", {
-            command: "printf tool",
-            description: "Print deterministic output",
+        yield* llm.push(reply().text("partial response"))
+
+        const result = yield* opencode.run("trigger a missing terminal finish", { timeoutMs: 30_000 })
+
+        expect(result.exitCode).not.toBe(0)
+        expect(result.stdout).toBe("partial response\n")
+        expect(result.stderr).toContain("Provider stream ended without a terminal finish event")
+        expect(yield* llm.pending).toBe(0)
+      }),
+    60_000,
+  )
+
+  cliIt.concurrent(
+    "missing terminal finish persists reasoning and an assistant error",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const reasoning = "unfinished top-level reasoning"
+        yield* llm.push(reply().reason(reasoning))
+
+        const result = yield* opencode.run("reason until the stream ends", {
+          format: "json",
+          extraArgs: ["--thinking"],
+        })
+
+        expect(result.exitCode).not.toBe(0)
+        const events = opencode.parseJsonEvents(result.stdout)
+        expect(events.map((event) => event.type)).toEqual(["step_start", "reasoning", "step_finish", "error"])
+        expect(events[1]?.part).toEqual(expect.objectContaining({ type: "reasoning", text: reasoning }))
+        expect(events[2]?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
+        expect(events[3]?.error).toEqual(
+          expect.objectContaining({
+            name: "UnknownError",
+            data: expect.objectContaining({ message: "Provider stream ended without a terminal finish event" }),
           }),
         )
-        yield* llm.fail("upstream provider exploded mid-stream")
-        const result = yield* opencode.run("trigger midstream error", { timeoutMs: 30_000 })
-        expect(result.exitCode).toBe(0)
-        expect(result.stdout).toBe("partial response\n")
-        expect(result.stderr).not.toContain("upstream provider exploded mid-stream")
+        const sessionID = typeof events[0]?.sessionID === "string" ? events[0].sessionID : undefined
+        expect(sessionID).toEqual(expect.any(String))
+        if (!sessionID) return
+
+        const escapedSessionID = sessionID.replaceAll("'", "''")
+        const stored = yield* opencode.spawn([
+          "db",
+          `select id, data from message where session_id = '${escapedSessionID}' order by time_created`,
+          "--format",
+          "json",
+        ])
+        opencode.expectExit(stored, 0, "query incomplete top-level transcript")
+        const rows = Schema.decodeUnknownSync(MessageRows)(JSON.parse(stored.stdout))
+        const messages = rows.map((row) => ({
+          id: row.id,
+          info: Schema.decodeUnknownSync(StoredMessage)(JSON.parse(row.data ?? "{}")),
+        }))
+        const storedParts = yield* opencode.spawn([
+          "db",
+          `select message_id, data from part where session_id = '${escapedSessionID}'`,
+          "--format",
+          "json",
+        ])
+        opencode.expectExit(storedParts, 0, "query incomplete top-level parts")
+        const partRows = Schema.decodeUnknownSync(PartRows)(JSON.parse(storedParts.stdout))
+        const assistant = messages.find((message) => message.info.role === "assistant")
+        const parts = partRows
+          .filter((row) => row.message_id === assistant?.id)
+          .map((row) => Schema.decodeUnknownSync(StoredPart)(JSON.parse(row.data ?? "{}")))
+
+        expect(assistant?.info.finish).toBe("unknown")
+        expect(assistant?.info.error?.name).toBe("UnknownError")
+        expect(parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: reasoning }))
+        expect(yield* llm.pending).toBe(0)
       }),
     60_000,
   )
@@ -428,30 +583,24 @@ describe("opencode run (non-interactive subprocess)", () => {
   )
 
   cliIt.concurrent(
-    "--format json records partial output for an unknown stream finish",
+    "--format json records partial output before a missing terminal error",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
-        yield* llm.push(
-          reply().text("partial json").tool("bash", {
-            command: "printf tool",
-            description: "Print deterministic output",
-          }),
-        )
-        yield* llm.fail("provider failed")
-        const result = yield* opencode.run("fail after output", { format: "json" })
+        yield* llm.push(reply().text("partial json"))
+        const result = yield* opencode.run("end after partial output", { format: "json" })
 
         const events = opencode.parseJsonEvents(result.stdout)
-        expect(result.exitCode).toBe(0)
-        expect(events.map((event) => event.type)).toEqual([
-          "step_start",
-          "text",
-          "tool_use",
-          "step_finish",
-          "step_start",
-          "step_finish",
-        ])
+        expect(result.exitCode).not.toBe(0)
+        expect(events.map((event) => event.type)).toEqual(["step_start", "text", "step_finish", "error"])
         expect(events[1]?.part).toEqual(expect.objectContaining({ type: "text", text: "partial json" }))
-        expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
+        expect(events[2]?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
+        expect(events[3]?.error).toEqual(
+          expect.objectContaining({
+            name: "UnknownError",
+            data: expect.objectContaining({ message: "Provider stream ended without a terminal finish event" }),
+          }),
+        )
+        expect(events.filter((event) => event.type === "error")).toHaveLength(1)
       }),
     60_000,
   )

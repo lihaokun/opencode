@@ -14,11 +14,33 @@
   `JSON.stringify()` 双引号转义影响的标签前缀检查，定向复跑通过。两个本地提交及当前
   测试/文档补强均尚未推送，等待用户确认提交
 - 初稿日期：2026-07-23
-- 最近审查：2026-07-25
+- 最近审查：2026-07-28
 - 对应问题：仓库外层 `Issue#1.md`
 - 影响模块：Provider 输出/reasoning 预算、Session 终态、Task 前后台结果交接
 - 原实现源码基线：`34e58090595d`（`packages/opencode/package.json` 版本 `1.17.18`）
 - 当前集成基线：`05c3e40a4e64`（仓库 `dev`；与原基线相隔 93 个提交）
+
+## Issue #3 follow-up：缺失终止帧
+
+Issue #1 与 Issue #3 都要求“不完整输出不能投影为成功”，但底层证据不同，不能共用一个
+`finish === "length"` 判断：
+
+| 情况                   | provider/SDK 证据                                                                                             | Session 错误                                                   | Task/CLI 行为                |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- | ---------------------------- |
+| Issue #1：明确耗尽额度 | provider 发送 `finish_reason="length"`                                                                        | `MessageOutputLengthError`，保留 token 统计和 partial excerpt  | Task 失败；顶层 CLI 非零退出 |
+| Issue #3：缺少终止帧   | AI SDK 给出 `finishReason="other"` 且 `rawFinishReason=undefined`，或 stream drain 后没有可信 step settlement | canonical `UnknownError`，保留已交付 reasoning/text/tool/usage | Task 失败；顶层 CLI 非零退出 |
+
+两类错误共同遵守：保留 partial transcript、不自动重试、不重放已完成 tool side effect、前后台
+Task 均传播失败。差异是 `length` 有可信物理终止原因和专用诊断；missing-terminal 没有可信
+终止证据，必须由 adapter/Session 完成性校验识别，不能伪造成
+`MessageOutputLengthError`。
+
+Issue #3 的完整根因、契约、测试矩阵和验证记录见
+`docs/fixes/session-fix-incomplete-provider-stream.md`。分层实现提交为：
+
+- `b101836266`：AI SDK adapter 使用 raw finish evidence 拒绝缺失终止帧；
+- `f26128dce8`：SessionProcessor 强制可信 step settlement；
+- `b62d16c029`：Prompt error-first ordering 与 Task incomplete-response 防御。
 
 ## 第一部分：现象与复现
 
