@@ -38,9 +38,10 @@ Task 均传播失败。差异是 `length` 有可信物理终止原因和专用�
 Issue #3 的完整根因、契约、测试矩阵和验证记录见
 `docs/fixes/session-fix-incomplete-provider-stream.md`。分层实现提交为：
 
-- `b101836266`：AI SDK adapter 使用 raw finish evidence 拒绝缺失终止帧；
-- `f26128dce8`：SessionProcessor 强制可信 step settlement；
-- `b62d16c029`：Prompt error-first ordering 与 Task incomplete-response 防御。
+- `160bd530ae`：AI SDK adapter 使用 raw finish evidence 拒绝缺失终止帧；
+- `1e3278a737`：SessionProcessor 强制可信 step settlement；
+- `725b17a2e8`：Prompt error-first ordering 与 Task incomplete-response 防御；
+- `dda9adf7af`：真实 CLI/child E2E、最终回归证据与文档同步。
 
 ## 第一部分：现象与复现
 

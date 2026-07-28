@@ -1,6 +1,6 @@
 # Provider 流缺失终止帧误报成功修正方案
 
-- 状态：实施完成；四个串行单元、受影响回归、typecheck 和最终审核均已完成，等待最终提交
+- 状态：实施完成；四个串行单元已提交，受影响回归、typecheck 和最终审核均已完成
 - 初稿日期：2026-07-27
 - 重审日期：2026-07-28
 - 对应问题：[Issue #3](https://github.com/lihaokun/opencode/issues/3)
@@ -10,6 +10,7 @@
 - 本次实施范围：legacy `SessionPrompt` / `TaskTool` 路径
 - 独立 follow-up：V2 `SessionRunner` 与 native Gemini 的协议特定终态风险；本次不修改对应
   runner/protocol 文件
+- 实现提交：`160bd530ae`、`1e3278a737`、`725b17a2e8`、`dda9adf7af`
 
 ## 一、现象与复现
 
