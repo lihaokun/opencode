@@ -306,6 +306,170 @@ describe("session.llm.ai-sdk adapter", () => {
     ])
   })
 
+  test("turns a missing raw finish reason into a terminal provider error after partial output", async () => {
+    const events = await adapt([
+      { type: "reasoning-start", id: "reasoning-1" },
+      { type: "reasoning-delta", id: "reasoning-1", text: "thinking" },
+      { type: "text-start", id: "text-1" },
+      { type: "text-delta", id: "text-1", text: "partial" },
+      {
+        type: "finish-step",
+        response: { id: "response-1", timestamp: new Date(0), modelId: "gpt-test" },
+        finishReason: "other",
+        rawFinishReason: undefined,
+        providerMetadata: undefined,
+        usage: {
+          inputTokens: 2,
+          outputTokens: 1,
+          totalTokens: 3,
+          inputTokenDetails: { noCacheTokens: 2, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+          outputTokenDetails: { textTokens: 1, reasoningTokens: undefined },
+        },
+      },
+    ])
+
+    expect(events).toMatchObject([
+      { type: "reasoning-start", id: "reasoning-1" },
+      { type: "reasoning-delta", id: "reasoning-1", text: "thinking" },
+      { type: "text-start", id: "text-1" },
+      { type: "text-delta", id: "text-1", text: "partial" },
+      {
+        type: "step-finish",
+        index: 0,
+        reason: "unknown",
+        usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+      },
+      {
+        type: "provider-error",
+        message: "Provider stream ended without a terminal finish event",
+        retryable: false,
+      },
+    ])
+  })
+
+  test("keeps defined raw reasons and known normalized reasons on the compatibility path", async () => {
+    const [definedRaw, knownReason] = await Promise.all([
+      adapt([
+        {
+          type: "finish-step",
+          response: { id: "response-1", timestamp: new Date(0), modelId: "gpt-test" },
+          finishReason: "other",
+          rawFinishReason: "provider_custom_stop",
+          providerMetadata: undefined,
+          usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            totalTokens: 2,
+            inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+            outputTokenDetails: { textTokens: 1, reasoningTokens: undefined },
+          },
+        },
+      ]),
+      adapt([
+        {
+          type: "finish-step",
+          response: { id: "response-2", timestamp: new Date(0), modelId: "gpt-test" },
+          finishReason: "stop",
+          rawFinishReason: undefined,
+          providerMetadata: undefined,
+          usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            totalTokens: 2,
+            inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+            outputTokenDetails: { textTokens: 1, reasoningTokens: undefined },
+          },
+        },
+      ]),
+    ])
+
+    expect(definedRaw).toMatchObject([{ type: "step-finish", reason: "unknown" }])
+    expect(knownReason).toMatchObject([{ type: "step-finish", reason: "stop" }])
+  })
+
+  test("suppresses events after a terminal adapter error and resets on the final finish", async () => {
+    const state = LLMAISDK.adapterState()
+    const run = (events: ReadonlyArray<AISDKAdapterEvent>) =>
+      Effect.runPromise(
+        Effect.forEach(events, (event) => LLMAISDK.toLLMEvents(state, event)).pipe(Effect.map((items) => items.flat())),
+      )
+
+    const failedStream = await run([
+      {
+        type: "finish-step",
+        response: { id: "response-1", timestamp: new Date(0), modelId: "gpt-test" },
+        finishReason: "other",
+        rawFinishReason: undefined,
+        providerMetadata: undefined,
+        usage: {
+          inputTokens: 1,
+          outputTokens: 0,
+          totalTokens: 1,
+          inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+          outputTokenDetails: { textTokens: 0, reasoningTokens: undefined },
+        },
+      },
+      { type: "text-delta", id: "late-text", text: "late" },
+      {
+        type: "finish",
+        finishReason: "other",
+        rawFinishReason: undefined,
+        totalUsage: {
+          inputTokens: 1,
+          outputTokens: 0,
+          totalTokens: 1,
+          inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+          outputTokenDetails: { textTokens: 0, reasoningTokens: undefined },
+        },
+      },
+    ])
+
+    expect(failedStream).toMatchObject([
+      { type: "step-finish", index: 0, reason: "unknown" },
+      {
+        type: "provider-error",
+        message: "Provider stream ended without a terminal finish event",
+        retryable: false,
+      },
+    ])
+
+    const nextStream = await run([
+      { type: "start-step", request: {}, warnings: [] },
+      {
+        type: "finish-step",
+        response: { id: "response-2", timestamp: new Date(0), modelId: "gpt-test" },
+        finishReason: "stop",
+        rawFinishReason: "stop",
+        providerMetadata: undefined,
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+          outputTokenDetails: { textTokens: 1, reasoningTokens: undefined },
+        },
+      },
+      {
+        type: "finish",
+        finishReason: "stop",
+        rawFinishReason: "stop",
+        totalUsage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+          outputTokenDetails: { textTokens: 1, reasoningTokens: undefined },
+        },
+      },
+    ])
+
+    expect(nextStream).toMatchObject([
+      { type: "step-start", index: 0 },
+      { type: "step-finish", index: 0, reason: "stop" },
+      { type: "finish", reason: "stop" },
+    ])
+  })
+
   test("creates stable block ids when AI SDK omits them", async () => {
     const events = await adapt([
       uncheckedAdapterEvent({ type: "text-delta", text: "implicit text" }),
