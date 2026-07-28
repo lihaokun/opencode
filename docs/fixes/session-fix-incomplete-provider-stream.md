@@ -1,6 +1,6 @@
 # Provider 流缺失终止帧误报成功修正方案
 
-- 状态：实施中；串行单元 1（AI SDK adapter）已完成，等待单元 2 确认
+- 状态：实施中；串行单元 2（SessionProcessor）已完成，等待单元 3 确认
 - 初稿日期：2026-07-27
 - 重审日期：2026-07-28
 - 对应问题：[Issue #3](https://github.com/lihaokun/opencode/issues/3)
@@ -822,17 +822,17 @@ raw-missing adapter 路径中，`step-finish` 必须先于 provider error 交付
 | 终态/Adapter | raw-missing error 后的事件被抑制；final finish 重置 state，下一正常 stream 可复用 adapter | 已通过 |
 | 兼容/Adapter | `finish-step(other, raw="provider_custom_stop")` 只映射 unknown，不合成错误 | 已通过 |
 | 兼容/Adapter | `finish-step(stop, raw=undefined)` 保持 stop，不被 `"other"` 专用谓词误判 | 已通过 |
-| 回归/Processor | empty unknown 使用“unknown/no usable output”错误，发布一次 error、返回 stop | 待加 |
-| 回归/Processor | 整个 stream 无 step-finish/error 时使用 settled-step 错误并持久化 `finish="error"` | 待加 |
-| 契约/Processor | 只有 final finish、没有 step-finish 时仍按 no-step-settlement 失败 | 待加 |
-| 多步/Processor | 第一步正常 finish、第二步 start 后 drain 时仍失败 | 待加 |
-| 互斥/Processor | 早期 empty unknown、后一 step 未结算时只产生 no-step-settlement 和一次 error event | 待加 |
-| 兼容/Processor | raw-defined unknown 且有 usable text/tool 时不被 empty-unknown fallback 拒绝 | 待加 |
-| 优先级/Processor | 已有 provider/API error 不被 generic fallback 覆盖且只发布一次 error | 待加 |
-| 优先级/Processor | length 仍产生 `MessageOutputLengthError`，不降级为 unknown | 待验证 |
-| 优先级/Processor | permission/question blocked turn 不被 generic fallback 改写为 provider error | 待加 |
-| 隔离/Processor | retry attempt 重置 last finish/text/tool evidence，不读取前一 attempt 的状态 | 待加 |
-| Plugin/Processor | `experimental.text.complete` 把 text 改空或补成非空时，usable-output 判定跟最终 part 一致 | 待加 |
+| 回归/Processor | empty unknown 使用“unknown/no usable output”错误，发布一次 error、返回 stop | 已通过 |
+| 回归/Processor | 整个 stream 无 step-finish/error 时使用 settled-step 错误并持久化 `finish="error"` | 已通过 |
+| 契约/Processor | 只有 final finish、没有 step-finish 时仍按 no-step-settlement 失败 | 已通过 |
+| 多步/Processor | 第一步正常 finish、第二步 start 后 drain 时仍失败 | 已通过 |
+| 互斥/Processor | 早期 empty unknown、后一 step 未结算时只产生 no-step-settlement 和一次 error event | 已通过 |
+| 兼容/Processor | raw-defined unknown 且有 usable text/tool 时不被 empty-unknown fallback 拒绝 | 已通过 |
+| 优先级/Processor | 已有 provider/API error 不被 generic fallback 覆盖且只发布一次 error | 已通过 |
+| 优先级/Processor | length 仍产生 `MessageOutputLengthError`，不降级为 unknown | 已通过 |
+| 优先级/Processor | permission/question blocked turn 不被 generic fallback 改写为 provider error | 已通过 |
+| 隔离/Processor | retry attempt 重置 last finish/text/tool evidence，不读取前一 attempt 的状态 | 已通过 |
+| Plugin/Processor | `experimental.text.complete` 把 text 改空或补成非空时，usable-output 判定跟最终 part 一致 | 已通过 |
 | 恢复/Prompt | persisted error 即使带 completed tool part，在无新 user message 时也直接退出且不重放 provider | 待加 |
 | 恢复/Prompt | persisted error 后新增 user message 仍可正常生成下一 turn | 待加 |
 | 回归/Prompt | reasoning-only raw-missing 不重放、保留 reasoning、返回错误 | 待加 |
@@ -852,11 +852,11 @@ raw-missing adapter 路径中，`step-finish` 必须先于 provider error 交付
 | E2E/Recovery | parent 收到 child Task error 后可生成恢复文本；父会话允许最终 exit 0 | 待加 |
 | 回归/CLI | 翻转现有 text unknown exit-0 compatibility lock，同时保留 partial stdout | 待改 |
 | 回归/CLI JSON | 翻转现有 JSON unknown exit-0 lock，保持 `partial → step_finish → error` 顺序且只有一个 error record | 待改 |
-| 回归/Compaction | summary stream 缺少 step settlement 时返回 stop，不发布 `Compacted` success | 待加 |
-| 契约/Retry | canonical raw-missing `UnknownError` 不匹配 `SessionRetry.retryable()` | 待加 |
+| 回归/Compaction | summary stream 缺少 step settlement 时返回 stop，不发布 `Compacted` success | 已通过 |
+| 契约/Retry | canonical raw-missing `UnknownError` 不匹配 `SessionRetry.retryable()` | 已通过 |
 | 契约/LLM | `LLMClient.stream()` partial/no-terminal 既有测试保持不变 | 待验证 |
 | 全量 | 受影响测试文件全部通过 | 待跑 |
-| 静态 | `packages/opencode` typecheck 通过 | 单元 1 后已通过；最终单元待复跑 |
+| 静态 | `packages/opencode` typecheck 通过 | 单元 2 后已通过；最终单元待复跑 |
 
 所有“不重放”测试必须按 request marker 或目标 tool side-effect 计数，排除并发 title 请求。
 
@@ -885,16 +885,16 @@ bun test test/provider/openai-chat.test.ts
 | 文件 | 函数 / 行号 | 改动概述 | 状态（修复后回填） |
 |---|---|---|---|
 | `packages/opencode/src/session/llm/ai-sdk.ts` | `adapterState`/`toLLMEvents` | 使用 raw finish evidence 产生 canonical terminal error，并抑制 error 后的矛盾事件 | 已改 |
-| `packages/opencode/src/session/processor.ts` | `Context`/`handleEvent`/`process` | 跟踪 attempt-local step/output evidence，通过现有 cleanup 持久化两类 generic error | 待改 |
+| `packages/opencode/src/session/processor.ts` | `Context`/`handleEvent`/`process` | 跟踪 attempt-local step/output evidence，通过现有 cleanup 持久化两类 generic error | 已改 |
 | `packages/opencode/src/session/prompt.ts` | loop entry/post-process ordering | persisted error 先于 tool continuation；本轮 error 先于 structured success | 待改 |
 | `packages/opencode/src/tool/task.ts` | failure formatter/`runTask` | 增加独立 incomplete-response 防御；复用现有 BackgroundJob error settlement | 待改 |
 | `packages/opencode/test/session/llm.test.ts` | AI SDK adapter tests | 覆盖 raw 缺失/已定义、已知 reason、partial ordering 和 terminal suppression | 已加并通过 |
-| `packages/opencode/test/session/processor-effect.test.ts` | processor settlement tests | 覆盖两类 fallback、多 step、attempt/plugin 隔离、错误优先级和单次发布 | 待加 |
+| `packages/opencode/test/session/processor-effect.test.ts` | processor settlement tests | 覆盖两类 fallback、多 step、attempt/plugin 隔离、错误优先级和单次发布 | 已加并通过 |
 | `packages/opencode/test/session/prompt.test.ts` | prompt loop regressions | 覆盖 reasoning/text/tool/structured、partial 保留和 no replay | 待加 |
 | `packages/opencode/test/tool/task.test.ts` | Task foreground/background tests | 覆盖防御、promotion、转义和 reasoning 隔离 | 待加 |
 | `packages/opencode/test/cli/run/run-process.test.ts` | real CLI regressions | 固化顶层/child no-finish，翻转旧 exit-0 断言，验证 parent recovery | 待加/待改 |
-| `packages/opencode/test/session/compaction.test.ts` | summary settlement regression | 验证共用 processor 的 no-step-settlement error 阻止 `Compacted` success | 待加 |
-| `packages/opencode/test/session/retry.test.ts` | incomplete retry contract | 固化 canonical raw-missing UnknownError 不可重试 | 待加 |
+| `packages/opencode/test/session/compaction.test.ts` | summary settlement regression | 验证共用 processor 的 no-step-settlement error 阻止 `Compacted` success | 已加并通过 |
+| `packages/opencode/test/session/retry.test.ts` | incomplete retry contract | 固化 canonical raw-missing UnknownError 不可重试 | 已加并通过 |
 
 Adapter 的 raw-defined/raw-undefined 分支直接调用已导出的 `LLMAISDK.toLLMEvents()` 测试；
 E2E raw-missing 使用现有 `reply().reason(...)` 且不调用 `.stop()`，无需扩展 test provider。
@@ -902,7 +902,7 @@ E2E raw-missing 使用现有 `reply().reason(...)` 且不调用 `.stop()`，无�
 按工作流拆成四个串行实现单元，每个单元完成红测、实现、局部回归和状态回填后再进入下一单元：
 
 1. [x] AI SDK adapter + adapter tests；
-2. [ ] SessionProcessor + retry/processor/compaction tests；
+2. [x] SessionProcessor + retry/processor/compaction tests；
 3. [ ] Prompt/Task + 对应单元测试；
 4. [ ] CLI 父子 E2E、全量受影响回归、typecheck 和文档回填。
 
@@ -910,6 +910,13 @@ E2E raw-missing 使用现有 `reply().reason(...)` 且不调用 `.stop()`，无�
 `provider-error` 以及 error 后仍交付 late text/final finish。实现后新增 3 个契约测试通过，
 完整 `test/session/llm.test.ts` 为 `38 pass / 0 fail`，`packages/opencode` 的
 `bun run typecheck` 通过。补齐 reasoning 顺序断言后，adapter 分组为 `11 pass / 0 fail`。
+
+单元 2 的 Processor 红测先得到 `2 pass / 6 fail`：失败均为当前代码把 empty unknown、
+no-step-settlement、plugin-cleared text 或 retry 后的空 unknown 误判为 `continue`；兼容的
+usable output 与 specific provider error 分支通过。compaction 的 no-step summary 红测也从
+`continue` 失败。实现后 Processor 新增契约组为 `9 pass / 0 fail`；完整
+`processor-effect.test.ts` 为 `27 pass / 0 fail`，`retry.test.ts` 为 `34 pass / 0 fail`，
+`compaction.test.ts` 为 `57 pass / 1 skip / 0 fail`，`packages/opencode` typecheck 通过。
 
 明确不在本次清单中的文件：
 
@@ -923,7 +930,7 @@ E2E raw-missing 使用现有 `reply().reason(...)` 且不调用 `.stop()`，无�
 
 | 文档路径 | 要改什么 | 状态（修复后回填） |
 |---|---|---|
-| `docs/fixes/session-fix-incomplete-provider-stream.md` | 记录当前基线、父子 E2E、根因、分布式契约、方案、证明和测试/代码状态 | 实施中；单元 1 已回填 |
+| `docs/fixes/session-fix-incomplete-provider-stream.md` | 记录当前基线、父子 E2E、根因、分布式契约、方案、证明和测试/代码状态 | 实施中；单元 2 已回填 |
 | `docs/fixes/subagent-fix-output-length.md` | 增加 Issue #3 follow-up，区分显式 `length` 与缺失终止帧 | 待改 |
 
 不修改公共 API/SDK schema、CLI 参数或配置文档。用户可观察行为会从 silent success 变为明确

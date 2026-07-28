@@ -24,9 +24,12 @@ import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
-import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { NamedError } from "@opencode-ai/core/util/error"
+import { Usage, type FinishReason, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
+const EMPTY_UNKNOWN_MESSAGE = "Provider stream ended with an unknown finish reason and no usable output"
+const UNSETTLED_STEP_MESSAGE = "Provider stream ended without a settled model step"
 export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
@@ -74,6 +77,24 @@ interface ProcessorContext extends Input {
   reasoningMap: Record<string, SessionV1.ReasoningPart>
 }
 
+type ProviderTurnEvidence = {
+  activeStep: boolean
+  completedSteps: number
+  lastStepFinish: FinishReason | undefined
+  hasCompletedVisibleText: boolean
+  hasToolEvidence: boolean
+}
+
+function providerTurnEvidence(): ProviderTurnEvidence {
+  return {
+    activeStep: false,
+    completedSteps: 0,
+    lastStepFinish: undefined,
+    hasCompletedVisibleText: false,
+    hasToolEvidence: false,
+  }
+}
+
 type StreamEvent = LLMEvent
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionProcessor") {}
@@ -113,6 +134,7 @@ const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
+      let evidence = providerTurnEvidence()
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -329,6 +351,7 @@ const layer = Layer.effect(
           }
 
           case "tool-call": {
+            evidence.hasToolEvidence = true
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
@@ -422,6 +445,7 @@ const layer = Layer.effect(
             throw new Error(value.message)
 
           case "step-start":
+            evidence.activeStep = true
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
             yield* session.updatePart({
               id: PartID.ascending(),
@@ -433,6 +457,9 @@ const layer = Layer.effect(
             return
 
           case "step-finish": {
+            evidence.activeStep = false
+            evidence.completedSteps++
+            evidence.lastStepFinish = value.reason
             const completedSnapshot = yield* snapshot.track()
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             const usage = Session.getUsage({
@@ -535,6 +562,7 @@ const layer = Layer.effect(
               },
               { text: ctx.currentText.text },
             )).text
+            evidence.hasCompletedVisibleText ||= ctx.currentText.text.trim().length > 0
             {
               const end = Date.now()
               ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
@@ -547,6 +575,28 @@ const layer = Layer.effect(
           case "finish":
             return
         }
+      })
+
+      const settleIncomplete = Effect.fn("SessionProcessor.settleIncomplete")(function* () {
+        if (ctx.assistantMessage.error || ctx.blocked) return
+        const credibleStepSettlement = evidence.completedSteps > 0 && !evidence.activeStep
+        const hasVisibleText =
+          evidence.hasCompletedVisibleText || (ctx.currentText !== undefined && ctx.currentText.text.trim().length > 0)
+        const hasUsableOutput = hasVisibleText || evidence.hasToolEvidence
+        const message = !credibleStepSettlement
+          ? UNSETTLED_STEP_MESSAGE
+          : evidence.lastStepFinish === "unknown" && !hasUsableOutput
+            ? EMPTY_UNKNOWN_MESSAGE
+            : undefined
+        if (!message) return
+
+        const error = new NamedError.Unknown({ message }).toObject()
+        ctx.assistantMessage.error = error
+        if (!credibleStepSettlement) ctx.assistantMessage.finish = "error"
+        yield* events.publish(Session.Event.Error, {
+          sessionID: ctx.assistantMessage.sessionID,
+          error,
+        })
       })
 
       const cleanup = Effect.fn("SessionProcessor.cleanup")(function* () {
@@ -651,6 +701,7 @@ const layer = Layer.effect(
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
+            evidence = providerTurnEvidence()
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
@@ -661,6 +712,7 @@ const layer = Layer.effect(
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
+            yield* settleIncomplete()
           }).pipe(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {

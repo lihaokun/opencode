@@ -1,9 +1,10 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { tool } from "ai"
+import { APICallError, tool } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
 import z from "zod"
@@ -27,6 +28,8 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent } from "@opencode-ai/llm"
+import { Plugin } from "@/plugin"
+import { Question } from "@/question"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -263,11 +266,252 @@ const lengthThenFailureEnv = LayerNode.compile(root, [
 ])
 const itLengthThenFailure = testEffect(lengthThenFailureEnv)
 
+function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
+  switch (name) {
+    case "empty-unknown":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.finish({ reason: "unknown" }),
+      )
+    case "empty":
+      return Stream.empty
+    case "final-only":
+      return Stream.make(LLMEvent.finish({ reason: "stop" }))
+    case "multi-step-incomplete":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.stepStart({ index: 1 }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+    case "unknown-then-incomplete":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.stepStart({ index: 1 }),
+      )
+    case "unknown-visible":
+    case "plugin-clear":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: `${name}-text` }),
+        LLMEvent.textDelta({ id: `${name}-text`, text: "visible" }),
+        LLMEvent.textEnd({ id: `${name}-text` }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.finish({ reason: "unknown" }),
+      )
+    case "unknown-partial":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "partial-text" }),
+        LLMEvent.textDelta({ id: "partial-text", text: "partial" }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.finish({ reason: "unknown" }),
+      )
+    case "unknown-whitespace":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "whitespace-text" }),
+        LLMEvent.textDelta({ id: "whitespace-text", text: " \n\t " }),
+        LLMEvent.textEnd({ id: "whitespace-text" }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.finish({ reason: "unknown" }),
+      )
+    case "unknown-reasoning":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.reasoningStart({ id: "reasoning-only" }),
+        LLMEvent.reasoningDelta({ id: "reasoning-only", text: "private reasoning" }),
+        LLMEvent.reasoningEnd({ id: "reasoning-only" }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.finish({ reason: "unknown" }),
+      )
+    case "unknown-pending-tool":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "pending-call", name: "lookup" }),
+        LLMEvent.toolInputDelta({ id: "pending-call", name: "lookup", text: "{}" }),
+        LLMEvent.toolInputEnd({ id: "pending-call", name: "lookup" }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.finish({ reason: "unknown" }),
+      )
+    case "plugin-fill":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "plugin-fill-text" }),
+        LLMEvent.textDelta({ id: "plugin-fill-text", text: "  " }),
+        LLMEvent.textEnd({ id: "plugin-fill-text" }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.finish({ reason: "unknown" }),
+      )
+    case "unknown-tool":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-1", name: "lookup", input: {} }),
+        LLMEvent.toolResult({
+          id: "call-1",
+          name: "lookup",
+          result: { type: "json", value: { title: "lookup", output: "done", metadata: {} } },
+        }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.finish({ reason: "unknown" }),
+      )
+    case "provider-error":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.providerError({ message: "specific provider failure", retryable: false }),
+      )
+    case "blocked-permission":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-blocked", name: "lookup", input: {} }),
+        LLMEvent.toolError({
+          id: "call-blocked",
+          name: "lookup",
+          message: "permission rejected",
+          error: new PermissionV1.RejectedError(),
+        }),
+      )
+    case "blocked-question":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-blocked", name: "lookup", input: {} }),
+        LLMEvent.toolError({
+          id: "call-blocked",
+          name: "lookup",
+          message: "question dismissed",
+          error: new Question.RejectedError(),
+        }),
+      )
+    default:
+      throw new Error(`Unknown settlement scenario: ${name}`)
+  }
+}
+
+const settlementLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: (input) => {
+      const content = input.messages.at(-1)?.content
+      return settlementStream(typeof content === "string" ? content : "")
+    },
+  }),
+)
+const settlementEnv = LayerNode.compile(root, [...replacements, [LLM.node, settlementLLM]])
+const itSettlement = testEffect(settlementEnv)
+
+const textEvidencePlugin = Layer.mock(Plugin.Service)({
+  trigger: <Output>(name: string, _input: unknown, output: Output) => {
+    if (
+      name === "experimental.text.complete" &&
+      typeof output === "object" &&
+      output !== null &&
+      "text" in output &&
+      typeof output.text === "string"
+    ) {
+      output.text = output.text.trim().length > 0 ? "" : "plugin visible"
+    }
+    return Effect.succeed(output)
+  },
+  list: () => Effect.succeed([]),
+  init: () => Effect.void,
+})
+const textEvidenceEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, settlementLLM],
+  [Plugin.node, textEvidencePlugin],
+])
+const itTextEvidence = testEffect(textEvidenceEnv)
+
+const attemptEvidenceLLM = Layer.effect(
+  LLM.Service,
+  Effect.sync(() => {
+    let attempt = 0
+    return LLM.Service.of({
+      stream: () => {
+        attempt++
+        if (attempt > 1) {
+          return Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+            LLMEvent.finish({ reason: "unknown" }),
+          )
+        }
+        return Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id: "attempt-1-text" }),
+          LLMEvent.textDelta({ id: "attempt-1-text", text: "first attempt" }),
+          LLMEvent.textEnd({ id: "attempt-1-text" }),
+          LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        ).pipe(
+          Stream.concat(
+            Stream.fail(
+              new APICallError({
+                message: "retry",
+                url: "https://example.com/v1/chat/completions",
+                requestBodyValues: {},
+                statusCode: 503,
+                responseHeaders: { "retry-after-ms": "0" },
+                responseBody: '{"error":"retry"}',
+                isRetryable: true,
+              }),
+            ),
+          ),
+        )
+      },
+    })
+  }),
+)
+const attemptEvidenceEnv = LayerNode.compile(root, [...replacements, [LLM.node, attemptEvidenceLLM]])
+const itAttemptEvidence = testEffect(attemptEvidenceEnv)
+
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
   const session = yield* Session.Service
   const provider = yield* Provider.Service
   return { processors, session, provider }
+})
+
+const runSettlement = Effect.fn("test.runSettlement")(function* (dir: string, scenario: string) {
+  const { processors, session, provider } = yield* boot()
+  const eventBridge = yield* EventV2Bridge.Service
+  const chat = yield* session.create({})
+  const parent = yield* user(chat.id, scenario)
+  const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+  const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+  const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+  const off = yield* eventBridge.listen((event) => {
+    if (event.type !== Session.Event.Error.type) return Effect.void
+    const data = event.data as typeof Session.Event.Error.data.Type
+    if (data.sessionID === chat.id && data.error) errors.push(data.error)
+    return Effect.void
+  })
+  const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+  const result = yield* handle.process({
+    user: {
+      id: parent.id,
+      sessionID: chat.id,
+      role: "user",
+      time: parent.time,
+      agent: parent.agent,
+      model: { providerID: ref.providerID, modelID: ref.modelID },
+    } satisfies SessionV1.User,
+    sessionID: chat.id,
+    model: mdl,
+    agent: agent(),
+    system: [],
+    messages: [{ role: "user", content: scenario }],
+    tools: {},
+  })
+  yield* off
+  return {
+    result,
+    message: handle.message,
+    stored: yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id }),
+    parts: yield* MessageV2.parts(msg.id),
+    errors,
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -427,6 +671,196 @@ itLengthThenFailure.live("session.processor preserves length across a later snap
           expect(stored.info.error?.name).toBe("MessageOutputLengthError")
         }
         expect(errors.map((error) => error.name)).toEqual(["MessageOutputLengthError"])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor rejects an empty unknown finish with one durable error", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const result = yield* runSettlement(dir, "empty-unknown")
+        const expected = {
+          name: "UnknownError",
+          data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
+        }
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toMatchObject(expected)
+        expect(result.stored.info.role).toBe("assistant")
+        if (result.stored.info.role === "assistant") {
+          expect(result.stored.info.finish).toBe("unknown")
+          expect(result.stored.info.error).toMatchObject(expected)
+        }
+        expect(result.errors).toHaveLength(1)
+        expect(result.errors[0]).toMatchObject(expected)
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor excludes reasoning, whitespace, and pending tool input from usable output", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        for (const scenario of ["unknown-reasoning", "unknown-whitespace", "unknown-pending-tool"]) {
+          const result = yield* runSettlement(dir, scenario)
+          expect(result.result).toBe("stop")
+          expect(result.message.finish).toBe("unknown")
+          expect(result.message.error).toMatchObject({
+            name: "UnknownError",
+            data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
+          })
+          expect(result.errors).toHaveLength(1)
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor rejects every stream without a credible final step settlement", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        for (const scenario of ["empty", "final-only", "multi-step-incomplete"]) {
+          const result = yield* runSettlement(dir, scenario)
+          const expected = {
+            name: "UnknownError",
+            data: { message: "Provider stream ended without a settled model step" },
+          }
+
+          expect(result.result).toBe("stop")
+          expect(result.message.finish).toBe("error")
+          expect(result.message.error).toMatchObject(expected)
+          expect(result.errors).toHaveLength(1)
+          expect(result.errors[0]).toMatchObject(expected)
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor gives no-step settlement priority over an earlier empty unknown", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const result = yield* runSettlement(dir, "unknown-then-incomplete")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("error")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended without a settled model step" },
+        })
+        expect(result.errors).toHaveLength(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor accepts unknown finishes with usable text or complete tool evidence", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        for (const scenario of ["unknown-visible", "unknown-partial", "unknown-tool"]) {
+          const result = yield* runSettlement(dir, scenario)
+          expect(result.result).toBe("continue")
+          expect(result.message.finish).toBe("unknown")
+          expect(result.message.error).toBeUndefined()
+          expect(result.errors).toEqual([])
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor preserves a specific provider error instead of adding a generic fallback", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const result = yield* runSettlement(dir, "provider-error")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "specific provider failure" },
+        })
+        expect(result.errors).toHaveLength(1)
+        expect(result.errors[0]).toMatchObject({
+          name: "UnknownError",
+          data: { message: "specific provider failure" },
+        })
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor does not replace a blocked tool turn with an incomplete-stream error", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        for (const [scenario, message] of [
+          ["blocked-permission", new PermissionV1.RejectedError().message],
+          ["blocked-question", new Question.RejectedError().message],
+        ] as const) {
+          const result = yield* runSettlement(dir, scenario)
+
+          expect(result.result).toBe("stop")
+          expect(result.message.error).toBeUndefined()
+          expect(result.errors).toEqual([])
+          expect(result.parts).toContainEqual(
+            expect.objectContaining({
+              type: "tool",
+              state: expect.objectContaining({
+                status: "error",
+                error: message,
+              }),
+            }),
+          )
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
+itTextEvidence.live("session.processor bases usable text evidence on the plugin-completed value", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const filled = yield* runSettlement(dir, "plugin-fill")
+        expect(filled.result).toBe("continue")
+        expect(filled.message.error).toBeUndefined()
+        expect(filled.parts).toContainEqual(expect.objectContaining({ type: "text", text: "plugin visible" }))
+
+        const cleared = yield* runSettlement(dir, "plugin-clear")
+        expect(cleared.result).toBe("stop")
+        expect(cleared.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
+        })
+        expect(cleared.parts).toContainEqual(expect.objectContaining({ type: "text", text: "" }))
+      }),
+    { config: cfg },
+  ),
+)
+
+itAttemptEvidence.live("session.processor resets finish and output evidence before a retry attempt", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const result = yield* runSettlement(dir, "retry-attempt")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
+        })
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "first attempt" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(2)
+        expect(result.errors).toHaveLength(1)
       }),
     { config: cfg },
   ),
