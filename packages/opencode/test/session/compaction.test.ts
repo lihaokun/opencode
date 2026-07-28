@@ -9,6 +9,7 @@ import * as Stream from "effect/Stream"
 import { Config } from "@/config/config"
 import { LLM } from "../../src/session/llm"
 import { SessionCompaction } from "../../src/session/compaction"
+import { usable } from "../../src/session/overflow"
 import { Token } from "@/util/token"
 import { Plugin } from "../../src/plugin"
 import { provideTmpdirInstance, TestInstance } from "../fixture/fixture"
@@ -364,6 +365,31 @@ function autocontinue(enabled: boolean) {
     init: () => Effect.void,
   })
 }
+
+describe("session.compaction.usable", () => {
+  const config: ConfigV1.Info = {}
+
+  test("reserves the full core output envelope when the model has no input limit", () => {
+    const model = createModel({ context: 400_000, output: 128_000 })
+    model.capabilities.reasoning = true
+
+    expect(usable({ cfg: config, model })).toBe(272_000)
+  })
+
+  test("keeps the 20k reservation ceiling when the model has an input limit", () => {
+    const model = createModel({ context: 400_000, input: 272_000, output: 128_000 })
+    model.capabilities.reasoning = true
+
+    expect(usable({ cfg: config, model })).toBe(252_000)
+  })
+
+  test("uses the explicit output cap in the no-input-limit reservation", () => {
+    const model = createModel({ context: 400_000, output: 128_000 })
+    model.capabilities.reasoning = true
+
+    expect(usable({ cfg: config, model, outputTokenMax: 64_000 })).toBe(336_000)
+  })
+})
 
 describe("session.compaction.isOverflow", () => {
   it.live(
@@ -860,6 +886,56 @@ describe("session.compaction.process", () => {
       expect(seen).toContain(SessionCompaction.Event.Compacted.type)
       expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
     }),
+  )
+
+  itCompaction.instance(
+    "keeps a length-truncated summary out of completed compactions",
+    () => {
+      const stub = llm()
+      stub.push(
+        Stream.make(
+          LLMEvent.textStart({ id: "txt-length" }),
+          LLMEvent.textDelta({ id: "txt-length", text: "partial summary" }),
+          LLMEvent.textEnd({ id: "txt-length" }),
+          LLMEvent.stepFinish({ index: 0, reason: "length", usage: basicUsage() }),
+          LLMEvent.finish({ reason: "length", usage: basicUsage() }),
+        ),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const events = yield* EventV2Bridge.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const seen: string[] = []
+        const off = yield* events.listen((event) => {
+          seen.push(event.type)
+          return Effect.void
+        })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+        yield* off
+
+        const compacted = yield* ssn.messages({ sessionID: session.id })
+        const summary = compacted.find((item) => item.info.role === "assistant" && item.info.summary)
+
+        expect(result).toBe("stop")
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") {
+          expect(summary.info.finish).toBe("length")
+          expect(summary.info.error?.name).toBe("MessageOutputLengthError")
+        }
+        expect(summary?.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial summary" }))
+        expect(seen).toContain(SessionNs.Event.Error.type)
+        expect(seen).not.toContain(SessionCompaction.Event.Compacted.type)
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
   )
 
   itCompaction.instance(
