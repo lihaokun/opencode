@@ -1,11 +1,12 @@
 # Provider 流缺失终止帧误报成功修正方案
 
-- 状态：原始修复与 2026-08-04 compaction crossover 修订均已实施并完成本地验证；待最终文档提交后同步远端
+- 状态：原始修复与 2026-08-04 compaction crossover 修订均已实施、验证并同步至 PR #5
 - 初稿日期：2026-07-27
 - 重审日期：2026-07-28
 - Compaction crossover 重审日期：2026-08-04
 - 对应问题：[Issue #3](https://github.com/lihaokun/opencode/issues/3)
 - 对应 review：[PR #5 comment](https://github.com/lihaokun/opencode/pull/5#issuecomment-5170765949)
+- Review 处理证据：[PR #5 follow-up](https://github.com/lihaokun/opencode/pull/5#issuecomment-5175011758)
 - 影响模块：AI SDK LLM adapter、LLM service batch boundary、Session 流终态、Prompt agent loop、
   Task 前后台结果传播、CLI 退出状态
 - 原始复现/修复前源码基线（pre-rebase）：`74637461887da7514fcc272846a1fdcd946b3aeb`
@@ -19,16 +20,16 @@
   `80c34f68991897867b1ed0366bdfe6a3567f0cad`、`cc1c76d008255aa02c8d571431139da89b4bb95b`、
   `1662d53e5f0393dae23bcb895255d54b6f0e5594`
 - 当前 PR 文档整合提交：`dbed80fccf0afeb2656736f8abe0f3b07d4b95e0`
-- 本地 crossover 单元 1 提交（尚未推送）：`1ba447213b`（计划审计）、`8c652ba107`（红测）、
+- Crossover 单元 1 提交：`1ba447213b`（计划审计）、`8c652ba107`（红测）、
   `612419fb31`（实现与回归）、`f2080642fd`（backpressure 证据补强）、`b7ae9f1081`（文档回填）
-- 本地 crossover 单元 2 提交（尚未推送）：`771e782418`（Prompt/副作用交叉回归）、
+- Crossover 单元 2 提交：`771e782418`（Prompt/副作用交叉回归）、
   `f24eb8ef21`（文档回填）
-- 本地 crossover 单元 3 提交（尚未推送）：`7bb625a6ce`（CLI/Task/subagent E2E）
+- Crossover 单元 3 提交：`7bb625a6ce`（CLI/Task/subagent E2E）、`1592b01a03`（最终审核回填）
 
 阅读约定：第一至三节记录原始修复前基线的现象、根因与参考对照；第四至八节记录已经实施的
 原始方案及验证；第九节是原审核结论及其失效说明；第十节记录 compaction crossover 修订计划
 及分单元实施状态。第十节描述“修复前”“当前缺陷”或原实现时，指上述 crossover 审计基线；
-带“单元 1/2/3 实施后”标记的内容指本地 `7bb625a6ce`。
+带“单元 1/2/3 实施后”标记的内容指 `1592b01a03`。
 
 ## 一、现象与复现
 
@@ -1503,10 +1504,10 @@ typecheck 为 `30 successful / 30 total`。
 
 ### 10.8 文档更新清单与确认门
 
-| 文档路径                                               | 要改什么                                                                  | 状态（修复后回填）         |
-| ------------------------------------------------------ | ------------------------------------------------------------------------- | -------------------------- |
-| `docs/fixes/session-fix-incomplete-provider-stream.md` | 撤销旧 compaction 优先假设，记录 crossover 八部分计划、实施证据和最终审核 | 单元 3 本地最终审核已回填  |
-| PR #5 body/comment                                     | 说明 failure-settlement 修复、交叉回归和验证结果                          | 内容已准备；最终提交后同步 |
+| 文档路径                                               | 要改什么                                                                  | 状态（修复后回填）        |
+| ------------------------------------------------------ | ------------------------------------------------------------------------- | ------------------------- |
+| `docs/fixes/session-fix-incomplete-provider-stream.md` | 撤销旧 compaction 优先假设，记录 crossover 八部分计划、实施证据和最终审核 | 单元 3 本地最终审核已回填 |
+| PR #5 body/comment                                     | 说明 failure-settlement 修复、交叉回归和验证结果                          | 已同步                    |
 
 不修改公共 API/SDK schema、CLI 参数或用户配置文档。本修订恢复原计划已经声明的“raw-missing
 必须失败”契约，属于内部 ephemeral LLM stream contract 与状态机修正，不引入 user-facing 能力、
@@ -1523,7 +1524,8 @@ subplan。其它设计/README 没有新的契约需要同步。
   `stepModel.doStream()`，据此否决 one-successor lookahead；
 - 重新拉取 PR #5 的 issue comments、inline review comments 和 reviews；最新技术 finding 仍为
   `issuecomment-5170765949`，没有更晚的 review thread；
-- PR #5 当前 base/head 与五个提交重新核对为 `dev@d12b1e924d -> yixiao-issue-3@dbed80fccf`；四个
+- 单元 1 重审时，PR #5 base/head 与五个提交核对为
+  `dev@d12b1e924d -> yixiao-issue-3@dbed80fccf`；四个
   代码/测试提交与一个文档提交均已使用 rebase 后的当前 OID；
 - 全仓 `LLM.Service.of(...)` 仅出现在 `processor-effect.test.ts` 与 `compaction.test.ts`；前者已在
   单元 1 的主测试文件清单中，后者必须同步 required `streamBatches()` fixture 并由单元 1 typecheck
@@ -1546,8 +1548,8 @@ subplan。其它设计/README 没有新的契约需要同步。
 2026-08-04 单元 1 实施结果：`8c652ba107` 保存修复前真实 SSE 红灯，`612419fb31` 实现并验证
 batch-preserving stream、batch 后 cutoff、error/blocked-first 与 retry compaction reset，
 `f2080642fd` 用真实 raw-defined SSE 和惰性 successor counter 补齐 singleton/backpressure 证据。
-本地分支当前基于 `origin/yixiao-issue-3@dbed80fccf` 前进，未修改或恢复
-`yixiao-issue-3-retry`；上述提交尚未推送，因此 PR #5 远端 head 仍是审计基线。
+实施时本地分支基于 `origin/yixiao-issue-3@dbed80fccf` 前进，未修改或恢复
+`yixiao-issue-3-retry`；上述提交在三个单元完成后统一推送。
 
 2026-08-04 单元 2 实施结果：`771e782418` 在真实本地 SSE、真实 Prompt loop、真实
 StructuredOutput/bash tool、EventV2Bridge 和持久化 Session 上完成交叉回归，没有修改 production
@@ -1586,6 +1588,6 @@ replay；Task 投影、CLI/subagent E2E 仍明确留在单元 3。
 启动的 provider/tool side effect 无法回滚，本修订只保证 Processor 不为终态分类 demand 下一
 emission；两个 V2 projector 用例仍按仓库现状条件跳过。
 
-确认门：三个 crossover 实施单元已完成并分别提交代码/测试；本地最终文档提交完成后，下一步仅
-同步 `yixiao-issue-3` 远端分支与 PR #5 body/comment，不恢复 `yixiao-issue-3-retry` 的 bounded retry
-草稿。
+完成状态：三个 crossover 实施单元均已提交并推送至 `yixiao-issue-3`；PR #5 body 已按仓库模板同步，
+review 处理证据已发布在 `issuecomment-5175011758`。实现、测试、文档和 PR 同步门均已完成；远端 CI
+按 PR head 独立运行。整个过程未恢复 `yixiao-issue-3-retry` 的 bounded retry 草稿。
