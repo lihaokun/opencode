@@ -52,7 +52,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { raw, reply, TestLLMServer, type Usage } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -303,6 +303,89 @@ function providerCfg(url: string) {
   }
 }
 
+function crossoverCfg(url: string) {
+  const config = providerCfg(url)
+  return {
+    ...config,
+    provider: {
+      ...config.provider,
+      test: {
+        ...config.provider.test,
+        models: {
+          ...config.provider.test.models,
+          "test-model": {
+            ...config.provider.test.models["test-model"],
+            limit: { context: 20, output: 10 },
+          },
+        },
+      },
+    },
+  }
+}
+
+const crossoverUsage = { input: 100, output: 1 } satisfies Usage
+
+function usageWithoutFinish(usage: Usage) {
+  return {
+    id: "chatcmpl-test",
+    object: "chat.completion.chunk",
+    choices: [{ delta: {} }],
+    usage: {
+      prompt_tokens: usage.input,
+      completion_tokens: usage.output,
+      total_tokens: usage.input + usage.output,
+    },
+  }
+}
+
+function partialWithoutFinish(input: { text?: string; reason?: string; usage: Usage }) {
+  const chunk = (delta: Record<string, unknown>) => ({
+    id: "chatcmpl-test",
+    object: "chat.completion.chunk",
+    choices: [{ delta }],
+  })
+  return raw({
+    chunks: [
+      chunk({ role: "assistant" }),
+      ...(input.reason ? [chunk({ reasoning_content: input.reason })] : []),
+      ...(input.text ? [chunk({ content: input.text })] : []),
+      usageWithoutFinish(input.usage),
+    ],
+  })
+}
+
+function toolWithoutFinish(name: string, input: unknown, usage?: Usage) {
+  const chunk = (delta: Record<string, unknown>) => ({
+    id: "chatcmpl-test",
+    object: "chat.completion.chunk",
+    choices: [{ delta }],
+  })
+  return raw({
+    chunks: [
+      chunk({ role: "assistant" }),
+      chunk({
+        tool_calls: [
+          {
+            index: 0,
+            id: "call_incomplete",
+            type: "function",
+            function: { name, arguments: "" },
+          },
+        ],
+      }),
+      chunk({
+        tool_calls: [
+          {
+            index: 0,
+            function: { arguments: JSON.stringify(input) },
+          },
+        ],
+      }),
+      ...(usage ? [usageWithoutFinish(usage)] : []),
+    ],
+  })
+}
+
 const writeText = Effect.fn("test.writeText")(function* (file: string, text: string) {
   const fs = yield* FSUtil.Service
   yield* fs.writeWithDirs(file, text)
@@ -486,6 +569,64 @@ it.instance("loop exits without an LLM request for interrupted orphan tool calls
     const result = yield* prompt.loop({ sessionID: chat.id })
     expect(result.info.id).toBe(seeded.assistant.id)
     expect(yield* llm.hits).toHaveLength(0)
+  }),
+)
+
+it.instance("loop does not replay a persisted assistant error with a completed tool", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const seeded = yield* seed(chat.id)
+    seeded.assistant.error = new NamedError.Unknown({ message: "persisted provider failure" }).toObject()
+    yield* sessions.updateMessage(seeded.assistant)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "completed-call",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: { filePath: "README.md" },
+        output: "done",
+        title: "README.md",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* llm.text("must not replay")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(result.info.id).toBe(seeded.assistant.id)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.error).toEqual(seeded.assistant.error)
+    }
+    expect(yield* llm.hits).toHaveLength(0)
+  }),
+)
+
+it.instance("loop allows a new user message after a persisted assistant error", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const seeded = yield* seed(chat.id)
+    seeded.assistant.error = new NamedError.Unknown({ message: "persisted provider failure" }).toObject()
+    yield* sessions.updateMessage(seeded.assistant)
+    yield* user(chat.id, "try again")
+    yield* llm.text("recovered")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(result.info.id).not.toBe(seeded.assistant.id)
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "recovered" }))
+    expect(yield* llm.hits).toHaveLength(1)
   }),
 )
 
@@ -723,6 +864,244 @@ it.instance("loop preserves partial text and reasoning on length without replay"
   }),
 )
 
+it.instance("loop preserves reasoning-only output and stops on a missing terminal finish", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "reason without a finish" }],
+    })
+    yield* llm.push(reply().reason("unfinished reasoning"))
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(yield* llm.hits).toHaveLength(1)
+    expect(yield* llm.pending).toBe(0)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("unknown")
+      expect(result.info.error).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Provider stream ended without a terminal finish event" },
+      })
+    }
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: "unfinished reasoning" }))
+  }),
+)
+
+it.instance("loop preserves partial text and stops on a missing terminal finish", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "text without a finish" }],
+    })
+    yield* llm.push(reply().text("partial answer"))
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(yield* llm.hits).toHaveLength(1)
+    expect(yield* llm.pending).toBe(0)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("unknown")
+      expect(result.info.error).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Provider stream ended without a terminal finish event" },
+      })
+    }
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial answer" }))
+  }),
+)
+
+it.instance("loop persists a high-usage missing finish without compaction or replay", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(crossoverCfg)
+    const events = yield* EventV2Bridge.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+    const compacted: (typeof SessionCompaction.Event.Compacted.data.Type)[] = []
+    const off = yield* events.listen((event) => {
+      if (event.type === Session.Event.Error.type) {
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID === chat.id && data.error) errors.push(data.error)
+      }
+      if (event.type === SessionCompaction.Event.Compacted.type) {
+        const data = event.data as typeof SessionCompaction.Event.Compacted.data.Type
+        if (data.sessionID === chat.id) compacted.push(data)
+      }
+      return Effect.void
+    })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "crossover partial marker" }],
+    })
+    yield* llm.push(partialWithoutFinish({ text: "partial crossover answer", usage: crossoverUsage }))
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    const replay = yield* prompt.loop({ sessionID: chat.id })
+    const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: result.info.id })
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    yield* off
+
+    const hits = yield* llm.hits
+    expect(hits).toHaveLength(1)
+    expect(JSON.stringify(hits[0]?.body)).toContain("crossover partial marker")
+    expect(yield* llm.pending).toBe(0)
+    expect(replay.info.id).toBe(result.info.id)
+    expect(result.info.role).toBe("assistant")
+    expect(stored.info.role).toBe("assistant")
+    if (result.info.role === "assistant" && stored.info.role === "assistant") {
+      expect(result.info.finish).toBe("unknown")
+      expect(result.info.error).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Provider stream ended without a terminal finish event" },
+      })
+      expect(result.info.tokens).toMatchObject({ input: 100, output: 1, total: 101 })
+      expect(result.info.time.completed).toBeNumber()
+      expect(stored.info.finish).toBe(result.info.finish)
+      expect(stored.info.error).toEqual(result.info.error)
+      expect(stored.info.time.completed).toBe(result.info.time.completed)
+    }
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial crossover answer" }))
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatchObject({
+      name: "UnknownError",
+      data: { message: "Provider stream ended without a terminal finish event" },
+    })
+    expect(compacted).toHaveLength(0)
+    expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(false)
+    expect(messages.some((message) => message.info.role === "assistant" && message.info.summary)).toBe(false)
+  }),
+)
+
+it.instance("high-usage missing finish prevents StructuredOutput promotion and compaction", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(crossoverCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      format: new SessionV1.OutputFormatJsonSchema({
+        type: "json_schema",
+        schema: {
+          type: "object",
+          properties: { result: { type: "number" } },
+          required: ["result"],
+          additionalProperties: false,
+        },
+        retryCount: 0,
+      }),
+      parts: [{ type: "text", text: "crossover structured marker" }],
+    })
+    yield* llm.push(toolWithoutFinish("StructuredOutput", { result: 2 }, crossoverUsage))
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: result.info.id })
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const hits = yield* llm.hits
+
+    expect(hits).toHaveLength(1)
+    expect(JSON.stringify(hits[0]?.body)).toContain("crossover structured marker")
+    expect(yield* llm.pending).toBe(0)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("unknown")
+      expect(result.info.error).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Provider stream ended without a terminal finish event" },
+      })
+      expect(result.info.structured).toBeUndefined()
+      expect(result.info.tokens).toMatchObject({ input: 100, output: 1, total: 101 })
+    }
+    const output = completedTool(result.parts)
+    expect(output?.tool).toBe("StructuredOutput")
+    expect(stored.info.role).toBe("assistant")
+    if (stored.info.role === "assistant") {
+      expect(stored.info.error).toEqual(result.info.role === "assistant" ? result.info.error : undefined)
+      expect(stored.info.structured).toBeUndefined()
+    }
+    expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(false)
+    expect(messages.some((message) => message.info.role === "assistant" && message.info.summary)).toBe(false)
+  }),
+)
+
+unix("high-usage missing finish does not replay a completed tool or start compaction", () =>
+  Effect.gen(function* () {
+    if (!(yield* hasBash)) return
+    const { dir, llm } = yield* useServerConfig(crossoverCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const marker = path.join(dir, "crossover-tool-count.txt")
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "crossover completed tool marker" }],
+    })
+    yield* llm.push(
+      reply().tool("bash", {
+        command: `printf 'charged\\n' >> '${marker}'`,
+        description: "Append one crossover marker",
+      }),
+      partialWithoutFinish({ reason: "cut off after completed tool", usage: crossoverUsage }),
+    )
+
+    const result = yield* withSh(() => prompt.loop({ sessionID: chat.id }))
+    const replay = yield* prompt.loop({ sessionID: chat.id })
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const hits = yield* llm.hits
+
+    expect(hits).toHaveLength(2)
+    expect(hits.every((hit) => JSON.stringify(hit.body).includes("crossover completed tool marker"))).toBe(true)
+    expect(yield* llm.pending).toBe(0)
+    expect(replay.info.id).toBe(result.info.id)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("unknown")
+      expect(result.info.error).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Provider stream ended without a terminal finish event" },
+      })
+      expect(result.info.tokens).toMatchObject({ input: 100, output: 1, total: 101 })
+    }
+    expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("charged\n")
+    expect(
+      messages
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "tool" && part.tool === "bash" && part.state.status === "completed"),
+    ).toHaveLength(1)
+    expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(false)
+    expect(messages.some((message) => message.info.role === "assistant" && message.info.summary)).toBe(false)
+  }),
+)
+
 unix("loop does not replay a completed tool after a later length finish", () =>
   Effect.gen(function* () {
     if (!(yield* hasBash)) return
@@ -759,6 +1138,47 @@ unix("loop does not replay a completed tool after a later length finish", () =>
   }),
 )
 
+unix("loop does not replay a completed tool after a later missing terminal finish", () =>
+  Effect.gen(function* () {
+    if (!(yield* hasBash)) return
+    const { dir, llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const marker = path.join(dir, "incomplete-charged.txt")
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "run once then truncate" }],
+    })
+    yield* llm.push(
+      reply().tool("bash", {
+        command: `printf 'charged\\n' >> '${marker}'`,
+        description: "Append one marker",
+      }),
+      reply().reason("cut off after tool"),
+    )
+
+    const result = yield* withSh(() => prompt.loop({ sessionID: chat.id }))
+
+    expect(yield* llm.hits).toHaveLength(2)
+    expect(yield* llm.pending).toBe(0)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.error).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Provider stream ended without a terminal finish event" },
+      })
+    }
+    expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("charged\n")
+  }),
+)
+
 it.instance("length wins over a successful StructuredOutput tool result", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -791,6 +1211,46 @@ it.instance("length wins over a successful StructuredOutput tool result", () =>
     if (result.info.role === "assistant") {
       expect(result.info.finish).toBe("length")
       expect(result.info.error?.name).toBe("MessageOutputLengthError")
+      expect(result.info.structured).toBeUndefined()
+    }
+  }),
+)
+
+it.instance("a missing terminal finish wins over a successful StructuredOutput tool result", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      format: new SessionV1.OutputFormatJsonSchema({
+        type: "json_schema",
+        schema: {
+          type: "object",
+          properties: { result: { type: "number" } },
+          required: ["result"],
+          additionalProperties: false,
+        },
+        retryCount: 0,
+      }),
+      parts: [{ type: "text", text: "return incomplete structured output" }],
+    })
+    yield* llm.push(toolWithoutFinish("StructuredOutput", { result: 2 }))
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(yield* llm.hits).toHaveLength(1)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("unknown")
+      expect(result.info.error).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Provider stream ended without a terminal finish event" },
+      })
       expect(result.info.structured).toBeUndefined()
     }
   }),

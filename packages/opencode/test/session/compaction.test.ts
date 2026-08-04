@@ -297,6 +297,11 @@ function llm() {
   const queue: Array<
     Stream.Stream<LLMEvent, unknown> | ((input: LLM.StreamInput) => Stream.Stream<LLMEvent, unknown>)
   > = []
+  const streamBatches: LLM.Interface["streamBatches"] = (input) => {
+    const item = queue.shift() ?? Stream.empty
+    const stream = typeof item === "function" ? item(input) : item
+    return stream.pipe(Stream.mapEffect((event) => Effect.succeed([event])))
+  }
 
   return {
     push(stream: Stream.Stream<LLMEvent, unknown> | ((input: LLM.StreamInput) => Stream.Stream<LLMEvent, unknown>)) {
@@ -305,11 +310,8 @@ function llm() {
     llmLayer: Layer.succeed(
       LLM.Service,
       LLM.Service.of({
-        stream: (input) => {
-          const item = queue.shift() ?? Stream.empty
-          const stream = typeof item === "function" ? item(input) : item
-          return stream.pipe(Stream.mapEffect((event) => Effect.succeed(event)))
-        },
+        streamBatches,
+        stream: (input) => streamBatches(input).pipe(Stream.flatMap((batch) => Stream.fromIterable(batch))),
       }),
     ),
   }
@@ -929,6 +931,58 @@ describe("session.compaction.process", () => {
         if (summary?.info.role === "assistant") {
           expect(summary.info.finish).toBe("length")
           expect(summary.info.error?.name).toBe("MessageOutputLengthError")
+        }
+        expect(summary?.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial summary" }))
+        expect(seen).toContain(SessionNs.Event.Error.type)
+        expect(seen).not.toContain(SessionCompaction.Event.Compacted.type)
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "keeps a summary without a settled model step out of completed compactions",
+    () => {
+      const stub = llm()
+      stub.push(
+        Stream.make(
+          LLMEvent.textStart({ id: "txt-unsettled" }),
+          LLMEvent.textDelta({ id: "txt-unsettled", text: "partial summary" }),
+          LLMEvent.textEnd({ id: "txt-unsettled" }),
+          LLMEvent.finish({ reason: "stop", usage: basicUsage() }),
+        ),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const events = yield* EventV2Bridge.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const seen: string[] = []
+        const off = yield* events.listen((event) => {
+          seen.push(event.type)
+          return Effect.void
+        })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+        yield* off
+
+        const compacted = yield* ssn.messages({ sessionID: session.id })
+        const summary = compacted.find((item) => item.info.role === "assistant" && item.info.summary)
+
+        expect(result).toBe("stop")
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") {
+          expect(summary.info.finish).toBe("error")
+          expect(summary.info.error).toMatchObject({
+            name: "UnknownError",
+            data: { message: "Provider stream ended without a settled model step" },
+          })
         }
         expect(summary?.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial summary" }))
         expect(seen).toContain(SessionNs.Event.Error.type)

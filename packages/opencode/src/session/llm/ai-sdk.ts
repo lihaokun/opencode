@@ -6,6 +6,8 @@ import { errorMessage } from "@/util/error"
 type Result = Awaited<ReturnType<typeof streamText>>
 type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : never
 
+const incompleteStreamMessage = "Provider stream ended without a terminal finish event"
+
 export function adapterState() {
   return {
     step: 0,
@@ -15,6 +17,7 @@ export function adapterState() {
     currentReasoningID: undefined as string | undefined,
     toolNames: {} as Record<string, string>,
     copilotTotalNanoAiu: undefined as number | undefined,
+    terminalFailure: false,
   }
 }
 
@@ -77,6 +80,14 @@ export function toLLMEvents(
   state: ReturnType<typeof adapterState>,
   event: AISDKEvent,
 ): Effect.Effect<ReadonlyArray<LLMEvent>, unknown> {
+  if (state.terminalFailure) {
+    if (event.type !== "finish") return Effect.succeed([])
+    return Effect.sync(() => {
+      Object.assign(state, adapterState())
+      return []
+    })
+  }
+
   switch (event.type) {
     case "start":
       return Effect.succeed([])
@@ -98,7 +109,7 @@ export function toLLMEvents(
                 },
               }
         state.copilotTotalNanoAiu = undefined
-        return [
+        const events: LLMEvent[] = [
           LLMEvent.stepFinish({
             index: state.step++,
             reason: finishReason(event.finishReason),
@@ -106,6 +117,16 @@ export function toLLMEvents(
             providerMetadata: metadata,
           }),
         ]
+        if (event.finishReason === "other" && event.rawFinishReason === undefined) {
+          state.terminalFailure = true
+          events.push(
+            LLMEvent.providerError({
+              message: incompleteStreamMessage,
+              retryable: false,
+            }),
+          )
+        }
+        return events
       })
 
     case "finish":

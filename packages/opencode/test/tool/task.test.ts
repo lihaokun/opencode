@@ -143,14 +143,14 @@ function assistantResult(
   opts: {
     texts?: string[]
     reasoning?: string[]
-    finish?: SessionV1.Assistant["finish"]
+    finish?: SessionV1.Assistant["finish"] | null
     error?: SessionV1.Assistant["error"]
     tokens?: Partial<SessionV1.Assistant["tokens"]>
   } = {},
 ): SessionV1.WithParts {
   const result = reply(input, "")
   if (result.info.role !== "assistant") throw new Error("expected assistant result")
-  result.info.finish = opts.finish ?? "stop"
+  result.info.finish = opts.finish === null ? undefined : (opts.finish ?? "stop")
   result.info.error = opts.error
   result.info.tokens = {
     ...result.info.tokens,
@@ -183,6 +183,32 @@ function assistantResult(
         }) satisfies SessionV1.TextPart,
     ),
   ]
+  return result
+}
+
+function assistantToolResult(input: SessionPrompt.PromptInput, status: "pending" | "completed"): SessionV1.WithParts {
+  const result = assistantResult(input, { finish: "unknown" })
+  if (result.info.role !== "assistant") throw new Error("expected assistant result")
+  const state: SessionV1.ToolPart["state"] =
+    status === "pending"
+      ? { status: "pending", input: {}, raw: "{}" }
+      : {
+          status: "completed",
+          input: {},
+          output: "done",
+          title: "lookup",
+          metadata: {},
+          time: { start: 1, end: 2 },
+        }
+  result.parts.push({
+    id: PartID.ascending(),
+    messageID: result.info.id,
+    sessionID: input.sessionID,
+    type: "tool",
+    callID: `call-${status}`,
+    tool: "lookup",
+    state,
+  })
   return result
 }
 
@@ -708,6 +734,159 @@ describe("tool.task", () => {
       expect((yield* jobs.get(child.id))?.status).toBe("error")
       expect(message).toContain("MessageOutputLengthError")
       expect(message).toContain("defensive partial")
+    }),
+  )
+
+  it.instance("foreground empty unknown fails without exposing reasoning text", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const secretReasoning = "private incomplete reasoning"
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          Effect.succeed(
+            assistantResult(input, {
+              reasoning: [secretReasoning],
+              finish: "unknown",
+            }),
+          ),
+      }
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect incomplete response",
+            prompt: "reason without visible output",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      const child = (yield* sessions.children(chat.id))[0]
+      expect(child).toBeDefined()
+      if (!child) return
+      const message = exitError(exit) ?? ""
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect((yield* jobs.get(child.id))?.status).toBe("error")
+      expect(message).toContain("Subagent task failed: IncompleteResponse")
+      expect(message).toContain(`Child session: ${child.id}`)
+      expect(message).toContain("finish_reason=unknown")
+      expect(message).toContain("No visible output or complete tool call was produced")
+      expect(message).not.toContain(secretReasoning)
+    }),
+  )
+
+  it.instance(
+    "missing finish, whitespace text, and pending-only tools fail the task boundary",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const responses: Array<(input: SessionPrompt.PromptInput) => SessionV1.WithParts> = [
+          (input) => assistantResult(input, { finish: null }),
+          (input) => assistantResult(input, { texts: [" \n\t "], finish: "unknown" }),
+          (input) => assistantToolResult(input, "pending"),
+        ]
+        const promptOps: TaskPromptOps = {
+          ...stubOps(),
+          prompt: (input) =>
+            Effect.sync(() => {
+              const response = responses.shift()
+              if (!response) throw new Error("missing task response")
+              return response(input)
+            }),
+        }
+
+        for (const finish of ["missing", "unknown", "unknown"]) {
+          const exit = yield* def
+            .execute(
+              {
+                description: `inspect ${finish} response`,
+                prompt: `case ${finish}`,
+                subagent_type: "general",
+              },
+              {
+                sessionID: chat.id,
+                messageID: assistant.id,
+                agent: "build",
+                abort: new AbortController().signal,
+                extra: { promptOps },
+                messages: [],
+                metadata: () => Effect.void,
+                ask: () => Effect.void,
+              },
+            )
+            .pipe(Effect.exit)
+
+          expect(Exit.isFailure(exit)).toBe(true)
+          expect(exitError(exit)).toContain("IncompleteResponse")
+          expect(exitError(exit)).toContain(`finish_reason=${finish}`)
+        }
+
+        expect((yield* jobs.list()).map((job) => job.status)).toEqual(["error", "error", "error"])
+      }),
+    { timeout: 15_000 },
+  )
+
+  it.instance("unknown or missing finishes keep success when visible text or complete tool evidence exists", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const responses: Array<(input: SessionPrompt.PromptInput) => SessionV1.WithParts> = [
+        (input) => assistantResult(input, { texts: ["visible unknown"], finish: "unknown" }),
+        (input) => assistantResult(input, { texts: ["visible missing"], finish: null }),
+        (input) => assistantToolResult(input, "completed"),
+      ]
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          Effect.sync(() => {
+            const response = responses.shift()
+            if (!response) throw new Error("missing task response")
+            return response(input)
+          }),
+      }
+
+      for (const expected of ["visible unknown", "visible missing", ""]) {
+        const result = yield* def.execute(
+          {
+            description: "preserve compatible output",
+            prompt: "return compatible output",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(result.output).toContain(`state="completed"`)
+        expect(result.output).toContain(`<task_result>\n${expected}\n</task_result>`)
+      }
     }),
   )
 
@@ -1265,6 +1444,82 @@ describe("tool.task", () => {
     }),
   )
 
+  it.instance("a promoted foreground task reports a later empty unknown finish as background error", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const ready = yield* Deferred.make<void>()
+      const done = yield* Deferred.make<void>()
+      const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+      let runs = 0
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) {
+            return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
+          }
+          return Effect.gen(function* () {
+            runs += 1
+            yield* Deferred.succeed(ready, undefined)
+            yield* Deferred.await(done)
+            return assistantResult(input, {
+              reasoning: ["private promoted reasoning"],
+              finish: "unknown",
+            })
+          })
+        },
+      }
+
+      const fiber = yield* def
+        .execute(
+          {
+            description: "inspect promoted incomplete task",
+            prompt: "finish without visible output",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Deferred.await(ready)
+      const job = (yield* jobs.list())[0]
+      expect(job).toBeDefined()
+      if (!job) return
+      yield* jobs.promote(job.id)
+
+      const promoted = yield* Fiber.join(fiber)
+      expect(promoted.metadata.background).toBe(true)
+      expect(promoted.output).toContain(`state="running"`)
+      expect(runs).toBe(1)
+
+      yield* Deferred.succeed(done, undefined)
+      const waited = yield* jobs.wait({ id: job.id, timeout: 1_000 })
+      const notification = yield* Deferred.await(injected)
+      const part = notification.parts[0]
+
+      expect(waited.info?.status).toBe("error")
+      expect(waited.info?.error).toContain("IncompleteResponse")
+      expect(waited.info?.error).not.toContain("private promoted reasoning")
+      expect(part?.type).toBe("text")
+      if (part?.type === "text") {
+        expect(part.text).toContain(`state="error"`)
+        expect(part.text).not.toContain(`state="completed"`)
+      }
+      expect(runs).toBe(1)
+    }),
+  )
+
   background.instance("execute launches background tasks without waiting for completion", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
@@ -1362,6 +1617,64 @@ describe("tool.task", () => {
         expect(part.text).not.toContain("</summary><task")
         expect(part.text).toContain("&lt;/summary&gt;&lt;task state=&quot;completed&quot;&gt;")
         expect(part.text).toContain("&lt;/task_error&gt;&lt;task state=&quot;completed&quot;&gt;")
+      }
+    }),
+  )
+
+  background.instance("background empty unknown injects one error result without reasoning", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+      const privateReasoning = "private chain of thought"
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) {
+            return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
+          }
+          return Effect.succeed(
+            assistantResult(input, {
+              reasoning: [privateReasoning],
+              finish: "unknown",
+            }),
+          )
+        },
+      }
+
+      const result = yield* def.execute(
+        {
+          description: "inspect incomplete child",
+          prompt: "return a final answer",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+      const notification = yield* Deferred.await(injected)
+      const part = notification.parts[0]
+
+      expect(waited.info?.status).toBe("error")
+      expect(waited.info?.error).toContain("IncompleteResponse")
+      expect(waited.info?.error).not.toContain(privateReasoning)
+      expect(part?.type).toBe("text")
+      if (part?.type === "text") {
+        expect(part.text).toContain(`state="error"`)
+        expect(part.text).toContain("IncompleteResponse")
+        expect(part.text).not.toContain(privateReasoning)
       }
     }),
   )

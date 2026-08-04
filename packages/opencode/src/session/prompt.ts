@@ -1097,6 +1097,15 @@ const layer = Layer.effect(
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
+          if (lastAssistant?.error && lastUser.id < lastAssistant.id) {
+            yield* Effect.logInfo("exiting loop after assistant error", {
+              "session.id": sessionID,
+              messageID: lastAssistant.id,
+              error: lastAssistant.error.name,
+            })
+            break
+          }
+
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
           )
@@ -1288,6 +1297,8 @@ const layer = Layer.effect(
             if (handle.message.error?.name === "MessageOutputLengthError" || handle.message.finish === "length") {
               return "break" as const
             }
+
+            if (handle.message.error) return "break" as const
 
             if (structured !== undefined) {
               handle.message.structured = structured

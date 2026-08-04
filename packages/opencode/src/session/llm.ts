@@ -51,7 +51,10 @@ export type StreamRequest = StreamInput & {
   abort: AbortSignal
 }
 
+export type LLMEventBatch = ReadonlyArray<LLMEvent>
+
 export interface Interface {
+  readonly streamBatches: (input: StreamInput) => Stream.Stream<LLMEventBatch, unknown>
   readonly stream: (input: StreamInput) => Stream.Stream<LLMEvent, unknown>
 }
 
@@ -354,7 +357,7 @@ const live: Layer.Layer<
       }
     })
 
-    const stream: Interface["stream"] = (input) =>
+    const streamBatches: Interface["streamBatches"] = (input) =>
       Stream.scoped(
         Stream.unwrap(
           Effect.gen(function* () {
@@ -365,22 +368,25 @@ const live: Layer.Layer<
 
             const result = yield* run({ ...input, abort: ctrl.signal })
 
-            if (result.type === "native") return result.stream
+            if (result.type === "native") return result.stream.pipe(Stream.map((event) => [event]))
 
-            // Adapter seam: both runtimes expose the same LLMEvent stream. Native
-            // already returns one; AI SDK streams are converted here.
+            // Preserve one adapter mapping as a batch so downstream cutoff logic
+            // cannot split a step settlement from its terminal failure.
             const state = LLMAISDK.adapterState()
             return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
               e instanceof Error ? e : new Error(String(e)),
             ).pipe(
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
-              Stream.flatMap((events) => Stream.fromIterable(events)),
+              Stream.filter((events) => events.length > 0),
             )
           }),
         ),
       )
 
-    return Service.of({ stream })
+    const stream: Interface["stream"] = (input) =>
+      streamBatches(input).pipe(Stream.flatMap((events) => Stream.fromIterable(events)))
+
+    return Service.of({ stream, streamBatches })
   }),
 )
 

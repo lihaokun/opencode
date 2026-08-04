@@ -59,6 +59,22 @@ const it = testEffect(AppNodeBuilder.build(LayerNode.group([LLM.node, Provider.n
 // LLM.stream returns a Stream, not an Effect, so we can't use the serviceUse proxy.
 const drain = (input: LLM.StreamInput) => LLM.Service.use((svc) => svc.stream(input).pipe(Stream.runDrain))
 
+const collect = (input: LLM.StreamInput) =>
+  LLM.Service.use((svc) =>
+    svc.stream(input).pipe(
+      Stream.runCollect,
+      Effect.map((events) => Array.from(events)),
+    ),
+  )
+
+const collectBatches = (input: LLM.StreamInput) =>
+  LLM.Service.use((svc) =>
+    svc.streamBatches(input).pipe(
+      Stream.runCollect,
+      Effect.map((batches) => Array.from(batches)),
+    ),
+  )
+
 // drainWith builds an isolated runtime so custom replacements fully own LLM and
 // its transitive deps.
 const drainWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
@@ -303,6 +319,170 @@ describe("session.llm.ai-sdk adapter", () => {
           cacheReadInputTokens: 4,
         },
       },
+    ])
+  })
+
+  test("turns a missing raw finish reason into a terminal provider error after partial output", async () => {
+    const events = await adapt([
+      { type: "reasoning-start", id: "reasoning-1" },
+      { type: "reasoning-delta", id: "reasoning-1", text: "thinking" },
+      { type: "text-start", id: "text-1" },
+      { type: "text-delta", id: "text-1", text: "partial" },
+      {
+        type: "finish-step",
+        response: { id: "response-1", timestamp: new Date(0), modelId: "gpt-test" },
+        finishReason: "other",
+        rawFinishReason: undefined,
+        providerMetadata: undefined,
+        usage: {
+          inputTokens: 2,
+          outputTokens: 1,
+          totalTokens: 3,
+          inputTokenDetails: { noCacheTokens: 2, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+          outputTokenDetails: { textTokens: 1, reasoningTokens: undefined },
+        },
+      },
+    ])
+
+    expect(events).toMatchObject([
+      { type: "reasoning-start", id: "reasoning-1" },
+      { type: "reasoning-delta", id: "reasoning-1", text: "thinking" },
+      { type: "text-start", id: "text-1" },
+      { type: "text-delta", id: "text-1", text: "partial" },
+      {
+        type: "step-finish",
+        index: 0,
+        reason: "unknown",
+        usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+      },
+      {
+        type: "provider-error",
+        message: "Provider stream ended without a terminal finish event",
+        retryable: false,
+      },
+    ])
+  })
+
+  test("keeps defined raw reasons and known normalized reasons on the compatibility path", async () => {
+    const [definedRaw, knownReason] = await Promise.all([
+      adapt([
+        {
+          type: "finish-step",
+          response: { id: "response-1", timestamp: new Date(0), modelId: "gpt-test" },
+          finishReason: "other",
+          rawFinishReason: "provider_custom_stop",
+          providerMetadata: undefined,
+          usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            totalTokens: 2,
+            inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+            outputTokenDetails: { textTokens: 1, reasoningTokens: undefined },
+          },
+        },
+      ]),
+      adapt([
+        {
+          type: "finish-step",
+          response: { id: "response-2", timestamp: new Date(0), modelId: "gpt-test" },
+          finishReason: "stop",
+          rawFinishReason: undefined,
+          providerMetadata: undefined,
+          usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            totalTokens: 2,
+            inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+            outputTokenDetails: { textTokens: 1, reasoningTokens: undefined },
+          },
+        },
+      ]),
+    ])
+
+    expect(definedRaw).toMatchObject([{ type: "step-finish", reason: "unknown" }])
+    expect(knownReason).toMatchObject([{ type: "step-finish", reason: "stop" }])
+  })
+
+  test("suppresses events after a terminal adapter error and resets on the final finish", async () => {
+    const state = LLMAISDK.adapterState()
+    const run = (events: ReadonlyArray<AISDKAdapterEvent>) =>
+      Effect.runPromise(
+        Effect.forEach(events, (event) => LLMAISDK.toLLMEvents(state, event)).pipe(Effect.map((items) => items.flat())),
+      )
+
+    const failedStream = await run([
+      {
+        type: "finish-step",
+        response: { id: "response-1", timestamp: new Date(0), modelId: "gpt-test" },
+        finishReason: "other",
+        rawFinishReason: undefined,
+        providerMetadata: undefined,
+        usage: {
+          inputTokens: 1,
+          outputTokens: 0,
+          totalTokens: 1,
+          inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+          outputTokenDetails: { textTokens: 0, reasoningTokens: undefined },
+        },
+      },
+      { type: "text-delta", id: "late-text", text: "late" },
+      {
+        type: "finish",
+        finishReason: "other",
+        rawFinishReason: undefined,
+        totalUsage: {
+          inputTokens: 1,
+          outputTokens: 0,
+          totalTokens: 1,
+          inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+          outputTokenDetails: { textTokens: 0, reasoningTokens: undefined },
+        },
+      },
+    ])
+
+    expect(failedStream).toMatchObject([
+      { type: "step-finish", index: 0, reason: "unknown" },
+      {
+        type: "provider-error",
+        message: "Provider stream ended without a terminal finish event",
+        retryable: false,
+      },
+    ])
+
+    const nextStream = await run([
+      { type: "start-step", request: {}, warnings: [] },
+      {
+        type: "finish-step",
+        response: { id: "response-2", timestamp: new Date(0), modelId: "gpt-test" },
+        finishReason: "stop",
+        rawFinishReason: "stop",
+        providerMetadata: undefined,
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+          outputTokenDetails: { textTokens: 1, reasoningTokens: undefined },
+        },
+      },
+      {
+        type: "finish",
+        finishReason: "stop",
+        rawFinishReason: "stop",
+        totalUsage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+          outputTokenDetails: { textTokens: 1, reasoningTokens: undefined },
+        },
+      },
+    ])
+
+    expect(nextStream).toMatchObject([
+      { type: "step-start", index: 0 },
+      { type: "step-finish", index: 0, reason: "stop" },
+      { type: "finish", reason: "stop" },
     ])
   })
 
@@ -980,6 +1160,114 @@ describe("session.llm.stream", () => {
 
         const reasoning = (body.reasoningEffort as string | undefined) ?? (body.reasoning_effort as string | undefined)
         expect(reasoning).toBe("high")
+      }),
+    {
+      config: () => ({
+        enabled_providers: [vivgridFixture.providerID],
+        provider: {
+          [vivgridFixture.providerID]: {
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "preserves adapter event batches while keeping the flat stream compatible",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(vivgridFixture.providerID, vivgridFixture.modelID)
+        const chunks = [
+          {
+            id: "chatcmpl-batch-contract",
+            object: "chat.completion.chunk",
+            choices: [{ delta: { role: "assistant" } }],
+          },
+          {
+            id: "chatcmpl-batch-contract",
+            object: "chat.completion.chunk",
+            choices: [{ delta: { content: "partial" } }],
+          },
+          {
+            id: "chatcmpl-batch-contract",
+            object: "chat.completion.chunk",
+            choices: [{ delta: {} }],
+            usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+          },
+        ]
+        const batchRequest = waitRequest("/chat/completions", createEventResponse(chunks, true))
+        const flatRequest = waitRequest("/chat/completions", createEventResponse(chunks, true))
+        const definedRawRequest = waitRequest(
+          "/chat/completions",
+          createEventResponse(
+            [
+              {
+                id: "chatcmpl-batch-contract-defined-raw",
+                object: "chat.completion.chunk",
+                choices: [{ delta: { role: "assistant" } }],
+              },
+              {
+                id: "chatcmpl-batch-contract-defined-raw",
+                object: "chat.completion.chunk",
+                choices: [{ delta: { content: "compatible" } }],
+              },
+              {
+                id: "chatcmpl-batch-contract-defined-raw",
+                object: "chat.completion.chunk",
+                choices: [{ delta: {}, finish_reason: "provider_custom_stop" }],
+                usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(vivgridFixture.providerID),
+          ModelV2.ID.make(fixture.model.id),
+        )
+        const sessionID = SessionID.make("session-test-batch-contract")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.make("msg_user-batch-contract"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: ProviderV2.ID.make(vivgridFixture.providerID), modelID: resolved.id },
+        } satisfies SessionV1.User
+        const input = {
+          user,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user" as const, content: "Hello" }],
+          tools: {},
+        } satisfies LLM.StreamInput
+
+        const batches = yield* collectBatches(input)
+        const flat = yield* collect(input)
+        const definedRawBatches = yield* collectBatches(input)
+        yield* Effect.promise(() => Promise.all([batchRequest, flatRequest, definedRawRequest]))
+
+        expect(batches.every((batch) => batch.length > 0)).toBe(true)
+        expect(batches.map((batch) => batch.map((event) => event.type))).toContainEqual([
+          "step-finish",
+          "provider-error",
+        ])
+        expect(flat.map((event) => event.type)).toEqual(batches.flat().map((event) => event.type))
+        expect(
+          definedRawBatches
+            .find((batch) => batch.some((event) => event.type === "step-finish"))
+            ?.map((event) => event.type),
+        ).toEqual(["step-finish"])
+        expect(definedRawBatches.flat().some((event) => event.type === "provider-error")).toBe(false)
       }),
     {
       config: () => ({
