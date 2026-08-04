@@ -1047,6 +1047,96 @@ it.live("session.processor effect tests stop after token overflow requests compa
   ),
 )
 
+it.live("session.processor preserves a missing-finish error when usage requests compaction", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+
+        yield* llm.push(
+          raw({
+            chunks: [
+              {
+                id: "chatcmpl-missing-finish-overflow",
+                object: "chat.completion.chunk",
+                choices: [{ delta: { role: "assistant" } }],
+              },
+              {
+                id: "chatcmpl-missing-finish-overflow",
+                object: "chat.completion.chunk",
+                choices: [{ delta: { content: "partial before cutoff" } }],
+              },
+              {
+                id: "chatcmpl-missing-finish-overflow",
+                object: "chat.completion.chunk",
+                choices: [{ delta: {} }],
+                usage: {
+                  prompt_tokens: 100,
+                  completion_tokens: 1,
+                  total_tokens: 101,
+                },
+              },
+            ],
+          }),
+        )
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "compact incomplete")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const base = yield* provider.getModel(ref.providerID, ref.modelID)
+        const mdl = { ...base, limit: { context: 20, output: 10 } }
+        const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type !== Session.Event.Error.type) return Effect.void
+          const data = event.data as typeof Session.Event.Error.data.Type
+          if (data.sessionID === chat.id && data.error) errors.push(data.error)
+          return Effect.void
+        })
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "compact incomplete" }],
+          tools: {},
+        })
+        yield* off
+
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        const parts = yield* MessageV2.parts(msg.id)
+
+        expect(value).toBe("stop")
+        expect(handle.message.finish).toBe("unknown")
+        expect(handle.message.tokens.input).toBe(100)
+        expect(handle.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended without a terminal finish event" },
+        })
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") expect(stored.info.error).toEqual(handle.message.error)
+        expect(parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial before cutoff" }))
+        expect(errors).toEqual([handle.message.error])
+        expect(yield* llm.calls).toBe(1)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
 it.live("session.processor effect tests capture reasoning from http mock", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
