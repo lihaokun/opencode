@@ -9,6 +9,9 @@ import { SessionID, MessageID, PartID } from "../../src/session/schema"
 import { Question } from "../../src/question"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Cause } from "effect"
+import { ConstraintError, SqlError } from "effect/unstable/sql/SqlError"
+import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 
 const sessionID = SessionID.make("session")
 const providerID = ProviderV2.ID.make("test")
@@ -1364,6 +1367,33 @@ describe("session.message-v2.toModelMessage", () => {
 })
 
 describe("session.message-v2.fromError", () => {
+  test("returns a safe correlated UnknownError for nested database failures", () => {
+    const native = Object.assign(new Error("FOREIGN KEY constraint failed"), {
+      code: "SQLITE_CONSTRAINT_FOREIGNKEY",
+      errno: 787,
+    })
+    const error = new EffectDrizzleQueryError({
+      query: "insert into part values (?)",
+      params: ["sensitive-prompt-marker"],
+      cause: Cause.fail(
+        new SqlError({
+          reason: new ConstraintError({ cause: native, message: "Failed to execute statement", operation: "execute" }),
+        }),
+      ),
+    })
+
+    const result = MessageV2.fromError(Cause.die(error), { providerID, ref: "msg_diagnostic_ref" })
+
+    expect(result).toEqual({
+      name: "UnknownError",
+      data: {
+        message: "Database operation failed",
+        ref: "msg_diagnostic_ref",
+      },
+    })
+    expect(JSON.stringify(result)).not.toContain("sensitive-prompt-marker")
+  })
+
   test("serializes context_length_exceeded as ContextOverflowError", () => {
     const input = {
       type: "error",

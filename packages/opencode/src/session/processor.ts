@@ -24,6 +24,7 @@ import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
+import { SqlErrorDiagnostic } from "@opencode-ai/core/database/sql-error"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Usage, type FinishReason, type LLMEvent } from "@opencode-ai/llm"
 
@@ -140,6 +141,7 @@ const layer = Layer.effect(
         MessageV2.fromError(e, {
           providerID: input.model.providerID,
           aborted,
+          ref: input.assistantMessage.id,
         })
 
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
@@ -660,11 +662,18 @@ const layer = Layer.effect(
       })
 
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
+        const diagnostic = SqlErrorDiagnostic.extract(e)
         yield* Effect.logError("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
-          error: errorMessage(e),
-          stack: e instanceof Error ? e.stack : undefined,
+          error: diagnostic ? "Database operation failed" : errorMessage(e),
+          stack: diagnostic ? undefined : e instanceof Error ? e.stack : undefined,
+          "database.reason": diagnostic?.reason,
+          "database.operation": diagnostic?.operation,
+          "database.retryable": diagnostic?.retryable,
+          "database.code": diagnostic?.code,
+          "database.errno": diagnostic?.errno,
+          "database.message": diagnostic?.message,
         })
         if (ctx.assistantMessage.error) {
           yield* status.set(ctx.sessionID, { type: "idle" })

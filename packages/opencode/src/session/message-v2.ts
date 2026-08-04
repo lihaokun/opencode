@@ -19,6 +19,7 @@ import {
 import { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessage, type UIMessage } from "ai"
 import { Database } from "@opencode-ai/core/database/database"
+import { SqlErrorDiagnostic } from "@opencode-ai/core/database/sql-error"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NotFoundError } from "@/storage/storage"
 import { and } from "drizzle-orm"
@@ -602,8 +603,14 @@ export function latest(msgs: WithParts[]) {
 
 export function fromError(
   e: unknown,
-  ctx: { providerID: ProviderV2.ID; aborted?: boolean },
+  ctx: { providerID: ProviderV2.ID; aborted?: boolean; ref?: string },
 ): NonNullable<Assistant["error"]> {
+  if (SqlErrorDiagnostic.extract(e)) {
+    return new NamedError.Unknown({
+      message: "Database operation failed",
+      ...(ctx.ref ? { ref: ctx.ref } : {}),
+    }).toObject()
+  }
   switch (true) {
     case e instanceof DOMException && e.name === "AbortError":
       return new AbortedError(
