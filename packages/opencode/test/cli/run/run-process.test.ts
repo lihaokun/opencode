@@ -5,8 +5,9 @@
 // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
 import { describe, expect } from "bun:test"
 import { Effect, Schema } from "effect"
-import { reply } from "../../lib/llm-server"
+import { raw, reply, type Usage } from "../../lib/llm-server"
 import { cliIt } from "../../lib/cli-process"
+import { testProviderConfig } from "../../lib/test-provider"
 
 const TaskEventPart = Schema.Struct({
   tool: Schema.optional(Schema.String),
@@ -40,13 +41,87 @@ const StoredMessage = Schema.Struct({
   error: Schema.optional(
     Schema.Struct({
       name: Schema.optional(Schema.String),
+      data: Schema.optional(
+        Schema.Struct({
+          message: Schema.optional(Schema.String),
+        }),
+      ),
     }),
   ),
 })
 const StoredPart = Schema.Struct({
   type: Schema.optional(Schema.String),
   text: Schema.optional(Schema.String),
+  tool: Schema.optional(Schema.String),
+  state: Schema.optional(
+    Schema.Struct({
+      status: Schema.optional(Schema.String),
+    }),
+  ),
 })
+
+const crossoverUsage = { input: 100, output: 1 } satisfies Usage
+
+function missingFinishWithUsage(input: { text: string; usage: Usage }) {
+  const chunk = (delta: Record<string, unknown>) => ({
+    id: "chatcmpl-crossover",
+    object: "chat.completion.chunk",
+    choices: [{ delta }],
+  })
+  return raw({
+    chunks: [
+      chunk({ role: "assistant" }),
+      chunk({ content: input.text }),
+      {
+        ...chunk({}),
+        usage: {
+          prompt_tokens: input.usage.input,
+          completion_tokens: input.usage.output,
+          total_tokens: input.usage.input + input.usage.output,
+        },
+      },
+    ],
+  })
+}
+
+function crossoverEnv(llmUrl: string) {
+  const config = testProviderConfig(llmUrl)
+  return {
+    OPENCODE_DISABLE_AUTOCOMPACT: "0",
+    OPENCODE_CONFIG_CONTENT: JSON.stringify({
+      ...config,
+      provider: {
+        ...config.provider,
+        test: {
+          ...config.provider.test,
+          models: {
+            ...config.provider.test.models,
+            "test-model": {
+              ...config.provider.test.models["test-model"],
+              limit: { context: 20, output: 10 },
+            },
+          },
+        },
+      },
+    }),
+  }
+}
+
+function bodyIncludes(body: Record<string, unknown>, value: string) {
+  return JSON.stringify(body).includes(value)
+}
+
+function isTitleInput(body: Record<string, unknown>) {
+  return bodyIncludes(body, "Generate a title for this conversation")
+}
+
+function hasUserText(body: Record<string, unknown>, value: string) {
+  if (!Array.isArray(body.messages)) return false
+  return body.messages.some((message) => {
+    if (!message || typeof message !== "object" || !("role" in message) || message.role !== "user") return false
+    return JSON.stringify("content" in message ? message.content : undefined).includes(value)
+  })
+}
 
 describe("opencode run (non-interactive subprocess)", () => {
   // Happy path: prompt completes, output reaches stdout, process exits 0.
@@ -266,6 +341,109 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(childInputs).toHaveLength(1)
         expect(recoveryInputs).toHaveLength(1)
         expect(JSON.stringify(recoveryInputs[0])).not.toContain(childReasoning)
+        expect(yield* llm.pending).toBe(0)
+      }),
+    60_000,
+  )
+
+  cliIt.concurrent(
+    "propagates a child compaction crossover after one completed tool without replay",
+    ({ home, llm, opencode }) =>
+      Effect.gen(function* () {
+        const parentPrompt = "delegate a child crossover after one completed tool"
+        const childPrompt = "run one tool before the high-usage stream ends"
+        const partial = "partial child crossover output"
+        const recovery = "parent recovered from the child crossover"
+        const marker = `${home}/child-crossover-tool.txt`
+
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, parentPrompt),
+          reply().tool("task", {
+            description: "trigger child compaction crossover",
+            prompt: childPrompt,
+            subagent_type: "general",
+          }),
+        )
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, childPrompt),
+          reply().tool("bash", {
+            command: `printf 'charged\\n' >> '${marker}'`,
+            description: "Append one child crossover marker",
+          }),
+          missingFinishWithUsage({ text: partial, usage: crossoverUsage }),
+        )
+        yield* llm.pushMatch(
+          ({ body }) => bodyIncludes(body, "Provider stream ended without a terminal finish event"),
+          reply().text(recovery).stop(),
+        )
+
+        const result = yield* opencode.run(parentPrompt, {
+          format: "json",
+          env: crossoverEnv(llm.url),
+          extraArgs: ["--dangerously-skip-permissions"],
+        })
+        opencode.expectExit(result, 0)
+
+        const events = opencode.parseJsonEvents(result.stdout)
+        const taskEvent = events.find((event) => {
+          if (event.type !== "tool_use") return false
+          const part = Schema.decodeUnknownSync(TaskEventPart)(event.part)
+          return part?.tool === "task"
+        })
+        const taskPart = taskEvent ? Schema.decodeUnknownSync(TaskEventPart)(taskEvent.part) : undefined
+        const childID = taskPart?.state?.metadata?.sessionId
+
+        expect(taskPart?.state?.status).toBe("error")
+        expect(taskPart?.state?.error).toContain("Subagent task failed: UnknownError")
+        expect(taskPart?.state?.error).toContain("Provider stream ended without a terminal finish event")
+        expect(events.some((event) => event.type === "text" && bodyIncludes(event, recovery))).toBe(true)
+        expect(childID).toEqual(expect.any(String))
+        if (!childID) return
+
+        const escapedChildID = childID.replaceAll("'", "''")
+        const stored = yield* opencode.spawn([
+          "db",
+          `select id, data from message where session_id = '${escapedChildID}' order by time_created`,
+          "--format",
+          "json",
+        ])
+        opencode.expectExit(stored, 0, "query crossover child transcript")
+        const messages = Schema.decodeUnknownSync(MessageRows)(JSON.parse(stored.stdout)).map((row) => ({
+          id: row.id,
+          info: Schema.decodeUnknownSync(StoredMessage)(JSON.parse(row.data ?? "{}")),
+        }))
+        const storedParts = yield* opencode.spawn([
+          "db",
+          `select message_id, data from part where session_id = '${escapedChildID}'`,
+          "--format",
+          "json",
+        ])
+        opencode.expectExit(storedParts, 0, "query crossover child parts")
+        const parts = Schema.decodeUnknownSync(PartRows)(JSON.parse(storedParts.stdout)).map((row) => ({
+          messageID: row.message_id,
+          part: Schema.decodeUnknownSync(StoredPart)(JSON.parse(row.data ?? "{}")),
+        }))
+        const failed = messages.find(
+          (message) => message.info.role === "assistant" && message.info.error?.name === "UnknownError",
+        )
+        const failedParts = parts.filter((item) => item.messageID === failed?.id).map((item) => item.part)
+        const completedBash = parts.filter(
+          (item) => item.part.type === "tool" && item.part.tool === "bash" && item.part.state?.status === "completed",
+        )
+        const inputs = yield* llm.inputs
+        const childInputs = inputs.filter((body) => hasUserText(body, childPrompt))
+        const recoveryInputs = inputs.filter((body) =>
+          bodyIncludes(body, "Provider stream ended without a terminal finish event"),
+        )
+
+        expect(failed?.info.finish).toBe("unknown")
+        expect(failed?.info.error?.data?.message).toBe("Provider stream ended without a terminal finish event")
+        expect(failedParts).toContainEqual(expect.objectContaining({ type: "text", text: partial }))
+        expect(completedBash).toHaveLength(1)
+        expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("charged\n")
+        expect(childInputs).toHaveLength(2)
+        expect(recoveryInputs).toHaveLength(1)
+        expect(yield* llm.calls).toBe(5)
         expect(yield* llm.pending).toBe(0)
       }),
     60_000,
@@ -601,6 +779,45 @@ describe("opencode run (non-interactive subprocess)", () => {
           }),
         )
         expect(events.filter((event) => event.type === "error")).toHaveLength(1)
+      }),
+    60_000,
+  )
+
+  cliIt.concurrent(
+    "exits nonzero without compaction when a high-usage stream misses its terminal finish",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const marker = "top-level compaction crossover marker"
+        const partial = "partial top-level crossover output"
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, marker),
+          missingFinishWithUsage({ text: partial, usage: crossoverUsage }),
+        )
+
+        const result = yield* opencode.run(marker, {
+          format: "json",
+          env: crossoverEnv(llm.url),
+        })
+
+        const events = opencode.parseJsonEvents(result.stdout)
+        const inputs = yield* llm.inputs
+        const targetInputs = inputs.filter((body) => hasUserText(body, marker) && !isTitleInput(body))
+
+        expect(result.exitCode).not.toBe(0)
+        expect(events.map((event) => event.type)).toEqual(["step_start", "text", "step_finish", "error"])
+        expect(events[1]?.part).toEqual(expect.objectContaining({ type: "text", text: partial }))
+        expect(events[2]?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
+        expect(events[3]?.error).toEqual(
+          expect.objectContaining({
+            name: "UnknownError",
+            data: expect.objectContaining({ message: "Provider stream ended without a terminal finish event" }),
+          }),
+        )
+        expect(events.filter((event) => event.type === "error")).toHaveLength(1)
+        expect(targetInputs).toHaveLength(1)
+        expect(targetInputs[0]?.max_tokens ?? targetInputs[0]?.max_output_tokens).toBe(10)
+        expect(yield* llm.calls).toBe(2)
+        expect(yield* llm.pending).toBe(0)
       }),
     60_000,
   )
