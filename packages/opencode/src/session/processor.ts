@@ -696,19 +696,21 @@ const layer = Layer.effect(
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
         })
-        ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
+            ctx.needsCompaction = false
             evidence = providerTurnEvidence()
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream(streamInput)
+            const stream = llm.streamBatches(streamInput)
 
             yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
+              Stream.tap((batch) =>
+                Effect.forEach(batch, (event) => handleEvent(event), { concurrency: 1, discard: true }),
+              ),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
@@ -752,8 +754,8 @@ const layer = Layer.effect(
             ),
           )
 
-          if (ctx.needsCompaction) return "compact"
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
+          if (ctx.needsCompaction) return "compact"
           return "continue"
         })
       })

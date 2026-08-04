@@ -297,6 +297,11 @@ function llm() {
   const queue: Array<
     Stream.Stream<LLMEvent, unknown> | ((input: LLM.StreamInput) => Stream.Stream<LLMEvent, unknown>)
   > = []
+  const streamBatches: LLM.Interface["streamBatches"] = (input) => {
+    const item = queue.shift() ?? Stream.empty
+    const stream = typeof item === "function" ? item(input) : item
+    return stream.pipe(Stream.mapEffect((event) => Effect.succeed([event])))
+  }
 
   return {
     push(stream: Stream.Stream<LLMEvent, unknown> | ((input: LLM.StreamInput) => Stream.Stream<LLMEvent, unknown>)) {
@@ -305,11 +310,8 @@ function llm() {
     llmLayer: Layer.succeed(
       LLM.Service,
       LLM.Service.of({
-        stream: (input) => {
-          const item = queue.shift() ?? Stream.empty
-          const stream = typeof item === "function" ? item(input) : item
-          return stream.pipe(Stream.mapEffect((event) => Effect.succeed(event)))
-        },
+        streamBatches,
+        stream: (input) => streamBatches(input).pipe(Stream.flatMap((batch) => Stream.fromIterable(batch))),
       }),
     ),
   }

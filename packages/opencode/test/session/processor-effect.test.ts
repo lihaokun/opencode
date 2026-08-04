@@ -190,56 +190,68 @@ const env = LayerNode.compile(
 
 const it = testEffect(env)
 
+function batchLLM(
+  streamBatches: LLM.Interface["streamBatches"],
+  stream: LLM.Interface["stream"] = (input) =>
+    streamBatches(input).pipe(Stream.flatMap((batch) => Stream.fromIterable(batch))),
+) {
+  return LLM.Service.of({ stream, streamBatches })
+}
+
+function singletonBatchLLM(stream: LLM.Interface["stream"]) {
+  return LLM.Service.of({
+    stream,
+    streamBatches: (input) => stream(input).pipe(Stream.map((event) => [event])),
+  })
+}
+
 const providerErrorLLM = Layer.succeed(
   LLM.Service,
-  LLM.Service.of({
-    stream: () =>
-      Stream.make(
-        LLMEvent.stepStart({ index: 0 }),
-        LLMEvent.toolInputStart({ id: "call-1", name: "lookup" }),
-        LLMEvent.toolInputEnd({ id: "call-1", name: "lookup" }),
-        LLMEvent.toolCall({ id: "call-1", name: "lookup", input: {}, providerExecuted: true }),
-        LLMEvent.toolResult({
-          id: "call-1",
-          name: "lookup",
-          result: { type: "error", value: "provider boom" },
-          providerExecuted: true,
-        }),
-        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
-        LLMEvent.finish({ reason: "stop" }),
-      ),
-  }),
+  singletonBatchLLM(() =>
+    Stream.make(
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.toolInputStart({ id: "call-1", name: "lookup" }),
+      LLMEvent.toolInputEnd({ id: "call-1", name: "lookup" }),
+      LLMEvent.toolCall({ id: "call-1", name: "lookup", input: {}, providerExecuted: true }),
+      LLMEvent.toolResult({
+        id: "call-1",
+        name: "lookup",
+        result: { type: "error", value: "provider boom" },
+        providerExecuted: true,
+      }),
+      LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+      LLMEvent.finish({ reason: "stop" }),
+    ),
+  ),
 )
 const providerErrorEnv = LayerNode.compile(root, [...replacements, [LLM.node, providerErrorLLM]])
 const itProviderError = testEffect(providerErrorEnv)
 
 const fragmentFailureLLM = Layer.succeed(
   LLM.Service,
-  LLM.Service.of({
-    stream: () =>
-      Stream.make(
-        LLMEvent.stepStart({ index: 0 }),
-        LLMEvent.reasoningStart({ id: "reasoning-1" }),
-        LLMEvent.reasoningDelta({ id: "reasoning-1", text: "thinking" }),
-        LLMEvent.textStart({ id: "text-1" }),
-        LLMEvent.textDelta({ id: "text-1", text: "partial" }),
-        LLMEvent.providerError({ message: "provider boom" }),
-      ),
-  }),
+  singletonBatchLLM(() =>
+    Stream.make(
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.reasoningStart({ id: "reasoning-1" }),
+      LLMEvent.reasoningDelta({ id: "reasoning-1", text: "thinking" }),
+      LLMEvent.textStart({ id: "text-1" }),
+      LLMEvent.textDelta({ id: "text-1", text: "partial" }),
+      LLMEvent.providerError({ message: "provider boom" }),
+    ),
+  ),
 )
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
 const lengthLLM = Layer.succeed(
   LLM.Service,
-  LLM.Service.of({
-    stream: () =>
-      Stream.make(
-        LLMEvent.stepStart({ index: 0 }),
-        LLMEvent.stepFinish({ index: 0, reason: "length" }),
-        LLMEvent.finish({ reason: "length" }),
-      ),
-  }),
+  singletonBatchLLM(() =>
+    Stream.make(
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.stepFinish({ index: 0, reason: "length" }),
+      LLMEvent.finish({ reason: "length" }),
+    ),
+  ),
 )
 const lengthEnv = LayerNode.compile(root, [...replacements, [LLM.node, lengthLLM]])
 const itLength = testEffect(lengthEnv)
@@ -391,15 +403,86 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
 
 const settlementLLM = Layer.succeed(
   LLM.Service,
-  LLM.Service.of({
-    stream: (input) => {
-      const content = input.messages.at(-1)?.content
-      return settlementStream(typeof content === "string" ? content : "")
-    },
+  singletonBatchLLM((input) => {
+    const content = input.messages.at(-1)?.content
+    return settlementStream(typeof content === "string" ? content : "")
   }),
 )
 const settlementEnv = LayerNode.compile(root, [...replacements, [LLM.node, settlementLLM]])
 const itSettlement = testEffect(settlementEnv)
+
+const highUsage = { inputTokens: 100, outputTokens: 1, totalTokens: 101 }
+
+function boundaryBatches(name: string): Stream.Stream<LLM.LLMEventBatch, unknown> {
+  const unexpected = [LLMEvent.providerError({ message: "unexpected next batch" })]
+  switch (name) {
+    case "canonical-overflow-reasoning":
+      return Stream.fromIterable([
+        [LLMEvent.stepStart({ index: 0 })],
+        [LLMEvent.reasoningStart({ id: "crossover-reasoning" })],
+        [LLMEvent.reasoningDelta({ id: "crossover-reasoning", text: "private partial" })],
+        [LLMEvent.reasoningEnd({ id: "crossover-reasoning" })],
+        [
+          LLMEvent.stepFinish({ index: 0, reason: "unknown", usage: highUsage }),
+          LLMEvent.providerError({
+            message: "Provider stream ended without a terminal finish event",
+            retryable: false,
+          }),
+        ],
+        unexpected,
+      ])
+    case "raw-defined-overflow":
+      return Stream.fromIterable([
+        [LLMEvent.stepStart({ index: 0 })],
+        [LLMEvent.textStart({ id: "compatible-text" })],
+        [LLMEvent.textDelta({ id: "compatible-text", text: "compatible partial" })],
+        [LLMEvent.stepFinish({ index: 0, reason: "unknown", usage: highUsage })],
+        unexpected,
+      ])
+    case "empty-unknown-overflow":
+      return Stream.fromIterable([
+        [LLMEvent.stepStart({ index: 0 })],
+        [LLMEvent.stepFinish({ index: 0, reason: "unknown", usage: highUsage })],
+        unexpected,
+      ])
+    case "length-overflow":
+      return Stream.fromIterable([
+        [LLMEvent.stepStart({ index: 0 })],
+        [LLMEvent.stepFinish({ index: 0, reason: "length", usage: highUsage })],
+        unexpected,
+      ])
+    case "blocked-overflow":
+      return Stream.fromIterable([
+        [LLMEvent.stepStart({ index: 0 })],
+        [LLMEvent.toolCall({ id: "blocked-call", name: "lookup", input: {} })],
+        [
+          LLMEvent.toolError({
+            id: "blocked-call",
+            name: "lookup",
+            message: "permission rejected",
+            error: new PermissionV1.RejectedError(),
+          }),
+        ],
+        [LLMEvent.stepFinish({ index: 0, reason: "stop", usage: highUsage })],
+        unexpected,
+      ])
+    default:
+      return Stream.die(new Error(`Unknown batch boundary scenario: ${name}`))
+  }
+}
+
+const boundaryLLM = Layer.succeed(
+  LLM.Service,
+  batchLLM(
+    (input) => {
+      const content = input.messages.at(-1)?.content
+      return boundaryBatches(typeof content === "string" ? content : "")
+    },
+    () => Stream.die(new Error("processor must consume streamBatches")),
+  ),
+)
+const boundaryEnv = LayerNode.compile(root, [...replacements, [LLM.node, boundaryLLM]])
+const itBoundary = testEffect(boundaryEnv)
 
 const textEvidencePlugin = Layer.mock(Plugin.Service)({
   trigger: <Output>(name: string, _input: unknown, output: Output) => {
@@ -428,43 +511,77 @@ const attemptEvidenceLLM = Layer.effect(
   LLM.Service,
   Effect.sync(() => {
     let attempt = 0
-    return LLM.Service.of({
-      stream: () => {
-        attempt++
-        if (attempt > 1) {
-          return Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
-            LLMEvent.finish({ reason: "unknown" }),
-          )
-        }
+    return singletonBatchLLM(() => {
+      attempt++
+      if (attempt > 1) {
         return Stream.make(
           LLMEvent.stepStart({ index: 0 }),
-          LLMEvent.textStart({ id: "attempt-1-text" }),
-          LLMEvent.textDelta({ id: "attempt-1-text", text: "first attempt" }),
-          LLMEvent.textEnd({ id: "attempt-1-text" }),
           LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
-        ).pipe(
-          Stream.concat(
-            Stream.fail(
-              new APICallError({
-                message: "retry",
-                url: "https://example.com/v1/chat/completions",
-                requestBodyValues: {},
-                statusCode: 503,
-                responseHeaders: { "retry-after-ms": "0" },
-                responseBody: '{"error":"retry"}',
-                isRetryable: true,
-              }),
-            ),
-          ),
+          LLMEvent.finish({ reason: "unknown" }),
         )
-      },
+      }
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "attempt-1-text" }),
+        LLMEvent.textDelta({ id: "attempt-1-text", text: "first attempt" }),
+        LLMEvent.textEnd({ id: "attempt-1-text" }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+      ).pipe(
+        Stream.concat(
+          Stream.fail(
+            new APICallError({
+              message: "retry",
+              url: "https://example.com/v1/chat/completions",
+              requestBodyValues: {},
+              statusCode: 503,
+              responseHeaders: { "retry-after-ms": "0" },
+              responseBody: '{"error":"retry"}',
+              isRetryable: true,
+            }),
+          ),
+        ),
+      )
     })
   }),
 )
 const attemptEvidenceEnv = LayerNode.compile(root, [...replacements, [LLM.node, attemptEvidenceLLM]])
 const itAttemptEvidence = testEffect(attemptEvidenceEnv)
+
+const compactionAttemptLLM = Layer.effect(
+  LLM.Service,
+  Effect.sync(() => {
+    let attempt = 0
+    const batches = (): Stream.Stream<LLM.LLMEventBatch, unknown> => {
+      attempt++
+      if (attempt > 1) {
+        return Stream.fromIterable([
+          [LLMEvent.stepStart({ index: 0 })],
+          [LLMEvent.textStart({ id: "attempt-2-text" })],
+          [LLMEvent.textDelta({ id: "attempt-2-text", text: "second attempt" })],
+          [LLMEvent.textEnd({ id: "attempt-2-text" })],
+          [LLMEvent.stepFinish({ index: 0, reason: "stop" })],
+          [LLMEvent.finish({ reason: "stop" })],
+        ])
+      }
+      return Stream.fromIterable([
+        [LLMEvent.stepStart({ index: 0 })],
+        [LLMEvent.textStart({ id: "attempt-1-overflow-text" })],
+        [LLMEvent.textDelta({ id: "attempt-1-overflow-text", text: "first attempt" })],
+        [LLMEvent.textEnd({ id: "attempt-1-overflow-text" })],
+        [
+          LLMEvent.stepFinish({ index: 0, reason: "stop", usage: highUsage }),
+          LLMEvent.providerError({ message: "rate limit", retryable: true }),
+        ],
+      ])
+    }
+    return batchLLM(
+      () => Stream.suspend(batches),
+      () => Stream.die(new Error("processor must consume streamBatches")),
+    )
+  }),
+)
+const compactionAttemptEnv = LayerNode.compile(root, [...replacements, [LLM.node, compactionAttemptLLM]])
+const itCompactionAttempt = testEffect(compactionAttemptEnv)
 
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
@@ -473,13 +590,18 @@ const boot = Effect.fn("test.boot")(function* () {
   return { processors, session, provider }
 })
 
-const runSettlement = Effect.fn("test.runSettlement")(function* (dir: string, scenario: string) {
+const runSettlement = Effect.fn("test.runSettlement")(function* (
+  dir: string,
+  scenario: string,
+  options?: { limit?: { context: number; output: number } },
+) {
   const { processors, session, provider } = yield* boot()
   const eventBridge = yield* EventV2Bridge.Service
   const chat = yield* session.create({})
   const parent = yield* user(chat.id, scenario)
   const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-  const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+  const base = yield* provider.getModel(ref.providerID, ref.modelID)
+  const mdl = options?.limit ? { ...base, limit: options.limit } : base
   const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
   const off = yield* eventBridge.listen((event) => {
     if (event.type !== Session.Event.Error.type) return Effect.void
@@ -776,6 +898,96 @@ itSettlement.live("session.processor accepts unknown finishes with usable text o
   ),
 )
 
+itBoundary.live("session.processor handles a complete terminal-error batch before compaction cutoff", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const result = yield* runSettlement(dir, "canonical-overflow-reasoning", {
+          limit: { context: 20, output: 10 },
+        })
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.tokens.input).toBe(100)
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended without a terminal finish event" },
+        })
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: "private partial" }))
+        expect(result.errors).toHaveLength(1)
+        expect(result.errors[0]).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended without a terminal finish event" },
+        })
+      }),
+    { config: cfg },
+  ),
+)
+
+itBoundary.live("session.processor keeps raw-defined unknown overflow compatible without demanding a successor", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const result = yield* runSettlement(dir, "raw-defined-overflow", {
+          limit: { context: 20, output: 10 },
+        })
+
+        expect(result.result).toBe("compact")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toBeUndefined()
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "compatible partial" }))
+        expect(result.errors).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itBoundary.live("session.processor gives an empty unknown error priority over compaction", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const result = yield* runSettlement(dir, "empty-unknown-overflow", {
+          limit: { context: 20, output: 10 },
+        })
+
+        expect(result.result).toBe("stop")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
+        })
+        expect(result.errors).toHaveLength(1)
+        expect(result.errors[0]).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
+        })
+      }),
+    { config: cfg },
+  ),
+)
+
+itBoundary.live("session.processor gives length and blocked terminals priority over compaction", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const length = yield* runSettlement(dir, "length-overflow", {
+          limit: { context: 20, output: 10 },
+        })
+        expect(length.result).toBe("stop")
+        expect(length.message.error?.name).toBe("MessageOutputLengthError")
+        expect(length.errors).toHaveLength(1)
+        expect(length.errors[0]?.name).toBe("MessageOutputLengthError")
+
+        const blocked = yield* runSettlement(dir, "blocked-overflow", {
+          limit: { context: 20, output: 10 },
+        })
+        expect(blocked.result).toBe("stop")
+        expect(blocked.message.error).toBeUndefined()
+        expect(blocked.errors).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
 itSettlement.live("session.processor preserves a specific provider error instead of adding a generic fallback", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -861,6 +1073,26 @@ itAttemptEvidence.live("session.processor resets finish and output evidence befo
         expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "first attempt" }))
         expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(2)
         expect(result.errors).toHaveLength(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itCompactionAttempt.live("session.processor resets compaction state before a retry attempt", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const result = yield* runSettlement(dir, "retry-compaction-state", {
+          limit: { context: 20, output: 10 },
+        })
+
+        expect(result.result).toBe("continue")
+        expect(result.message.finish).toBe("stop")
+        expect(result.message.error).toBeUndefined()
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "first attempt" }))
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "second attempt" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(2)
+        expect(result.errors).toEqual([])
       }),
     { config: cfg },
   ),
@@ -1130,7 +1362,11 @@ it.live("session.processor preserves a missing-finish error when usage requests 
         expect(stored.info.role).toBe("assistant")
         if (stored.info.role === "assistant") expect(stored.info.error).toEqual(handle.message.error)
         expect(parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial before cutoff" }))
-        expect(errors).toEqual([handle.message.error])
+        expect(errors).toHaveLength(1)
+        expect(errors[0]).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended without a terminal finish event" },
+        })
         expect(yield* llm.calls).toBe(1)
       }),
     { config: (url) => providerCfg(url) },

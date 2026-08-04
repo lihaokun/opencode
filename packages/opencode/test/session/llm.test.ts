@@ -59,6 +59,22 @@ const it = testEffect(AppNodeBuilder.build(LayerNode.group([LLM.node, Provider.n
 // LLM.stream returns a Stream, not an Effect, so we can't use the serviceUse proxy.
 const drain = (input: LLM.StreamInput) => LLM.Service.use((svc) => svc.stream(input).pipe(Stream.runDrain))
 
+const collect = (input: LLM.StreamInput) =>
+  LLM.Service.use((svc) =>
+    svc.stream(input).pipe(
+      Stream.runCollect,
+      Effect.map((events) => Array.from(events)),
+    ),
+  )
+
+const collectBatches = (input: LLM.StreamInput) =>
+  LLM.Service.use((svc) =>
+    svc.streamBatches(input).pipe(
+      Stream.runCollect,
+      Effect.map((batches) => Array.from(batches)),
+    ),
+  )
+
 // drainWith builds an isolated runtime so custom replacements fully own LLM and
 // its transitive deps.
 const drainWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
@@ -1144,6 +1160,83 @@ describe("session.llm.stream", () => {
 
         const reasoning = (body.reasoningEffort as string | undefined) ?? (body.reasoning_effort as string | undefined)
         expect(reasoning).toBe("high")
+      }),
+    {
+      config: () => ({
+        enabled_providers: [vivgridFixture.providerID],
+        provider: {
+          [vivgridFixture.providerID]: {
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "preserves adapter event batches while keeping the flat stream compatible",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(vivgridFixture.providerID, vivgridFixture.modelID)
+        const chunks = [
+          {
+            id: "chatcmpl-batch-contract",
+            object: "chat.completion.chunk",
+            choices: [{ delta: { role: "assistant" } }],
+          },
+          {
+            id: "chatcmpl-batch-contract",
+            object: "chat.completion.chunk",
+            choices: [{ delta: { content: "partial" } }],
+          },
+          {
+            id: "chatcmpl-batch-contract",
+            object: "chat.completion.chunk",
+            choices: [{ delta: {} }],
+            usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+          },
+        ]
+        const batchRequest = waitRequest("/chat/completions", createEventResponse(chunks, true))
+        const flatRequest = waitRequest("/chat/completions", createEventResponse(chunks, true))
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(vivgridFixture.providerID),
+          ModelV2.ID.make(fixture.model.id),
+        )
+        const sessionID = SessionID.make("session-test-batch-contract")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.make("msg_user-batch-contract"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: ProviderV2.ID.make(vivgridFixture.providerID), modelID: resolved.id },
+        } satisfies SessionV1.User
+        const input = {
+          user,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user" as const, content: "Hello" }],
+          tools: {},
+        } satisfies LLM.StreamInput
+
+        const batches = yield* collectBatches(input)
+        const flat = yield* collect(input)
+        yield* Effect.promise(() => Promise.all([batchRequest, flatRequest]))
+
+        expect(batches.every((batch) => batch.length > 0)).toBe(true)
+        expect(batches.map((batch) => batch.map((event) => event.type))).toContainEqual([
+          "step-finish",
+          "provider-error",
+        ])
+        expect(flat.map((event) => event.type)).toEqual(batches.flat().map((event) => event.type))
       }),
     {
       config: () => ({
