@@ -1198,6 +1198,30 @@ describe("session.llm.stream", () => {
         ]
         const batchRequest = waitRequest("/chat/completions", createEventResponse(chunks, true))
         const flatRequest = waitRequest("/chat/completions", createEventResponse(chunks, true))
+        const definedRawRequest = waitRequest(
+          "/chat/completions",
+          createEventResponse(
+            [
+              {
+                id: "chatcmpl-batch-contract-defined-raw",
+                object: "chat.completion.chunk",
+                choices: [{ delta: { role: "assistant" } }],
+              },
+              {
+                id: "chatcmpl-batch-contract-defined-raw",
+                object: "chat.completion.chunk",
+                choices: [{ delta: { content: "compatible" } }],
+              },
+              {
+                id: "chatcmpl-batch-contract-defined-raw",
+                object: "chat.completion.chunk",
+                choices: [{ delta: {}, finish_reason: "provider_custom_stop" }],
+                usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+              },
+            ],
+            true,
+          ),
+        )
         const resolved = yield* Provider.use.getModel(
           ProviderV2.ID.make(vivgridFixture.providerID),
           ModelV2.ID.make(fixture.model.id),
@@ -1229,7 +1253,8 @@ describe("session.llm.stream", () => {
 
         const batches = yield* collectBatches(input)
         const flat = yield* collect(input)
-        yield* Effect.promise(() => Promise.all([batchRequest, flatRequest]))
+        const definedRawBatches = yield* collectBatches(input)
+        yield* Effect.promise(() => Promise.all([batchRequest, flatRequest, definedRawRequest]))
 
         expect(batches.every((batch) => batch.length > 0)).toBe(true)
         expect(batches.map((batch) => batch.map((event) => event.type))).toContainEqual([
@@ -1237,6 +1262,12 @@ describe("session.llm.stream", () => {
           "provider-error",
         ])
         expect(flat.map((event) => event.type)).toEqual(batches.flat().map((event) => event.type))
+        expect(
+          definedRawBatches
+            .find((batch) => batch.some((event) => event.type === "step-finish"))
+            ?.map((event) => event.type),
+        ).toEqual(["step-finish"])
+        expect(definedRawBatches.flat().some((event) => event.type === "provider-error")).toBe(false)
       }),
     {
       config: () => ({

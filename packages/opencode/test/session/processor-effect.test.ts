@@ -412,12 +412,28 @@ const settlementEnv = LayerNode.compile(root, [...replacements, [LLM.node, settl
 const itSettlement = testEffect(settlementEnv)
 
 const highUsage = { inputTokens: 100, outputTokens: 1, totalTokens: 101 }
+const successorDemand = new Map<string, number>()
+
+function withSuccessorProbe(
+  name: string,
+  batches: ReadonlyArray<LLM.LLMEventBatch>,
+): Stream.Stream<LLM.LLMEventBatch, unknown> {
+  return Stream.fromIterable(batches).pipe(
+    Stream.concat(
+      Stream.fromEffect(
+        Effect.sync(() => {
+          successorDemand.set(name, (successorDemand.get(name) ?? 0) + 1)
+          return [LLMEvent.providerError({ message: "unexpected next batch" })]
+        }),
+      ),
+    ),
+  )
+}
 
 function boundaryBatches(name: string): Stream.Stream<LLM.LLMEventBatch, unknown> {
-  const unexpected = [LLMEvent.providerError({ message: "unexpected next batch" })]
   switch (name) {
     case "canonical-overflow-reasoning":
-      return Stream.fromIterable([
+      return withSuccessorProbe(name, [
         [LLMEvent.stepStart({ index: 0 })],
         [LLMEvent.reasoningStart({ id: "crossover-reasoning" })],
         [LLMEvent.reasoningDelta({ id: "crossover-reasoning", text: "private partial" })],
@@ -429,30 +445,26 @@ function boundaryBatches(name: string): Stream.Stream<LLM.LLMEventBatch, unknown
             retryable: false,
           }),
         ],
-        unexpected,
       ])
     case "raw-defined-overflow":
-      return Stream.fromIterable([
+      return withSuccessorProbe(name, [
         [LLMEvent.stepStart({ index: 0 })],
         [LLMEvent.textStart({ id: "compatible-text" })],
         [LLMEvent.textDelta({ id: "compatible-text", text: "compatible partial" })],
         [LLMEvent.stepFinish({ index: 0, reason: "unknown", usage: highUsage })],
-        unexpected,
       ])
     case "empty-unknown-overflow":
-      return Stream.fromIterable([
+      return withSuccessorProbe(name, [
         [LLMEvent.stepStart({ index: 0 })],
         [LLMEvent.stepFinish({ index: 0, reason: "unknown", usage: highUsage })],
-        unexpected,
       ])
     case "length-overflow":
-      return Stream.fromIterable([
+      return withSuccessorProbe(name, [
         [LLMEvent.stepStart({ index: 0 })],
         [LLMEvent.stepFinish({ index: 0, reason: "length", usage: highUsage })],
-        unexpected,
       ])
     case "blocked-overflow":
-      return Stream.fromIterable([
+      return withSuccessorProbe(name, [
         [LLMEvent.stepStart({ index: 0 })],
         [LLMEvent.toolCall({ id: "blocked-call", name: "lookup", input: {} })],
         [
@@ -464,7 +476,6 @@ function boundaryBatches(name: string): Stream.Stream<LLM.LLMEventBatch, unknown
           }),
         ],
         [LLMEvent.stepFinish({ index: 0, reason: "stop", usage: highUsage })],
-        unexpected,
       ])
     default:
       return Stream.die(new Error(`Unknown batch boundary scenario: ${name}`))
@@ -928,6 +939,7 @@ itBoundary.live("session.processor keeps raw-defined unknown overflow compatible
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
+        successorDemand.set("raw-defined-overflow", 0)
         const result = yield* runSettlement(dir, "raw-defined-overflow", {
           limit: { context: 20, output: 10 },
         })
@@ -937,6 +949,7 @@ itBoundary.live("session.processor keeps raw-defined unknown overflow compatible
         expect(result.message.error).toBeUndefined()
         expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "compatible partial" }))
         expect(result.errors).toEqual([])
+        expect(successorDemand.get("raw-defined-overflow")).toBe(0)
       }),
     { config: cfg },
   ),
@@ -946,6 +959,7 @@ itBoundary.live("session.processor gives an empty unknown error priority over co
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
+        successorDemand.set("empty-unknown-overflow", 0)
         const result = yield* runSettlement(dir, "empty-unknown-overflow", {
           limit: { context: 20, output: 10 },
         })
@@ -960,6 +974,7 @@ itBoundary.live("session.processor gives an empty unknown error priority over co
           name: "UnknownError",
           data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
         })
+        expect(successorDemand.get("empty-unknown-overflow")).toBe(0)
       }),
     { config: cfg },
   ),
