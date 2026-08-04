@@ -1,16 +1,28 @@
 # Provider 流缺失终止帧误报成功修正方案
 
-- 状态：实施完成；四个串行单元已提交，受影响回归、typecheck 和最终审核均已完成
+- 状态：原始修复已实施；2026-08-04 compaction crossover 修订计划已完成全文证据重审，待确认
 - 初稿日期：2026-07-27
 - 重审日期：2026-07-28
+- Compaction crossover 重审日期：2026-08-04
 - 对应问题：[Issue #3](https://github.com/lihaokun/opencode/issues/3)
-- 影响模块：AI SDK LLM adapter、Session 流终态、Prompt agent loop、Task 前后台结果传播、CLI 退出状态
-- 源码基线：`74637461887da7514fcc272846a1fdcd946b3aeb`
+- 对应 review：[PR #5 comment](https://github.com/lihaokun/opencode/pull/5#issuecomment-5170765949)
+- 影响模块：AI SDK LLM adapter、LLM service batch boundary、Session 流终态、Prompt agent loop、
+  Task 前后台结果传播、CLI 退出状态
+- 原始复现/修复前源码基线（pre-rebase）：`74637461887da7514fcc272846a1fdcd946b3aeb`
+- 当前 PR base：`d12b1e924d7a18551767690e9f02294d0b3c6f1a`
+- Compaction crossover 审计基线：`dbed80fccf0afeb2656736f8abe0f3b07d4b95e0`
 - 前置修复：`docs/fixes/subagent-fix-output-length.md`（Issue #1 / PR #2）
 - 本次实施范围：legacy `SessionPrompt` / `TaskTool` 路径
 - 独立 follow-up：V2 `SessionRunner` 与 native Gemini 的协议特定终态风险；本次不修改对应
   runner/protocol 文件
-- 实现提交：`160bd530ae`、`1e3278a737`、`725b17a2e8`、`dda9adf7af`
+- 当前 PR 代码/测试提交：`c5edbe9c95d11a198b1f5dbe769c4f1d55eec2a2`、
+  `80c34f68991897867b1ed0366bdfe6a3567f0cad`、`cc1c76d008255aa02c8d571431139da89b4bb95b`、
+  `1662d53e5f0393dae23bcb895255d54b6f0e5594`
+- 当前 PR 文档整合提交：`dbed80fccf0afeb2656736f8abe0f3b07d4b95e0`
+
+阅读约定：第一至三节记录原始修复前基线的现象、根因与参考对照；第四至八节记录已经实施的
+原始方案及验证；第九节是原审核结论及其失效说明；第十节是当前尚未实施的 compaction
+crossover 修订计划。未特别标注时，第十节中的“当前”指上述 crossover 审计基线。
 
 ## 一、现象与复现
 
@@ -30,7 +42,7 @@ AI SDK 把这种“流正常耗尽但没有终止原因”的状态表示为：
 }
 ```
 
-当前 opencode adapter 丢弃 `rawFinishReason`，并把不在本地枚举中的 `"other"` 映射成
+在原始修复前基线，opencode adapter 丢弃 `rawFinishReason`，并把不在本地枚举中的 `"other"` 映射成
 `"unknown"`。Session 将其保存为普通 `step-finish`，但不创建 assistant error。Prompt
 loop 随后退出，Task 又只检查 `error` 和 `finish === "length"`，最终把子任务登记成成功：
 
@@ -38,7 +50,7 @@ loop 随后退出，Task 又只检查 `error` 和 `finish === "length"`，最终
 - 已产生部分 text 时，父 agent 得到残缺文本；
 - 前台和后台 Task 都可能被登记成 `completed`；
 - 顶层 provider turn 直接发生同类截断时，plain CLI 可能空输出并退出 0；
-- 子 Task 截断时，父 agent 当前看不到 tool failure，因而无法有意识地恢复或向用户报错。
+- 子 Task 截断时，父 agent 当时看不到 tool failure，因而无法有意识地恢复或向用户报错。
 
 ### 1.2 触发条件
 
@@ -55,7 +67,7 @@ Issue 中的实际环境是 `glm-5.2` 经本地 new-api gateway 调用。上游 
 阶段，gateway 已经把 200 返回给 opencode，因而 opencode 无法再用 HTTP status 判断这次
 模型生成是否完整。
 
-### 1.3 当前 HEAD 本地实证
+### 1.3 原始修复前基线本地实证
 
 2026-07-28 在基线 `7463746188` 上使用真实 `opencode run`、真实 TaskTool、真实 child
 Session 和 test provider 执行临时 E2E。测试结果：
@@ -97,28 +109,33 @@ reasoning_content chunk
 | child text part        | 不存在                                |
 | child provider turn 数 | `1`，无自动重放                       |
 
-临时审计测试已经删除。实施阶段必须把同一父子链固化到
-`packages/opencode/test/cli/run/run-process.test.ts`，并把断言翻转为 Task error。
+该临时审计测试当时已删除；同一父子链后来在
+`packages/opencode/test/cli/run/run-process.test.ts` 的
+`persists a child missing-finish error and lets the parent recover without replay` 中固化，并把断言
+翻转为 Task error。
 
 另有两层现有证据：
 
 - `packages/opencode/test/cli/run/run-process.test.ts` 的
-  `unknown stream finish preserves partial output and exits 0` 证明 partial unknown 当前仍被
-  锁定为成功；
+  原用例 `unknown stream finish preserves partial output and exits 0` 证明 partial unknown 在
+  修复前被锁定为成功；
 - `packages/llm/test/provider/openai-chat.test.ts` 的
   `does not finalize streamed tool calls without a finish reason` 证明原生 `LLMClient.stream()`
   可以交付 partial events 而不产生 terminal event；完成性校验由持久化流 consumer 负责。
 
-### 1.4 现有兼容性锁
+### 1.4 修复前兼容性锁（已翻转）
 
-`packages/opencode/test/cli/run/run-process.test.ts` 当前有两个用例明确锁定旧行为：
+`packages/opencode/test/cli/run/run-process.test.ts` 在原始修复前有两个用例明确锁定旧行为：
 
 - `unknown stream finish preserves partial output and exits 0`
 - `--format json records partial output for an unknown stream finish`
 
 两个用例都断言 `exitCode === 0`，后者还断言最后一个事件是
-`step-finish(reason="unknown")`。它们证明当前行为不是单一 UI 偶发现象，而是已被测试固定的
-跨层语义。修复时必须有意识地更新这些断言，同时保留 partial output/JSON event 的可观察性。
+`step-finish(reason="unknown")`。它们证明修复前行为不是单一 UI 偶发现象，而是已被测试固定的
+跨层语义。当前 PR 提交 `1662d53e5f` 已将它们翻转/重命名为
+`missing terminal finish preserves partial text and exits nonzero` 和
+`--format json records partial output before a missing terminal error`，同时保留 partial
+output/JSON event 的可观察性。
 
 ### 1.5 出错代码路径
 
@@ -141,13 +158,13 @@ OpenAI-compatible SSE
       direct top-level truncation exits 0; child truncation is hidden from the parent as a successful tool result
 ```
 
-关键位置：
+原始修复前关键位置（以文件和符号为准，避免后续改动导致行号漂移）：
 
-- `packages/opencode/src/session/llm/ai-sdk.ts:21,87,111`
-- `packages/opencode/src/session/processor.ts:421,435,703`
-- `packages/opencode/src/session/prompt.ts:1110,1288,1299`
-- `packages/opencode/src/tool/task.ts:121,311,328,439`
-- `packages/opencode/test/cli/run/run-process.test.ts:299,430`
+- `packages/opencode/src/session/llm/ai-sdk.ts`：`finishReason()` / `toLLMEvents()`；
+- `packages/opencode/src/session/processor.ts`：`handleEvent(step-finish)` / `process()`；
+- `packages/opencode/src/session/prompt.ts`：loop entry / single-turn post-process；
+- `packages/opencode/src/tool/task.ts`：`runTask()` result projection；
+- `packages/opencode/test/cli/run/run-process.test.ts`：修复前 unknown text/JSON compatibility tests。
 
 ### 1.6 预期行为
 
@@ -182,7 +199,7 @@ Task 将上述状态映射为 `completed`，使父 agent 无法区分完整响�
 
 ### 2.2 根因
 
-根因由四个连续缺口组成。当前默认执行路径的选择也有明确代码依据：
+以下根因描述原始修复前基线，由四个连续缺口组成。该基线默认执行路径的选择也有明确代码依据：
 `packages/opencode/src/session/llm.ts` 只有在 `experimentalNativeLlm` 开启时才尝试 native
 runtime，否则调用 `streamText()` 并把 `fullStream` 交给 `LLMAISDK.toLLMEvents()`。
 
@@ -231,15 +248,16 @@ Task 只在 `assistant.error` 存在或 `finish === "length"` 时失败。`unkno
 ### 2.3 证据
 
 - AI SDK stream event 类型同时公开 `finishReason` 和 `rawFinishReason`。
-- 当前安装的 `@ai-sdk/openai-compatible@2.0.41` 初始化
+- 原始修复前基线与 crossover 审计基线的 opencode workspace lockfile 均解析到
+  `@ai-sdk/openai-compatible@2.0.41`；该版本初始化
   `{ unified: "other", raw: undefined }`，只有真实 `finish_reason` 才更新二者，且 flush
   无条件发出 finish。
-- 当前安装的 `ai@6.0.168` 把上述两项原样投影为 `finish-step.finishReason` 与
+- 两个基线均使用的 `ai@6.0.168` 把上述两项原样投影为 `finish-step.finishReason` 与
   `finish-step.rawFinishReason`。
 - `ai@6.0.168` 的公开 full-stream 类型在 `finish-step` 和 final `finish` 上都声明
   `rawFinishReason: string | undefined`；该字段是 AI SDK V3 事件契约，不是
   OpenAI-compatible 私有扩展。
-- 当前安装的 `@ai-sdk/anthropic@3.0.82` 同样以
+- 两个基线均使用的 `@ai-sdk/anthropic@3.0.82` 同样以
   `{ unified: "other", raw: undefined }` 初始化 stream finish state，并在收到
   `stop_reason` 时同时更新 unified/raw。这证明通用 AI SDK bridge 使用 raw evidence 的判定
   不依赖 OpenAI provider ID。
@@ -250,9 +268,10 @@ Task 只在 `assistant.error` 存在或 `finish === "length"` 时失败。`unkno
 - `SessionProcessor.step-finish` 只为 `"length"` 创建错误。
 - Prompt 的同一状态在相邻两个判断中分别被视为 unfinished 和 loop terminal。
 - Task failure gate 没有检查 `"unknown"` 或缺失 finish。
-- 当前 HEAD 的真实父子 Task E2E 得到 Task `completed`、child `finish=unknown`、
+- 原始修复前基线的真实父子 Task E2E 得到 Task `completed`、child `finish=unknown`、
   `error=undefined`、reasoning-only、child provider turn 数为 1。
-- 现有 CLI 测试明确断言 unknown stream finish 应退出 0。
+- 原始修复前 CLI 测试明确断言 unknown stream finish 应退出 0；当前 PR 提交 `1662d53e5f` 已翻转
+  该断言。
 
 ### 2.4 Workaround
 
@@ -281,7 +300,8 @@ Task 只在 `assistant.error` 存在或 `finish === "length"` 时失败。`unkno
 - 测试 stub 或未来 runtime adapter 可能直接结束而不发 finish/error；
 - compaction/summary 使用同一个 SessionProcessor，不能接受无可信 step settlement 的空 summary；
 - StructuredOutput 不能覆盖同一 turn 已经存在的截断错误；
-- 自动重试可能在 partial tool activity 之后重放非幂等 provider turn。
+- 若未来为 incomplete stream 增加自动重试，partial tool activity 之后可能重放非幂等 provider
+  turn；原始修复与当前 crossover 修订均保持 no-retry。
 
 范围决策：
 
@@ -295,10 +315,11 @@ Task 只在 `assistant.error` 存在或 `finish === "length"` 时失败。`unkno
 
 ## 三、参考实现对照（算法类 bug 必填）
 
-本问题不是数值算法 bug，而是流协议状态机 bug。对照对象使用当前 lockfile 实际安装的
-AI SDK，以及仓库内已实现完成性检查的 `LLMClient.generate()`。
+本问题不是数值算法 bug，而是流协议状态机 bug。对照对象使用原始修复前基线与 crossover
+审计基线中版本一致的 lockfile AI SDK，以及仓库内已实现完成性检查的
+`LLMClient.generate()`。
 
-| 步骤 | 输入 / 状态              | 当前实现                           | 参考契约                                                                             | 首个差异          |
+| 步骤 | 输入 / 状态              | 修复前实现                         | 参考契约                                                                             | 首个差异          |
 | ---- | ------------------------ | ---------------------------------- | ------------------------------------------------------------------------------------ | ----------------- |
 | 1    | stream 初始化            | opencode 尚未参与                  | SDK 初始化 `unified=other, raw=undefined`                                            | 否                |
 | 2    | 收到真实 `finish_reason` | opencode 尚未参与                  | SDK 同时更新 unified 和 raw                                                          | 否                |
@@ -355,8 +376,8 @@ eligibleForGenericIncomplete
 reasoning 不计入 `hasUsableOutput`，因为 Task 不把 reasoning 投影给父 agent；但无论成功或失败，
 reasoning part 都必须保留在 child session。
 
-不能在第一次非空 `text-delta` 时永久把 `hasVisibleText` 置为 true：当前
-`processor.ts:529-537` 的 `experimental.text.complete` 可以改写完整 text。实现应在
+不能在第一次非空 `text-delta` 时永久把 `hasVisibleText` 置为 true：
+`SessionProcessor.handleEvent("text-end")` 的 `experimental.text.complete` 可以改写完整 text。实现应在
 `text-end` 的 plugin 结果落定后更新 `hasCompletedVisibleText`；若流在 `text-end` 前耗尽，
 则直接检查仍在 `ctx.currentText` 中的 partial text。这样既保留 attempt-local 性质，也不会让
 plugin 改空/补全后的真实持久化结果与 fallback 判定不一致。
@@ -407,7 +428,7 @@ raw 已定义则仍代表“有 provider 终止证据、但本地不认识其语
 5. partial content 和 usage 必须在错误前按原顺序交付；
 6. 不修改公共 `FinishReason` schema，不增加新的 SDK wire 值。
 
-`provider-error` 是 terminal event，之后不能再向下游交付相互矛盾的 final
+本 adapter 合成的 `provider-error` 是 terminal event，之后不能再向下游交付相互矛盾的 final
 `finish(reason="unknown")`。若 AI SDK 在该 failure 后继续产生事件，adapter 应忽略它们；
 收到对应 final `finish` 时只重置 adapter state，不再次发错，也不转发 `LLMEvent.finish`。
 正常、未失败的 `finish` 仍按当前逻辑映射并重置 state。只出现 final `finish` 而没有任何
@@ -478,7 +499,7 @@ Provider stream ended without a settled model step
 ```
 
 该分支将 `ctx.assistantMessage.finish` 设为 `"error"`。原因是没有 `step-finish` 可提供 durable
-loop terminal；仅写 `assistant.error` 虽能停止当前 `process()`，但当前 Prompt 顶部既有退出
+loop terminal；仅写 `assistant.error` 虽能停止当前 `process()`，但修复前 Prompt 顶部既有退出
 分支以 `lastAssistant.finish` 为入口，且没有 error-first 判断。显式 `"error"` 为 Session
 consumer 提供 durable terminal marker，4.3 的 persisted-error guard 则保证即使存在 tool
 part 也不会在恢复时重放。empty-unknown 与 raw-missing 已有持久化的 `"unknown"`
@@ -503,28 +524,33 @@ follow-up。
 - 在内存中的 `ctx.assistantMessage` 设置 error，并依赖现有 `cleanup()` 末尾的
   `session.updateMessage()` 完成最终持久化；fallback 本身不增加一次重复写入；
 - 只发布一次 `Session.Event.Error`；
-- 未同时触发 compaction 时让 `process()` 返回 `"stop"`；若同轮已设置
-  `needsCompaction=true`，保持当前 `"compact"` 优先级，由 4.3 的 Prompt error guard 终止；
+- incomplete error 必须先于 compaction cutoff 落地；raw-missing 的
+  `[step-finish(reason="unknown"), provider-error]` adapter batch 必须在 compaction cutoff
+  判定前作为整体处理，具体修订见第十节；
 - 保留已经由现有 event handler 持久化的 partial reasoning/text/tool/usage/snapshot；
 - 不覆盖更具体的现有 error；
 - 不把已由 `step-finish(reason="length")` 创建的 `MessageOutputLengthError` 降级为
   `UnknownError`；只有 final finish、没有 step-finish 的非标准流仍按 no-step-settlement 分类；
-- 不改变 abort、permission deny、context overflow 和 compaction 的优先级。
+- 第十节除修正 raw-missing 的 batch/cutoff 顺序外，还把 persisted assistant error 与 blocked
+  明确提升到正常返回时的 final `"stop"` 优先级；这会阻止 API/length error 或 permission deny 被
+  usage compaction 结果覆盖。Abort 继续使用既有 Effect interruption 语义，不在本修订中承诺一个
+  正常返回值。Auto context-overflow recovery 不持久化 assistant error，仍保持
+  `"compact"`；其它 error-free compaction 路径不变。
 
 函数规约：`SessionProcessor.process(streamInput)`
 
-- Requires：输入 assistant 属于当前 session；`LLM.Service.stream()` 事件保持原有顺序；
+- Requires：输入 assistant 属于当前 session；LLM service 的 flat event/batch 均保持原有事件顺序；
 - Ensures：
   - 正常返回 `"continue"` 时，`assistant.error` 必须为空，且
     `credibleStepSettlement=true`；
   - raw 缺失 adapter error、empty unknown 或 no-step-settlement drain 均持久化一个
-    assistant error，并发布 exactly one Session error；无 compaction 时返回 `"stop"`，有
-    compaction 时可保持当前 `"compact"` 返回值，但 Prompt 必须因 error 终止；
+    assistant error，并发布 exactly one Session error；同一 turn 不得因 token overflow
+    在该 error 落地前返回 `"compact"`；
   - no-step-settlement 将 assistant finish 固化为 `"error"`，其它两类保留
     `step-finish(reason="unknown")`；
   - 已存在的更具体 error 与 `length` 分类不被覆盖；
-- 副作用：保留并持久化已交付的 part/usage/snapshot；可能发布一次 Session error；不发起新的
-  provider request。
+- 副作用：保留并持久化已交付的 part/usage/snapshot；可能发布一次 Session error；incomplete
+  settlement 本身不在当前 LLM stream/retry attempt 之外发起额外 provider request。
 
 正确性论证：
 
@@ -541,7 +567,7 @@ follow-up。
 
 修改 `packages/opencode/src/session/prompt.ts`，但不在这里重复 provider-specific 判定。
 
-当前顺序只在 structured 提升前特判 `MessageOutputLengthError`/`finish==="length"`；其它
+修复前顺序只在 structured 提升前特判 `MessageOutputLengthError`/`finish==="length"`；其它
 `assistant.error` 要到后面的 `result==="stop"` 才生效。因此当 structured tool 已产生值、
 随后同一 stream 截断时，`structured !== undefined` 分支会先执行。
 
@@ -636,7 +662,8 @@ message。
 
 从高到低：
 
-1. 已存在的明确 assistant error，例如 abort、API error、context overflow；
+1. 已存在的明确 assistant error，例如 abort、API error、auto compaction 关闭时持久化的 context
+   overflow；
 2. `finish="length"` 对应的 `MessageOutputLengthError`；
 3. adapter 明确报告的“缺少原始终止原因”provider error；
 4. Session 无 step settlement/空 unknown 兜底 `UnknownError`；
@@ -647,12 +674,14 @@ message。
 ### 4.6 网络接口契约检查
 
 1. 连接模型
-   - 每次 retry attempt 调用一次 `LLM.Service.stream()`；具体 HTTP step sequencing 仍由所选
+   - 原始修复中每次 retry attempt 调用一次 `LLM.Service.stream()`；第十节改用一次
+     `streamBatches()`，两者都只建立一个底层 runtime stream；具体 HTTP step sequencing 仍由所选
      AI SDK/native runtime 负责；
    - HTTP 200 只表示响应头成功，不是模型完成证据；
    - 本修复不新增重连，也不把新连接拼接到旧 assistant turn；
-   - adapter 检出 incomplete 后，Prompt/SessionRetry 不再发起后续请求；检测时已经执行或
-     runtime 已经启动的 tool/HTTP side effect 无法回滚，因此只保留并显式报错。
+   - 目标行为（需第十节补齐）是 adapter 检出 incomplete 后，Prompt/SessionRetry 不再因
+     compaction 发起后续请求；检测时已经执行或 runtime 已经启动的 tool/HTTP side effect 无法
+     回滚，因此只保留并显式报错。
 2. 超时与截止时间
    - 既有 abort、timeout 和 stream error handling 保持现状，本修复不增加新 deadline；
    - 已被 runtime 表示为 timeout/error 的请求继续走既有显式 error；
@@ -665,7 +694,9 @@ message。
 4. 交付与顺序
    - LLMEvent 按现有 stream 顺序消费；
    - 已由现有 handler 接受的 reasoning/text/tool/usage 先持久化，再记录 terminal error；
-   - 本次 incomplete attempt 的 partial state 不丢弃，且不由本修复重放。
+   - 本次 incomplete attempt 的 partial state 不丢弃，且不由本修复重放；
+   - 第十节保留单次 runtime emission 经 adapter 映射后的 batch 边界；Processor 处理完整 batch 后
+     才检查 cutoff，且不为分类目的对下一次 runtime emission 发起 demand。
 5. 失败模式
    - 对端/中间层 fail-stop 后若客户端只观察到 drain，无可信 terminal evidence 即失败；
    - 网络分区、慢响应在 timeout 前的状态不可知；本修复不引入 split-brain 或额外写入方；
@@ -675,9 +706,12 @@ message。
    - partial transcript 保留在原 session；
    - N/A：不提供跨连接恢复，因为没有 attempt/continuation 协议。
 7. 背压与流控
-   - 不修改 Effect Stream 的 pull、buffer、队列容量或并发；
+   - 不修改 Effect Stream 的 buffer、队列容量或并发；
+   - 原始修复未改变 demand；第十节把 cutoff 从“每个映射后 event”移动到“每个原子 batch”，
+     Processor 不会为判定 terminal error demand 下一 batch；
    - N/A：不新增独立队列或溢出策略；
-   - 仅在事件处理和 drain 边界增加固定数量的标量状态，不随 token/delta 数增长。
+   - 原始修复只增加固定数量的标量 evidence；第十节 AI SDK path 复用 adapter 现有数组，native
+     path 增加短生命周期 singleton batch，不缓存累计 event，也不随 token/delta 数增长。
 
 ### 4.7 不自动重试
 
@@ -730,6 +764,10 @@ text delta
 
 partial text 不再被当作完整成功结果。
 
+若同一 raw-missing `step-finish` 还触发 token overflow，第十节要求 Processor 在 compaction
+cutoff 前完整处理 adapter 已生成的同一 batch；canonical `provider-error` 必须先落地，之后同样
+走上述 error 路径，而不是创建 compaction。
+
 #### provider-specific 原始终止值
 
 ```text
@@ -740,6 +778,10 @@ SDK finish-step(other, raw="provider_custom_stop")
 ```
 
 ## 五、正确性论证
+
+本节是整体修复的目标契约。当前 PR 的四个代码/测试提交完成了非 crossover 路径，但第九节的证据没有覆盖
+raw-missing 与 compaction 同时发生的情况；第十节补齐该缺口后，本节不变量才在声明范围内完整
+成立。
 
 ### 5.1 根因消除
 
@@ -779,6 +821,16 @@ stream drained ∧ no credible step settlement ∧ no prior error ∧ blocked=fa
 stream drained ∧ (completedSteps = 0 ∨ activeStep = true) ∧ no prior error ∧ blocked=false
 ⇒ assistant terminal error
 ```
+
+Compaction crossover 修订后的 final result 不变量：
+
+```text
+assistant.error is present ∨ blocked=true
+⇒ SessionProcessor.process() = "stop"
+```
+
+Recoverable context overflow 在 auto compaction 开启时不持久化 `assistant.error`，因此不与该不变量
+冲突，仍可返回 `"compact"`。
 
 ### 5.3 Partial state 保持
 
@@ -967,15 +1019,461 @@ V2 follow-up 文档 `docs/fixes/session-v2-fix-missing-terminal-settlement.md` �
    不重新推断 provider-specific raw finish，CLI 不创建第二种错误分类。
 2. **风格**：实现沿用现有 Effect、Session error、BackgroundJob 和 `renderOutput()` 路径；
    没有新增依赖、公共 schema、配置项或并行状态机。
-3. **正确性**：raw 缺失、无 step settlement、persisted error、structured output、前后台
-   Task、CLI text/JSON、child transcript 和 parent recovery 均有测试；partial state 保留，
-   reasoning 不进入 Task diagnostic，provider/tool side effect 不自动重放。
-4. **性能**：adapter/processor 只增加固定数量的标量状态和终态分支；Task 的
-   `hasUsableOutput()` 对已有 parts 线性扫描一次；没有新增网络请求、retry、持久化轮次或
-   无界缓存。
+3. **正确性（原审核）**：raw 缺失、无 step settlement、persisted error、structured output、
+   前后台 Task、CLI text/JSON、child transcript 和 parent recovery 均有测试；但这些用例没有把
+   raw-missing 与 high-usage compaction 放在同一 turn，因此不足以证明 terminal error 总能到达
+   Prompt/Task 边界。
+4. **性能（原审核）**：adapter/processor 本身只增加固定数量的标量状态和终态分支，Task 的
+   `hasUsableOutput()` 对已有 parts 线性扫描一次；但“没有新增网络请求”的结论遗漏了 crossover：
+   被误判为 compact 后，既有 compaction summary 和 synthetic continuation 会带来额外 provider
+   请求。
 5. **可维护性**：canonical error 只在 adapter/processor 产生，Prompt 只做 error-first
    ordering，Task 只做调用边界防御；V2 runner 与 native Gemini 风险继续作为独立 follow-up，
    未混入本次 legacy 修复。
 
-审核结论：Issue #3 在本次声明的 legacy `SessionPrompt` / `TaskTool` 范围内已消除，无未解决
-critical finding。剩余风险仅是 2.5 已声明的 V2/native protocol follow-up，不影响本次完成判定。
+原审核结论在不触发 compaction 的路径上仍成立。PR #5 review 新发现的交叉条件证明“legacy
+范围内已消除、无未解决 critical finding”不再成立；整体状态重新打开，以第十节的修订审核门
+为准。
+
+## 十、2026-08-04 Compaction cutoff 吞错修订计划
+
+### 10.1 现象与复现
+
+PR #5 review 发现，canonical raw-missing stream 与自动 compaction 同时发生时，已由 adapter
+生成的 terminal `provider-error` 可能在 SessionProcessor 层被截断。AI SDK adapter 的事件顺序
+是：
+
+```text
+partial reasoning/text/tool events
+step-finish(reason="unknown", high usage)
+provider-error("Provider stream ended without a terminal finish event")
+```
+
+Processor 当前的消费管线是：
+
+```ts
+Stream.tap((event) => handleEvent(event)),
+Stream.takeUntil(() => ctx.needsCompaction),
+Stream.runDrain,
+```
+
+`handleEvent(step-finish)` 先持久化 finish/usage，并在 usage overflow 时设置
+`ctx.needsCompaction=true`。Effect `Stream.takeUntil` 包含触发停止条件的当前元素，但不会拉取下一
+元素，因此紧随其后的 `provider-error` 不进入 `handleEvent`。
+
+2026-08-04 在 `origin/yixiao-issue-3` 对应 production tree 上完成了三层临时审计复现；临时测试
+改动均已撤销：
+
+1. Effect 最小流 `step-finish -> provider-error` 在 tap 中由前一事件设置 cutoff 后，实际只观察到
+   `step-finish`；
+2. Processor 集成输入使用 context=20、output limit=10，wire usage 为 input=100/output=1，返回
+   partial text 且无 raw finish；实际返回 `"compact"`，保留 `finish="unknown"` 和 partial text，
+   但 `assistant.error` 为空；
+3. Prompt E2E 为同一 session 依次准备 incomplete response、compaction summary response 和
+   continuation response，实际发生 3 次 LLM 请求，最终返回正常 `finish="stop"`，原始错误完全
+   不可见；临时断言同时验证 `llm.hits=3`、response queue 为空。StructuredOutput 变体还会把
+   截断前的工具值提升为成功结果。
+
+吞掉 canonical `provider-error` 的最小交叉条件：
+
+1. 自动 compaction 开启，模型具有有限且非零的 context limit；
+2. AI SDK adapter 判定 `finishReason="other" && rawFinishReason===undefined`；
+3. `step-finish` usage 达到 `SessionCompaction.isOverflow()` 阈值。
+
+若还要从“错误类型丢失”进一步变成 silent success/hidden compaction，则需要第四个条件：在
+`step-finish` 前已有非空 text 或完整 tool-call evidence，使 generic empty-unknown fallback 不命中。
+Reasoning-only/empty 变体同样会吞掉 canonical error，但 generic fallback 会补一个较弱的 error，
+因此不会进入 silent compaction；第十节仍要让它保留准确的 canonical error。
+
+以下观测表对应具备 usable text/tool 的 silent-success 变体：
+
+| 观测边界                              | 预期                                    | 实际                                             |
+| ------------------------------------- | --------------------------------------- | ------------------------------------------------ |
+| Processor result                      | `"stop"`，持久化 canonical error        | `"compact"`                                      |
+| Assistant                             | `finish="unknown"` 且存在 error         | `finish="unknown"`、`error=undefined`            |
+| Session event                         | exactly one `Session.Event.Error`       | 无 error event                                   |
+| Compaction                            | 不创建 marker/summary，不 auto-continue | 创建 marker、summary，并可能继续生成             |
+| StructuredOutput                      | 不提升成功                              | 可写入 `result.info.structured`                  |
+| 本地复现中带 marker 的目标 LLM 请求数 | 当前 no-retry 契约下为 1                | compaction summary 与 auto-continue 均成功时为 3 |
+
+出错路径：
+
+```text
+LLMAISDK.toLLMEvents()
+  -> step-finish(unknown)
+  -> provider-error(canonical raw-missing)
+SessionProcessor.handleEvent(step-finish)
+  -> persist finish/usage
+  -> needsCompaction=true
+Stream.takeUntil()
+  -> stop before provider-error
+settleIncomplete()
+  -> usable text/tool => no fallback error
+process()
+  -> compact wins
+Prompt loop
+  -> structured promotion or compaction marker/summary/synthetic continue
+```
+
+该问题与 bounded retry follow-up 分离：这里修复“terminal failure 是否可靠到达 Session 状态机”；
+只有该事实可靠落地后，retry 分类、次数上限和 tool-activity fence 才有可执行输入。
+
+### 10.2 根因分析
+
+直接症状是 `provider-error` 被吞掉；根因不是 adapter 未发错，也不是 Prompt 的 error-first guard
+失效，而是两个相邻缺陷叠加：
+
+1. `llm.ts` 把一次 `toLLMEvents()` 返回的数组 flatten 成独立 event，丢失“这些 event 来自同一
+   runtime emission”的原子边界；
+2. Processor 在每个 flatten 后 event 上把两个不同生命周期状态合并到同一个布尔量：
+
+```text
+compaction requested by usage
+!=
+event stream is safe to stop consuming
+```
+
+`step-finish` 是 step settlement，不是整个 event stream 的 terminal settlement。当前 AI SDK
+adapter 在 canonical raw-missing 情况下必须先发 `step-finish` 以保留 usage/finish，再在同一个
+返回数组中发 terminal `provider-error`。LLM service 先丢失数组边界，Processor 又在前一 event
+上立即把“需要压缩”提升为“停止读取”，共同破坏了 adapter 已建立的原子映射契约。
+
+后续三个机制只能放大问题，不能修复根因：
+
+1. `settleIncomplete()` 为兼容 raw-defined unknown，允许 unknown 加 usable text/tool 正常结束；
+   它无法从已丢失的事件恢复 raw-missing 事实；
+2. `process()` 在返回值上以 `needsCompaction` 优先于 assistant error，但本场景甚至没有 error
+   可供 Prompt guard 消费；
+3. Prompt compaction 会创建 durable marker、调用 summary model 并合成 continuation，最终成功
+   turn 可以掩盖原始失败。
+
+这是内部 LLM stream contract 与 attempt-local state machine 的组合缺陷。公共 `FinishReason`/
+`LLMEvent` schema、adapter 事件内容、Prompt/Task 对 assistant error 的消费契约都不需要改变；
+需要补的是 opencode LLM service 的 batch-preserving 内部接口。
+
+### 10.3 参考契约对照
+
+本修订不是数值算法 bug。参考对象是本仓库 AI SDK adapter 已实现的事件顺序契约，以及 Effect
+`Stream.takeUntil` 在同一输入上的实际语义。
+
+| 步骤                    | 当前 Processor            | 参考事件契约                                              | 首个差异       |
+| ----------------------- | ------------------------- | --------------------------------------------------------- | -------------- |
+| partial content         | 持久化                    | 先于 terminal settlement 交付                             | 否             |
+| `step-finish(unknown)`  | 持久化并立即 cutoff       | 只完成 step；同一 adapter batch 尚有 raw-missing failure  | **是**         |
+| `provider-error`        | 同一 batch 内仍不再处理   | 同一 batch 的 terminal failure 必须交付 consumer          | 已由上一步导致 |
+| final classification    | usable output => 无 error | raw-missing => terminal error                             | 已由上一步导致 |
+| usage-driven compaction | 立即提升为 ready          | provisional unknown 只允许在 error-free settlement 后提升 | 已由上一步导致 |
+
+对照位置：
+
+- `packages/opencode/src/session/llm/ai-sdk.ts`：canonical 相邻事件由同一次 `finish-step` 映射产生；
+- `packages/opencode/src/session/llm.ts`：adapter 返回的数组经 `Stream.fromIterable()` 顺序展开，
+  两个事件之间不会插入其它 Session event；
+- `packages/opencode/src/session/processor.ts`：tap 后的 `takeUntil` 和 compaction 状态提升；
+- `packages/opencode/test/session/llm.test.ts`：
+  `maps AI SDK stream chunks without losing session-visible fields` 固化单步 raw-defined unknown 后的
+  final finish 示例；`turns a missing raw finish reason into a terminal provider error after partial output`
+  固化 canonical pair 由一次 adapter 调用返回；
+- `packages/opencode/test/session/processor-effect.test.ts`：
+  `session.processor effect tests stop after token overflow requests compaction` 固化既有 known-finish
+  cutoff；
+- 已安装 `ai@6.0.168` 的 `streamText()` 控制流在 `finish-step` 后既可能直接发 final `finish`，也可能
+  在已完成 client tool calls 后递归启动下一 model step；后者在发出下一 `start-step` 前已经调用
+  `stepModel.doStream()`，因此“多拉一个 successor”可能新增并随后中止 provider 请求；
+- `packages/llm/src/protocols/utils/lifecycle.ts`：正常 lifecycle 同样区分 step settlement 与 final
+  finish；
+- Effect 最小复现实测确认 cutoff 当前会保留 `step-finish` 并丢弃下一 `provider-error`。
+
+因此，安全边界不是“unknown 后的下一个 event”，而是“同一次 upstream runtime emission 经
+adapter 映射出的 event batch”。Canonical raw-missing pair 已在同一数组内，无需由 Processor
+demand 下一次 AI SDK emission；raw-defined unknown 的下一 emission 则可能是 final `finish`，也可能
+属于新的 model step，不能为分类目的主动 demand。当前没有在 native runtime 找到同样的
+`step-finish(unknown) -> provider-error` producer，因此本修订只声称修复已复现的 legacy AI SDK
+路径；其它 protocol-specific incomplete 序列仍属于 2.5 的 follow-up。
+
+### 10.4 修复方案
+
+修改 `packages/opencode/src/session/llm.ts` 与 `packages/opencode/src/session/processor.ts`，在
+opencode 内部 LLM service 增加 batch-preserving stream。批次是 ephemeral internal type，不修改
+`@opencode-ai/llm` 的公共 `LLMEvent` schema：
+
+```text
+LLMEventBatch := ReadonlyArray<LLMEvent>
+```
+
+批次不变量：
+
+1. `batch.length > 0`；空 adapter mapping 在 LLM 层过滤；
+2. 一个 batch 中的 event 全部来自同一次 upstream runtime emission，保持 adapter 返回顺序；
+3. 不合并两个 upstream emission；AI SDK `toLLMEvents()` 的返回数组原样成为一个 batch；
+4. native runtime 的每个现有 `LLMEvent` 包装为 singleton batch；
+5. batch 只存在于内存流中，不持久化、不跨进程、不改变 provider wire protocol。
+
+接口规约：`LLM.Service.streamBatches(input)`
+
+- Requires：底层 runtime emission 有稳定顺序；AI SDK adapter 对一次 emission 只调用一次
+  `toLLMEvents()`；
+- Ensures：
+  - AI SDK mapping 的非空数组逐个、按序产出为 batch，不拆分或跨 emission 合并；
+  - native event 逐个产出为 singleton batch；
+  - 调用只建立一个 runtime stream/subscription；Processor 完成当前 batch 后不会仅为分类目的对
+    下一 batch 发起 demand；
+  - 现有 flat `stream(input)` 从同一个 batch source 顺序展开，保持既有 consumer/test 可观察事件；
+- Side effects：维持既有 AbortController acquire/release；相对当前 cutoff 不新增由本层发起的
+  upstream demand、provider request demand、buffer、队列或并发 worker。
+
+Processor 的事件与 settlement 规则：
+
+1. `SessionProcessor` 改用 `streamBatches()`；每个 batch 内按数组顺序串行执行现有
+   `handleEvent()`，完整 batch 成功处理后才由 `Stream.takeUntil(() => ctx.needsCompaction)` 检查
+   cutoff；
+2. `step-finish` 的 reasoning closure、usage、finish、step part、snapshot、message 与
+   `needsCompaction` 计算顺序保持不变；
+3. canonical batch `[step-finish(unknown), provider-error]` 中，前一 event 即使设置
+   `needsCompaction=true`，后一 event 仍在同一个 batch 内进入现有 error handler 并使 batch 失败；
+   `takeUntil` 不会在失败 batch 上执行下一次 cutoff 判定；
+4. raw-defined unknown 的 `finish-step` mapping 只有一个 `step-finish` event；该 singleton batch
+   完成后立即命中既有 cutoff，不 demand AI SDK 的下一 emission，因此 Processor 不会为分类目的
+   请求 final `finish`、下一 `start-step` 或下一 provider step；
+5. `Stream.runDrain` 正常返回后仍只运行一次现有 `settleIncomplete()`；empty unknown 在 final
+   result 分类前创建 generic error；
+6. `process()` 的 final result 顺序改为 error-first：
+
+   ```text
+   if blocked or assistant.error: "stop"
+   else if needsCompaction: "compact"
+   else: "continue"
+   ```
+
+   自动 context-overflow recovery 仍可返回 `"compact"`，因为该既有分支在 auto compaction 开启时
+   只设置 `needsCompaction`，不把 recoverable overflow 持久化为 `assistant.error`；compaction-summary
+   assistant 还受既有 `!assistant.summary` usage-overflow guard 保护，不会仅因 summary usage 设置
+   `needsCompaction`；
+
+7. 把 `ctx.needsCompaction=false` 与既有 `ProviderTurnEvidence` 重建放在每次 retry attempt 的入口；
+   failed attempt 的 usage decision 不得泄漏到下一 attempt，batch 本身也没有跨 attempt 状态。该
+   调整不回滚既有 retry 已持久化的 part/cost/tool 事实，也不扩大 retry 分类或次数。
+
+选择该方案而不采用以下替代方案：
+
+- 不把所有 unknown 加 usable output 改判失败：这会破坏 raw-defined provider-specific finish
+  的既有兼容契约；
+- 不采用 one-successor lookahead：当前 AI SDK 合法多步控制流可能在下一 `start-step` 前已经调用
+  `stepModel.doStream()`；额外 demand 在 runtime 尚未预取时可能新增并随后 abort provider 请求，
+  因而 lookahead 不能证明相对当前 cutoff 无网络副作用；
+- 不把 raw-missing 标记复制进公共 event/schema 或 assistant metadata：adapter 已经发出准确的
+  terminal error；保留既有 batch 边界即可，无需增加第二个事实来源；
+- 不移除 `takeUntil` 并无条件 drain 所有 overflow stream：这可能允许后续 model step/tool
+  activity；本方案只完成当前已经拉取的 adapter batch；
+- 不调换 canonical pair 为 `provider-error -> step-finish`：现有 handler 在 provider error 上抛错，
+  会使 usage/finish/step settlement 丢失；
+- 不在 Prompt/Task 补猜 raw-missing：到达这些层时原始证据已经不可逆丢失。
+
+函数规约：`SessionProcessor.process(streamInput)` 的 compaction settlement
+
+- Requires：`streamBatches()` 满足上述批次不变量；当前 AI SDK canonical raw-missing batch 是
+  `[step-finish(reason="unknown"), provider-error]`；
+- Ensures：
+  - canonical raw-missing 即使 usage overflow 且已有 usable output，也持久化 exactly one
+    assistant error，并且当前 no-retry 契约下返回 `"stop"`；
+  - `process()` 正常返回且 `assistant.error !== undefined` 或 `blocked=true` 时 final result 为
+    `"stop"`，不返回 `"compact"`；
+  - raw-defined unknown 加 usable output 且 overflow 仍返回 `"compact"`，且 Processor 不对下一
+    AI SDK emission 发起 demand；无 usable output 时 generic incomplete error 优先，返回 `"stop"`；
+  - retryable failed attempt 设置过的 `needsCompaction` 不影响下一 attempt；
+  - known stop/tool-calls 等 finish 的既有 compaction cutoff 不变；
+  - recoverable context overflow 在没有 persisted assistant error 时仍可返回 `"compact"`；
+- Side effects：保留已交付 partial part、usage、snapshot 和已执行 tool 事实；不创建新 schema 或
+  额外 `LLM.Service` subscription，Processor 不对下一 runtime emission 发起 demand。失败路径不创建
+  compaction marker、compaction-summary assistant、
+  `SessionCompaction.Event.Compacted`、synthetic continuation 或其对应的额外 model cost/usage。
+  `step-finish` 已有的 `SessionSummary.summarize()` diff bookkeeping 保持不变，它不是 compaction
+  model summary。Prompt loop 退出时既有的异步 `SessionCompaction.prune()` 无论成功或失败都会
+  调度，本修订不改变它；“不创建 compaction side effect”不等于禁止该既有 prune 对历史 completed
+  tool part 写入 `time.compacted`。
+
+### 10.5 正确性论证
+
+**根因消除**：修复保留 `toLLMEvents()` 已经表达的原子映射边界，把 compaction cutoff 从 batch
+内部移动到 batch 成功处理之后。Canonical pair 无需 lookahead 就完整进入既有 handler；
+raw-defined unknown 与 native singleton event 则仍在原位置 cutoff，Processor 不 demand 下一 runtime
+emission。
+Final result 再以 persisted error/blocked 优先，消除“同一 batch 先设 compact、后落 error”造成的
+结果冲突。不靠内容启发式或下游补偿重建丢失事实。
+
+核心顺序不变量：
+
+```text
+canonicalRawMissing
+=> batch = [step-finish(unknown), provider-error]
+```
+
+```text
+for each batch:
+handleEvent(batch[0..n-1]) succeeds
+precedes cutoff evaluation
+```
+
+```text
+canonicalRawMissing && overflow
+=> provider-error handled before any successful cutoff evaluation for that batch
+```
+
+```text
+batch handling fails
+=> takeUntil does not classify that batch as a successful compaction boundary
+```
+
+```text
+assistant.error || blocked
+=> process result = "stop"
+```
+
+```text
+needsCompaction && !assistant.error && !blocked
+=> process result = "compact"
+```
+
+```text
+rawDefinedUnknownOverflow
+=> cutoff after current singleton batch
+∧ Processor does not demand the next upstream emission
+```
+
+**不变量保持**：step/usage/partial/tool 的持久化顺序不变；raw-defined unknown compatibility
+不变；known finish 与 native event 的 immediate cutoff 不变；batch 不持久化，也不跨 attempt；
+`needsCompaction` 与其它 attempt-local evidence 同时重置。生产 AI SDK path 复用 adapter 已创建的
+数组，native path 只增加 singleton wrapper；不增加 token 相关状态、buffer、并发、subscription
+或由 Processor 发起的 upstream demand。
+
+**性能与背压**：处理复杂度仍为 `O(event count)`，batch 内保持串行，不引入并行 handler。AI SDK
+path 复用 `toLLMEvents()` 已创建的数组；native path 每个 event 增加一个短生命周期 singleton
+array，空间不随累计 token 增长。实现审核需确认没有缓存 batch，也没有改变 AbortController 的
+释放时点。
+
+**无回归引入**：
+
+- raw-missing partial text、reasoning、StructuredOutput 和 completed tool 都统一依赖 canonical
+  error，不新增分叉错误类型；
+- Prompt 已有 error-first ordering 会阻止 structured promotion，并在 process 返回 stop 后退出；
+- Task/CLI 已有 assistant/session error 消费路径继续生效；
+- 已执行工具不回滚，但当前 no-retry 路径不会因 compaction 自动发起 compaction summary、
+  continuation、新的本地工具动作或相应的额外 model cost/usage；
+- raw-defined unknown high-usage 仍可正常 compaction，避免把兼容场景误判为 provider failure；
+- length/high-usage 由 persisted `MessageOutputLengthError` 得到 `"stop"`；recoverable context overflow
+  没有 persisted assistant error，仍得到 `"compact"`；
+- compaction disabled、context limit 为 0、未 overflow 的现有路径没有行为变化。
+
+**残余假设与边界**：正确性依赖 production AI SDK path 不在 `streamBatches()` 之后再次 flatten
+再重建批次；静态/单元测试必须锁定该接口。Native runtime 当前每 event singleton，因此本修订
+不把两个独立 native events 推断为同一原子 settlement；若未来 native producer 也需要表达
+“step settlement + terminal error 不可拆分”，必须在其 adapter 层显式形成同一 batch。已在
+runtime 内完成或由 runtime 自身预取的 tool/provider side effect 不回滚；本修订保证的是
+Processor 不为分类目的 demand 下一 emission，不能把 runtime 内部 eager work 误写成 exactly-once。
+
+### 10.6 测试用例清单
+
+| 类型               | 用例描述                                                                                                                          | 状态（修复后回填） |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| 契约/LLM           | raw-missing `finish-step` 的 `[step-finish, provider-error]` 保持在一个 batch，flat stream 顺序不变                               | 待加               |
+| 契约/LLM           | raw-defined `finish-step` 是 singleton batch；consumer 停止后 source 的 next-emission demand count 为 0                           | 待加               |
+| Wiring/Processor   | 注入 flat `stream()` 调用即失败的 service，证明 Processor 只调用一次 `streamBatches()`                                            | 待加               |
+| 最小回归/Processor | raw-missing atomic batch + high usage + partial text：返回 stop、canonical error exactly once、保留 text/usage，subscription 为 1 | 待加               |
+| 边界/Processor     | raw-missing atomic batch + high usage + reasoning-only：保留 canonical error，不降级为 generic fallback                           | 待加               |
+| 兼容/Processor     | raw-defined unknown singleton + high usage + usable text：仍返回 compact、无 error、Processor next-batch demand count 为 0        | 待加               |
+| Empty/Processor    | unknown singleton + high usage + no usable output：generic error 优先，返回 stop、Processor next-batch demand count 为 0          | 待加               |
+| 优先级/Processor   | length + high usage 返回 stop；recoverable context overflow 无 persisted error 时仍返回 compact                                   | 待加               |
+| 优先级/Processor   | blocked turn 即使已有 usage compaction 请求也返回 stop，不创建 compaction                                                         | 待加               |
+| 隔离/Processor     | retryable failed batch 设置过 compaction 后，下一 attempt 重置 decision，不提前 cutoff                                            | 待加               |
+| 回归/Prompt        | raw-missing + high usage + partial text：无 compaction marker/summary/continuation 或额外 compaction LLM 请求                     | 待加               |
+| StructuredOutput   | high-usage raw-missing 在 StructuredOutput 后发生：structured 不提升、本地测试 tool 计数为 1、无 compaction/continuation 请求     | 待加               |
+| Tool side effect   | high-usage raw-missing 在 completed tool 后发生：本地测试 tool 计数为 1、assistant/Task 失败且不 replay                           | 待加               |
+| Event              | crossover 只发布一次 `Session.Event.Error`，不发布 `SessionCompaction.Event.Compacted`                                            | 待加               |
+| Persistence        | 失败 assistant 的 `time.completed` 已定义、`finish="unknown"`、error name/message 为 canonical；重新进入 loop 不 replay           | 待加               |
+| E2E/CLI            | 顶层 crossover 保留 partial 输出、记录一个 error、非零退出、无额外 compaction/continuation provider 请求                          | 待加               |
+| E2E/Subagent       | child crossover 投影为 Task error 而非 completed；child tool 不重放                                                               | 待加               |
+| 既有回归           | known stop high usage 仍立即请求 compaction；原 Issue #3 受影响集合全部通过                                                       | 待跑               |
+| 静态               | 单元 1 立即通过 `packages/opencode` typecheck；最终再通过 `packages/llm` typecheck、格式和 batch-interface usage 检查             | 待跑               |
+
+所有请求数断言必须使用本地测试 provider 的专用 request marker，区分当前 turn、compaction summary
+与 synthetic continuation，并排除并发 title 请求；batch demand 断言使用 Deferred/counter 记录下一
+upstream emission 是否被 demand，不能只检查本地 handler。事件测试必须在触发请求前建立订阅，使用
+Deferred/latch 等可观察信号，禁止固定 sleep 竞态。
+
+实施顺序遵守先红后绿：先固化 LLM batch 与 Processor 最小回归并确认当前 flat stream 会拆开
+canonical pair，再实现 batch-preserving interface 与 error-first result；随后逐层增加 Prompt、
+tool/structured、CLI/Task 和 persistence 交叉测试，最后运行第六节已有受影响集合与 typecheck。
+
+### 10.7 代码更新清单
+
+| 文件                                                      | 函数 / 行号                                  | 改动概述                                                                 | 状态（修复后回填） |
+| --------------------------------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------ | ------------------ |
+| `packages/opencode/src/session/llm.ts`                    | `Interface`/live stream factory              | 增加原子 `streamBatches()`；flat `stream()` 从同一 batch source 派生     | 待改               |
+| `packages/opencode/src/session/processor.ts`              | `process()` batch drain/final classification | batch 内顺序处理后再 cutoff；error/blocked 优先于 compact                | 待改               |
+| `packages/opencode/test/session/llm.test.ts`              | live adapter stream contract                 | 固化 batch 边界、flat 兼容和 no-next-emission demand                     | 待加               |
+| `packages/opencode/test/session/processor-effect.test.ts` | overflow settlement regressions              | 固化 partial/reasoning/raw-defined/empty、优先级和 exactly-one error     | 待加               |
+| `packages/opencode/test/session/compaction.test.ts`       | LLM service fixture/event guard              | 单元 1 同步 required batch interface；单元 2 证明无 completed compaction | 待核对/待加        |
+| `packages/opencode/test/session/prompt.test.ts`           | loop/structured/persistence regressions      | 证明不创建 compaction、不提升 structured、不 replay                      | 待加               |
+| `packages/opencode/test/tool/task.test.ts`                | completed-tool child boundary                | 证明 child/tool side effect 不被误报 completed 或重放                    | 待核对/待加        |
+| `packages/opencode/test/cli/run/run-process.test.ts`      | real CLI/child E2E                           | 覆盖退出码、partial、单 error、请求次数和 Task 传播                      | 待加               |
+
+预期无需修改：
+
+- `packages/opencode/src/session/llm/ai-sdk.ts`：当前返回数组与 canonical message 正确；
+- `packages/opencode/src/session/prompt.ts`：error 可靠落地后，已有 error-first guard 足够；
+- `packages/opencode/src/tool/task.ts` 与 CLI production code：已有 error propagation 足够；
+- `packages/opencode/src/session/retry.ts`：本单元保持 raw-missing 不可重试；bounded retry 属于独立
+  follow-up，不能与 failure-settlement 修复混合。
+
+按 workflow 拆成三个串行实施单元，每个单元完成红测、实现/补测、局部回归和文档状态回填后
+停下报告：
+
+1. [ ] LLM atomic batch contract + Processor batch cutoff/error-first result、最小/兼容红测、required
+       service fixture 编译适配及 `packages/opencode` typecheck；
+2. [ ] Prompt、StructuredOutput、completed tool、event 和 persistence 交叉回归；
+3. [ ] CLI/Task E2E、完整受影响集合、typecheck、五维审核和 PR 说明同步。
+
+### 10.8 文档更新清单与确认门
+
+| 文档路径                                               | 要改什么                                                                  | 状态（修复后回填） |
+| ------------------------------------------------------ | ------------------------------------------------------------------------- | ------------------ |
+| `docs/fixes/session-fix-incomplete-provider-stream.md` | 撤销旧 compaction 优先假设，记录 crossover 八部分计划、实施证据和最终审核 | 计划已写，待确认   |
+| PR #5 body/comment                                     | 说明 failure-settlement 修复、交叉回归和验证结果                          | 待实现后更新       |
+
+不修改公共 API/SDK schema、CLI 参数或用户配置文档。本修订恢复原计划已经声明的“raw-missing
+必须失败”契约，属于内部 ephemeral LLM stream contract 与状态机修正，不引入 user-facing 能力、
+新模块边界或跨 feature 契约；所需数据/接口/函数规约已在 10.4 内完整定义，因此不另开 feature/
+subplan。其它设计/README 没有新的契约需要同步。
+
+2026-08-04 全文证据重审结果：
+
+- Effect 最小流再次得到 handled events `["step-finish"]`，确认当前 `takeUntil` 确实吞掉 successor；
+- batch 方案的 Effect 最小验证得到 canonical handled
+  `["step-finish", "provider-error"]`，而 raw-defined singleton 只处理 `"step-finish"` 且下一 batch
+  demand count 为 0；
+- 已安装 `ai@6.0.168` 源码再次确认：多步 continuation 在下一 `start-step` 前调用
+  `stepModel.doStream()`，据此否决 one-successor lookahead；
+- 重新拉取 PR #5 的 issue comments、inline review comments 和 reviews；最新技术 finding 仍为
+  `issuecomment-5170765949`，没有更晚的 review thread；
+- PR #5 当前 base/head 与五个提交重新核对为 `dev@d12b1e924d -> yixiao-issue-3@dbed80fccf`；四个
+  代码/测试提交与一个文档提交均已使用 rebase 后的当前 OID；
+- 全仓 `LLM.Service.of(...)` 仅出现在 `processor-effect.test.ts` 与 `compaction.test.ts`；前者已在
+  单元 1 的主测试文件清单中，后者必须同步 required `streamBatches()` fixture 并由单元 1 typecheck
+  锁定；
+- production `SessionProcessor.process()` 的 consumer 仅为 Prompt 与 SessionCompaction；Prompt 已有
+  persisted-error guard，compaction summary 的 usage cutoff 受 `!assistant.summary` 保护，而 recoverable
+  context overflow 不持久化 assistant error，因此 error-first 正常返回分类不会破坏 summary recovery；
+- 本地 `issue3-pre-rebase@ee41b4d28a` 与当前 `dbed80fccf` 的 tree 均为 `20027f1623`，两者
+  `git diff` 为空，因此 pre-rebase 的分层测试报告可对应到当前 PR tree；
+- 原始六个 opencode 受影响测试文件重跑为
+  `259 pass / 2 skip / 0 fail / 962 assertions`；
+- CLI subprocess E2E 在允许 loopback listener 的环境重跑为
+  `18 pass / 0 fail / 97 assertions`；
+- native OpenAI Chat provider contract 重跑为 `27 pass / 0 fail / 41 assertions`；
+- `packages/opencode` 与 `packages/llm` typecheck 均通过。
+
+这些结果重新确认当前 PR 的四个代码/测试提交及其历史回填，没有替代第十节待加的 crossover
+红测；现有全绿测试集合正因为缺少 high-usage raw-missing 组合，才没有捕获 reviewer finding。
+
+确认门：本节经用户确认后，只实施 10.7 的单元 1；单元 1 完成红绿测试和文档回填后停下报告，
+未经下一次确认不进入单元 2，也不恢复 `yixiao-issue-3-retry` 中的 bounded retry 草稿。
