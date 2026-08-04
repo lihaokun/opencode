@@ -1,6 +1,6 @@
 # Provider 流缺失终止帧误报成功修正方案
 
-- 状态：原始修复已实施；2026-08-04 compaction crossover 修订单元 2 已完成，待确认后进入单元 3
+- 状态：原始修复与 2026-08-04 compaction crossover 修订均已实施并完成本地验证；待最终文档提交后同步远端
 - 初稿日期：2026-07-27
 - 重审日期：2026-07-28
 - Compaction crossover 重审日期：2026-08-04
@@ -21,12 +21,14 @@
 - 当前 PR 文档整合提交：`dbed80fccf0afeb2656736f8abe0f3b07d4b95e0`
 - 本地 crossover 单元 1 提交（尚未推送）：`1ba447213b`（计划审计）、`8c652ba107`（红测）、
   `612419fb31`（实现与回归）、`f2080642fd`（backpressure 证据补强）、`b7ae9f1081`（文档回填）
-- 本地 crossover 单元 2 提交（尚未推送）：`771e782418`（Prompt/副作用交叉回归）
+- 本地 crossover 单元 2 提交（尚未推送）：`771e782418`（Prompt/副作用交叉回归）、
+  `f24eb8ef21`（文档回填）
+- 本地 crossover 单元 3 提交（尚未推送）：`7bb625a6ce`（CLI/Task/subagent E2E）
 
 阅读约定：第一至三节记录原始修复前基线的现象、根因与参考对照；第四至八节记录已经实施的
 原始方案及验证；第九节是原审核结论及其失效说明；第十节记录 compaction crossover 修订计划
 及分单元实施状态。第十节描述“修复前”“当前缺陷”或原实现时，指上述 crossover 审计基线；
-带“单元 1/2 实施后”标记的内容指本地 `771e782418`。
+带“单元 1/2/3 实施后”标记的内容指本地 `7bb625a6ce`。
 
 ## 一、现象与复现
 
@@ -1389,27 +1391,27 @@ Processor 不为分类目的 demand 下一 emission，不能把 runtime 内部 e
 
 ### 10.6 测试用例清单
 
-| 类型               | 用例描述                                                                                                                          | 状态（修复后回填）                       |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
-| 契约/LLM           | raw-missing `finish-step` 的 `[step-finish, provider-error]` 保持在一个 batch，flat stream 顺序不变                               | 已通过（单元 1）                         |
-| 契约/LLM           | raw-defined `finish-step` 是 singleton batch；consumer 停止后 source 的 next-emission demand count 为 0                           | 已通过（单元 1）                         |
-| Wiring/Processor   | 注入 flat `stream()` 调用即失败的 service，证明 Processor 只调用一次 `streamBatches()`                                            | 已通过（单元 1）                         |
-| 最小回归/Processor | raw-missing atomic batch + high usage + partial text：返回 stop、canonical error exactly once、保留 text/usage，subscription 为 1 | 已通过（单元 1）                         |
-| 边界/Processor     | raw-missing atomic batch + high usage + reasoning-only：保留 canonical error，不降级为 generic fallback                           | 已通过（单元 1）                         |
-| 兼容/Processor     | raw-defined unknown singleton + high usage + usable text：仍返回 compact、无 error、Processor next-batch demand count 为 0        | 已通过（单元 1）                         |
-| Empty/Processor    | unknown singleton + high usage + no usable output：generic error 优先，返回 stop、Processor next-batch demand count 为 0          | 已通过（单元 1）                         |
-| 优先级/Processor   | length + high usage 返回 stop；recoverable context overflow 无 persisted error 时仍返回 compact                                   | 已通过（单元 1）                         |
-| 优先级/Processor   | blocked turn 即使已有 usage compaction 请求也返回 stop，不创建 compaction                                                         | 已通过（单元 1）                         |
-| 隔离/Processor     | retryable failed batch 设置过 compaction 后，下一 attempt 重置 decision，不提前 cutoff                                            | 已通过（单元 1）                         |
-| 回归/Prompt        | raw-missing + high usage + partial text：无 compaction marker/summary/continuation 或额外 compaction LLM 请求                     | 已通过（单元 2）                         |
-| StructuredOutput   | high-usage raw-missing 在 StructuredOutput 后发生：structured 不提升、本地测试 tool 计数为 1、无 compaction/continuation 请求     | 已通过（单元 2）                         |
-| Tool side effect   | high-usage raw-missing 在 completed tool 后发生：本地测试 tool 计数为 1、assistant/Task 失败且不 replay                           | assistant/tool 已通过；Task 待单元 3     |
-| Event              | crossover 只发布一次 `Session.Event.Error`，不发布 `SessionCompaction.Event.Compacted`                                            | 已通过（单元 2）                         |
-| Persistence        | 失败 assistant 的 `time.completed` 已定义、`finish="unknown"`、error name/message 为 canonical；重新进入 loop 不 replay           | 已通过（单元 2）                         |
-| E2E/CLI            | 顶层 crossover 保留 partial 输出、记录一个 error、非零退出、无额外 compaction/continuation provider 请求                          | 待加                                     |
-| E2E/Subagent       | child crossover 投影为 Task error 而非 completed；child tool 不重放                                                               | 待加                                     |
-| 既有回归           | known stop high usage 仍立即请求 compaction；原 Issue #3 受影响集合全部通过                                                       | known stop 已通过；完整集合待单元 3      |
-| 静态               | 单元 1 立即通过 `packages/opencode` typecheck；最终再通过 `packages/llm` typecheck、格式和 batch-interface usage 检查             | opencode/格式/usage 已通过；llm 待单元 3 |
+| 类型               | 用例描述                                                                                                                          | 状态（修复后回填）   |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| 契约/LLM           | raw-missing `finish-step` 的 `[step-finish, provider-error]` 保持在一个 batch，flat stream 顺序不变                               | 已通过（单元 1）     |
+| 契约/LLM           | raw-defined `finish-step` 是 singleton batch；consumer 停止后 source 的 next-emission demand count 为 0                           | 已通过（单元 1）     |
+| Wiring/Processor   | 注入 flat `stream()` 调用即失败的 service，证明 Processor 只调用一次 `streamBatches()`                                            | 已通过（单元 1）     |
+| 最小回归/Processor | raw-missing atomic batch + high usage + partial text：返回 stop、canonical error exactly once、保留 text/usage，subscription 为 1 | 已通过（单元 1）     |
+| 边界/Processor     | raw-missing atomic batch + high usage + reasoning-only：保留 canonical error，不降级为 generic fallback                           | 已通过（单元 1）     |
+| 兼容/Processor     | raw-defined unknown singleton + high usage + usable text：仍返回 compact、无 error、Processor next-batch demand count 为 0        | 已通过（单元 1）     |
+| Empty/Processor    | unknown singleton + high usage + no usable output：generic error 优先，返回 stop、Processor next-batch demand count 为 0          | 已通过（单元 1）     |
+| 优先级/Processor   | length + high usage 返回 stop；recoverable context overflow 无 persisted error 时仍返回 compact                                   | 已通过（单元 1）     |
+| 优先级/Processor   | blocked turn 即使已有 usage compaction 请求也返回 stop，不创建 compaction                                                         | 已通过（单元 1）     |
+| 隔离/Processor     | retryable failed batch 设置过 compaction 后，下一 attempt 重置 decision，不提前 cutoff                                            | 已通过（单元 1）     |
+| 回归/Prompt        | raw-missing + high usage + partial text：无 compaction marker/summary/continuation 或额外 compaction LLM 请求                     | 已通过（单元 2）     |
+| StructuredOutput   | high-usage raw-missing 在 StructuredOutput 后发生：structured 不提升、本地测试 tool 计数为 1、无 compaction/continuation 请求     | 已通过（单元 2）     |
+| Tool side effect   | high-usage raw-missing 在 completed tool 后发生：本地测试 tool 计数为 1、assistant/Task 失败且不 replay                           | 已通过（单元 2/3）   |
+| Event              | crossover 只发布一次 `Session.Event.Error`，不发布 `SessionCompaction.Event.Compacted`                                            | 已通过（单元 2）     |
+| Persistence        | 失败 assistant 的 `time.completed` 已定义、`finish="unknown"`、error name/message 为 canonical；重新进入 loop 不 replay           | 已通过（单元 2）     |
+| E2E/CLI            | 顶层 crossover 保留 partial 输出、记录一个 error、非零退出、无额外 compaction/continuation provider 请求                          | 已通过（单元 3）     |
+| E2E/Subagent       | child crossover 投影为 Task error 而非 completed；child tool 不重放                                                               | 已通过（单元 3）     |
+| 既有回归           | known stop high usage 仍立即请求 compaction；原 Issue #3 受影响集合全部通过                                                       | 已通过（单元 1/3）   |
+| 静态               | 两个受影响 package 与 workspace typecheck、格式和 batch-interface usage 检查                                                      | 已通过（单元 1/2/3） |
 
 所有请求数断言必须使用本地测试 provider 的专用 request marker，区分当前 turn、compaction summary
 与 synthetic continuation，并排除并发 title 请求；batch demand 断言使用 Deferred/counter 记录下一
@@ -1450,6 +1452,26 @@ empty-unknown cutoff 后 counter 均严格为 0。该断言观测 source evaluat
 - bash tool transcript 只有 1 个 completed part，marker 文件只有 1 行；第二个 high-usage
   raw-missing turn 后请求总数保持为 2，重入不 replay，也不创建 compaction。
 
+单元 3 在 `7bb625a6ce` 中增加两个真实 `opencode run` 子进程 E2E。定向运行结果为
+`2 pass / 0 fail / 24 assertions`；完整 `run-process.test.ts` 为
+`20 pass / 0 fail / 121 assertions`。证据包括：
+
+- 顶层 high-usage raw-missing 依次输出 `step_start -> text -> step_finish -> error`，只记录一个
+  canonical error 并非零退出；专用 user marker 只有 1 个非 title provider request，response queue
+  为 0；
+- 真实父 turn 调用真实 `task`，child 先完成一次 bash side effect，再遇到 crossover；Task part 为
+  error，父 agent 恢复，child 数据库保留 `finish="unknown"`、canonical error、partial text 和唯一
+  completed bash part，marker 文件只有 1 行；
+- child 专用 prompt 只有两次请求，分别是 tool turn 与 raw-missing turn；canonical error 只触发一次
+  parent recovery，未出现 compaction summary、synthetic continuation 或 tool replay。
+
+最终受影响回归为：七个 opencode 测试文件
+`272 pass / 3 skip / 0 fail / 1079 assertions`；`run-process.test.ts`
+`20 pass / 0 fail / 121 assertions`；`packages/llm` 的 `openai-chat.test.ts`
+`27 pass / 0 fail / 41 assertions`。三个 skip 分别是两个既有 V2 projector 条件用例与一个需要
+OpenAI API key 的 recorded 用例。`packages/opencode`、`packages/llm` typecheck 均通过；workspace
+typecheck 为 `30 successful / 30 total`。
+
 ### 10.7 代码更新清单
 
 | 文件                                                      | 函数 / 行号                                  | 改动概述                                                                 | 状态（修复后回填）                                     |
@@ -1460,8 +1482,8 @@ empty-unknown cutoff 后 counter 均严格为 0。该断言观测 source evaluat
 | `packages/opencode/test/session/processor-effect.test.ts` | overflow settlement regressions              | 固化 partial/reasoning/raw-defined/empty、优先级和 exactly-one error     | 已加并通过（`8c652ba107`、`612419fb31`、`f2080642fd`） |
 | `packages/opencode/test/session/compaction.test.ts`       | LLM service fixture/event guard              | 单元 1 同步 required batch interface；单元 2 证明无 completed compaction | fixture 已通过；event guard 由 Prompt 集成测试覆盖     |
 | `packages/opencode/test/session/prompt.test.ts`           | loop/structured/persistence regressions      | 证明不创建 compaction、不提升 structured、不 replay                      | 已加并通过（`771e782418`）                             |
-| `packages/opencode/test/tool/task.test.ts`                | completed-tool child boundary                | 证明 child/tool side effect 不被误报 completed 或重放                    | 待核对/待加                                            |
-| `packages/opencode/test/cli/run/run-process.test.ts`      | real CLI/child E2E                           | 覆盖退出码、partial、单 error、请求次数和 Task 传播                      | 待加                                                   |
+| `packages/opencode/test/tool/task.test.ts`                | completed-tool child boundary                | 既有 Task error 投影保持全绿；真实 child/tool crossover 由 CLI E2E 覆盖  | 已核对并通过                                           |
+| `packages/opencode/test/cli/run/run-process.test.ts`      | real CLI/child E2E                           | 覆盖退出码、partial、单 error、请求次数和 Task 传播                      | 已加并通过（`7bb625a6ce`）                             |
 
 预期无需修改：
 
@@ -1477,14 +1499,14 @@ empty-unknown cutoff 后 counter 均严格为 0。该断言观测 source evaluat
 1. [x] LLM atomic batch contract + Processor batch cutoff/error-first result、最小/兼容红测、required
        service fixture 编译适配及 `packages/opencode` typecheck；
 2. [x] Prompt、StructuredOutput、completed tool、event 和 persistence 交叉回归；
-3. [ ] CLI/Task E2E、完整受影响集合、typecheck、五维审核和 PR 说明同步。
+3. [x] CLI/Task E2E、完整受影响集合、typecheck、五维审核和 PR 说明同步准备。
 
 ### 10.8 文档更新清单与确认门
 
-| 文档路径                                               | 要改什么                                                                  | 状态（修复后回填）              |
-| ------------------------------------------------------ | ------------------------------------------------------------------------- | ------------------------------- |
-| `docs/fixes/session-fix-incomplete-provider-stream.md` | 撤销旧 compaction 优先假设，记录 crossover 八部分计划、实施证据和最终审核 | 单元 2 已回填；最终审核待单元 3 |
-| PR #5 body/comment                                     | 说明 failure-settlement 修复、交叉回归和验证结果                          | 待单元 3 更新                   |
+| 文档路径                                               | 要改什么                                                                  | 状态（修复后回填）         |
+| ------------------------------------------------------ | ------------------------------------------------------------------------- | -------------------------- |
+| `docs/fixes/session-fix-incomplete-provider-stream.md` | 撤销旧 compaction 优先假设，记录 crossover 八部分计划、实施证据和最终审核 | 单元 3 本地最终审核已回填  |
+| PR #5 body/comment                                     | 说明 failure-settlement 修复、交叉回归和验证结果                          | 内容已准备；最终提交后同步 |
 
 不修改公共 API/SDK schema、CLI 参数或用户配置文档。本修订恢复原计划已经声明的“raw-missing
 必须失败”契约，属于内部 ephemeral LLM stream contract 与状态机修正，不引入 user-facing 能力、
@@ -1532,5 +1554,38 @@ StructuredOutput/bash tool、EventV2Bridge 和持久化 Session 上完成交叉�
 code。该单元证明 Unit 1 的 canonical error 可以阻止 compaction、structured promotion 和 tool
 replay；Task 投影、CLI/subagent E2E 仍明确留在单元 3。
 
-确认门：单元 2 已完成测试提交和文档回填；在此停下报告。未经下一次确认不进入单元 3，
-不更新 PR body/comment，也不推送分支或恢复 `yixiao-issue-3-retry` 中的 bounded retry 草稿。
+2026-08-04 单元 3 实施结果：`7bb625a6ce` 完成真实 CLI、Task 与 child session crossover E2E；
+完整受影响回归、两个 package typecheck 和 workspace typecheck 均通过。实现 diff 复核确认 production
+改动仍只位于 `llm.ts` 与 `processor.ts`，没有恢复或修改 `yixiao-issue-3-retry` 中的 bounded retry
+草稿。
+
+### 10.9 最终五维审核
+
+1. **一致性**：AI SDK adapter 的一次 mapping 数组原样成为 batch，flat `stream()` 只从该 source
+   派生；Processor 是 production 中唯一 `streamBatches()` consumer。Canonical error 落地后继续
+   复用既有 Prompt、Task 和 CLI error 通道，没有第二套分类或下游内容猜测。全仓
+   `LLM.Service.of(...)` fixture 均已提供 required batch interface。
+2. **风格**：实现沿用 Effect `Stream`、`Effect.forEach`、现有 service interface 与 attempt-local
+   context；没有新增依赖、公共 schema、配置、持久化字段或并发 worker。测试配置只在单个 CLI
+   invocation 内开启 auto compaction 并覆盖模型 limit，不改变全局 harness 默认值。
+3. **正确性**：修复前红测保存了 `compact` 误分类；修复后 adapter batch、Processor cutoff、
+   raw-defined 兼容、empty/length/blocked/context-overflow 优先级、retry reset、Prompt persistence、
+   StructuredOutput、completed tool、CLI 非零退出与 child Task propagation 均有分层证据。惰性
+   successor counter 与 provider request marker 分别证明 Processor 不 demand 下一 emission，且
+   Prompt/CLI 没有发起 compaction 或 continuation 请求。
+4. **性能**：时间复杂度仍为 `O(event count)`，batch 内串行处理；AI SDK path 复用 adapter 已创建
+   的数组，native path 每个 event 只增加一个短生命周期 singleton array。没有累计 buffer、队列、
+   新 subscription 或并发度变化；两个新增 E2E 均断言 provider response queue 归零。
+5. **可维护性**：batch contract、flat compatibility 与 Processor wiring 分别有测试锁定；修复只在
+   事实首次被拆分的 service/consumer 边界生效。V2 runner、protocol-specific native incomplete
+   settlement 和 bounded retry 继续作为独立 follow-up，未混入本修订。
+
+最终结论：声明范围内未发现未解决的 critical finding，原 reviewer 指出的 compaction crossover
+根因已经被消除。残余边界不作过度承诺：native runtime 目前只能表达 singleton batch，未来若要
+原子交付多个 terminal events，必须由其 adapter 显式形成 batch；runtime 在 cutoff 前已经 eager
+启动的 provider/tool side effect 无法回滚，本修订只保证 Processor 不为终态分类 demand 下一
+emission；两个 V2 projector 用例仍按仓库现状条件跳过。
+
+确认门：三个 crossover 实施单元已完成并分别提交代码/测试；本地最终文档提交完成后，下一步仅
+同步 `yixiao-issue-3` 远端分支与 PR #5 body/comment，不恢复 `yixiao-issue-3-retry` 的 bounded retry
+草稿。
