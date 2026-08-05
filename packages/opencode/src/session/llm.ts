@@ -372,12 +372,20 @@ const live: Layer.Layer<
 
             // Preserve one adapter mapping as a batch so downstream cutoff logic
             // cannot split a step settlement from its terminal failure.
-            const state = LLMAISDK.adapterState()
+            const state = LLMAISDK.adapterState({
+              coalesceOpenAICompatibleReasoning: input.model.api.npm === "@ai-sdk/openai-compatible",
+            })
+            const drain = () => {
+              const events = LLMAISDK.drainPendingReasoningEnd(state)
+              return events.length === 0 ? Stream.empty : Stream.succeed(events)
+            }
             return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
               e instanceof Error ? e : new Error(String(e)),
             ).pipe(
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
               Stream.filter((events) => events.length > 0),
+              Stream.catch((error) => Stream.concat(Stream.suspend(drain), Stream.fail(error))),
+              Stream.concat(Stream.suspend(drain)),
             )
           }),
         ),
