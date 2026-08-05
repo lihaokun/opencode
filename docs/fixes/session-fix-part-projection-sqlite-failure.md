@@ -1,9 +1,9 @@
 # Session Part 投影并发失败修正方案
 
-- 状态：单元 1（诊断信息保真）已实施并验证；timeout/transport cleanup 竞态已由真实 TCP 对照和 Runner ownership 实验确认；Issue 的 `EffectDrizzleQueryError: Failed query: insert into part` 已证明失败发生于 statement execution，而非 prepare/schema/参数编码阶段；Part query 位于已成功的 `BEGIN IMMEDIATE` 内，普通 WAL writer 竞争已受 adapter 代码、SQLite 语义和双连接实验共同反证；样本从 assistant Message ID 到首个 Part SQL 约 39.931 秒，强烈贴近一个可能的 40 秒 caller deadline，但公开默认 reviewer timeout 为 600 秒，且 Issue 所述完整 `UnknownError` response 与 timeout-cleanup 分支冲突；根因仍等待原始 reason、删除来源、有效 timeout 与 caller outcome 关联确认
+- 状态：单元 1（诊断信息保真）已实施并验证；timeout/transport cleanup 竞态已由真实 TCP 对照和 Runner ownership 实验确认，但公开 caller 使用局部 session ID、每请求独立 Hyper client、600 秒默认 reviewer timeout，已知 OpenCode/Bun 连接链也没有约 40 秒 response deadline，故该竞态作为 Issue 根因的优先级已明显下调；Issue 的 `EffectDrizzleQueryError: Failed query: insert into part` 已证明失败发生于 statement execution，而非 prepare/schema/参数编码阶段；Part query 位于已成功的 `BEGIN IMMEDIATE` 内，普通 WAL writer 竞争、durable event 重排、生产 native/Drizzle 旁路和 reviewer session 串线均已反证；`SQLITE_FULL` 容量实验的最终错误形态也与 Issue 不同，但 `IOERR/NOMEM` 等资源错误仍不能仅凭该实验排除；根因继续等待原始 reason、删除来源与 caller outcome 关联确认
 - 日期：2026-08-05
 - 对应问题：[Issue #6](https://github.com/lihaokun/opencode/issues/6)
-- 分析基线：`9050ddfa0780645133b9ee80971c1ba191133911`
+- 分析基线：`b95397f5c07418f21d34e0cba9fecc8aafed6571`
 - 初始工作基线：`a22be532fc390ef0622f8f8cb95bb61746b3f841`
 - fork `origin/dev`：`d12b1e924d7a18551767690e9f02294d0b3c6f1a`
 - 分析时 `upstream/dev`：`6c3299103ce1494b4b37f5727199ac9539130534`
@@ -186,6 +186,14 @@ stop-gate timeout 为 30 秒。因此三路 fan-out 是强 provenance 证据，�
 套到三路 vote reviewer；只有现场 YAML/运行日志证明有效 `timeout_seconds` 小于请求尾延迟，才能确认
 caller timeout 前提。
 
+已知 HTTP 连接链也没有恢复出一个隐含的 40 秒 response deadline。`v1.17.8` 的 OpenCode server 通过
+Node `createServer()` 建立 listener，没有设置 response timeout；本机同类 Bun runtime 的默认
+`requestTimeout=300000` 约束接收请求体，`headersTimeout=60000` 约束接收请求头，
+`keepAliveTimeout=5000` 发生在响应之后，均不能在已收完的小型 OC2 请求上于约 40 秒终止服务端处理。
+Rust `http_json()` 也没有除 `bounded(prompt_timeout, ...)` 之外的 read/response timeout，且目标是直接
+localhost endpoint，没有代码内代理层。故在没有未保存 YAML、自定义 binary、外部代理或不同 runtime
+默认值的前提下，当前可见连接模型不能把 39.9 秒窗口转换成 timeout-cleanup。
+
 `http_json()` 只有在 response body 完整 collect 并成功解析 JSON 后才返回 `Ok(Value)`；OC3 虽然在
 `extract_structured(&prompted?)` 之前执行，但此时 `prompted` 已是不可被 DELETE 改写的本地 JSON。
 因此 outcome 分叉是确定的：
@@ -193,6 +201,14 @@ caller timeout 前提。
 - `prompted = Ok(response with UnknownError)`：Part failure 已在 OC3 之前发生，2C 对该次记录被排除；
 - `prompted = Err(Timeout | request/body transport error)`：OC3 可与 Runner 重叠，但函数最终传播
   `JudgeError::Timeout/Http`，不会向上返回 `Structured("UnknownError")`。
+
+三路 reviewer 的 session 关联也已按公开源码闭合：`run_vote_review()` 为每个 `tokio::spawn` 克隆
+`SoftCheck`、变量 map 和 cwd，每个 task 独立进入 `judge_opencode()`；OC1 response 中取得的 `sid` 只
+保存在该调用栈的局部 `String`，OC2 和 OC3 都由同一局部值构造 path。每次 `http_json()` 又创建独立
+Hyper client，并由对应 request future 收取 body，不存在共享数组下标、全局 session cache 或手工
+response-ID 映射。公开仓库的 Rust 调用面搜索中，向 OpenCode 发 `hyper::Method::DELETE` 的位置也只有
+`agent_cli.rs`，没有按 `fsm-gate` title 批量回收的第二个 actor。因此公开 caller 内部“一个 reviewer
+误删另一个 reviewer session”已被代码反证；若现场发生这种删除，只能来自未记录版本或 caller 外部。
 
 Issue 示例同时提供了可从 ID 还原的时间证据。ID 的前 12 个十六进制字符编码
 `timestamp * 0x1000 + counter` 的低 48 位；以 SQL 中已知的 `time_created=1785600488974` 选择最近的
@@ -205,12 +221,11 @@ Issue 示例同时提供了可从 ID 还原的时间证据。ID 的前 12 个十
 | step-start Part ID      | 2026-08-01 16:08:08.973Z |         -1 ms |
 | Part SQL `time_created` | 2026-08-01 16:08:08.974Z |          0 ms |
 
-这证明 Session 创建和 assistant Message 生成后，约 39.9 秒才到达首个 Part SQL。该时长非常贴近一个
-可能的 40 秒 client deadline；而 client timer 在发出 HTTP 请求前启动，Message ID 要到服务端收到请求
-并创建 user/assistant message 时才生成，所以几十毫秒的连接、解析和调度开销可以解释“Message ID 到
-失败只有约 39.93 秒”而非正好 40.00 秒。这是 timeout-cleanup 的强时间相关性证据，但公开源码无法
-恢复现场实际 `timeout_seconds`，默认 reviewer timeout 又是 600 秒，因此仍不能把相关性写成 timeout
-已经发生。
+这证明 Session 创建和 assistant Message 生成后，约 39.9 秒才到达首个 Part SQL。该时长在数值上贴近
+40 秒，但已知 caller/server/runtime 链没有对应 deadline；默认 reviewer timeout 又是 600 秒。因此它
+目前只证明首 Part 前存在长尾窗口，不能继续单独作为 timeout-cleanup 的强证据。只有原始配置或代理
+日志恢复出约 40 秒 deadline，且 caller outcome 为 timeout/transport ambiguity，才能重新解释几十毫秒
+差值是连接、解析和调度开销。
 
 还需要修正此前对这段窗口的代码路径描述：processor 在启动 LLM stream 之前会无条件预捕获 initial
 Snapshot，随后才解析 tools/system/plugin 输入并启动 provider；AI SDK 在收到首个有效 stream chunk 后发出
@@ -252,10 +267,16 @@ daemon/hook e2e 和 installer tests，没有启动真实 OpenCode structured-out
 运行日志或数据库 artifact。Issue 本身也没有 comment 或额外附件。因此原始 caller outcome、有效
 timeout 和 SQLite reason 只能从原运行环境或下一次复现取得，不能由公开 CI 追溯补全。
 
-当前结论应表述为：**timeout-cleanup 是已确认的独立生命周期缺陷机制，Snapshot 是新确认的共享延迟
-放大边界；按照 reviewer 默认配置和 Issue 当前所述的完整 `UnknownError` 响应，二者仍不是这 7 次
-记录的已确认根因。** 只有原始 caller 日志证明实际 outcome 是 timeout/transport ambiguity、有效
-timeout 小于该次尾延迟，且同一 session 的新诊断为 FK，才能把 2C 重新提升为 Issue 根因。
+本机默认运行目录同样没有保留原现场：`~/.mcp_server_fsm` 不存在，OpenCode data/log/config 目录为空，
+目标 session ID 只命中本次分析记录，没有命中原始数据库或日志；环境中也没有自定义 `XDG_DATA_HOME`
+或 OpenCode/FSM 路径变量。由此不能从当前主机默认 XDG 路径补回 8 月 1 日的 effective timeout、DELETE
+时间戳或 SQLite extended code。
+
+当前结论应表述为：**timeout-cleanup 是已确认的独立生命周期缺陷机制，Snapshot 是已确认的共享延迟
+放大边界；但公开 caller 的 session 关联、默认 timeout、已知连接链和 Issue 所述完整 `UnknownError`
+响应共同反证它是这 7 次记录的默认解释。** 只有原始 caller 日志证明实际 outcome 是
+timeout/transport ambiguity、存在足够短的有效 deadline，且同一 session 的新诊断为 FK，才能把 2C
+重新提升为 Issue 根因。
 
 ### 1.6 出错代码路径
 
@@ -425,9 +446,10 @@ reason 是 lock，普通 writer 只能解释事务起点的 `SQLITE_BUSY`，Part
 
 - 数据库初始化已设置 WAL、`busy_timeout = 5000`、`foreign_keys = ON`；
 - `sqlite.bun.ts` 的 transaction acquirer 在整个 transaction scope 内持有单许可 semaphore；相关
-  durable Message/Part/Delete projector 均通过该路径串行化。普通 acquirer 的许可只覆盖“返回
-  connection”这一 Effect，属于应独立审计的 hardening 风险，但不能推翻本次事务已经成功 BEGIN 的
-  顺序事实；
+  durable Message/Part/Delete projector 均通过该路径串行化。普通 acquirer 的许可虽然只覆盖“返回
+  connection”这一 Effect，但生产 `run()`/`runValues()` 随后执行的 `native.query(...).all()/values()`
+  是同一 JS fiber 内无 yield 的同步调用，permit 释放时等待 transaction 的 fiber 只会进入后续调度；
+  statement 中间没有可供另一事务插入的异步边界。当前未实现的 stream 路径不参与 Issue；
 - headless API 的正常运行图使用共享 AppRuntime/memo map，预期只有一个 Database service；
 - assistant Message 在 processor 启动、写入 `step-start` Part 之前被同步发布并持久化；
 - processor 流事件以 `concurrency: 1` 顺序处理，prompt 在 processor 完成后才返回。
@@ -455,6 +477,16 @@ plugin 引入的 shared-cache/table/schema/reentrant 等非常规锁形态。当
 happens-before 又否定了“正常 post-await DELETE 抢先删除 parent”，所以即使 FK 是最现实 constraint，
 也不能在取得原始 reason/caller outcome 前把 Issue 正式定为 foreign-key failure。
 
+针对 `SQLITE_FULL` 又完成了真实 Effect + Drizzle + Bun SQLite 容量实验。内存库与 WAL 文件库都先
+成功提交 parent Message，再把 `max_page_count` 固定到当前页数；`BEGIN IMMEDIATE` 成功后，使用大 Part
+payload 强制 INSERT 得到 `SQLITE_FULL`。两种 journal mode 下 SQLite 都自动结束了事务，transaction
+finalizer 随后执行 `ROLLBACK` 并得到 `cannot rollback - no transaction is active`，最终暴露的是裸
+Effect `SqlError`，而不是 Issue 的 `EffectDrizzleQueryError: Failed query: insert into part`；parent
+Message 保留，Part 为零，之后 DELETE parent 仍可成功。这使该实验覆盖的典型容量耗尽路径与 Issue
+外形不相容。SQLite 官方语义同时说明 `FULL/IOERR/NOMEM/INTERRUPT` 可能只回滚当前 statement，也可能
+回滚整个事务，取决于失败点；故这个结果显著下调 `FULL`，但不能逻辑外推为彻底排除所有
+`IOERR/NOMEM` 或所有可能的 `FULL` 失败点。
+
 真实调用端和 TCP 对照把候选改成条件决策树，而不是单一排序：
 
 1. **完整 OC2 response 已含 `UnknownError`（Issue 当前描述）**：2C 被排除。优先取得
@@ -462,7 +494,8 @@ happens-before 又否定了“正常 post-await DELETE 抢先删除 parent”，
    的 constraint/磁盘/I/O/corruption/shared-cache 等错误。prepare/schema/参数编码已经由 wrapper 形态
    排除，标准运行图中的 shared-cache/reentrant lock 也受到连接图反证；因此若新诊断为 Constraint，
    parent Message 的未观测删除成为压倒性候选，若不是 Constraint，则优先从
-   `SQLITE_FULL/IOERR/NOMEM` 等 execution-time 资源错误重新建立最小复现。入口审计未发现按 `fsm-gate` title、TTL、
+   `SQLITE_IOERR/NOMEM` 等 execution-time 资源错误重新建立最小复现；`SQLITE_FULL` 还必须解释为何没有
+   出现实验中的自动回滚/rollback-finalizer 错误形态。入口审计未发现按 `fsm-gate` title、TTL、
    request completion 或 Snapshot 自动删除 Session 的内部逻辑，所以“未观测的 OpenCode 自动清理”
    优先级下调；显式 workspace/message/session 删除、remote replay 和外部数据库 writer 仍需用 source
    日志排除。
@@ -476,17 +509,19 @@ happens-before 又否定了“正常 post-await DELETE 抢先删除 parent”，
    `SQLITE_LOCKED`/schema/shared-cache 属于另一类非常规 statement lock，不能借普通 WAL 竞争之名进入
    2A 重试。
 
-综合 provenance（`fsm-gate` 临时 session、默认三路 reviewer）、约 40 秒的精确时间相关性、caller
-无条件 OC3 和已确认的 Runner/DELETE/FK 机制，**ambiguous outcome → OC3 DELETE → FK** 是当前所有
-证据下最强的单一候选链；但它与“OC2 已完整返回 `UnknownError`”在因果上互斥，且公开默认 timeout
-不是 40 秒。因此“最强候选”不能升级为“已确认根因”：下一条最高价值证据不是继续调整 SQLite 锁，
-而是关联同一 session 的原始 caller outcome/effective timeout、DELETE source 和新诊断 reason。
+综合最新证据，**ambiguous outcome → OC3 DELETE → FK** 仍是已确认、可确定复现的独立缺陷机制，但不再
+是 Issue 的默认最高候选：它与“OC2 已完整返回 `UnknownError`”因果互斥，公开 caller 默认 600 秒，
+已知连接链没有约 40 秒 deadline，三路 task 又不存在 session ID/response 串线或第二个 cleanup actor。
+当前 Issue 归因收敛为两个都缺关键现场证据的分支：若新 reason 为 FK，则寻找 caller 外部、未记录版本
+或显式 Session/Message 删除；若 reason 不是 Constraint，则检查 `IOERR/NOMEM` 等极低概率 statement
+资源/文件系统错误。普通 WAL 竞争、durable event 重排和标准 caller 误删已经有足够反证，不再与这两个
+分支并列。
 
 Issue 明确写的是请求“返回”带 `UnknownError` 的 assistant 响应，所以当前默认应按分支 1 推进；不能
 仅因真实 caller 存在 timeout 就把 2C 当成这 7 次记录的根因。
 
-只有把新的结构化诊断部署到原始环境，并取得调用端 prompt/delete 与服务端 writer 的关联时间线，
-才能给 Issue 的首个失败定类。
+只有把新的结构化诊断部署到原始环境并捕获一次失败，才能先用 `database.reason/code/message` 在上述
+两条分支间选择；若为 FK，再取得调用端 prompt/delete 与服务端 writer 的关联时间线才能完成删除归因。
 
 ### 2.3 已确认机制：删除可与活跃 writer 交叉
 
@@ -618,8 +653,9 @@ ambiguous outcome 的 DELETE，保留数据库、session 和完整结构化 caus
 - 在 provider/prompt 层重试整个 turn 会重复模型调用、tool 执行和副作用；
 - 无差别重试 constraint 会掩盖生命周期或数据不变量破坏；
 - UnknownError 若直接暴露完整 SQL params，可能泄漏用户内容，客户端信息与服务端诊断字段必须分层；
-- SQLite normal acquirer 未把 permit 生命周期显式延伸到 statement scope，应单独审计所有非 transaction
-  statement 的并发安全，但不能把该边界直接当成本 Issue 的已证实原因；
+- SQLite normal acquirer 未把 permit 生命周期显式延伸到 statement scope；当前生产
+  `all()/values()` 为无 yield 的同步 native 调用，等待者又在 permit release 后进入后续调度，已确认不能
+  切入本次 Part statement。若未来实现异步 stream/driver，必须重新把 permit scope 纳入并发契约；
 - 同 worktree 的 initial/fallback/completion Snapshot 串行化会把不同 Session 耦合到首 Part 前的尾延迟
   队列；在外部 deadline 存在时应分别记录 lock wait，而不能把“独立 Session”误写成“关键路径无共享
   资源”；
@@ -778,13 +814,16 @@ Snapshot 若只被确认是延迟放大器，不足以选择 2A/2B/2C，也不�
   导致此前首个 Part INSERT 失败”；真实调用端 timeout 会打断客户端等待但不打断 server Runner，TCP
   E/F 与直接 Runner ownership 实验证明它可以形成受控 C 的重叠顺序；但完整 response 已含
   `UnknownError` 时，Part failure 必在 OC3 前发生，2C 对该次记录被排除。Issue ID 证明约 39.9 秒前置
-  窗口并与可能的 40 秒 client deadline 高度相关；reviewer 默认 600 秒且等待全部任务，所以该窗口仍
-  不能独立证明 timeout。窗口按代码顺序包含 initial Snapshot、tools/system 准备、provider 首个有效
-  chunk 和可选 Snapshot fallback，不能只用 Part ID 给其中任一阶段分配耗时。
+  窗口，但 reviewer 默认 600 秒、聚合器等待全部任务、已知 server/runtime 链没有约 40 秒 response
+  deadline，故该窗口当前只表示尾延迟，不能独立证明 timeout。窗口按代码顺序包含 initial Snapshot、
+  tools/system 准备、provider 首个有效 chunk 和可选 Snapshot fallback，不能只用 Part ID 给其中任一
+  阶段分配耗时。
 - 错误阶段论证：真实 adapter 对照证明只有 `statement.all()` execution failure 会生成 Issue 所见
   `EffectDrizzleQueryError: Failed query`；prepare/schema failure 直接成为原生 SQLite defect，参数编码
   又发生在 executor 之前。因此后续修复只应针对 execution-time Constraint/LOCKED/资源错误，不能用
-  migration、SQL prepare 或 JSON 编码假说设计修复。
+  migration、SQL prepare 或 JSON 编码假说设计修复。`SQLITE_FULL` 容量实验还表明典型 Part 容量耗尽
+  会因 SQLite 自动回滚而最终暴露 rollback `SqlError`，与 Issue wrapper 不同；官方语义不保证所有
+  `FULL/IOERR/NOMEM` 失败点都自动回滚，所以该结果用于降级而不是绝对排除资源分支。
 - parent Message 论证：MessageUpdated projector 在 durable publish 返回前原子提交；Part 参数合法且
   唯一外键指向 Message。Part transaction 的成功 `BEGIN IMMEDIATE` 又阻止其他 writer 在 INSERT 前
   插队，因此若诊断为 FK，Message 必在 Message commit 之后、Part BEGIN 之前被删除。对无 parent/
@@ -800,7 +839,9 @@ Snapshot 若只被确认是延迟放大器，不足以选择 2A/2B/2C，也不�
   另一条共享顺序边界，但不写数据库。它只能在 deadline 已证实时作为延迟放大器，不能作为 SQL 根因。
 - 跨进程顺序正确性：2C 只把完整 response body 当作远端 settle 证明；对 timeout/transport ambiguity
   不假设跨连接 FIFO 或远端取消。于是调用端不再在缺少 happens-before 证据时发出破坏性 cleanup。
-  TCP 对照满足必要性分离：abort-only 能完整结束，abort + DELETE 才产生 FK。
+  TCP 对照满足必要性分离：abort-only 能完整结束，abort + DELETE 才产生 FK。公开 caller 的每个
+  reviewer 使用局部 `sid`、独立 Hyper request future，仓库内也只有 `agent_cli.rs` 发 OpenCode session
+  DELETE，因此标准三路 fan-out 不会交叉清理彼此 session。
 - Trivial 判定：不适用。本缺陷跨 durable transaction、projector、error cause 和 session lifecycle，
   且错误修复可能重复外部副作用。
 - provenance：实际部署 commit/version 尚未记录；调用端材料引用的 `v1.17.8`、`d12b1e924d` 和分析
@@ -820,10 +861,13 @@ Snapshot 若只被确认是延迟放大器，不足以选择 2A/2B/2C，也不�
 | 新增       | 第二 SQLite 连接持写锁，稳定得到 LockTimeout 诊断                                         | 已通过（单元 1）                       |
 | 语义实验   | 双连接验证 BEGIN 后 DELETE=BUSY、DELETE 先提交=FK、WAL reader 不阻塞 writer               | 已完成（临时诊断，无仓库改动）         |
 | 阶段实验   | 真实 adapter 对照 prepare failure 与 statement execution failure 的外层错误形态           | 已完成；Issue wrapper 只对应 execution |
+| 资源实验   | parent 已提交、BEGIN 成功后以 `max_page_count` 强制 Part INSERT `SQLITE_FULL`              | 已完成；自动回滚后暴露 rollback SqlError，外形不同 |
 | 所有权实验 | interrupt `ensureRunning()` waiter 后 instance-scoped Runner 仍继续完成                   | 已完成；busy→completed/idle            |
+| timeout 审计 | reviewer/OpenCode/Bun/Hyper 已知 deadline 与 39.9 秒窗口对照                            | 已完成；公开链无约 40 秒 response timeout |
+| caller 审计 | 三 task 的局部 sid、独立 Hyper future、OpenCode DELETE 全调用面                          | 已完成；无 session 串线或第二 cleanup actor |
 | 边界       | 服务端诊断与客户端 error 不包含 query params/用户 prompt                                  | 已通过（单元 1）                       |
 | 现场取证   | 解码 Issue 示例 Session/Message/Part ID，并与 SQL `time_created` 对齐                     | 已完成；Message→Part SQL 约 39.931s    |
-| 配置取证   | 记录实际 OpenCode/caller SHA、有效 timeout、reviewer 数、Snapshot 配置与 DB 路径          | 待跑（Issue 环境）                     |
+| 配置取证   | 记录实际 OpenCode/caller SHA、有效 timeout、reviewer 数、Snapshot 配置与 DB 路径          | 公开/本机路径已审计；Issue 环境待跑    |
 | 现场诊断   | 原始 caller 按 sid 记录 OC1/OC2 outcome/elapsed 与 OC3 start/outcome                      | 待跑（Issue 环境）                     |
 | 现场时序   | 记录 initial/fallback Snapshot、tools ready、provider first chunk、Part wait/BEGIN/upsert | 待跑（Issue 环境）                     |
 | 删除归因   | 每个 Session/Message 删除记录 source 与 request/admission/BEGIN/commit                    | 待跑（Issue 环境）                     |
@@ -876,8 +920,9 @@ Issue 根因。
 | 同一修复计划                                               | 回填诊断单元、真实拓扑 A/B/C 与证据边界                       | 已提交 `d71c0193b0`    |
 | 同一修复计划                                               | 同步 happens-before、锁反证、后台边界及删除 TOCTOU            | 已提交 `6a12337e4a`    |
 | 同一修复计划                                               | 同步 caller、TCP E/F、ID 时间线、Snapshot 与单元 2C           | 已提交 `9050ddfa07`    |
-| 同一修复计划                                               | 修正 Snapshot 前置时序并反证普通 WAL Part-statement BUSY      | 已更新（本轮，待提交） |
-| 同一修复计划                                               | 同步 execution 阶段边界、Runner ownership、公开取证与候选排序 | 已更新（本轮，待提交） |
+| 同一修复计划                                               | 修正 Snapshot 前置时序并反证普通 WAL Part-statement BUSY      | 已提交 `b95397f5c0`    |
+| 同一修复计划                                               | 同步 execution 阶段边界、Runner ownership、公开取证与候选排序 | 已提交 `b95397f5c0`    |
+| 同一修复计划                                               | 同步 timeout 链、caller sid/DELETE 审计、FULL 实验与候选降级   | 已同步（本提交）       |
 | 同一修复计划                                               | 回填 Issue 环境原始 reason、选定的 2A/2B/2C 与提交            | 待更新                 |
 
 本轮只同步分析与候选契约，不修改公开 API/schema。若单元 2B 选择改变删除 endpoint 的 busy 行为，
