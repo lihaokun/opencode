@@ -1486,6 +1486,54 @@ it.live("session.processor coalesces interleaved openai-compatible reasoning fro
   ),
 )
 
+it.live("session.processor finalizes pending reasoning when a compatible stream ends incomplete", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.push(reply().reason("one").text("bridge").streamError())
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "reason")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "reason" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const reasoning = parts.filter((part): part is SessionV1.ReasoningPart => part.type === "reasoning")
+
+        expect(value).toBe("stop")
+        expect(yield* llm.calls).toBe(1)
+        expect(reasoning).toHaveLength(1)
+        expect(reasoning[0]).toMatchObject({ text: "one", time: { end: expect.any(Number) } })
+        expect(JSON.stringify(handle.message.error)).toContain("terminal finish event")
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
 it.live("session.processor effect tests reset reasoning state across retries", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
