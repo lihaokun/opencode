@@ -10,6 +10,7 @@ import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import z from "zod"
 import { LLM } from "../../src/session/llm"
 import { LLMRequestPrep } from "../../src/session/llm/request"
+import type { LLMEvent } from "@opencode-ai/llm"
 import { LLMClient, RequestExecutor } from "@opencode-ai/llm/route"
 import { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
@@ -193,14 +194,394 @@ describe("session.llm.hasToolCalls", () => {
 describe("session.llm.ai-sdk adapter", () => {
   type AISDKAdapterEvent = Parameters<typeof LLMAISDK.toLLMEvents>[1]
 
-  const adapt = (events: ReadonlyArray<AISDKAdapterEvent>) => {
-    const state = LLMAISDK.adapterState()
-    return Effect.runPromise(
-      Effect.forEach(events, (event) => LLMAISDK.toLLMEvents(state, event)).pipe(Effect.map((items) => items.flat())),
+  const adaptBatches = (
+    events: ReadonlyArray<AISDKAdapterEvent>,
+    state = LLMAISDK.adapterState(),
+  ) =>
+    Effect.runPromise(
+      Effect.forEach(events, (event) => LLMAISDK.toLLMEvents(state, event)),
     )
-  }
+  const adapt = (events: ReadonlyArray<AISDKAdapterEvent>) => adaptBatches(events).then((items) => items.flat())
+  const compatibleState = () => LLMAISDK.adapterState({ coalesceOpenAICompatibleReasoning: true })
   // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- tests defensive adapter branches outside AI SDK's current typed surface
   const uncheckedAdapterEvent = (input: unknown) => input as AISDKAdapterEvent
+
+  test("coalesces the openai-compatible reasoning signature without buffering text", async () => {
+    const state = compatibleState()
+    const batches = await Effect.runPromise(
+      Effect.forEach(
+        [
+          { type: "reasoning-start", id: "reasoning-0" },
+          { type: "reasoning-delta", id: "reasoning-0", text: "think-1" },
+          { type: "reasoning-end", id: "reasoning-0" },
+          { type: "text-start", id: "txt-0" },
+          { type: "text-delta", id: "txt-0", text: "answer-1" },
+          { type: "reasoning-start", id: "reasoning-0" },
+          { type: "reasoning-delta", id: "reasoning-0", text: "think-2" },
+          { type: "reasoning-end", id: "reasoning-0" },
+          { type: "text-delta", id: "txt-0", text: "answer-2" },
+          { type: "text-end", id: "txt-0" },
+        ] satisfies ReadonlyArray<AISDKAdapterEvent>,
+        (event) => LLMAISDK.toLLMEvents(state, event),
+      ),
+    )
+
+    expect(batches.map((batch) => batch.map((event) => event.type))).toEqual([
+      ["reasoning-start"],
+      ["reasoning-delta"],
+      [],
+      ["text-start"],
+      ["text-delta"],
+      [],
+      ["reasoning-delta"],
+      [],
+      ["text-delta"],
+      ["reasoning-end", "text-end"],
+    ])
+    expect(batches.flat()).toMatchObject([
+      { type: "reasoning-start", id: "reasoning-0" },
+      { type: "reasoning-delta", id: "reasoning-0", text: "think-1" },
+      { type: "text-start", id: "txt-0" },
+      { type: "text-delta", id: "txt-0", text: "answer-1" },
+      { type: "reasoning-delta", id: "reasoning-0", text: "think-2" },
+      { type: "text-delta", id: "txt-0", text: "answer-2" },
+      { type: "reasoning-end", id: "reasoning-0" },
+      { type: "text-end", id: "txt-0" },
+    ])
+  })
+
+  test("keeps the same fragmented lifecycle when normalization is gated off", async () => {
+    const events = await adapt([
+      { type: "reasoning-start", id: "reasoning-0" },
+      { type: "reasoning-delta", id: "reasoning-0", text: "think-1" },
+      { type: "reasoning-end", id: "reasoning-0" },
+      { type: "text-delta", id: "txt-0", text: "answer" },
+      { type: "reasoning-start", id: "reasoning-0" },
+      { type: "reasoning-delta", id: "reasoning-0", text: "think-2" },
+      { type: "reasoning-end", id: "reasoning-0" },
+    ])
+
+    expect(events.filter((event) => event.type === "reasoning-start")).toHaveLength(2)
+    expect(events.filter((event) => event.type === "reasoning-end")).toHaveLength(2)
+  })
+
+  test("delays a compatible single reasoning end until the text-end barrier", async () => {
+    const state = compatibleState()
+    const batches = await Effect.runPromise(
+      Effect.forEach(
+        [
+          { type: "reasoning-start", id: "reasoning-0" },
+          { type: "reasoning-delta", id: "reasoning-0", text: "thinking" },
+          { type: "reasoning-end", id: "reasoning-0" },
+          uncheckedAdapterEvent({ type: "raw", rawValue: {} }),
+          { type: "text-start", id: "txt-0" },
+          { type: "text-delta", id: "txt-0", text: "answer" },
+          { type: "text-end", id: "txt-0" },
+        ] satisfies ReadonlyArray<AISDKAdapterEvent>,
+        (event) => LLMAISDK.toLLMEvents(state, event),
+      ),
+    )
+
+    expect(batches[2]).toEqual([])
+    expect(batches[3]).toEqual([])
+    expect(batches[4]?.map((event) => event.type)).toEqual(["text-start"])
+    expect(batches[5]?.map((event) => event.type)).toEqual(["text-delta"])
+    expect(batches[6]?.map((event) => event.type)).toEqual(["reasoning-end", "text-end"])
+  })
+
+  test("does not coalesce an empty end-to-start gap or a different text id", async () => {
+    const emptyGapState = compatibleState()
+    const emptyGap = await Effect.runPromise(
+      Effect.forEach(
+        [
+          { type: "reasoning-start", id: "reasoning-0" },
+          { type: "reasoning-end", id: "reasoning-0" },
+          { type: "reasoning-start", id: "reasoning-0" },
+        ] satisfies ReadonlyArray<AISDKAdapterEvent>,
+        (event) => LLMAISDK.toLLMEvents(emptyGapState, event),
+      ),
+    )
+    const differentTextState = compatibleState()
+    const differentText = await Effect.runPromise(
+      Effect.forEach(
+        [
+          { type: "reasoning-start", id: "reasoning-0" },
+          { type: "reasoning-end", id: "reasoning-0" },
+          { type: "text-start", id: "text-other" },
+        ] satisfies ReadonlyArray<AISDKAdapterEvent>,
+        (event) => LLMAISDK.toLLMEvents(differentTextState, event),
+      ),
+    )
+
+    expect(emptyGap[2]?.map((event) => event.type)).toEqual(["reasoning-end", "reasoning-start"])
+    expect(differentText[2]?.map((event) => event.type)).toEqual(["reasoning-end", "text-start"])
+  })
+
+  test("flushes pending reasoning before anonymous and different-id lifecycles", async () => {
+    const anonymousState = compatibleState()
+    const anonymous = await Effect.runPromise(
+      Effect.forEach(
+        [
+          { type: "reasoning-start", id: "reasoning-0" },
+          { type: "reasoning-end", id: "reasoning-0" },
+          { type: "text-delta", id: "txt-0", text: "bridge" },
+          uncheckedAdapterEvent({ type: "reasoning-start" }),
+        ] satisfies ReadonlyArray<AISDKAdapterEvent>,
+        (event) => LLMAISDK.toLLMEvents(anonymousState, event),
+      ),
+    )
+    const differentState = compatibleState()
+    const different = await Effect.runPromise(
+      Effect.forEach(
+        [
+          { type: "reasoning-start", id: "reasoning-0" },
+          { type: "reasoning-end", id: "reasoning-0" },
+          { type: "text-delta", id: "txt-0", text: "bridge" },
+          { type: "reasoning-start", id: "reasoning-1" },
+        ] satisfies ReadonlyArray<AISDKAdapterEvent>,
+        (event) => LLMAISDK.toLLMEvents(differentState, event),
+      ),
+    )
+
+    expect(anonymous[3]?.map((event) => event.type)).toEqual(["reasoning-end", "reasoning-start"])
+    expect(different[3]?.map((event) => event.type)).toEqual(["reasoning-end", "reasoning-start"])
+    expect(different[3]).toMatchObject([
+      { type: "reasoning-end", id: "reasoning-0" },
+      { type: "reasoning-start", id: "reasoning-1" },
+    ])
+  })
+
+  test("flushes pending reasoning and disables normalization when raw metadata appears", async () => {
+    const state = compatibleState()
+    const metadata = { openai: { itemID: "late-metadata" } }
+    const batches = await Effect.runPromise(
+      Effect.forEach(
+        [
+          { type: "reasoning-start", id: "reasoning-0" },
+          { type: "reasoning-delta", id: "reasoning-0", text: "think-1" },
+          { type: "reasoning-end", id: "reasoning-0" },
+          { type: "text-delta", id: "txt-0", text: "bridge" },
+          { type: "reasoning-delta", id: "reasoning-0", text: "metadata", providerMetadata: metadata },
+          { type: "reasoning-end", id: "reasoning-0" },
+          { type: "reasoning-start", id: "reasoning-0" },
+          { type: "reasoning-end", id: "reasoning-0" },
+        ] satisfies ReadonlyArray<AISDKAdapterEvent>,
+        (event) => LLMAISDK.toLLMEvents(state, event),
+      ),
+    )
+
+    expect(batches[4]).toMatchObject([
+      { type: "reasoning-end", id: "reasoning-0" },
+      { type: "reasoning-delta", id: "reasoning-0", text: "metadata", providerMetadata: metadata },
+    ])
+    expect(batches[5]?.map((event) => event.type)).toEqual(["reasoning-end"])
+    expect(batches[6]?.map((event) => event.type)).toEqual(["reasoning-start"])
+    expect(batches[7]?.map((event) => event.type)).toEqual(["reasoning-end"])
+    expect(state.normalizationDisabled).toBe(true)
+  })
+
+  test("treats raw metadata on every reasoning event kind as a normalization opt-out", async () => {
+    const metadata = { openai: { itemID: "signed-reasoning" } }
+    const events = [
+      { type: "reasoning-start", id: "reasoning-0", providerMetadata: metadata },
+      { type: "reasoning-delta", id: "reasoning-0", text: "delta", providerMetadata: metadata },
+      { type: "reasoning-end", id: "reasoning-0", providerMetadata: metadata },
+    ] satisfies ReadonlyArray<AISDKAdapterEvent>
+
+    for (const event of events) {
+      const state = compatibleState()
+      const output = await Effect.runPromise(LLMAISDK.toLLMEvents(state, event))
+      expect(output).toHaveLength(1)
+      expect(output[0]).toMatchObject({ type: event.type, id: "reasoning-0", providerMetadata: metadata })
+      expect(state.normalizationDisabled).toBe(true)
+      expect(LLMAISDK.drainPendingReasoningEnd(state)).toEqual([])
+    }
+  })
+
+  test("flushes pending reasoning before visible and ignored semantic barriers", async () => {
+    const barriers = [
+      {
+        event: uncheckedAdapterEvent({ type: "start" }),
+        expected: ["reasoning-end"],
+      },
+      {
+        event: { type: "start-step", request: {}, warnings: [] } satisfies AISDKAdapterEvent,
+        expected: ["reasoning-end", "step-start"],
+      },
+      {
+        event: {
+          type: "tool-input-start",
+          id: "call-1",
+          toolName: "lookup",
+        } satisfies AISDKAdapterEvent,
+        expected: ["reasoning-end", "tool-input-start"],
+      },
+      {
+        event: uncheckedAdapterEvent({ type: "source" }),
+        expected: ["reasoning-end"],
+      },
+      {
+        event: uncheckedAdapterEvent({ type: "abort" }),
+        expected: ["reasoning-end"],
+      },
+    ] satisfies ReadonlyArray<{ event: AISDKAdapterEvent; expected: ReadonlyArray<LLMEvent["type"]> }>
+
+    for (const barrier of barriers) {
+      const state = compatibleState()
+      await adaptBatches(
+        [
+          { type: "reasoning-start", id: "reasoning-0" },
+          { type: "reasoning-end", id: "reasoning-0" },
+        ],
+        state,
+      )
+      const output = await Effect.runPromise(LLMAISDK.toLLMEvents(state, barrier.event))
+      expect(output.map((event) => event.type)).toEqual(barrier.expected)
+      expect(LLMAISDK.drainPendingReasoningEnd(state)).toEqual([])
+    }
+  })
+
+  test("keeps duplicate pending ends idempotent and lets a bridged delta resume", async () => {
+    const state = compatibleState()
+    const batches = await Effect.runPromise(
+      Effect.forEach(
+        [
+          { type: "reasoning-start", id: "reasoning-0" },
+          { type: "reasoning-end", id: "reasoning-0" },
+          { type: "text-delta", id: "txt-0", text: "bridge" },
+          { type: "reasoning-end", id: "reasoning-0" },
+          { type: "reasoning-delta", id: "reasoning-0", text: "resumed" },
+          { type: "reasoning-end", id: "reasoning-0" },
+          { type: "text-end", id: "txt-0" },
+        ] satisfies ReadonlyArray<AISDKAdapterEvent>,
+        (event) => LLMAISDK.toLLMEvents(state, event),
+      ),
+    )
+
+    expect(batches[1]).toEqual([])
+    expect(batches[3]).toEqual([])
+    expect(batches[4]).toMatchObject([{ type: "reasoning-delta", id: "reasoning-0", text: "resumed" }])
+    expect(batches[5]).toEqual([])
+    expect(batches[6]?.map((event) => event.type)).toEqual(["reasoning-end", "text-end"])
+    expect(batches.flat().filter((event) => event.type === "reasoning-end")).toHaveLength(1)
+  })
+
+  test("flushes reasoning into the same incomplete finish-step batch", async () => {
+    const state = compatibleState()
+    await adaptBatches(
+      [
+        { type: "reasoning-start", id: "reasoning-0" },
+        { type: "reasoning-end", id: "reasoning-0" },
+      ],
+      state,
+    )
+    const batch = await Effect.runPromise(
+      LLMAISDK.toLLMEvents(state, {
+        type: "finish-step",
+        response: { id: "response-1", timestamp: new Date(0), modelId: "gpt-test" },
+        finishReason: "other",
+        rawFinishReason: undefined,
+        providerMetadata: undefined,
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          inputTokenDetails: { noCacheTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+          outputTokenDetails: { textTokens: 1, reasoningTokens: undefined },
+        },
+      }),
+    )
+
+    expect(batch.map((event) => event.type)).toEqual(["reasoning-end", "step-finish", "provider-error"])
+  })
+
+  test("drains pending ends exactly once and preserves the gate across finish reset", async () => {
+    const state = compatibleState()
+    await adaptBatches(
+      [
+        { type: "reasoning-start", id: "reasoning-0" },
+        { type: "reasoning-end", id: "reasoning-0" },
+      ],
+      state,
+    )
+
+    expect(LLMAISDK.drainPendingReasoningEnd(state)).toMatchObject([
+      { type: "reasoning-end", id: "reasoning-0" },
+    ])
+    expect(LLMAISDK.drainPendingReasoningEnd(state)).toEqual([])
+
+    await Effect.runPromise(
+      LLMAISDK.toLLMEvents(state, {
+        type: "finish",
+        finishReason: "stop",
+        rawFinishReason: "stop",
+        totalUsage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          inputTokenDetails: { noCacheTokens: undefined, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+          outputTokenDetails: { textTokens: undefined, reasoningTokens: undefined },
+        },
+      }),
+    )
+
+    const afterReset = await adaptBatches(
+      [
+        { type: "reasoning-start", id: "reasoning-0" },
+        { type: "reasoning-end", id: "reasoning-0" },
+      ],
+      state,
+    )
+    expect(afterReset[1]).toEqual([])
+    expect(LLMAISDK.drainPendingReasoningEnd(state)).toHaveLength(1)
+  })
+
+  test("does not defer an orphan end and leaves typed stream errors unchanged", async () => {
+    const orphanState = compatibleState()
+    const orphan = await Effect.runPromise(
+      LLMAISDK.toLLMEvents(orphanState, { type: "reasoning-end", id: "reasoning-0" }),
+    )
+    expect(orphan).toMatchObject([{ type: "reasoning-end", id: "reasoning-0" }])
+    expect(LLMAISDK.drainPendingReasoningEnd(orphanState)).toEqual([])
+
+    const pendingState = compatibleState()
+    await adaptBatches(
+      [
+        { type: "reasoning-start", id: "reasoning-0" },
+        { type: "reasoning-end", id: "reasoning-0" },
+      ],
+      pendingState,
+    )
+    const error = new Error("retryable stream failure")
+    const exit = await Effect.runPromiseExit(
+      LLMAISDK.toLLMEvents(pendingState, uncheckedAdapterEvent({ type: "error", error })),
+    )
+
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBe(error)
+    expect(LLMAISDK.drainPendingReasoningEnd(pendingState)).toMatchObject([
+      { type: "reasoning-end", id: "reasoning-0" },
+    ])
+  })
+
+  test("keeps one bounded reasoning lifecycle across the reporter's 34 segments", async () => {
+    const state = compatibleState()
+    const events: AISDKAdapterEvent[] = []
+    for (let index = 0; index < 34; index++) {
+      events.push({ type: "reasoning-start", id: "reasoning-0" })
+      events.push({ type: "reasoning-delta", id: "reasoning-0", text: `think-${index}` })
+      events.push({ type: "reasoning-end", id: "reasoning-0" })
+      if (index === 0) events.push({ type: "text-start", id: "txt-0" })
+      events.push({ type: "text-delta", id: "txt-0", text: `answer-${index}` })
+    }
+    events.push({ type: "text-end", id: "txt-0" })
+
+    const output = (await adaptBatches(events, state)).flat()
+    expect(output.filter((event) => event.type === "reasoning-start")).toHaveLength(1)
+    expect(output.filter((event) => event.type === "reasoning-delta")).toHaveLength(34)
+    expect(output.filter((event) => event.type === "reasoning-end")).toHaveLength(1)
+    expect(state.pendingReasoningEnd).toBeUndefined()
+  })
 
   test("maps AI SDK stream chunks without losing session-visible fields", async () => {
     const metadata = { openai: { itemID: "item-1" } }
