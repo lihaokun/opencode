@@ -1,19 +1,20 @@
 # 修正方案 — `session: fragmented reasoning blocks`
 
-- 状态：证据与 consumer 合同已复审；原 processor-only 方案已否决，adapter 方案等待实现确认
+- 状态：已实现；红绿回归、分层测试、类型检查与五维合同审计通过
 - 分析日期：2026-08-05
 - 补证日期：2026-08-05
 - consumer 合同复审日期：2026-08-05
+- 实现与最终审计日期：2026-08-05
 - 对应问题：[Issue #8](https://github.com/lihaokun/opencode/issues/8)
 - Reporter 补证：[`issuecomment-5189552479`](https://github.com/lihaokun/opencode/issues/8#issuecomment-5189552479)
 - 分析基线：`49fa19830d`
 - 影响模块：OpenAI-compatible provider、AI SDK LLM adapter、Session processor 及所有 PartUpdated consumers
 - 已选本地修复层：仅对 `@ai-sdk/openai-compatible` 已证实的 `reasoning-0` / `txt-0` producer
   signature 启用 adapter pending-end 生命周期规范化
-- 计划实现范围：`packages/opencode/src/session/llm.ts`、`packages/opencode/src/session/llm/ai-sdk.ts`
+- 实际实现范围：`packages/opencode/src/session/llm.ts`、`packages/opencode/src/session/llm/ai-sdk.ts`
   与 adapter/processor 回归测试；不修改 processor、TUI、LLMEvent/Session schema 或外部 provider 包
-- 实现门禁：本文件经用户确认后，先添加保留真实失败序列的红测，再逐单元修改 adapter；
-  未确认前不修改代码或测试
+- 实现门禁记录：用户确认方案与完成时机取舍后，先提交真实 HTTP 红测 `af9463c6dd`，再提交生产
+  修复 `1c670a4a98`、边界测试 `ab333813c3` 与 incomplete-stream 补证 `d13dcd5125`
 
 ## 一、现象与复现
 
@@ -35,7 +36,7 @@ Reporter 提供的环境，以及本地复现与其对齐的关键项：
 - Reporter 描述/重建的 provider wire shape：同一 turn 内交替出现 `reasoning_content` 与 `content`
   delta；本地没有访问 Reporter endpoint，而是用假 SSE 精确构造该 shape。
 
-当前缺陷在满足以下条件时必现：
+修复前缺陷在满足以下条件时必现：
 
 1. 请求走 `streamText(...).fullStream → LLMAISDK.toLLMEvents()` 的 AI SDK 路径；
 2. provider 在同一 step 内对 reasoning 发出两个或更多 start/delta/end 生命周期；
@@ -45,7 +46,7 @@ Reporter 提供的环境，以及本地复现与其对齐的关键项：
    reasoning-end 后的 stream flush 出现，期间没有 tool、不同 reasoning ID 或 step 边界；
 6. 若要观察 Issue 所述可见症状，TUI 需显示 reasoning part；持久化碎片本身不依赖 TUI。
 
-Reporter 实际 turn 重复该模式 34 次，当前 processor 因而持久化 34 个 reasoning part。满足上述
+Reporter 实际 turn 重复该模式 34 次，修复前 processor 因而持久化 34 个 reasoning part。满足上述
 条件时结果由状态机决定，不是概率问题。
 
 ### 1.3 最小复现
@@ -88,7 +89,7 @@ finish
 不改变 reasoning 碎片结论，但决定了 adapter normalization 必须允许同 ID reasoning 跨 text
 delta 继续同一个下游 lifecycle。
 
-把上述 `fullStream` 映射成 processor 输入后，当前实现执行：
+把上述 `fullStream` 映射成 processor 输入后，修复前基线执行：
 
 ```text
 reasoning-start(r0) → 创建 PartID=P1
@@ -100,7 +101,7 @@ reasoning-end(r0)   → 完成 P2
 最终 reasoning parts 为 `P1(text="reason-1")` 与 `P2(text="reason-2")`，TUI 显示两个
 `Thought`。Reporter 的 34 次交替是同一最小状态转移的重复。
 
-现有窄测：
+修复前已有窄测：
 
 ```text
 bun test test/session/llm.test.ts \
@@ -132,7 +133,7 @@ custom OpenAI-compatible SSE
       ReasoningPart 逐个渲染 ReasoningHeader("Thought", duration)
 ```
 
-当前基线关键位置：
+分析基线关键位置：
 
 - `node_modules/.bun/@ai-sdk+openai-compatible@2.0.41+d6123d32214422cb/node_modules/`
   `@ai-sdk/openai-compatible/dist/index.js:727-752,865-870`；
@@ -150,7 +151,7 @@ custom OpenAI-compatible SSE
   规范化成一个 start/delta/end lifecycle，再由 processor 持久化成一个 PartID 和一个 `Thought`。
 - 边界预期：其他 provider、匿名 ID、非 package 合成 ID、跨 text-end/tool/step 的 reasoning block
   必须保持现有生命周期；一旦观察到 raw reasoning metadata，停止该 stream 后续 normalization。
-- 实际：processor 把每次 end 后的同 ID reopen 当成新身份，为每段分配新 PartID；TUI 逐 part
+- 修复前实际：processor 把每次 end 后的同 ID reopen 当成新身份，为每段分配新 PartID；TUI 逐 part
   显示 header。
 
 ## 二、根因分析
@@ -261,7 +262,7 @@ Reporter 建议保留 map entry 的方向抓住了“希望复用 PartID”的�
 - **机械推论**：若 Reporter endpoint 的 wire shape 与其描述一致，则锁定 provider 状态机必然生成
   本地复现的 end/text/reopen 序列，processor 必然创建多个 PartID；
 - **产品选择**：把这些 segments 归并为一个 Thought 不是原始 ID 能证明的事实，而是本 Issue 要
-  达到的兼容行为，连同完成时机/duration 取舍一起等待确认。
+  达到的兼容行为；完成时机/duration 取舍已由用户在实现前确认。
 
 ### 2.6 不可能三角与残余风险
 
@@ -274,7 +275,7 @@ Reporter 建议保留 map entry 的方向抓住了“希望复用 PartID”的�
 本方案保留第 2、3 项，明确牺牲受影响 provider 的部分第 1 项：pending end 会延迟到
 `text-end`、tool、step 或 finish barrier。其残余风险是普通 `@ai-sdk/openai-compatible`
 reasoning→text（之后不 reopen）的 TUI 会在 text streaming 期间继续显示 `Thinking`，duration 也
-包含这段等待时间。该行为必须由回归测试固定，并在实现确认时作为显式产品取舍接受。
+包含这段等待时间。该行为已作为显式产品取舍接受，并由回归测试固定。
 
 其他方向及风险：
 
@@ -294,11 +295,11 @@ consumer：`Lifecycle.reasoningEnd()` 删除 active ID，processor 写入 `time.
 同时，`reasoning-0` 是 package 对所有 reasoning 硬编码的合成 ID，并非模型提供的语义 block ID；
 “同 ID”本身不能数学证明两个 segments 必属同一思考。把该 package 在一个 step、同一 active text
 block 两侧产生的 segments 归并，是基于 Issue 的产品预期与已证实 producer 机制所选择的兼容策略，
-不是从 ID 唯一推出的事实。这也是方案必须等待用户接受完成时机/duration 取舍后才实现的原因。
+不是从 ID 唯一推出的事实。因此实现前先由用户确认了完成时机/duration 取舍。
 
 同一输入在三个状态机中的差异如下：
 
-| 步骤 | AI SDK 2.0.41 输出                 | 当前 adapter / processor          | 拟议 gated adapter / processor         | 首个差异 |
+| 步骤 | AI SDK 2.0.41 输出                 | 修复前 adapter / processor         | 已实现 gated adapter / processor       | 首个差异 |
 | ---- | ---------------------------------- | --------------------------------- | -------------------------------------- | -------- |
 | 1    | `reasoning-start(r0)`              | 转发；创建 active P1              | 转发；创建 active P1                   | 否       |
 | 2    | `reasoning-delta(r0, "reason-1")`  | 转发；追加到 P1                   | 转发；追加到 P1                        | 否       |
@@ -669,41 +670,38 @@ finish-step/finish
 
 ## 六、测试用例清单
 
-| 类型 | 用例描述                                                 | 关键断言                                                                                                        | 状态（修复后回填） |
-| ---- | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------ |
-| 回归 | gated adapter 输入真实 GLM 交错序列两次                  | 1 start、2 delta、1 end；end 在 text-end 前；text 事件原序                                                      | 待加；先红后绿     |
-| 回归 | HTTP mock `.reason.text.reason.text` 走真实 AI SDK 路径  | 一个 reasoning part、一个 text part；文本完整；reasoning terminal update 一次                                   | 待加；先红后绿     |
-| 回归 | Reporter 规模：相同模式重复 34 次                        | reasoning part 数恒为 1；34 个 reasoning delta 无丢失/重复；pending 有界                                        | 待加               |
-| 新增 | gate=false 的相同事件序列                                | 与当前 adapter 输出逐事件等价，不发生合并                                                                       | 待加               |
-| 新增 | gated 普通单段 reasoning→text，不再 reopen               | end 明确延迟到 text-end；text delta 不被缓冲                                                                    | 待加               |
-| 新增 | 匿名 ID lifecycle（独立及 pending 之后）                 | 独立输入保持 fallback/reset；pending 后先 flush，再按既有 counter 分配，不复用下游 active lifecycle             | 待加               |
-| 新增 | 同 step 内不同 reasoning ID                              | pending 先 flush；两个完整 lifecycle                                                                            | 待加               |
-| 新增 | 同 ID 但 end→start 间隔为空                              | pending 先 flush；没有 `txt-0` bridge 时保持两个 lifecycle                                                      | 待加               |
-| 新增 | raw metadata 首次出现在 start、delta 或 end              | 若有 pending 则先 flush；合法/非法值均保持既有 mapper 结果；停止后续合并                                        | 待加               |
-| 新增 | 已合并一次后出现未来 package 才可能产生的 late metadata  | 不撤销既有输出；保持既有 metadata 映射并停止新合并；signature 断言提示复审                                      | 待加               |
-| 新增 | 不同 text ID 与 source/file/abort barrier                | 先 flush pending；ignored event 行为不变                                                                        | 待加               |
-| 新增 | tool-input/call/result/error/approval barrier            | tool 前 flush pending；事件顺序不变                                                                             | 待加               |
-| 新增 | text-end、start/start-step/finish-step、finish barrier   | pending 各自至多 flush 一次；不跨 stream/step；incomplete finish 的 end/step-finish/provider-error 保持同 batch | 待加               |
-| 新增 | duplicate end、pending 后无 start delta、完全 orphan end | pending 幂等；bridge 后 delta 可恢复；从未向下游发 start 的 end 不进入 pending                                  | 待加               |
-| 新增 | retryable error 出现在 pending end 之后                  | 先持久化首尝试 end，再重抛原 error；retry 不合并/遗留 part                                                      | 待加               |
-| 新增 | 无 finish 的 iterable exhaustion                         | 尾部 drain pending 恰好一次；既有 incomplete settlement 仍生效                                                  | 待加               |
-| 新增 | interrupt 与 adapter state 复用                          | cleanup 收尾；无跨 stream pending；gate 在合法 reset 后保持                                                     | 待加               |
-| 既有 | `test/session/llm.test.ts` adapter suite                 | 除 gated 新契约外全部通过                                                                                       | 待运行             |
-| 既有 | `test/session/processor-effect.test.ts` 相关 suite       | 全部通过                                                                                                        | 待运行             |
-| 既有 | CLI run/session-data reasoning streaming tests           | 全部通过；证明没有 end retraction                                                                               | 待运行             |
-| 静态 | `packages/opencode` 的 `bun typecheck`                   | 通过                                                                                                            | 待运行             |
+| 类型 | 用例描述                                                 | 关键断言                                                                                                        | 最终状态与证据                                              |
+| ---- | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| 回归 | gated adapter 输入真实 GLM 交错序列两次                  | 1 start、2 delta、1 end；end 在 text-end 前；text 事件原序                                                      | 通过：`coalesces the openai-compatible...`                  |
+| 回归 | HTTP mock `.reason.text.reason.text` 走真实 AI SDK 路径  | 一个 reasoning part、一个 text part；文本完整                                                                   | 先红后绿；`processor-effect.test.ts`                         |
+| 回归 | Reporter 规模：相同模式重复 34 次                        | 1 start、34 delta、1 end；pending 最终为空                                                                       | 通过：`keeps one bounded...34 segments`                     |
+| 新增 | gate=false 的相同事件序列                                | 保持修复前逐事件生命周期                                                                                         | 通过                                                        |
+| 新增 | gated 普通单段 reasoning→text，不再 reopen               | end 延迟到 text-end；text delta 不缓冲                                                                           | 通过；显式锁定已接受的时机取舍                              |
+| 新增 | 匿名 ID、不同 reasoning ID、空 end→start 间隔            | pending 先 flush，不发生跨 lifecycle 合并                                                                        | 通过                                                        |
+| 新增 | 不同 text ID                                             | pending 先 flush，再按原 text mapper 处理                                                                        | 通过                                                        |
+| 新增 | raw metadata 出现在 start、delta、end 或 pending 之后    | raw 存在即禁用；合法 metadata 保留；已发终态不撤销                                                               | 通过；非法 schema 仍走未改动的既有 decoder                  |
+| 新增 | raw、ignored、tool 与 step barrier                       | raw 透明；其他语义 barrier 先 flush；可见事件顺序不变                                                           | 通过：代表事件单测 + 未改 mapper 分支审计                   |
+| 新增 | text-end、finish-step、finish 与 state reset             | end 同批位于 settlement 前；incomplete 三事件不拆批；reset 保留 gate                                             | 通过                                                        |
+| 新增 | duplicate end、bridged delta、orphan end                 | pending 幂等；delta 恢复；没有已发 start 的 end 不进入 pending                                                   | 通过                                                        |
+| 新增 | typed stream error 与 drain helper                       | error Cause 保持同一对象；pending drain 幂等                                                                     | 通过：adapter 组件测试；`llm.ts` 组合路径经代码审计         |
+| 集成 | compatible stream 在 pending 后异常结束                  | reasoning part 在 incomplete settlement 前获得 terminal end                                                     | 通过：`finalizes pending reasoning...incomplete`            |
+| 新增 | iterable exhaustion 与 interrupt                         | exhaustion 使用同一 drain；interrupt 不被 catch，仍由 processor cleanup                                         | 通过：helper/组合代码审计 + 既有 interruption suites       |
+| 既有 | `test/session/llm.test.ts`                               | 新增合同与既有 adapter/stream 行为共同通过                                                                       | 52 pass，0 fail，169 assertions                             |
+| 既有 | `test/session/processor-effect.test.ts`                  | HTTP 回归、incomplete settlement、retry/interrupt 与既有 processor 行为通过                                      | 35 pass，0 fail，220 assertions                             |
+| 既有 | CLI session-data 与 stream transport                     | 没有 end retraction；现有 reasoning/重放 consumer 合同不变                                                      | 13 + 30 pass，0 fail                                       |
+| 静态 | `packages/opencode` 的 `bun typecheck`                   | 类型检查通过                                                                                                     | 通过：`tsgo --noEmit`                                      |
 
 ## 七、代码更新清单
 
-| 文件                                                      | 函数 / 行号                                    | 改动概述                                                                       | 状态（修复后回填） |
-| --------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------ | ------------------ |
-| `packages/opencode/src/session/llm.ts`                    | `streamBatches()` / `adapterState()`           | 传入 npm gate；exhaustion/failure drain pending，失败仍原样交给 retry policy   | 待改；等待确认     |
-| `packages/opencode/src/session/llm/ai-sdk.ts`             | `adapterState()`                               | 增加 immutable gate、两个 runtime flags 与 pending end，并保证 reset 不丢 gate | 待改；等待确认     |
-| `packages/opencode/src/session/llm/ai-sdk.ts`             | `toLLMEvents()` / `drainPendingReasoningEnd()` | 只匹配已证实 producer signature；统一 barrier/exhaustion/failure 幂等 flush    | 待改；等待确认     |
-| `packages/opencode/test/session/llm.test.ts`              | adapter scenarios                              | 固化真实序列、gate、metadata、ID、tool/step/finish/error 边界                  | 待加；等待确认     |
-| `packages/opencode/test/session/processor-effect.test.ts` | HTTP mock reasoning scenario                   | 经真实 provider+adapter 验证单一持久化 part 与单次 terminal PartUpdated        | 待加；等待确认     |
+| 文件                                                      | 函数 / 区域                                    | 实际改动                                                                       | 最终状态 |
+| --------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------ | -------- |
+| `packages/opencode/src/session/llm.ts`                    | `streamBatches()` / `adapterState()`           | 传入 npm gate；exhaustion/failure drain pending，失败原样交给 retry policy      | 已完成   |
+| `packages/opencode/src/session/llm/ai-sdk.ts`             | `adapterState()`                               | 增加 immutable gate、两个 runtime flags 与有界 pending end；reset 保留 gate    | 已完成   |
+| `packages/opencode/src/session/llm/ai-sdk.ts`             | `toLLMEvents()` / `drainPendingReasoningEnd()` | 只匹配已证实 signature；barrier 共用幂等 drain                                 | 已完成   |
+| `packages/opencode/test/session/llm.test.ts`              | adapter scenarios                              | 固化真实序列、gate、metadata、ID、barrier、error 与 34 段边界                  | 已完成   |
+| `packages/opencode/test/session/processor-effect.test.ts` | HTTP mock scenarios                            | 真实 provider+adapter 单 part 回归；异常结束时 pending reasoning 获得终态      | 已完成   |
 
-明确不计划修改：
+最终 diff 确认未修改：
 
 - `packages/opencode/src/session/processor.ts`；
 - `packages/tui/src/routes/session/index.tsx`；
@@ -714,14 +712,70 @@ finish-step/finish
 
 ## 八、文档更新清单
 
-| 文档路径                                                | 要改什么                                                                                                                               | 状态（修复后回填）         |
-| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
-| `docs/fixes/session-fix-fragmented-reasoning-blocks.md` | 已补真实 provider/fullStream 复跑、consumer 终态审计、原方案否决、gated adapter 规约与测试矩阵；实现后回填红绿测试、diff 审核和 commit | 审计已更新；实现状态待回填 |
+| 文档路径                                                | 更新内容                                                                                                   | 最终状态 |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | -------- |
+| `docs/fixes/session-fix-fragmented-reasoning-blocks.md` | 真实 fullStream 证据、consumer 审计、修复规约、红绿结果、实现 commit、测试矩阵与最终五维审计                | 已完成   |
 
 本方案不改变 schema、公开接口、错误码、用户配置或 PartUpdated 终态语义；它只改变
 `@ai-sdk/openai-compatible` 路径中无 metadata、显式 `reasoning-0` / `txt-0` producer signature 的
 reasoning terminal 发出时机。该行为
-契约由本修复文档与回归测试共同固定。若实现中发现必须撤销已发布的 end、主动泛化到匿名/不同 ID
+契约由本修复文档与回归测试共同固定。若未来修改必须撤销已发布的 end、主动泛化到匿名/不同 ID
 或非 package signature、跨 text-end/tool/step 复用或新增 pause/时长字段，则超出本方案：必须
 停止实现并返回契约/设计流程重新确认。未来 package 若开始产生 reasoning metadata，也必须按依赖
 升级门禁复审，不能把当前无 metadata 的证据静默外推。
+
+## 九、实现与最终审计记录
+
+### 9.1 红绿门禁与提交边界
+
+| 提交         | 内容                                                     | 结果 |
+| ------------ | -------------------------------------------------------- | ---- |
+| `af9463c6dd` | 真实 HTTP `.reason.text.reason.text` 回归                | 修复前按预期失败：期望 1 个 reasoning part，实际 2 个 |
+| `1c670a4a98` | npm-gated pending-end 状态机与 stream drain              | 红测转绿；既有 adapter suite 与 typecheck 通过 |
+| `ab333813c3` | adapter 合同边界、34 段规模、metadata/barrier/reset 测试 | 分层回归通过 |
+| `d13dcd5125` | compatible stream 异常结束时的 pending terminal 集成证据 | processor 完成 reasoning 后按既有 incomplete 规则停止 |
+
+每个工作单元都在继续下一步前单独提交。实现没有把红测和生产修改压进同一个 commit，因此可以从
+Git 历史直接复核失败合同、修复和边界证明。
+
+### 9.2 2026-08-05 最终验证结果
+
+所有命令均从 `packages/opencode` 运行：
+
+| 命令 / suite | 结果 |
+| ------------ | ---- |
+| targeted HTTP 回归（生产修改前） | 0 pass，1 fail；`reasoning.length` expected 1 / received 2 |
+| targeted HTTP 回归（生产修改后） | 1 pass，0 fail |
+| `bun test test/session/llm.test.ts --timeout 90000` | 52 pass，0 fail，169 assertions |
+| `bun test test/session/processor-effect.test.ts --timeout 90000` | 35 pass，0 fail，220 assertions |
+| `bun test test/cli/run/session-data.test.ts --timeout 90000` | 13 pass，0 fail，22 assertions |
+| `bun test test/cli/run/stream.transport.test.ts --timeout 90000` | 30 pass，0 fail，62 assertions |
+| `bun typecheck` | 通过；`tsgo --noEmit` |
+| `git diff --check` | 通过 |
+
+这里报告的是按影响面选择的分层 suites，不宣称运行了整个 monorepo 的所有测试。
+
+### 9.3 五维合同审计
+
+| 维度 | 审计证据 | 结论 |
+| ---- | -------- | ---- |
+| 数据 | 新状态仅含 frozen gate、两个 boolean 与一个固定 ID pending marker；不缓存 token/text；无 schema/config 变化 | 通过 |
+| 函数 | gate=false 走原 mapper；支持域只接受显式 r0/t0、无 raw metadata；所有非 raw barrier 共用同一 drain | 通过 |
+| 持久化 | HTTP 回归只生成一个 reasoning part；异常结束时 part 有 `time.end`；未修改 processor/PartID/DB projector | 通过 |
+| consumer | 从未发布 end retraction；CLI session-data 与 stream transport suites 全过；TUI/share/SDK 无需适配 | 通过 |
+| 集成 | gate 只取 `model.api.npm` 精确值；native 在 state 创建前返回；其他 AI SDK provider 默认关闭；错误分类不改 | 通过 |
+
+### 9.4 最终范围与残余风险
+
+从设计确认提交 `f4f68de772` 到实现审计提交 `d13dcd5125`，代码与测试 diff 只涉及四个预定文件：
+
+- `packages/opencode/src/session/llm.ts`；
+- `packages/opencode/src/session/llm/ai-sdk.ts`；
+- `packages/opencode/test/session/llm.test.ts`；
+- `packages/opencode/test/session/processor-effect.test.ts`。
+
+没有修改 processor 生产逻辑、TUI、LLMEvent/Session schema、依赖、CLI consumer 或公开配置。剩余风险
+仍是已确认的产品取舍：普通 compatible reasoning 的 terminal/duration 可能延迟到 text-end 或其他
+barrier。若 provider package 改变合成 ID、text lifecycle 或开始附加 reasoning metadata，当前 guard
+会停止新的 normalization；届时应更新真实 integration fixture 并重新走依赖升级与合同审计，而不是
+扩大当前匹配范围。
