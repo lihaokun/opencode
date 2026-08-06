@@ -1,6 +1,6 @@
 # 修正方案 — `session: incomplete provider stream recovery`
 
-- 状态：已完成第二轮契约审计的草案，等待确认；尚未修改实现
+- 状态：方案已确认；Unit A（契约与共享决策核心）完成，等待进入 legacy runtime Unit B
 - 日期：2026-08-06
 - 对应问题：[lihaokun/opencode Issue #7](https://github.com/lihaokun/opencode/issues/7)
 - 前置修复：[Issue #3 修正方案](./session-fix-incomplete-provider-stream.md)
@@ -305,12 +305,12 @@ type IncompleteStreamRecovery = {
 类型不变量：
 
 1. `tools` 中 ID 在当前 assistant attempt 内唯一，且与 durable tool parts 一一对应；
-2. `terminalResultPersisted => completeCall && inputPersisted && state in {completed,error}`；
+2. `terminalResultPersisted => completeCall && inputPersisted && providerExecuted && state in {completed,error}`；
 3. `pending/running => !terminalResultPersisted`；`interrupted=true` 的 evidence 不可视为正常 settled；
 4. `action=safe-retry => tools.length===0 && attempt<limit`；不允许按 tool name 设置例外；
 5. `action=continue-after-settled-tools => tools.length>0`；
 6. continuation 中对每个 tool 均满足
-   `completeCall && inputPersisted && terminalResultPersisted && state in {completed,error} && !interrupted`；
+   `completeCall && inputPersisted && providerExecuted && terminalResultPersisted && state in {completed,error} && !interrupted`；
 7. `action=manual-stop` 时若存在 uncertain tool，`tools` 保留其 id/name/failure-boundary state；
 8. recovery 与 error 同属 failed assistant；不得把旧 assistant 改写为 success；
 9. 一次活跃恢复链内 `0 <= attempt <= limit` 且按新 assistant 单调递增；自然 continuation/new user input
@@ -346,6 +346,7 @@ decide(blocked, persistenceFailed, tools, attempt, limit):
 
   if every(tool.completeCall
                and tool.inputPersisted
+               and tool.providerExecuted
                and tool.terminalResultPersisted
                and tool.state in {completed,error}
                and not tool.interrupted):
@@ -628,35 +629,35 @@ I15: legacy 自动恢复链在 successor 前不进入 idle；ManualStop/最终�
 
 ## 六、测试用例清单
 
-| 类型     | 用例描述                                                                                           | 状态（修复后回填）                                                  |
-| -------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| 回归     | legacy 无 tool incomplete：旧 assistant failed；新 ID retry；成功后自动完成                        | 待加                                                                |
-| 回归     | legacy settled local tool：副作用一次；failed assistant 保留；下一 turn 看见 result                | 待加                                                                |
-| 回归     | current settled local tool：execution 一次；新 assistant continuation；只带 tool context           | 待加                                                                |
-| 回归     | retry 达 2 次上限：共 3 个不同 assistant IDs；最后 ManualStop                                      | 待加                                                                |
-| 新增     | partial reasoning/text 在 failed transcript 可见，但 SafeRetry request 不含旧 partial              | 待加                                                                |
-| 新增     | settled completed/error 混合的多工具集合可 continuation，全部只执行一次                            | 待加                                                                |
-| 新增     | Continue 保持多工具原顺序/call ID 配对；同 provider 仅保留 tool 所需 metadata；跨 model 按既有降级 | 待加                                                                |
-| 新增     | 多工具仅部分结算 => ManualStop，诊断列出每个 uncertain id/name/state                               | 待加                                                                |
-| 新增     | local pending/running => ManualStop；cleanup 后 recovery 仍保留 original state                     | 待加                                                                |
-| 新增     | providerExecuted terminal result/error => Continue；无 result => ManualStop                        | 待加                                                                |
-| 新增     | tool result persistence failure => ManualStop，不依据内存 settled 继续                             | 待加                                                                |
-| 新增     | permission/question 默认 deny => ManualStop；legacy continue-on-deny 且 error 已持久化 => Continue | 待加                                                                |
-| 新增     | StructuredOutput 无完整 call 时 SafeRetry；已完成 call 时 Continue；旧 structured 不提升/不泄漏    | 待加                                                                |
-| 新增     | compaction/summary incomplete 产生新 summary ID retry；不消费 failed partial；只在成功后 Compacted | 待加                                                                |
-| 新增     | current clean EOF 无 step settlement：按同一 classifier 决策                                       | 待加                                                                |
-| 新增     | raw-defined unknown 不进入 incomplete auto recovery                                                | 待加                                                                |
-| 新增     | high-usage raw-missing 的 step-finish/provider-error 保持同 batch，recovery 优先于 compaction      | 待加                                                                |
-| 新增     | auto recovery 最终成功不发 terminal `session.error`，`opencode run` exit 0；耗尽时 exit 1          | 待加                                                                |
-| 新增     | SafeRetry/Continue 的 successor 前不发 idle；retry→busy 顺序稳定；ManualStop 才 idle               | 待加                                                                |
-| 新增     | failed attempt 与 successor usage/cost 分别保留、不合并                                            | 待加                                                                |
-| 新增     | current runner 在 process restart 后不把 persisted recovery 自动当作 provider work                 | 待加                                                                |
-| 新增     | `steps=1` 时 SafeRetry 保持同一 logical step/request shape，不提前注入 MAX_STEPS；Continue 才递增  | 待加                                                                |
-| 新增     | SafeRetry 间隙若提升新 user/steer，旧 chain 终止，新输入从 step 1 / attempt 0 开始                 | 待加                                                                |
-| 新增     | SafeRetry 不重复 title/summary/task consumption；重建请求不含 failed partial                       | 待加                                                                |
-| 回归     | stop/tool-calls/length/content-filter/context-overflow/API error 语义不变                          | 待跑/补                                                             |
-| Property | 对 facts 组合生成：I3-I5 决策互斥且完备；I4 对任一 uncertain tool 恒不成立                         | 待加；计划在 core devDependency 显式使用 `fast-check@4.8.0`，需确认 |
-| 跨实现   | 同一组 normalized vectors 输入 legacy/current normalizer，recovery action 完全一致                 | 待加                                                                |
+| 类型     | 用例描述                                                                                           | 状态（修复后回填）                                               |
+| -------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| 回归     | legacy 无 tool incomplete：旧 assistant failed；新 ID retry；成功后自动完成                        | 待加                                                             |
+| 回归     | legacy settled local tool：副作用一次；failed assistant 保留；下一 turn 看见 result                | 待加                                                             |
+| 回归     | current settled local tool：execution 一次；新 assistant continuation；只带 tool context           | 待加                                                             |
+| 回归     | retry 达 2 次上限：共 3 个不同 assistant IDs；最后 ManualStop                                      | 待加                                                             |
+| 新增     | partial reasoning/text 在 failed transcript 可见，但 SafeRetry request 不含旧 partial              | 待加                                                             |
+| 新增     | settled completed/error 混合的多工具集合可 continuation，全部只执行一次                            | 待加                                                             |
+| 新增     | Continue 保持多工具原顺序/call ID 配对；同 provider 仅保留 tool 所需 metadata；跨 model 按既有降级 | 待加                                                             |
+| 新增     | 多工具仅部分结算 => ManualStop，诊断列出每个 uncertain id/name/state                               | 待加                                                             |
+| 新增     | local pending/running => ManualStop；cleanup 后 recovery 仍保留 original state                     | 待加                                                             |
+| 新增     | providerExecuted terminal result/error => Continue；无 result => ManualStop                        | 待加                                                             |
+| 新增     | tool result persistence failure => ManualStop，不依据内存 settled 继续                             | 待加                                                             |
+| 新增     | permission/question 默认 deny => ManualStop；legacy continue-on-deny 且 error 已持久化 => Continue | 待加                                                             |
+| 新增     | StructuredOutput 无完整 call 时 SafeRetry；已完成 call 时 Continue；旧 structured 不提升/不泄漏    | 待加                                                             |
+| 新增     | compaction/summary incomplete 产生新 summary ID retry；不消费 failed partial；只在成功后 Compacted | 待加                                                             |
+| 新增     | current clean EOF 无 step settlement：按同一 classifier 决策                                       | 待加                                                             |
+| 新增     | raw-defined unknown 不进入 incomplete auto recovery                                                | 待加                                                             |
+| 新增     | high-usage raw-missing 的 step-finish/provider-error 保持同 batch，recovery 优先于 compaction      | 待加                                                             |
+| 新增     | auto recovery 最终成功不发 terminal `session.error`，`opencode run` exit 0；耗尽时 exit 1          | 待加                                                             |
+| 新增     | SafeRetry/Continue 的 successor 前不发 idle；retry→busy 顺序稳定；ManualStop 才 idle               | 待加                                                             |
+| 新增     | failed attempt 与 successor usage/cost 分别保留、不合并                                            | 待加                                                             |
+| 新增     | current runner 在 process restart 后不把 persisted recovery 自动当作 provider work                 | 待加                                                             |
+| 新增     | `steps=1` 时 SafeRetry 保持同一 logical step/request shape，不提前注入 MAX_STEPS；Continue 才递增  | 待加                                                             |
+| 新增     | SafeRetry 间隙若提升新 user/steer，旧 chain 终止，新输入从 step 1 / attempt 0 开始                 | 待加                                                             |
+| 新增     | SafeRetry 不重复 title/summary/task consumption；重建请求不含 failed partial                       | 待加                                                             |
+| 回归     | stop/tool-calls/length/content-filter/context-overflow/API error 语义不变                          | 待跑/补                                                          |
+| Property | 对 facts 组合生成：I3-I5 决策互斥且完备；I4 对任一 uncertain tool 恒不成立                         | Unit A 已加：7 tests / 527 assertions 通过；runtime chain 后续补 |
+| 跨实现   | 同一组 normalized vectors 输入 legacy/current normalizer，recovery action 完全一致                 | 待加                                                             |
 
 现有 1.4 九个 stream fixture/触发序列必须保留为回归素材；预期从 fail-stop 改成 recovery 的用例应更新
 断言，不得删除输入场景。真正属于 ManualStop 的安全性断言不得弱化。
@@ -665,12 +666,12 @@ I15: legacy 自动恢复链在 successor 前不进入 idle；ManualStop/最终�
 
 | 文件                                                            | 函数 / 行号                               | 改动概述                                                                   | 状态（修复后回填） |
 | --------------------------------------------------------------- | ----------------------------------------- | -------------------------------------------------------------------------- | ------------------ |
-| `packages/schema/src/session-recovery.ts`                       | 新文件                                    | 定义 recovery/action/tool evidence schema 与不变量 vocabulary              | 待加               |
-| `packages/schema/src/session-message.ts`                        | `Assistant`                               | current assistant 增加 optional recovery                                   | 待改               |
-| `packages/schema/src/v1/session.ts`                             | `Assistant`                               | legacy assistant 增加 optional recovery                                    | 待改               |
-| `packages/schema/src/session-event.ts`                          | `Step.Failed`                             | current failed event 携带 optional recovery                                | 待改               |
-| `packages/llm/src/schema/errors.ts`                             | `ProviderFailureClassification`           | 增加 `incomplete-stream`                                                   | 待改               |
-| `packages/core/src/session/incomplete-stream-recovery.ts`       | 新文件                                    | 共享纯决策函数                                                             | 待加               |
+| `packages/schema/src/session-recovery.ts`                       | 新文件                                    | 定义 recovery/action/tool evidence schema 与不变量 vocabulary              | Unit A 已完成      |
+| `packages/schema/src/session-message.ts`                        | `Assistant`                               | current assistant 增加 optional recovery                                   | Unit A 已完成      |
+| `packages/schema/src/v1/session.ts`                             | `Assistant`                               | legacy assistant 增加 optional recovery                                    | Unit A 已完成      |
+| `packages/schema/src/session-event.ts`                          | `Step.Failed`                             | current failed event 携带 optional recovery                                | Unit A 已完成      |
+| `packages/llm/src/schema/errors.ts`                             | `ProviderFailureClassification`           | 增加 `incomplete-stream`                                                   | Unit A 已完成      |
+| `packages/core/src/session/incomplete-stream-recovery.ts`       | 新文件                                    | 共享纯决策函数                                                             | Unit A 已完成      |
 | `packages/opencode/src/session/llm/ai-sdk.ts`                   | `toLLMEvents`                             | raw-missing 发稳定 classification                                          | 待改               |
 | `packages/opencode/src/session/processor.ts`                    | provider error / settlement / cleanup     | cleanup 前 facts、持久化 recovery、禁止同 message replay                   | 待改               |
 | `packages/opencode/src/session/prompt.ts`                       | `runLoop`                                 | active-chain bounded SafeRetry、settled-tool continuation、新 assistant ID | 待改               |
@@ -680,8 +681,9 @@ I15: legacy 自动恢复链在 successor 前不进入 idle；ManualStop/最终�
 | `packages/core/src/session/runner/llm.ts`                       | `runTurnAttempt` / outer run              | current recovery transition、bounded retry、clean EOF detection            | 待改               |
 | `packages/core/src/session/runner/to-llm-message.ts`            | `assistant`                               | current recovery-aware selective projection                                | 待改               |
 | `packages/core/src/session/message-updater.ts`                  | `session.next.step.failed`                | 把 event recovery 投影到 current assistant                                 | 待改               |
-| `packages/core/package.json` / `bun.lock`                       | devDependency                             | 若确认 property test，显式加入 `fast-check@4.8.0`                          | 待确认             |
-| `packages/schema/test/*`                                        | schema contracts                          | optional omission、stable identifier、current/V1 字段 round-trip           | 待加/改            |
+| `packages/core/package.json` / `bun.lock`                       | devDependency                             | 若确认 property test，显式加入 `fast-check@4.8.0`                          | Unit A 已完成      |
+| `packages/schema/test/*`                                        | schema contracts                          | optional omission、stable identifier、current/V1 字段 round-trip           | Unit A 5/5 通过    |
+| `packages/llm/test/schema.test.ts`                              | classification schema                     | closed enum 与 canonical `incomplete-stream`                               | Unit A 9/9 通过    |
 | `packages/opencode/test/session/llm.test.ts`                    | adapter tests                             | classification 与正常 finish 回归                                          | 待改               |
 | `packages/opencode/test/session/processor-effect.test.ts`       | processor tests                           | 三路 facts、cleanup/persistence 边界                                       | 待改               |
 | `packages/opencode/test/session/prompt.test.ts`                 | loop tests                                | 新 ID、有界 retry、settled continuation、structured、usage/cost            | 待改               |
@@ -691,8 +693,8 @@ I15: legacy 自动恢复链在 successor 前不进入 idle；ManualStop/最终�
 | `packages/opencode/test/tool/task.test.ts`                      | Task/subagent                             | child auto recovery success 与 terminal ManualStop 传播                    | 待改               |
 | `packages/core/test/session-runner.test.ts`                     | runner tests                              | current 三路、clean EOF、attempt limit                                     | 待改               |
 | `packages/core/test/session-runner-tool-events.test.ts`         | publisher tests                           | failure-boundary tool facts 与 persistence ordering                        | 待改               |
-| `packages/core/test/session-incomplete-stream-recovery.test.ts` | 新文件                                    | truth table/property/cross-vector tests                                    | 待加               |
-| `packages/client/src/generated*`                                | `bun run generate` from `packages/client` | current public Assistant/Step.Failed 变更后生成，禁止手改                  | 待生成             |
+| `packages/core/test/session-incomplete-stream-recovery.test.ts` | 新文件                                    | truth table/property/cross-vector tests                                    | Unit A 7/7 通过    |
+| `packages/client/src/generated*`                                | `bun run generate` from `packages/client` | current public Assistant/Step.Failed 变更后生成，禁止手改                  | Unit A 已生成      |
 | legacy JS SDK generated files                                   | `./packages/sdk/js/script/build.ts`       | legacy Assistant public schema 变更后生成，禁止手改                        | 待生成             |
 
 具体行号以实施时当前分支为准；禁止顺手重构无关 session/provider 代码。
@@ -701,12 +703,12 @@ I15: legacy 自动恢复链在 successor 前不进入 idle；ManualStop/最终�
 
 | 文档路径                                                               | 要改什么                                                                                  | 状态（修复后回填） |
 | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ------------------ |
-| `docs/fixes/session-fix-incomplete-stream-recovery.md`                 | 本八部分计划与实施/测试/commit 回填                                                       | 草案已加，待确认   |
+| `docs/fixes/session-fix-incomplete-stream-recovery.md`                 | 本八部分计划与实施/测试/commit 回填                                                       | Unit A 已回填      |
 | `docs/fixes/session-fix-incomplete-provider-stream.md`                 | 把“no-retry/current follow-up”状态更新为由 Issue #7 承接，不改写历史结论                  | 待改               |
-| `docs/design/session/architecture.md`                                  | 新建 Session feature 主架构；归属跨模块 recovery schema/invariants 与 legacy/current 边界 | 待加               |
-| `docs/design/session/subplans/session-1-incomplete-stream-recovery.md` | 半形式化共享 schema、三路流程、七项分布式契约、函数正确性论证                             | 待加               |
-| `docs/audits/session-1-incomplete-stream-recovery/expectations.md`     | 实施前独立抽取十节 expectations                                                           | 待加；代码前门禁   |
+| `docs/design/session/architecture.md`                                  | 新建 Session feature 主架构；归属跨模块 recovery schema/invariants 与 legacy/current 边界 | Unit A 已完成      |
+| `docs/design/session/subplans/session-1-incomplete-stream-recovery.md` | 半形式化共享 schema、三路流程、七项分布式契约、函数正确性论证                             | Unit A 已完成      |
+| `docs/audits/session-1-incomplete-stream-recovery/expectations.md`     | 实施前独立抽取十节 expectations                                                           | Unit A 已建立/回填 |
 | `docs/audits/session-1-incomplete-stream-recovery/audit-report.md`     | 实施后独立契约审核                                                                        | 待加               |
-| `docs/audits/session-1-incomplete-stream-recovery/decisions.md`        | 记录 warnings、retry/backoff/property dependency 等决策                                   | 待加               |
+| `docs/audits/session-1-incomplete-stream-recovery/decisions.md`        | 记录 warnings、retry/backoff/property dependency 等决策                                   | Unit A 已建立      |
 
 本修复明确改变 schema、错误分类、attempt workflow、不变量及 legacy/current 跨实现一致性，文档清单不允许写“无”。

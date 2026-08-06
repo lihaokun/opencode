@@ -8,6 +8,7 @@ import { FileAttachment, Prompt } from "./prompt"
 import { DateTimeUtcFromMillis, RelativePath, statics } from "./schema"
 import { SessionID } from "./session-id"
 import { ascending } from "./identifier"
+import { Info as IncompleteStreamRecovery } from "./session-recovery"
 
 export const ID = Schema.String.check(Schema.isStartsWith("msg_")).pipe(
   Schema.brand("Session.Message.ID"),
@@ -182,6 +183,7 @@ export const Assistant = Schema.Struct({
     cache: Schema.Struct({ read: Schema.Finite, write: Schema.Finite }),
   }).pipe(optional),
   error: UnknownError.pipe(optional),
+  recovery: IncompleteStreamRecovery.pipe(optional),
   time: Schema.Struct({
     created: DateTimeUtcFromMillis,
     completed: DateTimeUtcFromMillis.pipe(optional),

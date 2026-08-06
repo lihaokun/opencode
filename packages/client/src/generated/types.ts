@@ -663,6 +663,28 @@ export type SessionsContextOutput = {
           readonly cache: { readonly read: number; readonly write: number }
         }
         readonly error?: { readonly type: "unknown"; readonly message: string }
+        readonly recovery?: {
+          readonly classification: "incomplete-stream"
+          readonly action: "safe-retry" | "continue-after-settled-tools" | "manual-stop"
+          readonly reason:
+            | "no-tool-evidence"
+            | "settled-tools"
+            | "uncertain-side-effect"
+            | "retry-exhausted"
+            | "blocked"
+            | "persistence-failure"
+          readonly tools: ReadonlyArray<{
+            readonly id: string
+            readonly name: string
+            readonly state: "pending" | "running" | "completed" | "error"
+            readonly completeCall: boolean
+            readonly inputPersisted: boolean
+            readonly providerExecuted: boolean
+            readonly terminalResultPersisted: boolean
+            readonly interrupted: boolean
+          }>
+          readonly retry: { readonly attempt: number; readonly limit: number }
+        }
       }
     | {
         readonly type: "compaction"
@@ -878,6 +900,28 @@ export type SessionsHistoryOutput = {
           readonly sessionID: string
           readonly assistantMessageID: string
           readonly error: { readonly type: "unknown"; readonly message: string }
+          readonly recovery?: {
+            readonly classification: "incomplete-stream"
+            readonly action: "safe-retry" | "continue-after-settled-tools" | "manual-stop"
+            readonly reason:
+              | "no-tool-evidence"
+              | "settled-tools"
+              | "uncertain-side-effect"
+              | "retry-exhausted"
+              | "blocked"
+              | "persistence-failure"
+            readonly tools: ReadonlyArray<{
+              readonly id: string
+              readonly name: string
+              readonly state: "pending" | "running" | "completed" | "error"
+              readonly completeCall: boolean
+              readonly inputPersisted: boolean
+              readonly providerExecuted: boolean
+              readonly terminalResultPersisted: boolean
+              readonly interrupted: boolean
+            }>
+            readonly retry: { readonly attempt: number; readonly limit: number }
+          }
         }
       }
     | {
@@ -1336,6 +1380,28 @@ export type SessionsEventsOutput =
         readonly sessionID: string
         readonly assistantMessageID: string
         readonly error: { readonly type: "unknown"; readonly message: string }
+        readonly recovery?: {
+          readonly classification: "incomplete-stream"
+          readonly action: "safe-retry" | "continue-after-settled-tools" | "manual-stop"
+          readonly reason:
+            | "no-tool-evidence"
+            | "settled-tools"
+            | "uncertain-side-effect"
+            | "retry-exhausted"
+            | "blocked"
+            | "persistence-failure"
+          readonly tools: ReadonlyArray<{
+            readonly id: string
+            readonly name: string
+            readonly state: "pending" | "running" | "completed" | "error"
+            readonly completeCall: boolean
+            readonly inputPersisted: boolean
+            readonly providerExecuted: boolean
+            readonly terminalResultPersisted: boolean
+            readonly interrupted: boolean
+          }>
+          readonly retry: { readonly attempt: number; readonly limit: number }
+        }
       }
     }
   | {
@@ -1741,6 +1807,28 @@ export type SessionsMessageOutput = {
           readonly cache: { readonly read: number; readonly write: number }
         }
         readonly error?: { readonly type: "unknown"; readonly message: string }
+        readonly recovery?: {
+          readonly classification: "incomplete-stream"
+          readonly action: "safe-retry" | "continue-after-settled-tools" | "manual-stop"
+          readonly reason:
+            | "no-tool-evidence"
+            | "settled-tools"
+            | "uncertain-side-effect"
+            | "retry-exhausted"
+            | "blocked"
+            | "persistence-failure"
+          readonly tools: ReadonlyArray<{
+            readonly id: string
+            readonly name: string
+            readonly state: "pending" | "running" | "completed" | "error"
+            readonly completeCall: boolean
+            readonly inputPersisted: boolean
+            readonly providerExecuted: boolean
+            readonly terminalResultPersisted: boolean
+            readonly interrupted: boolean
+          }>
+          readonly retry: { readonly attempt: number; readonly limit: number }
+        }
       }
     | {
         readonly type: "compaction"
@@ -1913,6 +2001,28 @@ export type MessagesListOutput = {
           readonly cache: { readonly read: number; readonly write: number }
         }
         readonly error?: { readonly type: "unknown"; readonly message: string }
+        readonly recovery?: {
+          readonly classification: "incomplete-stream"
+          readonly action: "safe-retry" | "continue-after-settled-tools" | "manual-stop"
+          readonly reason:
+            | "no-tool-evidence"
+            | "settled-tools"
+            | "uncertain-side-effect"
+            | "retry-exhausted"
+            | "blocked"
+            | "persistence-failure"
+          readonly tools: ReadonlyArray<{
+            readonly id: string
+            readonly name: string
+            readonly state: "pending" | "running" | "completed" | "error"
+            readonly completeCall: boolean
+            readonly inputPersisted: boolean
+            readonly providerExecuted: boolean
+            readonly terminalResultPersisted: boolean
+            readonly interrupted: boolean
+          }>
+          readonly retry: { readonly attempt: number; readonly limit: number }
+        }
       }
     | {
         readonly type: "compaction"

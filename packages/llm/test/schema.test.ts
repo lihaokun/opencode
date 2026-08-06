@@ -4,6 +4,7 @@ import * as OpenAIChat from "../src/protocols/openai-chat"
 import * as OpenAIResponses from "../src/protocols/openai-responses"
 import { ContentPart, LLMEvent, LLMRequest, Model, ModelID, ProviderID, Usage } from "../src/schema"
 import { ProviderShared } from "../src/protocols/shared"
+import { ProviderFailureClassification } from "../src/schema/errors"
 
 const model = new Model({
   id: ModelID.make("fake-model"),
@@ -55,6 +56,13 @@ describe("llm schema", () => {
   test("content part tagged union exposes guards", () => {
     expect(ContentPart.guards.text({ type: "text", text: "hi" })).toBe(true)
     expect(ContentPart.guards.media({ type: "text", text: "hi" })).toBe(false)
+  })
+
+  test("accepts incomplete stream as a provider failure classification", () => {
+    const decode = Schema.decodeUnknownSync(ProviderFailureClassification)
+    expect(decode("context-overflow")).toBe("context-overflow")
+    expect(decode("incomplete-stream")).toBe("incomplete-stream")
+    expect(() => decode("retryable")).toThrow()
   })
 })
 

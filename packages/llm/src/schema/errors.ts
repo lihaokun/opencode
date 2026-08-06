@@ -1,7 +1,11 @@
 import { Schema } from "effect"
+import { Classification as IncompleteStreamClassification } from "@opencode-ai/schema/session-recovery"
 import { ModelID, ProviderID, ProviderMetadata, RouteID } from "./ids"
 
-export const ProviderFailureClassification = Schema.Literal("context-overflow")
+export const ProviderFailureClassification = Schema.Union([
+  Schema.Literal("context-overflow"),
+  IncompleteStreamClassification,
+])
 export type ProviderFailureClassification = typeof ProviderFailureClassification.Type
 
 export class HttpRequestDetails extends Schema.Class<HttpRequestDetails>("LLM.HttpRequestDetails")({

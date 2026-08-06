@@ -11,6 +11,7 @@ import { ascending } from "../identifier"
 import { SessionID } from "../session-id"
 import { WorkspaceID } from "../workspace-id"
 import { PermissionV1 } from "./permission"
+import { Info as IncompleteStreamRecovery } from "../session-recovery"
 
 const Timestamp = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))
 
@@ -458,6 +459,7 @@ export const Assistant = Schema.Struct({
     completed: Schema.optional(NonNegativeInt),
   }),
   error: Schema.optional(AssistantErrorSchema),
+  recovery: IncompleteStreamRecovery.pipe(optional),
   parentID: MessageID,
   modelID: Model.ID,
   providerID: Provider.ID,

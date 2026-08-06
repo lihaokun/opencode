@@ -12,6 +12,7 @@ import { SessionID } from "./session-id"
 import { Location } from "./location"
 import { SessionMessage } from "./session-message"
 import { Revert } from "./revert"
+import { Info as IncompleteStreamRecovery } from "./session-recovery"
 
 export { FileAttachment }
 
@@ -189,6 +190,7 @@ export namespace Step {
       ...Base,
       assistantMessageID: SessionMessage.ID,
       error: UnknownError,
+      recovery: IncompleteStreamRecovery.pipe(optional),
     },
   })
   export type Failed = typeof Failed.Type

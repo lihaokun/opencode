@@ -377,6 +377,7 @@
         "@types/turndown": "5.0.5",
         "@types/which": "3.0.4",
         "drizzle-kit": "catalog:",
+        "fast-check": "4.8.0",
       },
     },
     "packages/desktop": {
