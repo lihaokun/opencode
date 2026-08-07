@@ -3,7 +3,8 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import path from "path"
-import { tool, type ModelMessage } from "ai"
+import { streamText, tool, type ModelMessage } from "ai"
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
@@ -188,6 +189,58 @@ describe("session.llm.hasToolCalls", () => {
       },
     ] as ModelMessage[]
     expect(LLM.hasToolCalls(messages)).toBe(true)
+  })
+})
+
+describe("session.llm openai-compatible parser", () => {
+  const chunk = (delta: Record<string, unknown>, finishReason?: string) => ({
+    id: "chatcmpl-issue-8",
+    object: "chat.completion.chunk",
+    choices: [
+      {
+        delta,
+        ...(finishReason ? { finish_reason: finishReason } : {}),
+      },
+    ],
+  })
+
+  const response = (chunks: unknown[]) =>
+    new Response([...chunks.map((item) => `data: ${JSON.stringify(item)}\n\n`), "data: [DONE]\n\n"].join(""), {
+      headers: { "content-type": "text/event-stream" },
+    })
+
+  test("keeps reasoning active when streaming chunks contain empty tool call arrays", async () => {
+    const provider = createOpenAICompatible({
+      name: "issue-8",
+      baseURL: "https://example.test/v1",
+      fetch: Object.assign(
+        async () =>
+          response([
+            chunk({ role: "assistant" }),
+            chunk({ reasoning_content: "r1", tool_calls: [] }),
+            chunk({ reasoning_content: "r2", tool_calls: [] }),
+            chunk({ content: "done" }),
+            chunk({}, "stop"),
+          ]),
+        { preconnect: () => {} },
+      ),
+    })
+    const result = streamText({
+      model: provider.chatModel("glm-5.2"),
+      prompt: "reason",
+    })
+    const events = await Array.fromAsync(result.fullStream)
+    const reasoning = events.filter((event) => event.type.startsWith("reasoning-"))
+
+    expect(reasoning.map((event) => event.type)).toEqual([
+      "reasoning-start",
+      "reasoning-delta",
+      "reasoning-delta",
+      "reasoning-end",
+    ])
+    expect(
+      reasoning.flatMap((event) => (event.type === "reasoning-delta" ? [event.text] : [])).join(""),
+    ).toBe("r1r2")
   })
 })
 
