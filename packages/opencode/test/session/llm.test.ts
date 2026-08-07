@@ -242,6 +242,57 @@ describe("session.llm openai-compatible parser", () => {
       reasoning.flatMap((event) => (event.type === "reasoning-delta" ? [event.text] : [])).join(""),
     ).toBe("r1r2")
   })
+
+  test("ends reasoning before a nonempty tool call array and preserves the tool call", async () => {
+    const provider = createOpenAICompatible({
+      name: "issue-8",
+      baseURL: "https://example.test/v1",
+      fetch: Object.assign(
+        async () =>
+          response([
+            chunk({ role: "assistant" }),
+            chunk({ reasoning_content: "r1", tool_calls: [] }),
+            chunk({
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call-1",
+                  type: "function",
+                  function: { name: "lookup", arguments: '{"query":"x"}' },
+                },
+              ],
+            }),
+            chunk({}, "tool_calls"),
+          ]),
+        { preconnect: () => {} },
+      ),
+    })
+    const result = streamText({
+      model: provider.chatModel("glm-5.2"),
+      prompt: "reason",
+      tools: {
+        lookup: tool({
+          inputSchema: z.object({ query: z.string() }),
+        }),
+      },
+    })
+    const events = await Array.fromAsync(result.fullStream)
+    const types = events.map((event) => event.type)
+    const reasoningEnd = types.indexOf("reasoning-end")
+    const toolInputStart = types.indexOf("tool-input-start")
+
+    expect(events.filter((event) => event.type.startsWith("reasoning-")).map((event) => event.type)).toEqual([
+      "reasoning-start",
+      "reasoning-delta",
+      "reasoning-end",
+    ])
+    expect(types.slice(reasoningEnd, toolInputStart + 1)).toEqual(["reasoning-end", "tool-input-start"])
+    expect(events.find((event) => event.type === "tool-call")).toMatchObject({
+      toolCallId: "call-1",
+      toolName: "lookup",
+      input: { query: "x" },
+    })
+  })
 })
 
 describe("session.llm.ai-sdk adapter", () => {
