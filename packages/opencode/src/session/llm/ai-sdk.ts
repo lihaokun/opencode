@@ -7,18 +7,53 @@ type Result = Awaited<ReturnType<typeof streamText>>
 type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : never
 
 const incompleteStreamMessage = "Provider stream ended without a terminal finish event"
+const openAICompatibleReasoningID = "reasoning-0"
+const openAICompatibleTextID = "txt-0"
 
-export function adapterState() {
+type ReasoningNormalization = Readonly<{
+  coalesceOpenAICompatibleReasoning: boolean
+}>
+
+function createAdapterState(normalization: ReasoningNormalization) {
   return {
+    normalization,
     step: 0,
     text: 0,
     reasoning: 0,
     currentTextID: undefined as string | undefined,
     currentReasoningID: undefined as string | undefined,
+    pendingReasoningEnd: undefined as
+      | { id: typeof openAICompatibleReasoningID; textID: typeof openAICompatibleTextID | undefined }
+      | undefined,
+    normalizationDisabled: false,
+    normalizationReasoningActive: false,
     toolNames: {} as Record<string, string>,
     copilotTotalNanoAiu: undefined as number | undefined,
     terminalFailure: false,
   }
+}
+
+export function adapterState(
+  options: { readonly coalesceOpenAICompatibleReasoning?: boolean } = {},
+) {
+  return createAdapterState(
+    Object.freeze({
+      coalesceOpenAICompatibleReasoning: options.coalesceOpenAICompatibleReasoning === true,
+    }),
+  )
+}
+
+function resetAdapterState(state: ReturnType<typeof adapterState>) {
+  Object.assign(state, createAdapterState(state.normalization))
+}
+
+export function drainPendingReasoningEnd(state: ReturnType<typeof adapterState>): ReadonlyArray<LLMEvent> {
+  const pending = state.pendingReasoningEnd
+  if (!pending) return []
+  state.pendingReasoningEnd = undefined
+  state.currentReasoningID = undefined
+  state.normalizationReasoningActive = false
+  return [LLMEvent.reasoningEnd({ id: pending.id })]
 }
 
 function finishReason(value: string | undefined): FinishReason {
@@ -76,14 +111,14 @@ function currentReasoningID(state: ReturnType<typeof adapterState>, id: string |
   return state.currentReasoningID
 }
 
-export function toLLMEvents(
+function mapNormally(
   state: ReturnType<typeof adapterState>,
   event: AISDKEvent,
 ): Effect.Effect<ReadonlyArray<LLMEvent>, unknown> {
   if (state.terminalFailure) {
     if (event.type !== "finish") return Effect.succeed([])
     return Effect.sync(() => {
-      Object.assign(state, adapterState())
+      resetAdapterState(state)
       return []
     })
   }
@@ -139,8 +174,8 @@ export function toLLMEvents(
           }),
         ]
         // Reset so the adapter can be reused for a follow-up stream without leaking
-        // counters or block IDs. adapterState() is the single source of truth for shape.
-        Object.assign(state, adapterState())
+        // counters or block IDs. createAdapterState() is the single source of truth for shape.
+        resetAdapterState(state)
         return events
       })
 
@@ -304,6 +339,111 @@ export function toLLMEvents(
       return Effect.succeed([])
     }
   }
+}
+
+function prepend(
+  prefix: ReadonlyArray<LLMEvent>,
+  effect: Effect.Effect<ReadonlyArray<LLMEvent>, unknown>,
+): Effect.Effect<ReadonlyArray<LLMEvent>, unknown> {
+  if (prefix.length === 0) return effect
+  return effect.pipe(Effect.map((events) => [...prefix, ...events]))
+}
+
+export function toLLMEvents(
+  state: ReturnType<typeof adapterState>,
+  event: AISDKEvent,
+): Effect.Effect<ReadonlyArray<LLMEvent>, unknown> {
+  return Effect.suspend(() => {
+    if (state.terminalFailure) return mapNormally(state, event)
+    if (!state.normalization.coalesceOpenAICompatibleReasoning) return mapNormally(state, event)
+    if (event.type === "raw") return mapNormally(state, event)
+    if (event.type === "error") return mapNormally(state, event)
+
+    if (
+      (event.type === "reasoning-start" || event.type === "reasoning-delta" || event.type === "reasoning-end") &&
+      event.providerMetadata != null
+    ) {
+      const prefix = drainPendingReasoningEnd(state)
+      state.normalizationDisabled = true
+      state.normalizationReasoningActive = false
+      return prepend(prefix, mapNormally(state, event))
+    }
+
+    if (state.normalizationDisabled) return mapNormally(state, event)
+
+    if (event.type === "reasoning-start") {
+      if (
+        event.id === openAICompatibleReasoningID &&
+        state.pendingReasoningEnd?.textID === openAICompatibleTextID
+      ) {
+        state.pendingReasoningEnd = undefined
+        return Effect.succeed([])
+      }
+
+      const prefix = drainPendingReasoningEnd(state)
+      if (event.id !== openAICompatibleReasoningID) {
+        state.normalizationReasoningActive = false
+        return prepend(prefix, mapNormally(state, event))
+      }
+      return mapNormally(state, event).pipe(
+        Effect.map((events) => {
+          state.normalizationReasoningActive = true
+          return [...prefix, ...events]
+        }),
+      )
+    }
+
+    if (event.type === "reasoning-delta") {
+      if (
+        event.id === openAICompatibleReasoningID &&
+        state.pendingReasoningEnd?.textID === openAICompatibleTextID
+      ) {
+        state.pendingReasoningEnd = undefined
+        return mapNormally(state, event)
+      }
+
+      const prefix = drainPendingReasoningEnd(state)
+      if (event.id !== openAICompatibleReasoningID) state.normalizationReasoningActive = false
+      return prepend(prefix, mapNormally(state, event))
+    }
+
+    if (event.type === "reasoning-end") {
+      const eligible =
+        event.id === openAICompatibleReasoningID &&
+        state.normalizationReasoningActive &&
+        state.currentReasoningID === openAICompatibleReasoningID &&
+        (state.currentTextID === undefined || state.currentTextID === openAICompatibleTextID)
+      if (eligible) {
+        state.pendingReasoningEnd ??= {
+          id: openAICompatibleReasoningID,
+          textID: undefined,
+        }
+        return Effect.succeed([])
+      }
+
+      const prefix = drainPendingReasoningEnd(state)
+      state.normalizationReasoningActive = false
+      return prepend(prefix, mapNormally(state, event))
+    }
+
+    if (event.type === "text-start" || event.type === "text-delta") {
+      let prefix: ReadonlyArray<LLMEvent> = []
+      if (state.pendingReasoningEnd) {
+        if (
+          event.id === openAICompatibleTextID &&
+          (state.currentTextID === undefined || state.currentTextID === openAICompatibleTextID)
+        ) {
+          state.pendingReasoningEnd.textID = openAICompatibleTextID
+        } else {
+          prefix = drainPendingReasoningEnd(state)
+        }
+      }
+      return prepend(prefix, mapNormally(state, event))
+    }
+
+    const prefix = drainPendingReasoningEnd(state)
+    return prepend(prefix, mapNormally(state, event))
+  })
 }
 
 export * as LLMAISDK from "./ai-sdk"
