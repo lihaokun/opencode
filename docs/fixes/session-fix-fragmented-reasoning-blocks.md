@@ -8,14 +8,16 @@
 - 失败复盘与方案修订日期：2026-08-07
 - 对应问题：[Issue #8](https://github.com/lihaokun/opencode/issues/8)
 - Reporter 补证：[`issuecomment-5189552479`](https://github.com/lihaokun/opencode/issues/8#issuecomment-5189552479)
-- Reporter 最新根因与实测方案：[`issuecomment-5210940023`](https://github.com/lihaokun/opencode/issues/8#issuecomment-5210940023)
+- Issue 最新补充分析与实测方案（collaborator `yixiao5428`）：
+  [`issuecomment-5210940023`](https://github.com/lihaokun/opencode/issues/8#issuecomment-5210940023)
 - 分析基线：`49fa19830d`
-- 当前分支审计基线：`64e676ac45`（`yixiao-issue-8`）
+- 补修前生产代码审计基线：`64e676ac45`（`yixiao-issue-8`）
+- 本轮文档复审基线：`bb5e07ca01`
 - 影响模块：OpenAI-compatible provider、AI SDK LLM adapter、Session processor 及所有 PartUpdated consumers
 - 首轮本地修复层：仅对 `@ai-sdk/openai-compatible` 启用 adapter pending-end 生命周期规范化；
-  该框架保留，但“必须先观察 `txt-0` 才能合并”的触发条件已被真实 SSE 证伪
-- 修订后推荐范围：保留 npm gate、pending end、统一 barrier/error/exhaustion drain 与 metadata 隔离；
-  把 pending marker 简化为仅含 `reasoning-0`，同 ID reopen 无论是否经过 text bridge 都合并
+  该框架保留并继续覆盖已复现的 content bridge，但它的 `txt-0` 前提不能覆盖真实空数组输入
+- 修订后推荐范围：使用仓库现有 `patchedDependencies` 机制修正锁定 provider parser 的空数组判断，
+  只让非空 `tool_calls` 结束 reasoning；保留首轮 adapter 代码，不再放宽 same-ID 合并条件
 - 实现门禁记录：首轮依次提交真实 HTTP 红测 `af9463c6dd`、生产修复 `1c670a4a98`、边界测试
   `ab333813c3` 与 incomplete-stream 补证 `d13dcd5125`；这些提交只证明首轮假设覆盖的
   reasoning/content 交错，不证明真实 `tool_calls: []` 输入已经修复
@@ -24,10 +26,14 @@
 
 ### 1.1 现象
 
-当模型在同一 step 内交替流出 `reasoning_content` 与 `content` 时，AI SDK provider 会把 reasoning
-segments 表示成一系列离散的 `reasoning-start → reasoning-delta → reasoning-end` triple；opencode
-再把每个 triple 持久化成独立 `reasoning` part。TUI 对每个 part 独立渲染一个带时长的 `Thought`
-header，因而出现 Issue 所示的大量毫秒级思考块。
+真实 GLM-5.2 流在每个 `reasoning_content` chunk 上同时携带 `tool_calls: []`。锁定 AI SDK provider
+把这个空数组误判为 tool-call 边界，于是每个 chunk 都变成独立的
+`reasoning-start → reasoning-delta → reasoning-end` triple；opencode 再把每个 triple 持久化成独立
+`reasoning` part。TUI 对每个 part 渲染一个带时长的 `Thought` header，因而出现 Issue 所示的大量
+毫秒级思考块。
+
+reasoning/content 交错是 2026-08-05 独立构造并复现的另一种 producer 序列，也是首轮 adapter
+workaround 的覆盖对象；它不是最新现场所证实的主要触发输入，不能再用来替代空数组根因。
 
 首轮修复上线后，用户确认使用 `yixiao-issue-8` 当前分支最新代码自行编译，问题仍然出现；最新
 现场数据为单条 assistant message 包含 596–1409 个 reasoning parts，每个 part 只有 1–3 token，
@@ -35,7 +41,7 @@ header，因而出现 Issue 所示的大量毫秒级思考块。
 
 ### 1.2 触发条件
 
-Reporter 提供的环境，以及本地复现与其对齐的关键项：
+Issue 现场证据及本地复现与其对齐的关键项（来源在 2.5 节分级）：
 
 - OpenCode：`49fa19830d427b0ec59db255fb12d95542b4f7c8`；
 - provider：`@ai-sdk/openai-compatible@2.0.41`；
@@ -43,7 +49,7 @@ Reporter 提供的环境，以及本地复现与其对齐的关键项：
 - 模型：自定义 OpenAI-compatible `/v1/chat/completions` endpoint 上的 `glm52`；
 - 运行时日志：`llm.runtime=ai-sdk, llm.provider=Test-GLM5, llm.model=glm52`，确认走 V1 AI SDK
   adapter，不是 V2 native runtime；
-- Reporter 最新提供的真实 wire shape：每个 `reasoning_content` chunk 同时携带
+- 最新 collaborator comment 记录的现场 wire shape：每个 `reasoning_content` chunk 同时携带
   `tool_calls: []`；本地没有访问 Reporter endpoint，但已用相同 SSE shape 经锁定依赖链独立复现。
 
 修复前缺陷在满足以下条件时必现：
@@ -57,7 +63,8 @@ Reporter 提供的环境，以及本地复现与其对齐的关键项：
 6. 相邻 `reasoning-end → reasoning-start` 之间没有 text 或真实 tool event；
 7. 若要观察 Issue 所述可见症状，TUI 需显示 reasoning part；持久化碎片本身不依赖 TUI。
 
-Reporter 早期样本重复 34 次，最新数据库样本为 596–1409 个 parts。满足上述条件时，每个
+原始 Reporter 早期样本重复 34 次；最新 collaborator comment 记录的数据库样本为 596–1409 个
+parts。满足上述条件时，每个
 reasoning chunk 都被 parser 结束并立即在下一 chunk 重开，结果由状态机决定，不是概率问题。
 
 ### 1.3 最小复现
@@ -156,8 +163,9 @@ finish-step → finish
 把同一输出交给当前 `LLMAISDK.toLLMEvents()` 且打开 compatible gate，仍得到两次
 `reasoning-start` 和两次 `reasoning-end`。原因是 pending 创建后没有 text event 可绑定
 `pendingReasoningEnd.textID`；下一次 same-ID start 会先 drain pending，再按新 lifecycle 转发。
-当前测试 `does not coalesce an empty end-to-start gap or a different text id` 也明确锁定了这个错误
-预期，说明缺陷同时存在于生产条件和回归合同中。
+当前 adapter 测试 `does not coalesce an empty end-to-start gap or a different text id` 把一个脱离
+provider 原因的显式 end/start 视为两个 lifecycle。该边界本身没有被空数组语义证伪；真正缺失的是
+位于它上游、能证明空数组不应产生这组 end/start 的真实 parser 回归。
 
 ### 1.4 出错代码路径
 
@@ -169,7 +177,7 @@ custom OpenAI-compatible SSE
       next reasoning_content: 立即 reopen/delta(reasoning-0)
   → ai@6.0.168 streamText().fullStream
   → packages/opencode/src/session/llm/ai-sdk.ts
-      显式 event.id 优先，忠实转发重复的 reasoning-0 生命周期
+      首轮 `textID` 条件不匹配，drain pending 后仍输出重复的 reasoning-0 生命周期
   → packages/opencode/src/session/processor.ts
       reasoning-start 按 LLM block ID 创建新 PartID
       reasoning-end 设置 time.end 并从 reasoningMap 删除 active part
@@ -181,13 +189,13 @@ custom OpenAI-compatible SSE
 分析基线关键位置：
 
 - `node_modules/.bun/@ai-sdk+openai-compatible@2.0.41+d6123d32214422cb/node_modules/`
-  `@ai-sdk/openai-compatible/dist/index.js:727-752,865-870`；
-- `packages/opencode/src/session/llm/ai-sdk.ts:74-76,179-209`；
-- `packages/opencode/src/session/llm.ts:360-381`；
+  `@ai-sdk/openai-compatible/dist/index.js:725-766,863-870`；
+- `packages/opencode/src/session/llm/ai-sdk.ts:10-56,350-447`；
+- `packages/opencode/src/session/llm.ts:227-283,360-389`；
 - `packages/opencode/src/session/processor.ts:229-236,300-335`；
 - `packages/opencode/src/session/processor.ts:701-754`（retry attempt reset 与最终 cleanup）；
 - `packages/tui/src/routes/session/index.tsx:1480-1494,1572-1677`；
-- 测试缺口：`packages/opencode/test/session/llm.test.ts:489-503`。
+- 合成空间隔边界测试：`packages/opencode/test/session/llm.test.ts:292-317`。
 
 现场 TUI 调用链确认为 V1 Session 路径。最新 Issue comment 把请求写成
 `POST /session/{sessionID}/prompt_async`，但当前仓库 `sdk.client.session.prompt()` 实际调用
@@ -196,12 +204,12 @@ custom OpenAI-compatible SSE
 
 ### 1.5 预期行为与实际行为
 
-- 预期：对于已确认存在该 quirk 的 `@ai-sdk/openai-compatible` 路径，同一 step 内复用同一个显式
-  reasoning ID、没有 metadata，且仅由 package 的伪终态重开的 N 个 segments，应先在 adapter
-  规范化成一个 start/delta/end lifecycle；segment 之间可以有 `txt-0` start/delta，也可以是由
-  `tool_calls: []` 造成的空间隔。
-- 边界预期：其他 provider、匿名 ID、非 package 合成 ID、跨 text-end/tool/step 的 reasoning block
-  必须保持现有生命周期；一旦观察到 raw reasoning metadata，停止该 stream 后续 normalization。
+- 空数组根因的预期：锁定 provider 遇到 `tool_calls: []` 时不得结束 active reasoning；N 个连续
+  reasoning chunks 在 `fullStream` 层就应是一个 start、N 个 delta，直到 content、非空 tool 或 flush
+  才出现唯一 end。
+- 首轮独立行为的预期：已经复现的 `txt-0` content bridge 继续由当前 gated adapter 规范化；显式且
+  脱离该 producer 证据的空 end/start、其他 provider、匿名/不同 ID、metadata 与真实 barrier 仍保持
+  当前边界，不借本补修扩大合并范围。
 - 当前分支实际：首轮 adapter 只合并经过 `txt-0` bridge 的 reopen。空 `tool_calls` 造成的空间隔会
   被 drain 为真实 end/start，processor 为每段分配新 PartID，TUI 继续逐 part 显示 header。
 
@@ -225,27 +233,29 @@ custom OpenAI-compatible SSE
    `Lifecycle.reasoningEnd()` 会把 ID 从 active set 删除，processor 会写入 `time.end` 并删除 active
    mapping，CLI streaming consumer 也会在 `time.end` 出现后把 PartID 标为完成。
 3. 因而 processor 为重新 start 的 lifecycle 创建新 PartID 是对当前 end 语义的一致解释，不是
-   可以孤立修改的 map bug。真正需要本地兼容的是：在 end 进入公共 LLMEvent/PartUpdated 合同前，
-   把该 package 已知的伪终态序列规范化。
+   可以孤立修改的 map bug。修复必须在伪 end 进入公共 LLMEvent/PartUpdated 合同前完成；对已确认
+   的空数组根因，最窄位置就是产生该 end 的 provider parser。
 4. 首轮兼容已经暂存 end，却要求 pending 必须先绑定 `txt-0` 才允许 same-ID reopen 合并。真实
    `tool_calls: []` 序列在 end/reopen 之间没有 text event，故 `textID` 始终是 `undefined`，每次 reopen
-   都先 drain end。首轮框架到达了正确修复层，但触发条件错误，效果等同于未合并该真实序列。
+   都先 drain end。首轮 adapter 是 content-bridge 的有效 workaround，但没有覆盖这条真实序列；
+   直接修 parser 可消除伪事件，也无需放宽 adapter 对任意显式空 end/start 的解释。
 
 TUI 不是根因，只是一对一呈现已经碎片化的持久化 parts：
 
 ```text
-GLM52 reasoning/text 交错
-  → provider 反复 end/reopen 同一 reasoning-0
+GLM-5.2 reasoning_content + tool_calls: []
+  → provider parser 在每个 chunk 后反复 end/reopen 同一 reasoning-0
   → adapter 忠实保留显式 reasoning-0
   → processor 按终态契约为 reopen 分配新 PartID
-  → Session 中出现 P1, P2, ... P34
-  → TUI 显示 34 个 Thought
+  → Session 中出现 P1, P2, ... PN
+  → TUI 显示 N 个 Thought
 ```
 
-从“首个产生异常生命周期”的角度，`@ai-sdk/openai-compatible` 的 content/reasoning 状态机是
-上游根因；从本仓库的兼容边界看，AI SDK adapter 是正确位置，因为它是 provider-specific
-`fullStream` 进入公共 LLMEvent 合同前的最后一层。processor 之后的状态已经被持久化并发布给
-consumer，届时再撤销 end 会改变公共事件语义。
+从“首个产生异常生命周期”的角度，`@ai-sdk/openai-compatible` 的空 `tool_calls` 判断是已确认
+根因。仓库已有 `patchedDependencies`，并正在维护其他 AI SDK provider patch，因此可以在该产生点
+作可复现的本地修复；不必为了这个精确根因继续扩大 adapter 合并条件。processor 之后的状态已经
+被持久化并发布给 consumer，届时再撤销 end 仍会改变公共事件语义，所以 processor/TUI 不是正确
+修复层。
 
 ### 2.3 `ai-sdk.ts` ID reset 不是本次因果点
 
@@ -281,18 +291,20 @@ Reporter 建议保留 map entry 的方向抓住了“希望复用 PartID”的�
 
 ### 2.5 证据
 
-- Reporter 早期给出 commit、provider 版本、模型、相同 ID、metadata 缺失和 34 次重复次数；最新
-  回复补充 runtime 日志、真实 SSE 片段、596–1409 个持久化 parts，以及对真实 endpoint 修订前后
-  63/63 与 1/1 start/end 的对比。
+- 原始 Reporter `ssyram` 给出 commit、provider 版本、模型、相同 ID、metadata 缺失和 34 次重复
+  次数；collaborator `yixiao5428` 的最新 comment 另行记录 runtime 日志、现场 SSE 片段、596–1409
+  个持久化 parts，以及候选 adapter 补修在真实 endpoint 上的 63/63 与 1/1 start/end 对比。两者
+  来源不同，不能合并称为 Reporter 证据。
 - 本地假 SSE 经真实 `@ai-sdk/openai-compatible@2.0.41 → ai@6.0.168 fullStream` 得到同样的
   reasoning end/reopen 序列：2026-08-05 的 content-bridge 复现校正 text 事件顺序；2026-08-07
   的空 `tool_calls` 复现则直接证明当前首轮 adapter 仍输出两套 reasoning lifecycle。
 - 锁定 provider 源码的精确条件是 `delta.tool_calls != null`；`[]` 满足条件，先结束 active reasoning，
   随后的空循环不产生 tool event。该 producer 的 reasoning 事件只写入 `type`、`id` 和 delta 文本，
   不写 `providerMetadata`。
-- [npm 版本列表](https://www.npmjs.com/package/@ai-sdk/openai-compatible?activeTab=versions) 显示 AI SDK
-  v6 当前维护标签为 `@ai-sdk/openai-compatible@2.0.62`（commit
-  `da5fbd2703c54dfbaea7ec725757da5b121beef0`）仍保留同一逻辑，因此单纯从 2.0.41 升级不能
+- [npm 版本列表](https://www.npmjs.com/package/@ai-sdk/openai-compatible?activeTab=versions) 显示
+  `ai-v6` 标签为 `@ai-sdk/openai-compatible@2.0.62`（overall `latest` 已是 3.x；本仓库仍锁定
+  AI SDK v6），对应 commit
+  `da5fbd2703c54dfbaea7ec725757da5b121beef0` 仍保留同一逻辑，因此单纯从 2.0.41 升级不能
   消除此问题。
 - adapter 对显式 ID 做无损映射；本次没有经过匿名 ID fallback。
 - `SessionProcessor.finishReasoning()` 设置 end、更新 part 后删除 active mapping；下一次同 ID
@@ -316,16 +328,18 @@ Reporter 建议保留 map entry 的方向抓住了“希望复用 PartID”的�
 证据等级必须保持分离：
 
 - **直接观察**：本地锁定依赖源码、两类假 SSE 输入、真实 dependency-chain 的 fullStream 输出、
-  当前 adapter/processor/consumer 代码、当前错误测试预期与独立复跑结果；
-- **Reporter 现场证据**：runtime 日志、版本、模型、真实 SSE 片段、持久化结果，以及真实 endpoint
-  在其候选补修前后的 63/63 与 1/1 事件计数；候选 patch 和 87 tests/typecheck 结果尚未出现在共享
-  分支，本文不把它们记成本地已验证事实；
+  当前 adapter/processor/consumer 代码、现有合成空间隔边界测试与独立复跑结果；
+- **原始 Reporter 现场证据**：版本、模型、由 part 表重建的 34 段事件与持久化碎片；其早期
+  content/text 顺序不是原始 wire 抓包；
+- **最新 collaborator comment 证据**：runtime 日志、现场 SSE 片段、596–1409 个持久化 parts，
+  以及候选 adapter 补修前后的 63/63 与 1/1 事件计数；该候选 patch 尚未出现在共享分支，本文不把
+  它的 endpoint/test/typecheck 结果冒充为本地验证；
 - **机械推论**：对任意 `reasoning_content + tool_calls: []` chunk，锁定 parser 必然输出 end；当前
   `textID` gate 必然 drain pending，processor 必然创建多个 PartID；
 - **产品选择**：把这些 segments 归并为一个 Thought 不是原始 ID 能证明的事实，而是本 Issue 要
   达到的兼容行为；完成时机/duration 取舍已由用户在实现前确认。
 
-### 2.6 不可能三角与残余风险
+### 2.6 首轮 adapter 取舍与修订后风险
 
 在第一次 reasoning-end 到达时，系统无法知道未来是否会 reopen。因此无法同时满足：
 
@@ -333,10 +347,14 @@ Reporter 建议保留 map entry 的方向抓住了“希望复用 PartID”的�
 2. `time.end` 一旦发布就永不撤销；
 3. 不缓冲未来事件且最终只产生一个 part。
 
-本方案保留第 2、3 项，明确牺牲受影响 provider 的部分第 1 项：pending end 会延迟到
+首轮 adapter workaround 保留第 2、3 项，明确牺牲受影响 provider 的部分第 1 项：pending end 会延迟到
 `text-end`、tool、step 或 finish barrier。其残余风险是普通 `@ai-sdk/openai-compatible`
 reasoning→text（之后不 reopen）的 TUI 会在 text streaming 期间继续显示 `Thinking`，duration 也
 包含这段等待时间。该行为已作为显式产品取舍接受，并由回归测试固定。
+
+这个不可能三角不适用于本次空数组根因的直接 parser patch：`tool_calls: []` 本来就不是语义边界，
+修正判断后不会生成需要预测未来的伪 `reasoning-end`，也不会额外延迟普通 reasoning 的终态。当前
+分支因首轮 content-bridge workaround 已经存在上述时机取舍，但本次补修没有必要扩大它。
 
 其他方向及风险：
 
@@ -344,18 +362,20 @@ reasoning→text（之后不 reopen）的 TUI 会在 text streaming 期间继续
 - processor end retraction 会改变公开 PartUpdated 终态合同；
 - 无 provider gate 或不限制 package 合成 ID 的 adapter 合并可能影响其他 provider 的 signed/encrypted
   reasoning，或把真正不同的 block 合并；
-- 直接把外部 parser 条件改成 `delta.tool_calls?.length` 能从产生点消除本次空数组伪边界，不面临
-  这个特定输入的未来不可知问题；但需要维护依赖 patch，且不会覆盖首轮已经证实的 content/reasoning
-  交错，除非同时接受上游对 content 的既有 end 语义；
+- 直接 parser patch 需要随锁定依赖升级维护；仓库已有 `patchedDependencies` 和多个 AI SDK patch，
+  这个成本存在但不是新机制。patch 只修空数组，不改变 content/reasoning 交错；后者继续由首轮
+  adapter workaround 处理；
 - text fallback 没有反复 end/reopen 的复现依据，本次不扩大范围。
 
 ## 三、参考实现对照
 
-本问题不是存在唯一“标准答案”的纯算法 bug；参考约束来自仓库现有 LLMEvent lifecycle 与终态
+本问题的空数组判断有明确参考语义：仓库 native OpenAI Chat parser 仅在
+`toolDeltas.length > 0` 时结束 reasoning。公共生命周期约束同时来自现有 LLMEvent lifecycle 与终态
 consumer：`Lifecycle.reasoningEnd()` 删除 active ID，processor 写入 `time.end`，CLI 在 end 后
-终结 PartID。因此本地兼容必须在这些合同之前完成，而不是改变它们。
+终结 PartID。因此修复必须在 provider parser/adapter 进入这些合同之前完成，而不是改变终态合同。
 
-同时，`reasoning-0` 是 package 对所有 reasoning 硬编码的合成 ID，并非模型提供的语义 block ID；
+首轮 content-bridge workaround 还涉及一项独立产品选择：`reasoning-0` 是 package 对所有 reasoning
+硬编码的合成 ID，并非模型提供的语义 block ID；
 “同 ID”本身不能数学证明两个 segments 必属同一思考。把该 package 在一个 step、同一 active text
 block 两侧产生的 segments 归并，是基于 Issue 的产品预期与已证实 producer 机制所选择的兼容策略，
 不是从 ID 唯一推出的事实。因此实现前先由用户确认了完成时机/duration 取舍。
@@ -376,62 +396,72 @@ block 两侧产生的 segments 归并，是基于 Issue 的产品预期与已证
 
 精确参考来源：
 
-- 锁定依赖 2.0.41 的 `dist/index.js:725-756,863-870`；
+- 锁定依赖 2.0.41 的 `dist/index.js:725-766,863-870` 与等价 ESM 入口
+  `dist/index.mjs:712-753`；
 - AI SDK v6 维护标签 2.0.62 对应的 Vercel AI commit
   [`da5fbd2`](https://github.com/vercel/ai/blob/da5fbd2703c54dfbaea7ec725757da5b121beef0/packages/openai-compatible/src/chat/openai-compatible-chat-language-model.ts)，
-  仍在 content 前 end reasoning；
+  仍使用 `delta.tool_calls != null`，并在 content 前 end reasoning；
 - `packages/llm/src/protocols/utils/lifecycle.ts:27-62` 的 active reasoning lifecycle；
 - `packages/opencode/src/cli/cmd/run.ts:715-773` 与
   `packages/opencode/src/cli/cmd/run/session-data.ts:1001-1053` 的终态消费逻辑。
 
-外部 provider/package 的长期理想修复是提供可区分的 block ID/边界，或不要把可继续的 reasoning
-声明为 terminal。当前 2.0.x 没有该修复，本地 adapter normalization 不依赖外部发布时间。
+外部 package 的长期理想修复是接受同一空数组判断补丁并发布新 `ai-v6` 版本。当前已检查的 2.0.62
+仍没有该修复；在上游发布前，本仓库可用现有 dependency patch 机制固定行为。
 
 上述表格仍是有效的 content-bridge 对照，但不是用户最新现场的根因输入。对空 `tool_calls` 输入，
-首个差异发生在首轮 adapter 自己的 same-ID reopen 判断：
+首个差异发生在 provider parser 的空数组判断；修复不需要等待 adapter 看见伪 end/reopen：
 
-| 步骤 | 锁定 AI SDK 输出 | 当前首轮 adapter | 修订后 adapter |
-| ---- | --------------- | ---------------- | -------------- |
-| 1 | `start(r0), delta(r1), end(r0)` | start/delta；暂存 end | start/delta；暂存 end |
-| 2 | 紧接 `start(r0)`，中间无 text/tool event | `textID` 未绑定，drain end 后转发 start | 消费 same-ID pending，抑制冗余 start |
-| 3 | `delta(r2), end(r0)` | 第二个 lifecycle，再暂存 end | delta 追加到原 lifecycle，再暂存唯一 end |
-| 4 | 后续 text/step/finish barrier | 最终已有两个 reasoning parts | barrier 前只发一次 terminal end |
+| 步骤 | 未 patch 的 2.0.41 | patch 后 provider 输出 | 当前 adapter / processor |
+| ---- | ----------------- | ---------------------- | ------------------------ |
+| 1 | `start(r0), delta(r0,"r1")` 后因 `[] != null` 输出 `end(r0)` | `start(r0), delta(r0,"r1")`；空数组不结束 reasoning | start/delta；P1 保持 active |
+| 2 | 下一 chunk 再输出 `start(r0), delta(r0,"r2"), end(r0)` | reasoning 已 active，只输出 `delta(r0,"r2")` | delta 继续追加到 P1 |
+| 3 | 每个 reasoning chunk 重复一套 lifecycle | N 个 chunk 仍只有一个 start 与 N 个 delta | 不创建额外 PartID |
+| 4 | 后续 content/非空 tool/flush 才是真实边界 | 在真实边界输出唯一 `end(r0)` | 首轮 adapter/processor 按既有合同完成 P1 |
 
 仓库 native OpenAI Chat parser 的 `if (toolDeltas.length)` 是本次空数组判断的可信参考：空数组不是
 tool-call barrier。它证明外部 parser 的 `!= null` 是直接缺陷，但不意味着用户请求走了 native
-runtime，也不替代 V1 adapter 的本地兼容设计。
+runtime。它与锁定 provider 源码的逐行对照共同支持在 V1 provider parser 产生点修复。
 
 ## 四、修复方案
 
-### 4.1 修订后推荐方案：gated adapter pending-end normalization
+### 4.1 修订后推荐方案：维护锁定 provider 的 dependency patch
 
-修改 AI SDK 路径，但不修改公共 LLMEvent/Session 生命周期：
+修改 `@ai-sdk/openai-compatible@2.0.41` 的 parser 判断，但不修改公共 LLMEvent/Session 生命周期：
 
-1. `llm.ts` 根据 `input.model.api.npm === "@ai-sdk/openai-compatible"` 向 adapter state 传入一个
-   immutable normalization flag；native runtime 与其他 AI SDK provider 保持关闭。
-2. `ai-sdk.ts` 只识别该 package 已证实会合成的 signature：显式 `reasoning-0` 且无 raw
-   `providerMetadata`。满足条件的 end 只保存 `{ id: "reasoning-0" }` pending marker，不立刻发出
-   LLMEvent.reasoning-end；其他 ID 不泛化合并。
-3. pending 期间，同一个 `txt-0` 的 text-start/text-delta 可作为透明 bridge 原样即时转发，但不再
-   写入 pending，也不是 same-ID reasoning reopen 的前提；其他 text ID 仍是 barrier。
-4. 若出现 `reasoning-0`、无 metadata 的 reasoning-start 或防御性的 reasoning-delta，只要存在
-   same-ID pending 就消费它；start 被抑制，delta 继续属于原 active lifecycle。这样同时覆盖
-   reasoning/content 交错与 `tool_calls: []` 造成的空间隔。
-5. 在 text-end、不同 ID、任何观察到的 raw reasoning metadata、tool、step、finish 等 barrier 前，
-   先 flush 唯一 pending reasoning-end。metadata 同时关闭该 stream 后续 normalization，避免在
-   producer signature 已变化时继续作新合并。
-6. `llm.ts` 的 stream wrapper 通过 adapter 提供的幂等 drain helper 覆盖两个无 AI SDK boundary 的
-   终止路径：正常 iterable exhaustion 时必要则补一个非空 pending batch；失败时先交付该 batch，
-   再原样重抛 error 供 retry policy 判断。正常 finish 已清空 pending，因此 exhaustion drain 是
-   空操作；interrupt 仍由最终 cleanup 收尾。
-7. processor 因而只看到一次 start 和一次 terminal end；既不创建额外 PartID，也从不撤销
-   `time.end`。
+1. 使用根 `package.json` 已有的 `patchedDependencies` 机制新增
+   `patches/@ai-sdk%2Fopenai-compatible@2.0.41.patch`，并同步 `bun.lock`。
+2. 在 package source、ESM runtime 入口 `dist/index.mjs` 和 CJS runtime 入口 `dist/index.js` 中，把
+   `if (delta.tool_calls != null)` 改为 `if (delta.tool_calls?.length)`（编译产物可使用等价表达式）。
+   同时修改两个 runtime 入口，避免测试/开发因 import/require 条件不同而只覆盖一半。
+3. `tool_calls: []` 不再结束 active reasoning，也不进入空循环；下一 reasoning chunk 只追加 delta。
+   非空 tool-call 数组仍先结束 reasoning，再按原逻辑产生 tool events。
+4. content、flush、finish、usage、metadata、tool-call buffering 和错误语义完全保持 2.0.41 原行为。
+5. 保留首轮 adapter normalization 及其测试，不在本补修中放宽 same-ID pending 条件或删除
+   `textID`。该 adapter 继续只承担已单独复现并确认过的 content-bridge workaround。
+6. 向 Vercel AI 报告同一最小复现可作为后续动作，但本地 patch 和回归测试不依赖上游发布时间。
 
-外部 package 的 lifecycle 问题可并行向 Vercel AI 报告，但不作为本地修复的完成前置条件。
-该方案目前是经证据修订后的计划，不得把 Reporter 尚未进入共享分支的 patch 或测试结果标记为本地
-已完成。
+半形式化合同：
 
-### 4.2 数据结构规约
+```text
+Requires:
+  - delta.tool_calls 为 null/undefined 或符合 schema 的数组
+  - parser 按 reasoning_content → content → tool_calls 的既有顺序处理同一 delta
+
+Ensures:
+  - tool_calls.length == 0 时，该分支不改变 isActiveReasoning，不输出 reasoning-end/tool event
+  - tool_calls.length > 0 时，输出和状态转换与未 patch 的 2.0.41 完全相同
+  - content/flush 产生 reasoning-end 的条件与时机不变
+  - 每个 reasoning_content 文本按输入顺序恰好输出一次
+
+Side effects:
+  - 仅改变锁定 dependency parser 对空 tool-call 数组的判断
+  - 不新增 adapter/processor 状态，不修改 Session、TUI、LLMEvent 或公开配置
+```
+
+### 4.2 备选方案数据结构：id-only adapter（本次不采用）
+
+仅当项目明确拒绝 dependency patch 时，才考虑最新 comment 提出的 same-ID adapter 放宽。以下
+4.2–4.4 记录该备选方案的完整安全边界；本次不应与 4.1 同时实施，也不列入代码更新清单。
 
 ```text
 数据结构：ReasoningNormalizationOptions（adapter 私有）
@@ -499,7 +529,7 @@ metadata mapper 的行为（合法 schema 保留，非法值仍按现状丢弃�
 失败并触发依赖升级复审。文档不再声称能在看见未来 metadata 之前证明一个任意 producer 的完整
 lifecycle 无 metadata。
 
-### 4.3 状态转移与 barrier
+### 4.3 备选 adapter 的状态转移与 barrier
 
 | 输入事件/条件                                   | pending 状态         | 输出与状态动作                                                               |
 | ----------------------------------------------- | -------------------- | ---------------------------------------------------------------------------- |
@@ -596,7 +626,7 @@ on successful iterable exhaustion:
 `toLLMEvents()` 的 barrier 与 `llm.ts` 的 stream exhaustion/failure wrapper 必须共用它，避免多套
 flush 逻辑漂移。
 
-### 4.4 函数规约
+### 4.4 备选 adapter 的函数规约
 
 ```text
 函数：LLMAISDK.toLLMEvents（reasoning normalization 子状态机）
@@ -633,10 +663,10 @@ Invariants:
 
 ### 4.5 反事实与首轮改动必要性审计
 
-先给出不绕弯的结论：如果目标只限定为消除这次已确认的 `tool_calls: []` 伪边界，并且接受维护
-第三方依赖 patch，那么首轮那些 adapter 改动并非必要，直接修 parser 即可。只有在选择“由本仓库
-adapter 同时兼容空 tool 数组和已复现的 content/reasoning 交错”这条路线时，首轮安全框架才有保留
-价值；其中 `textID` 字段及其必要条件无论如何都不应保留。
+先给出不绕弯的结论：如果从分支最初只针对现在已证实的 `tool_calls: []` 根因，首轮 adapter 改动
+并非必要，直接 parser patch 即可。当前分支已经包含首轮 adapter；本次应保留它来维持已确认的
+content-bridge 行为，但没有必要再放宽 same-ID 条件。只有选择 comment 的 adapter 补修作为替代
+方案时，`textID` 才会因“只写不读”而应随同删除。
 
 需要区分三种不同的“只改 comment 提到的部分”：
 
@@ -644,13 +674,15 @@ adapter 同时兼容空 tool 数组和已复现的 content/reasoning 交错”�
    `pendingReasoningEnd`、normalization gate、barrier drain 或 error/exhaustion drain；那两行是对
    首轮状态机的增量补丁，不是可独立应用的完整修复。
 2. **在当前首轮实现上只放宽两个条件并保留其余代码**：能解决已观察的空 `tool_calls` 症状，
-   Reporter 的真实 endpoint 63/63 → 1/1 结果支持这一点；但 `pendingReasoningEnd.textID` 随后只写
+   最新 collaborator comment 记录的真实 endpoint 63/63 → 1/1 结果支持这一点；但
+   `pendingReasoningEnd.textID` 随后只写
    不读，成为死状态，保留它会让文档和实现继续暗示一个并不存在的正确性条件。
 3. **在分支最初基线上直接 patch 外部 parser，把 `delta.tool_calls != null` 改为
    `delta.tool_calls?.length`**：能从产生点解决本次空数组伪边界，是该精确症状的最小根因修复；
-   但它需要长期维护第三方依赖 patch，而且不会合并由真实 content 边界造成的后续 reasoning reopen。
+   仓库已有 dependency patch 机制；它不会改变由真实 content 边界造成的 reasoning reopen，而当前
+   分支已有首轮 adapter 继续处理该独立行为。
 
-因此，对仓库自有 adapter 修复路线的结论是“首轮框架必要，首轮触发条件错误”：
+若拒绝 dependency patch、坚持 comment 的 adapter 补修，才适用下表：
 
 | 首轮改动 | 修订后判断 | 理由 |
 | -------- | ---------- | ---- |
@@ -659,14 +691,14 @@ adapter 同时兼容空 tool 数组和已复现的 content/reasoning 交错”�
 | barrier drain helper | 保留 | 不同 ID、真实 tool、step、finish 等必须结束 pending lifecycle |
 | failure/exhaustion drain | 保留 | 无正常 finish 时也必须恰好交付 terminal end |
 | metadata opt-out 与 active flag | 保留 | 防止把带签名/metadata 或匿名 fallback 的 lifecycle 泛化合并 |
-| `pendingReasoningEnd.textID` | 删除 | 放宽 same-ID 条件后只写不读；正确 drain 由通用 barrier 完成 |
+| `pendingReasoningEnd.textID` | 仅备选方案删除 | 放宽 same-ID 条件后只写不读；正确 drain 由通用 barrier 完成 |
 | “必须先观察 `txt-0` 才合并” | 删除 | 被真实 `tool_calls: []` SSE 直接证伪，正是首轮失效原因 |
 | content-bridge 回归 | 保留 | 覆盖另一种已独立复现的 producer 序列，但不能替代真实空数组回归 |
 
-最新 comment 中“继续绑定 textID 可确保在正确时机 drain”的解释不准确：按照其两个条件改动，
+最新 comment 中“继续绑定 textID 可确保在正确时机 drain”的解释不准确：若采用其两个条件改动，
 same-ID start/delta 已不再读取 `textID`；而 text-end、不同 text ID、tool、step、finish、failure 和
-exhaustion 的正确 drain 本来就由通用 barrier/helper 保证。实现时应删掉这项无效复杂度，而不是
-只改条件后保留一个误导性的字段。
+exhaustion 的正确 drain 本来就由通用 barrier/helper 保证。若采用该备选实现，应删掉这项无效
+复杂度；采用 4.1 parser patch 时不改 adapter，`textID` 仍服务于首轮 content-bridge 条件。
 
 首轮真正缺失的不是更多合成 adapter 分支断言，而是一条包含 `reasoning_content + tool_calls: []`
 的真实 SSE → 锁定 provider parser → `streamText.fullStream` → adapter/processor 回归。若这条测试在
@@ -676,9 +708,9 @@ exhaustion 的正确 drain 本来就由通用 barrier/helper 保证。实现时�
 
 | 方案                             | 优点                                   | 结论 / 代价                                                                 |
 | -------------------------------- | -------------------------------------- | --------------------------------------------------------------------------- |
-| 维护外部 parser patch            | 从产生点消除空数组伪 tool barrier       | 精确症状可修；需维护依赖 patch，且不覆盖 content/reasoning 交错              |
+| 维护锁定 provider parser patch    | 从产生点消除空数组伪 tool barrier       | **采用**；现有 patch 机制可承载；content 交错继续由首轮 adapter 处理          |
 | 等待/升级外部 provider           | 若上游接受则无需本地兼容               | 已检查 2.0.62 仍保留该状态机（未单独实跑）；外部发布时间不可控              |
-| gated adapter pending end        | 下游合同不变；一个 PartID；text 不缓冲 | **采用**；仅匹配该 npm 已证实合成 ID，普通 reasoning 完成时机延迟到 barrier |
+| 放宽 gated adapter same-ID 合并  | 不改 dependency；comment 有 endpoint 实测 | 备选；比根因 patch更宽，且需删除变成死状态的 `textID`                      |
 | 全 provider adapter 合并         | 代码判断更少                           | 不采用；会影响 signed/encrypted 或语义不同的 provider                       |
 | processor end retraction         | 普通首次 end 时机不变                  | 不采用；破坏 CLI/JSON/外部 PartUpdated 终态假设                             |
 | processor 直接不 delete          | 改动表面最小                           | 不采用；completed part 仍在 active map，生命周期错误                        |
@@ -692,96 +724,81 @@ exhaustion 的正确 drain 本来就由通用 barrier/helper 保证。实现时�
 ### 4.7 最小复现走修正后逻辑
 
 ```text
-start-step → step-start
+chunk 1: reasoning_content="reason-1", tool_calls=[]
+  → parser 发 reasoning-start(r0), reasoning-delta(r0,"reason-1")
+  → patched empty-array guard 不进入 tool 分支，不发 reasoning-end
+  → processor 创建 P1(active)，追加 reason-1
 
-reasoning-start(r0)
-  → adapter 发 start；processor 创建 P1(active)
-reasoning-delta(r0, "reason-1")
-  → adapter 发 delta；P1.text="reason-1"
-reasoning-end(r0)
-  → adapter 暂存 pending end；processor 尚未看到 end
+chunk 2: reasoning_content="reason-2", tool_calls=[]
+  → isActiveReasoning 仍为 true；parser 只发 reasoning-delta(r0,"reason-2")
+  → processor 继续向 P1 追加 reason-2
 
-reasoning-start(r0, metadata=undefined)
-  → 即使中间没有 text event，adapter 也消费 same-ID pending、抑制冗余 start；processor 无身份变化
-reasoning-delta(r0, "reason-2")
-  → adapter 发 delta；P1.text="reason-1reason-2"
-reasoning-end(r0)
-  → adapter 再次暂存 pending end
+后续 content="answer"
+  → parser 按既有逻辑发唯一 reasoning-end(r0) 和 text start/delta
+  → 首轮 adapter 按既有 content-bridge 规则暂存 end，并在 text-end/barrier 前恰好 drain 一次
+  → processor 完成 P1，并创建/完成 text P2
 
-text-start/delta(t0, "answer")
-  → adapter 即时转发；processor 创建/更新 text P2；pending 保持不变
-text-end(t0)
-  → adapter 先发 reasoning-end(r0)，再发 text-end(t0)
-  → processor 完成 P1、P2；两者都只完成一次
 finish-step/finish
-  → 无 pending；按现有逻辑完成 turn/reset state
+  → 按现有逻辑完成 turn/reset state
 ```
 
 最终只存在一个 reasoning part P1 和一个 text part P2；P1 保持一个单调 lifecycle，TUI 显示
 一个 `Thought`，CLI/JSON consumer 只观察到一次 reasoning terminal update。
 
-同一状态机仍接受首轮的 content-bridge 输入：若两个 reasoning segments 之间出现 `txt-0`
-start/delta，它们原样转发且不改变 pending；后续 same-ID reopen 仍合并。
+若没有 content 而直接结束 stream，provider flush 仍按原逻辑发唯一 reasoning-end；首轮 adapter 在
+finish-step/finish barrier 前 drain。非空 tool-call 数组同样保留原来的 reasoning-end + tool 事件。
 
 ### 4.8 时间、实时显示与 consumer 语义
 
-- 受 gate 影响且不 reopen 的普通 reasoning→text：reasoning-end 延迟到 text-end；这是已知取舍。
-- 实际 interleaved reopen：TUI 在 text streaming 期间继续显示一个 `Thinking`，到 text-end 变成
-  一个 `Thought`；不会出现 completed→active 的反转。
-- 最终 duration 为 `flush 的 end 时间 - 第一次 start`，包含中间 text 时间；当前 schema 无法表达
-  多段 active duration 的精确和。
+- dependency patch 本身不延迟任何合法终态：空数组不是真实 tool boundary；content、非空 tool 与
+  flush 的 end 时机保持 2.0.41 原行为。
+- 当前分支首轮 adapter 已经使 reasoning→text 的 end 延迟到 text-end；这是既存 content-bridge
+  取舍，不是本次 parser patch 新增的行为。
+- 对真实空数组序列，duration 从第一次 reasoning start 到真实 content/tool/flush 边界，不再被每个
+  token chunk 人为切碎。
 - processor、DB projector、TUI、legacy run、session-data 与 share 不需要修改，因为它们收到的仍是
   单调且合法的 start/delta/end / PartUpdated 序列。
-- 若产品不接受普通 compatible provider 的完成时机延迟，则必须新增 provider capability/config 或
-  可表达 pause/reopen 的公共 schema；这属于独立设计，不得退回未审计的 processor retraction。
+- 若产品不再接受首轮 adapter 对普通 compatible provider 的完成时机延迟，应另开范围重新评估并
+  可能回滚该 workaround；这不影响空数组 parser patch 的正确性。
 
 ## 五、正确性论证
 
 ### 5.1 根因消除
 
-异常生命周期的首个可控边界是 AI SDK adapter：2.0.41 合成的中间 end 尚未成为公共 LLMEvent。
-方案在这里暂存伪终态，并在同 ID reopen 时消除冗余 end/start；processor 从第一段到第 N 段
-始终只看到一个 active ID，最终只在 barrier 收到一次 end。因此它消除了产生多个 PartID 的输入
-原因，而不是让 TUI 隐藏多个已持久化 part。
+异常生命周期由 2.0.41 的 `delta.tool_calls != null` 首次产生。把条件改为非空数组判断后，`[]`
+不再改变 `isActiveReasoning`，所以后续 reasoning chunk 不会 reopen，也不会生成可供 adapter/processor
+碎片化的伪 end/start。修复发生在异常事件产生点，不依赖 TUI 聚合或终态撤销。
 
 ### 5.2 不变量保持
 
-- **producer 隔离**：gate 只对 `model.api.npm === "@ai-sdk/openai-compatible"` 打开，且只合并源码
-  合成的 `reasoning-0`；`txt-0` 仅是允许透明通过的可选 bridge。native、其他 AI SDK provider、
-  匿名或不同 ID 输出不变。
-- **文本守恒**：每个 input reasoning/text delta 恰好输出一次；pending 只保存 end marker，不保存
-  或复制文本。
-- **顺序保持**：text/delta 仍按 fullStream 顺序即时输出；仅 terminal end 被后移到明确 barrier。
-- **终态单调**：adapter 一旦输出 reasoning-end 就不再对同 lifecycle 重开；processor 永远不需要
-  发布 `time.end → undefined`。
-- **边界保持**：匿名 ID、不同 reasoning/text ID、text-end、非 raw ignored event、tool、step 与
-  finish 禁止合并。
-- **metadata 映射与失效保护**：是否禁用 normalization 依据 raw providerMetadata 是否存在，不依赖
-  schema 解码成功；事件随后仍走既有 mapper，合法值保留、非法值照旧丢弃。已检查的 package
-  producer 不生成 reasoning metadata；未来版本若改变该事实，真实 provider 集成测试必须触发
-  复审，而不是继续宣称任意 lifecycle 可预测。
-- **失败清理**：retryable error 先 flush pending 再原样失败，避免 processor 在下一尝试重置 map 时
-  遗留无 end part；interrupt 仍由既有最终 cleanup 完成 active part。
-- **耗尽清理**：正常 finish 后 exhaustion drain 为空；若 iterable 异常地无 finish 便耗尽，则补发
-  pending end，随后由既有 settlement 规则判定整个 stream 是否完整。
-- **生命周期清理**：barrier flush pending；新的 stream 使用新的 state。
-- **状态有界**：只增加 pending 的固定 reasoning ID 与两个布尔运行时标记，不缓存
-  token/text 或无界历史。
+- **空数组语义**：`tool_calls.length === 0` 表示没有 tool-call delta；不结束 reasoning，与 native
+  `if (toolDeltas.length)` 参考一致。
+- **非空数组守恒**：`tool_calls.length > 0` 时仍进入原分支，先 end active reasoning，再逐项处理
+  tool delta；真实 tool boundary 不被合并。
+- **其他字段守恒**：reasoning_content、content、flush、finish、usage、metadata 与错误路径不变。
+- **文本与顺序守恒**：每个 reasoning/text/tool delta 仍按输入顺序恰好输出一次；不缓存或复制文本。
+- **公共合同保持**：adapter、processor、PartID、TUI 与 LLMEvent schema 不改；已经输出的 end 仍是
+  单调终态。
+- **运行入口一致**：patch 同时覆盖 ESM `dist/index.mjs`、CJS `dist/index.js` 和 package source，避免
+  不同解析条件产生行为漂移。
+- **升级可见性**：patch key 绑定精确版本 2.0.41；升级流程必须显式核对新版本源码与 patch 注册，
+  不能仅假设工具一定会阻止陈旧 patch 被旁路，也不能静默恢复 `!= null`。
 
 ### 5.3 无回归引入
 
 - 用 Issue 最新的 `reasoning_content + tool_calls: []` 真实 SSE shape 固化 provider parser、adapter 与
-  HTTP processor 回归，断言事件 lifecycle、
-  part 数量、文本及 terminal update 次数；
-- 用 gate=false、匿名 ID、非 package 合成 ID、metadata、tool 与 step/finish 分别证明隔离和 barrier；
-- 用普通 compatible reasoning→text 锁定“延迟到 text-end”这一明确代价，防止实现者误称时机不变；
+  HTTP processor 回归，断言 parser 自身只产生 1 start/N delta/1 end，并最终只持久化一个 part；
+- 用非空 tool-call 数组证明真实 tool boundary 仍先结束 reasoning 并完整生成 tool events；
+- 保留首轮 content-bridge、gate、metadata、barrier、failure/exhaustion 测试，证明 dependency patch
+  没有改变 adapter 合同；
 - 运行 adapter suite、processor effect suite、CLI streaming 相关既有测试与 package typecheck；
-- 审核最终 diff 不修改 processor、TUI、schema、dependency 或无关 runtime 分支。
+- 审核 patch 同时覆盖 package source/CJS/ESM，最终 diff 不修改 processor、TUI、schema 或无关
+  runtime 分支。
 
 ### 5.4 Trivial 判定
 
-不适用。修复改变特定 provider 的 adapter streaming 生命周期，涉及 pending terminal、metadata
-安全、provider gate、barrier 与实时完成时机，必须按非显然状态机修复验证。
+不适用。虽然核心条件是一行，但它位于第三方 streaming parser，并影响 reasoning/tool 生命周期；
+还需要维护 source/CJS/ESM 三份等价产物、精确版本 patch 和真实 parser/processor 回归。
 
 ## 六、测试用例清单
 
@@ -790,10 +807,11 @@ start/delta，它们原样转发且不改变 pending；后续 same-ID reopen 仍
 | 回归 | gated adapter 输入首轮 GLM content 交错序列两次          | 1 start、2 delta、1 end；end 在 text-end 前；text 事件原序                                                      | 首轮通过：`coalesces the openai-compatible...`              |
 | 回归 | HTTP mock `.reason.text.reason.text` 走真实 AI SDK 路径  | 一个 reasoning part、一个 text part；文本完整                                                                   | 先红后绿；`processor-effect.test.ts`                         |
 | 回归 | Reporter 规模：相同模式重复 34 次                        | 1 start、34 delta、1 end；pending 最终为空                                                                       | 通过：`keeps one bounded...34 segments`                     |
-| 回归 | 真实 parser 链输入 `reasoning_content + tool_calls: []`  | raw fullStream 每 chunk 的伪 end/reopen 被 adapter 合成 1 start/N delta/1 end；一个持久化 reasoning part       | **待加；必须先红后绿，作为补修实现门禁**                    |
+| 回归 | 真实 parser 链输入 `reasoning_content + tool_calls: []`  | provider fullStream 自身为 1 start/N delta/1 end；一个持久化 reasoning part                                     | **待加；必须先红后绿，作为补修实现门禁**                    |
+| 新增 | reasoning 后出现非空 `tool_calls`                       | reasoning-end 仍在首个 tool event 前；tool input/call 文本与 ID 完整                                           | 待加                                                        |
 | 新增 | gate=false 的相同事件序列                                | 保持修复前逐事件生命周期                                                                                         | 通过                                                        |
 | 新增 | gated 普通单段 reasoning→text，不再 reopen               | end 延迟到 text-end；text delta 不缓冲                                                                           | 通过；显式锁定已接受的时机取舍                              |
-| 新增 | 空 end→start 间隔                                        | same-ID pending 被消费，不输出冗余 end/start                                                                     | 当前测试锁定相反预期；待修订并以真实 SSE 回归为依据         |
+| 既有 | 合成的空 end→start adapter 间隔                          | 当前 adapter 仍把它视为两个 lifecycle；dependency patch 保证空数组不再生成该间隔                               | 保留当前测试，不改预期                                      |
 | 新增 | 匿名 ID、不同 reasoning ID                               | pending 先 flush，不发生跨 lifecycle 合并                                                                        | 首轮通过；预期保持                                          |
 | 新增 | 不同 text ID                                             | pending 先 flush，再按原 text mapper 处理                                                                        | 通过                                                        |
 | 新增 | raw metadata 出现在 start、delta、end 或 pending 之后    | raw 存在即禁用；合法 metadata 保留；已发终态不撤销                                                               | 通过；非法 schema 仍走未改动的既有 decoder                  |
@@ -803,20 +821,20 @@ start/delta，它们原样转发且不改变 pending；后续 same-ID reopen 仍
 | 新增 | typed stream error 与 drain helper                       | error Cause 保持同一对象；pending drain 幂等                                                                     | 通过：adapter 组件测试；`llm.ts` 组合路径经代码审计         |
 | 集成 | compatible stream 在 pending 后异常结束                  | reasoning part 在 incomplete settlement 前获得 terminal end                                                     | 通过：`finalizes pending reasoning...incomplete`            |
 | 新增 | iterable exhaustion 与 interrupt                         | exhaustion 使用同一 drain；interrupt 不被 catch，仍由 processor cleanup                                         | 通过：helper/组合代码审计 + 既有 interruption suites       |
-| 既有 | `test/session/llm.test.ts`                               | 修订后合同与既有 adapter/stream 行为共同通过                                                                     | 52 pass 是首轮历史结果；补修后须重跑                        |
-| 既有 | `test/session/processor-effect.test.ts`                  | 空数组回归、incomplete settlement、retry/interrupt 与既有 processor 行为通过                                     | 35 pass 是首轮历史结果；补修后须重跑                        |
-| 既有 | CLI session-data 与 stream transport                     | 没有 end retraction；现有 reasoning/重放 consumer 合同不变                                                      | 首轮 13 + 30 pass，0 fail；补修后须重跑                    |
-| 静态 | `packages/opencode` 的 `bun typecheck`                   | 类型检查通过                                                                                                     | 首轮通过；补修后须重跑                                     |
+| 既有 | `test/session/llm.test.ts`                               | 当前 adapter/stream 行为保持通过                                                                                 | 2026-08-07 复审实跑：52 pass；补修后须重跑                  |
+| 既有 | `test/session/processor-effect.test.ts`                  | incomplete settlement、retry/interrupt 与既有 processor 行为通过                                                | 2026-08-07 复审实跑：35 pass；补修后须重跑                  |
+| 既有 | CLI session-data 与 stream transport                     | 没有 end retraction；现有 reasoning/重放 consumer 合同不变                                                      | 2026-08-07 复审实跑：13 + 30 pass；补修后须重跑            |
+| 静态 | `packages/opencode` 的 `bun typecheck`                   | 类型检查通过                                                                                                     | 2026-08-07 复审实跑通过；补修后须重跑                      |
 
 ## 七、代码更新清单
 
 | 文件                                                      | 函数 / 区域                                    | 改动                                                                           | 当前状态 |
 | --------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------ | -------- |
 | `packages/opencode/src/session/llm.ts`                    | `streamBatches()` / `adapterState()`           | 传入 npm gate；exhaustion/failure drain pending，失败原样交给 retry policy      | 首轮已完成，保留 |
-| `packages/opencode/src/session/llm/ai-sdk.ts`             | `adapterState()`                               | 把 pending marker 从 `{ id, textID }` 简化为 `{ id }`                          | 待改     |
-| `packages/opencode/src/session/llm/ai-sdk.ts`             | `toLLMEvents()`                                | same-ID pending start/delta 无条件于 text bridge 合并；保留全部 barrier        | 待改     |
 | `packages/opencode/src/session/llm/ai-sdk.ts`             | flags / `drainPendingReasoningEnd()`           | immutable gate、active/metadata flags 与幂等 drain                             | 首轮已完成，保留 |
-| `packages/opencode/test/session/llm.test.ts`              | real SSE / adapter scenarios                   | 先增加空 `tool_calls` 真实 parser 红测，再修订空间隔预期并复跑原边界           | 待改     |
+| `package.json` / `bun.lock`                               | `patchedDependencies`                          | 注册 `@ai-sdk/openai-compatible@2.0.41` 精确版本 patch                         | 待改     |
+| `patches/@ai-sdk%2Fopenai-compatible@2.0.41.patch`        | package source / `dist/index.mjs` / `index.js` | 空数组判断改为非空数组判断                                                     | 待加     |
+| `packages/opencode/test/session/llm.test.ts`              | real SSE / provider scenarios                  | 先增加空 `tool_calls` 真实 parser 红测与非空 tool 边界测试；保留空间隔预期     | 待改     |
 | `packages/opencode/test/session/processor-effect.test.ts` | HTTP mock scenarios                            | 增加空数组输入的单 reasoning part 持久化回归；保留异常结束测试                 | 待改     |
 
 首轮最终 diff 未修改、修订方案也不计划修改：
@@ -824,7 +842,6 @@ start/delta，它们原样转发且不改变 pending；后续 same-ID reopen 仍
 - `packages/opencode/src/session/processor.ts`；
 - `packages/tui/src/routes/session/index.tsx`；
 - `packages/llm/src/schema/events.ts` 或 Session schema；
-- `@ai-sdk/openai-compatible` dependency/patch；
 - CLI run/session-data、share、SDK consumer；
 - text、tool 持久化逻辑本身。
 
@@ -835,12 +852,10 @@ start/delta，它们原样转发且不改变 pending；后续 same-ID reopen 仍
 | `docs/fixes/session-fix-fragmented-reasoning-blocks.md` | 补入空 `tool_calls` 证据，撤销首轮完成结论，修订状态机/必要性/测试与代码清单                                | 已完成   |
 
 本方案不改变 schema、公开接口、错误码、用户配置或 PartUpdated 终态语义；它只改变
-`@ai-sdk/openai-compatible` 路径中无 metadata、显式 `reasoning-0` producer signature 的
-reasoning terminal 发出时机。该行为
-契约由本修复文档与回归测试共同固定。若未来修改必须撤销已发布的 end、主动泛化到匿名/不同 ID
-或非 package signature、跨 text-end/tool/step 复用或新增 pause/时长字段，则超出本方案：必须
-停止实现并返回契约/设计流程重新确认。未来 package 若开始产生 reasoning metadata，也必须按依赖
-升级门禁复审，不能把当前无 metadata 的证据静默外推。
+`@ai-sdk/openai-compatible@2.0.41` 对空 `tool_calls` 数组的 parser 分支：空数组不再构成 reasoning
+terminal，非空数组、content 与 flush 仍是原有边界。该行为由本修复文档、精确版本 dependency patch
+与真实 parser 回归共同固定。依赖升级必须复审 patch 是否仍需要；若未来要修改 content 边界、公共
+end 语义或 adapter 合并范围，则超出本补修方案，必须重新确认。
 
 ## 九、首轮实现记录与 2026-08-07 复审
 
@@ -902,18 +917,24 @@ Git 历史直接复核失败合同、修复和边界证明。
 
 没有修改 processor 生产逻辑、TUI、LLMEvent/Session schema、依赖、CLI consumer 或公开配置。
 当前首先要消除的不是理论残余风险，而是已确认的未修缺陷：空 `tool_calls` 会持续产生碎片。
-补修后仍存在已接受的产品取舍：普通 compatible reasoning 的 terminal/duration 可能延迟到 text-end
-或其他 barrier。若 provider package 改变合成 ID、text lifecycle 或开始附加 reasoning metadata，
-guard 应停止新的 normalization；届时必须更新真实 integration fixture 并重新走依赖升级与合同审计。
+推荐的 dependency patch 不新增 terminal 延迟，也不依赖合成 ID 或 metadata；它只把空数组改为
+非边界。当前分支首轮 adapter 已有的 terminal/duration 延迟仍然存在，并继续只由 content-bridge
+合同与相应测试约束。依赖升级时必须重新核对上游 parser 条件、三份 patch 目标与真实 integration
+fixture；若上游已修复，则删除本地 patch 并先证明同一回归仍通过。
 
 ### 9.5 2026-08-07 复审结论与下一门禁
 
 - 用户确实运行当前分支最新构建；“反馈来自旧版本”已被排除。
 - runtime 日志确实指向 V1 AI SDK；native parser 只作为判断语义的参考，不是本次执行路径。
 - 最新 comment 的根因与本地锁定依赖源码完全一致，并已用真实 dependency chain + 假 SSE 独立复现。
-- comment 声称的候选补修和 87 tests/typecheck 是 Reporter 侧结果；共享分支 HEAD `64e676ac45`
-  未包含该补修，所以本文只把它作为现场证据，不冒充本地验证。
-- 推荐保留首轮安全框架，删除 `textID` 状态，放宽 same-ID pending 合并，并新增根因级真实 SSE
-  回归；不是只把两个条件机械替换后留下死字段。
+- comment 声称的候选 adapter 补修、真实 endpoint 计数和 typecheck 是 collaborator `yixiao5428`
+  提供的结果；补修前生产 HEAD `64e676ac45` 未包含该候选代码，所以本文只把这些结果作为 comment
+  证据，不冒充共享分支验证。本文独立复跑当前未补修基线得到 87 tests、389 assertions 全过，恰好
+  说明现有 suites 没有根因级红测，不能证明问题已修复；CLI consumer 13 + 30 tests 与 package
+  typecheck 也已独立复跑通过，只证明既有合同在当前基线未回归。
+- 推荐使用现有 `patchedDependencies` 精确修正 2.0.41 的空数组判断，并同时覆盖 package source、
+  ESM 与 CJS 入口；首轮 adapter 保留但不放宽，`textID` 也不删除。comment 的 id-only adapter 改法
+  能修复已观察症状，但范围更宽，只在项目明确拒绝 dependency patch 时作为备选。
 - 下一实现门禁：先提交能在当前代码上稳定失败的 `tool_calls: []` 真实 parser/processor 回归，等待
-  确认后再改生产状态机；每完成一个工作单元先单独 commit，再继续下一步。
+  确认后再提交 dependency patch；随后补非空 tool 边界测试并复跑分层 suites/typecheck。每完成一个
+  工作单元先单独 commit，再继续下一步。
