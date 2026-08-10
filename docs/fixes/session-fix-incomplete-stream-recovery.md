@@ -1,386 +1,546 @@
-# Incomplete provider stream 按副作用状态恢复修正方案
+# Session 不完整流恢复：根因分析与修正方案
 
-- 状态：修复前分析与方案草案，等待用户确认；尚未修改 production code
-- 日期：2026-08-07
-- 对应问题：[Issue #7](https://github.com/lihaokun/opencode/issues/7)
-- 工作分支：`yixiao-issue-7-new`
-- 前置修复：`docs/fixes/session-fix-incomplete-provider-stream.md`（Issue #3）
-- 分析范围：仅当前本地仓库与 Issue #7，不查看上游仓库
-- 问题分类：接口/架构层面的恢复状态机缺失，同时包含既有 fail-stop 行为的功能补充
-- 当前验证限制：仓库要求 Bun 1.3.14，但当前环境中 `bun` 不存在，定向测试命令均在启动前以
-  `command not found: bun` 失败；本文的当前行为结论来自源码、既有测试契约和本地提交记录的静态交叉验证
+> Issue: [#7](https://github.com/lihaokun/opencode/issues/7)
+>
+> 状态：修订后的实现前方案，尚未修改生产代码。
+>
+> 审视日期：2026-08-10。
+>
+> 证据范围：当前本地仓库与 Issue #7 正文；未查看上游仓库、上游分支或上游实现。
+>
+> 验证限制：当前环境没有 `bun`，本文结论来自静态代码审查，测试计划尚未实际执行。
 
-## 一、现象与复现
+## 结论摘要
 
-### 1.1 现象
+Issue #7 不能通过“把 incomplete-stream 改成普通可重试错误”安全解决。恢复决策必须独立于通用 transport retry，并且必须在以下事实已经确定后执行：
 
-Issue #3 已保证缺少可信 terminal finish event 的 provider stream 不会被误报为成功。当前统一行为是：
+1. 本次 provider turn 确实以 incomplete stream 结束；
+2. 已启动的本地工具均已等待并完成持久化；
+3. 分类依据来自持久化投影，而不是尚未提交的内存布尔值；
+4. provider 侧不存在未观测副作用，或对应 action 受覆盖整个 attempt replay 的幂等契约/覆盖 durable prefix 的续传契约保护；
+5. 本地工具没有被提供，或 runtime 已证明 durable-before-execute；
+6. settled-tool continuation context 可以按目标 provider protocol 合法构造；
+7. 自动恢复预算未耗尽；
+8. 下一次 provider 调用使用新的 assistant attempt，并且不会覆盖失败 attempt。
 
-```text
-incomplete provider stream
-  -> provider-error
-  -> assistant error
-  -> 当前 Prompt/SessionRunner 停止
-  -> 用户必须手动发送新消息或显式 resume
-```
-
-该 fail-stop 修复保证了安全，但没有区分以下三类本质不同的状态：
-
-1. 当前 provider attempt 没有产生任何完整 tool call 或 provider-executed side effect，可以用新的
-   assistant attempt 安全重试；
-2. 当前 attempt 已有工具调用，但所有工具均已结算并持久化，可以跳过旧 provider request，直接把已结算
-   tool result 交给下一 assistant turn；
-3. 当前 attempt 存在 pending/running、provider-executed 无 result、持久化失败或部分结算，副作用状态不明，
-   必须继续 fail-stop。
-
-当前实现把这三类状态都压缩为普通 assistant error，因此长任务遇到稳定 stream deadline 时无法自动恢复。
-
-### 1.2 Legacy 路径的当前可重复行为
-
-#### 复现 A：无工具的 incomplete stream
-
-现有测试 `packages/opencode/test/session/prompt.test.ts`：
-
-- `loop preserves reasoning-only output and stops on a missing terminal finish`
-- `loop preserves partial text and stops on a missing terminal finish`
-
-输入是 reasoning/text 已部分产生，但 provider 没有 finish reason。当前断言固定为：
-
-```text
-provider request count = 1
-assistant.finish = "unknown"
-assistant.error = canonical incomplete error
-Prompt loop stops
-```
-
-预期的新行为应是：原 assistant 保留 error 与 partial transcript，但 Prompt 创建新的 assistant ID，最多自动重试
-2 次；旧 partial reasoning/text 不进入新 provider request。
-
-#### 复现 B：工具已完成后 incomplete
-
-现有测试：
-
-- `loop does not replay a completed tool after a later missing terminal finish`
-- `high-usage missing finish does not replay a completed tool or start compaction`
-
-当前实现正确保证工具只执行一次，但随后直接停止。Issue #7 要求把该用例翻转为：
-
-```text
-completed tool count = 1
-old assistant remains error
-old provider request is not replayed
-new assistant turn starts
-new model request contains the settled tool call/result
-```
-
-#### 复现 C：工具状态不明
-
-`SessionProcessor.cleanup()` 会等待未结算工具至多 250ms，然后把仍在 `ctx.toolcalls` 中的工具写成：
-
-```text
-status = "error"
-error = "Tool execution aborted"
-metadata.interrupted = true
-```
-
-该状态虽然在 schema 上是 terminal `error`，但语义上不是“工具已可信结算”，而是“执行是否产生副作用不可知”。
-因此恢复分类不能只检查 `status in {completed,error}`，必须把 `metadata.interrupted=true` 视为
-`ManualStop`。
-
-### 1.3 Legacy 出错代码路径
-
-```text
-AI SDK finish-step(other, rawFinishReason=undefined)
-  -> packages/opencode/src/session/llm/ai-sdk.ts
-       emits provider-error(retryable=false), no stable classification
-  -> packages/opencode/src/session/processor.ts
-       case provider-error: throw new Error(message)
-  -> MessageV2.fromError()
-       converts to generic UnknownError
-  -> SessionRetry.policy()
-       does not recognize the generic error, so same Effect is not retried
-  -> SessionProcessor.halt()/cleanup()
-       persists assistant error and aborts unresolved tools
-  -> packages/opencode/src/session/prompt.ts
-       current-turn error gate breaks
-       persisted-error entry gate also breaks before tool continuation
-  -> packages/opencode/src/session/message-v2.ts
-       drops the entire errored assistant from model context
-```
-
-关键位置：
-
-- adapter classification：`packages/opencode/src/session/llm/ai-sdk.ts:120`
-- attempt evidence：`packages/opencode/src/session/processor.ts:80`
-- tool persistence：`packages/opencode/src/session/processor.ts:145`
-- provider-error information loss：`packages/opencode/src/session/processor.ts:444`
-- cleanup interruption marker：`packages/opencode/src/session/processor.ts:634`
-- same-message Effect retry boundary：`packages/opencode/src/session/processor.ts:694`
-- persisted-error loop guard：`packages/opencode/src/session/prompt.ts:1100`
-- current-turn error guard：`packages/opencode/src/session/prompt.ts:1297`
-- errored assistant context deletion：`packages/opencode/src/session/message-v2.ts:248`
-
-### 1.4 V2 SessionRunner 的当前可重复行为
-
-现有测试 `packages/core/test/session-runner.test.ts` 已固定：
-
-- `does not continue automatically after a provider error follows a local tool call`
-- `durably fails a hosted tool when its provider errors before returning a result`
-
-当前 V2 路径：
-
-```text
-provider-error
-  -> createLLMEventPublisher.failAssistant()
-  -> Step.Failed(error.type="unknown")
-  -> runner awaits local tool fibers
-  -> all remaining tools are failed
-  -> needsContinuation forced to false
-```
-
-相关位置：
-
-- publisher 已有 `called/settled/providerExecuted` evidence：
-  `packages/core/src/session/runner/publish-llm-event.ts:55`
-- provider error 立即 fail assistant：
-  `packages/core/src/session/runner/publish-llm-event.ts:404`
-- provider error 禁止 continuation：
-  `packages/core/src/session/runner/llm.ts:338`
-- runner 返回 `needsContinuation=false`：
-  `packages/core/src/session/runner/llm.ts:345`
-
-V2 比 legacy 已经拥有更精确的内存 tool evidence，并且会等待本地 tool fiber 结算；但这些 evidence 没有形成统一
-recovery decision，也没有持久化 recovery classification。
-
-### 1.5 Legacy 与 V2 的额外不一致
-
-Legacy 的 `MessageV2.toModelMessagesEffect()` 会删除普通 errored assistant；V2 的
-`toLLMMessages()` 当前仍会把 errored assistant 的 partial text/reasoning 转成下一次模型上下文，仅关闭 provider
-metadata 复用：
-
-- Legacy：`packages/opencode/src/session/message-v2.ts:248`
-- V2：`packages/core/src/session/runner/to-llm-message.ts:70`
-
-因此，即使两条 runner 路径都增加 retry，若不统一 model-context lowering：
-
-- Legacy 会丢掉 settled tool result；
-- V2 会错误重放 incomplete partial prose/reasoning。
-
-### 1.6 预期行为
-
-统一分类：
-
-```text
-classification = "incomplete-stream"
-```
-
-Session 层基于本 attempt 的 durable side-effect evidence 计算：
+建议保留三种用户可见结果，但收紧自动恢复条件：
 
 ```text
 IncompleteStreamRecovery
-  |- SafeRetry
-  |- ContinueAfterSettledTools
-  `- ManualStop
+├── SafeRetry
+├── ContinueAfterSettledTools
+└── ManualStop
 ```
 
-行为约束：
+其中“没有观察到 `providerExecuted`”不能证明“provider 没有执行副作用”。在缺少 provider 级安全围栏时必须降级为 `ManualStop`。
 
-- `SafeRetry`：保留旧失败 attempt，使用新 assistant ID 和新 processor/publisher 请求 provider；最多重试 2 次；
-- `ContinueAfterSettledTools`：不重放旧 request、不重新执行工具，创建下一 assistant turn，只注入已结算 tool context；
-- `ManualStop`：不 retry、不 continuation，错误明确列出未结算工具；
-- 三种情况都不能把旧 incomplete assistant 改写为成功；
-- Legacy 与 V2 对同一 evidence 必须产生相同 recovery decision。
+---
 
-## 二、根因分析
+## 1. 现象与复现
 
-### 2.1 直接症状与根因区分
+### 1.1 Issue #7 要求
 
-直接症状是 Prompt/SessionRunner 在 incomplete error 后停止。仅删除 error-first guard 或把
-`retryable:false` 改成 `true` 只能改变症状，不能保证副作用安全。
+根据 Issue #7 正文，目标行为是：
 
-根因是：当前系统只有“provider transport failure”与“assistant terminal error”两个层次，没有位于二者之间的
-**attempt-local side-effect recovery contract**。因此：
+- 没有完整 tool call、没有 provider 侧副作用时，自动重试；
+- 已出现 tool call，但全部工具已结算时，从已结算工具上下文继续；
+- 存在 `pending` / `running` / 中断工具或其他不确定状态时，停止并保留错误；
+- 每次恢复使用新的 assistant message / attempt；
+- 失败 attempt 保留错误，不伪装成成功；
+- 自动恢复有严格上限，避免永久循环；
+- Legacy 与 V2 路径的语义一致。
 
-1. provider event 上的 transport 信息在 legacy processor 中丢失；
-2. Session 层没有统一的 tool settlement evidence schema；
-3. runner 没有把“是否安全重放”和“是否应继续下一 turn”建模为互斥决策；
-4. model-context lowering 不知道 failed attempt 哪些内容可恢复；
-5. retry 没有 durable attempt isolation 与跨 resume 的 bounded count。
+以上是 Issue #7 的需求，不是当前代码已经满足的事实。
 
-### 2.2 根因一：`retryable` 同时承载了两个不同问题
+### 1.2 Legacy 当前事实
 
-`ProviderErrorEvent.retryable` 最多只能描述 provider/transport failure 是否可能是瞬态的，不能证明整个 agent attempt
-可以安全 replay。完整 tool call 之后，即使 EOF 是瞬态的，重放仍可能重复本地命令、写文件、网络请求或
-provider-executed side effect。
-
-因此 recovery decision 不能由 adapter 的一个布尔值决定。
-
-### 2.3 根因二：legacy provider-error 被压成普通 Error
-
-`packages/opencode/src/session/processor.ts:444` 当前只执行：
+Legacy AI SDK 适配器已识别一种 canonical incomplete stream：
 
 ```ts
-throw new Error(value.message)
+if (event.finishReason === "other" && event.rawFinishReason === undefined) {
+  state.terminalFailure = true
+  events.push(
+    LLMEvent.providerError({
+      message: incompleteStreamMessage,
+      retryable: false,
+    }),
+  )
+}
 ```
 
-`classification`、`retryable` 和 provider metadata 均丢失。随后 `MessageV2.fromError()` 只能创建
-`UnknownError`。这导致 Prompt 无法可靠区分 incomplete-stream、普通 provider error 和其它 unknown failure。
+证据：`packages/opencode/src/session/llm/ai-sdk.ts:120-127`。
 
-### 2.4 根因三：现有 Effect retry 不具备 attempt isolation
+该错误随后会终止当前 attempt：
 
-`SessionProcessor.process()` 的 `Effect.retry()` 包裹同一个 processor context 和同一个
-`assistantMessage`。Issue #3 文档已明确该边界没有 durable attempt identity，也不会回滚已持久化 parts、cost、tool
-facts。
+- `SessionProcessor` 将 `provider-error` 转成普通 `Error`，丢失 classification 与 retry 元数据：`packages/opencode/src/session/processor.ts:444-445`；
+- 当前 processor retry 边界位于 `packages/opencode/src/session/processor.ts:727-745`，但 canonical incomplete-stream 错误不会进入通用重试；
+- `SessionPrompt` 在当前 attempt 出错后执行通用 break：`packages/opencode/src/session/prompt.ts:1301`；
+- 下一次进入循环时，持久化错误 guard 也会停止：`packages/opencode/src/session/prompt.ts:1100-1111`；
+- `packages/opencode/test/session/retry.test.ts` 已明确断言 canonical incomplete-stream unknown error 不走通用 retry。
 
-因此 SafeRetry 不能加入当前 `SessionRetry.policy()`；必须退出旧 processor，并由外层 runner 创建新的 assistant
-message/attempt。
+因此 Legacy 当前是 fail-stop，而不是自动恢复。
 
-### 2.5 根因四：tool terminal schema 不等于副作用已可信结算
+Legacy processor 还会对没有可信 final step settlement 的 clean EOF 做路径无关检查：`packages/opencode/src/session/processor.ts:580-600`。现有测试覆盖 empty、final-only 与 multi-step-incomplete：`packages/opencode/test/session/processor-effect.test.ts:856-893`。
 
-下列状态不能被简单视为 settled：
+Legacy tool part 的关键持久化位置是：
 
-- `pending`：只有 partial tool input；
-- `running`：完整 call 已交付，side effect 可能已开始；
-- `error + interrupted=true`：cleanup 强制收尾，真实副作用状态不明；
-- provider-executed call 无 terminal result；
-- tool result persistence/projection 失败。
+- pending：`packages/opencode/src/session/processor.ts:258-274`；
+- running：`packages/opencode/src/session/processor.ts:353-374`；
+- completed：`packages/opencode/src/session/processor.ts:182-205`；
+- error：`packages/opencode/src/session/processor.ts:208-225`；
+- cleanup/interrupted：`packages/opencode/src/session/processor.ts:602-660`。
 
-只有真实 `completed` 或真实 tool `error`，且输入与 output/error 已持久化、没有 interrupted/persistence failure，才满足
-ContinueAfterSettledTools。
+但是这些位置不能证明 Legacy AI SDK 路径“先持久化 call、后执行工具”。AI SDK 当前负责 tool dispatch：`packages/opencode/src/session/llm.ts:279-283`；本地工具副作用发生在 SDK 调用的 `execute()` 回调中：`packages/opencode/src/session/tools.ts:102-129`；仓库的 race reproducer 明确记录工具可能在 processor 收到事件前执行：`packages/opencode/test/session/snapshot-tool-race.test.ts:4-12`。因此 Legacy 要安全自动恢复，必须新增 durable-before-execute handshake，或在提供了可执行本地工具时把 replay fence 视为 unknown。
 
-### 2.6 根因五：Prompt 有两个独立停止门
+### 1.3 V2 当前事实
 
-只修改 loop 顶部 `lastAssistant.error` guard 不足够。当前 turn 完成后还有：
+V2 对显式 `provider-error` 已采取 fail-stop：
+
+- publisher 收到 `provider-error` 后调用 `failAssistant()`：`packages/core/src/session/runner/publish-llm-event.ts:404-407`；
+- runner 在 provider error 后阻止 continuation，并失败未结算工具：`packages/core/src/session/runner/llm.ts:338-345`。
+
+V2 对原始 `LLMError` 流失败也会失败 assistant：`packages/core/src/session/runner/llm.ts:279-294`。
+
+但是 V2 尚未覆盖“stream 正常 drain，却没有 `step-finish`”的完整性检查：
+
+- `stepSettlement` 只由 `step-finish` 设置：`packages/core/src/session/runner/publish-llm-event.ts:396-401`；
+- runner 仅在 `stepSettlement` 存在时发布 `Step.Ended`：`packages/core/src/session/runner/llm.ts:316-337`；
+- 当 stream 是 Success、没有 provider error、也没有 `stepSettlement` 时，runner 仍可从 `runTurnAttempt()` 成功返回：`packages/core/src/session/runner/llm.ts:340-345`。
+
+当前测试 `durably fails a hosted tool left unresolved at normal provider EOF` 只证明未返回结果的 hosted tool 会被标记失败：`packages/core/test/session-runner.test.ts:3197-3219`。它没有证明 assistant 会被标记为 incomplete-stream，也没有证明 partial text / reasoning 或已结算本地工具不会被当成成功 continuation。
+
+因此，不能说当前 Legacy 与 V2 已经具有统一的 incomplete-stream fail-stop 行为。Issue #3 的 canonical 检测证据只直接覆盖 Legacy AI SDK 路径；V2 需要补充自己的 stream-settlement 检查。
+
+### 1.4 静态复现场景
+
+实现前至少要固定以下场景：
+
+| 场景 | 当前 Legacy | 当前 V2 | 目标 |
+|---|---|---|---|
+| partial text 后 canonical incomplete | 持久化错误并停止 | 取决于事件来源；clean EOF 可漏检 | 安全围栏成立时新 attempt 重试，否则 ManualStop |
+| reasoning-only 后 incomplete | 持久化错误并停止 | clean EOF 可漏检 | 同上 |
+| 空流或只有 `finish`、没有 `step-finish` | processor 已写 error 并停止，但还是 generic UnknownError | 可成功 drain | 两条路径都必须稳定分类为 incomplete |
+| 本地工具已 completed，随后 incomplete | 工具执行一次并停止 | 可能 continuation，未先分类 incomplete | 仅在 replay fence 安全且协议闭包可构造时继续；工具不得重放 |
+| hosted tool call 无结果后 EOF | 不适用或由 adapter 决定 | tool 变 error，assistant 未必失败 | 保留不确定来源并 ManualStop |
+| tool pending/running 后 incomplete | cleanup 标记 interrupted | cleanup 目前投影普通 error | 保留 interruption/uncertainty 并 ManualStop |
+| StructuredOutput partial 后 incomplete | 保持错误 | V2 尚无对应能力 | 不得把旧 attempt 的值晋升为成功 |
+| 持久化失败 | 当前执行失败 | 当前执行失败 | 当前进程 fail closed，绝不自动发起下一次 provider 调用 |
+
+---
+
+## 2. 根因分析
+
+### 2.1 incomplete-stream 信号没有形成跨路径的类型化契约
+
+当前 `ProviderFailureClassification` 只有 `context-overflow`：
+
+- `packages/llm/src/schema/errors.ts:4-5`。
+
+`ProviderErrorEvent` 支持可选 classification，但 canonical Legacy adapter 没有填写；V2 clean EOF 也不会产生 provider-error。
+
+同时，classification 当前只直接出现在 `InvalidRequestReason`：`packages/llm/src/schema/errors.ts:34-40`。`TransportReason` 与 `InvalidProviderOutputReason` 没有 classification：`packages/llm/src/schema/errors.ts:122-145`。因此不能假设所有 V2 raw stream failure 都能自动携带 `incomplete-stream`。
+
+结论：需要统一的 `incomplete-stream` 类型化信号，但必须分别接入：
+
+- Legacy AI SDK canonical adapter；
+- V2 protocol/route 能明确识别的异常；
+- V2 runner 对成功 drain 但缺少 `step-finish` 的本地完整性检查。
+
+### 2.2 transport retryability 与 agent replay safety 被混为一谈
+
+“网络错误可重试”不等于“整个 agent attempt 可安全重放”。
+
+一个 attempt 可能已经：
+
+- 持久化 partial text / reasoning；
+- 发出完整本地 tool call；
+- 执行有副作用的本地工具；
+- 触发 provider-hosted 工具；
+- 产生了 provider 侧操作，但相关事件在断流中未到达客户端。
+
+因此不能把 incomplete stream 加入 `SessionRetry.policy()` 后直接重跑同一个 processor。通用 retry 位于 `packages/opencode/src/session/processor.ts:727-745`，它发生在 Prompt 层检查持久化工具状态之前，无法证明整个 attempt 的重放安全。
+
+本方案明确决定：
+
+- 保留 incomplete-stream 的 `retryable: false`，阻止通用 transport retry；
+- 由专用恢复分类器决定是否创建新的 assistant attempt；
+- classification 与 `retryable` 是正交信息。
+
+删除 `retryable: false` 不是实现 Issue #7 的必要条件，也不应在没有新的 retry 边界证明前执行。
+
+### 2.3 “没有观察到工具事件”不能证明没有副作用
+
+存在两类独立的不确定性。
+
+**Provider-hosted 副作用：**V2 只有在收到 tool event 后才知道 `providerExecuted`：
+
+- publisher 在 `tool-call` 时记录：`packages/core/src/session/runner/publish-llm-event.ts:313-334`；
+- LLM 事件 schema 的 `providerExecuted` 是可选字段。
+
+如果 provider 已执行 hosted tool，但承载 call/result 的流片段丢失，客户端看到的仍可能是“没有 providerExecuted 证据”。
+
+**Legacy 本地工具副作用：**AI SDK 可以在 processor 收到 `tool-call` event 之前调用本地工具。`packages/opencode/test/session/snapshot-tool-race.test.ts:4-12` 是该时序的现有 reproducer。因此 Legacy 的“没有 durable tool part”也不能证明本地工具尚未执行。
+
+以下推理在两种情况下都无效：
 
 ```text
-handle.message.error -> break
+没有观察到 tool evidence
+=> 没有副作用
+=> 可以安全重试
 ```
 
-因此 recovery action 必须同时驱动：
+自动恢复必须依赖实际请求 dispatch 前确定并持久化的 attempt replay fence：
 
-1. 当前 processor 返回后的 same-process transition；
-2. crash/re-enter 后的 persisted-assistant transition。
+```ts
+type DispatchTarget = {
+  providerID: string
+  routeID: string
+  protocol: string
+  modelID: string
+  modelFamily?: string
+}
 
-两者必须使用同一 persisted recovery classification，避免进程内与恢复后的语义不同。
+type ProviderSafetyDomain = Omit<DispatchTarget, "modelID"> & {
+  modelID?: string // provider 契约若只在单一 model 内有效则必填
+}
 
-### 2.7 根因六：model context 没有 recovery-aware lowering
+type ProviderRecoveryProof =
+  | { type: "none-needed" }
+  | { type: "idempotency"; domain: ProviderSafetyDomain; key: string }
+  | {
+      type: "continuation"
+      domain: ProviderSafetyDomain
+      cursor: string
+      providerPrefixVersion: string
+    }
 
-三种 recovery 对旧 assistant context 的要求不同：
-
-- SafeRetry：旧 partial text/reasoning/tool-input 全部不进入模型上下文；
-- ContinueAfterSettledTools：只注入已结算 tool call/result；旧 partial prose/reasoning 不注入；
-- ManualStop：不自动发起下一 request；用户后续显式继续时也不应把 incomplete prose 当作完整历史。
-
-当前 Legacy 整条删除、V2 几乎整条保留，都不满足统一契约。
-
-### 2.8 根因七：StructuredOutput 状态不是 attempt-local
-
-Legacy `runLoop()` 中 `structured` 定义在 while loop 外。若 incomplete stream 在 StructuredOutput tool 已成功后进入
-ContinueAfterSettledTools，下一 provider turn 可能错误使用前一失败 attempt 留下的 `structured` 值进行成功提升。
-
-Recovery 实现必须在创建新 assistant attempt 前清除旧 attempt 的 transient StructuredOutput promotion state，只有当前
-成功 attempt 的 StructuredOutput 才能成为最终结果。
-
-## 三、参考实现对照
-
-本问题不是数值算法 bug，不查看上游仓库。参考对象只使用当前仓库内已有契约与实现。
-
-### 3.1 Issue #3 fail-stop 契约
-
-`docs/fixes/session-fix-incomplete-provider-stream.md` 已证明：
-
-- incomplete stream 必须持久化 terminal assistant error；
-- partial transcript 必须保留用于审计；
-- 同一个 assistant message 不能直接 retry；
-- completed tool 不能重放；
-- provider-error 必须优先于 compaction/structured success。
-
-Issue #7 必须在这些不变量之上增加恢复，不能撤销它们。
-
-### 3.2 V2 publisher 的 tool evidence
-
-`createLLMEventPublisher()` 已记录：
-
-```text
-called
-settled
-providerExecuted
-providerMetadata
+type AttemptReplayFence = {
+  provider:
+    | { type: "no-provider-side-effects-offered" }
+    | {
+        type: "provider-idempotency-protected"
+        scope: "entire-attempt-replay"
+        domain: ProviderSafetyDomain
+        key: string
+      }
+    | {
+        type: "provider-continuation-capable"
+        scope: "after-durable-prefix"
+        domain: ProviderSafetyDomain
+      }
+    | { type: "unknown" }
+  localTools:
+    | { type: "none-offered" }
+    | { type: "durable-before-execute" }
+    | { type: "unknown" }
+}
 ```
 
-并通过 owning `assistantMessageID` 持久化 tool call/result。该结构证明 recovery classifier 所需证据可以在不猜测
-provider prose 的情况下获得；缺口是没有暴露统一 decision，也没有把 interrupted/persistence failure 纳入状态。
+证据要求：
 
-### 3.3 V2 overflow recovery 的 attempt isolation
+- `provider.no-provider-side-effects-offered`：实际请求没有启用 provider-executed/hosted 能力；
+- `provider.provider-idempotency-protected`：adapter 有明确、可测试的 provider 契约，同一稳定 idempotency key 同时覆盖原 assistant attempt、其 recovery replay 以及两者内部的全部 physical provider requests；planned recovery target 必须属于相同 `ProviderSafetyDomain`；当前本地代码没有这种通用证明，不能默认使用；Legacy AI SDK 若只得到单次 HTTP request 级幂等，而内部 continuation requests 没有逐次 durable evidence，则该 fence 必须是 `unknown`；
+- `provider.provider-continuation-capable`：dispatch 前只能证明 provider/route 具备受保护续传能力；实际 cursor 必须在 stream 中产生并随其对应 durable prefix 持久化。只有 capability、durable cursor、cursor 对应的 providerPrefixVersion、该 prefix 与完整 recoverySourceVersion 的祖先关系，以及 planned continuation target domain 全部匹配时，Continue 才安全。当前本地代码没有这种通用契约；
+- `localTools.none-offered`：实际请求没有提供可执行本地工具；
+- `localTools.durable-before-execute`：runtime 保证完整 call 已 durable commit 后才允许执行副作用。V2 当前具有该边界：`packages/core/src/session/runner/llm.ts:242-271`；Legacy AI SDK 当前不具有；
+- 无法证明任一维度时，该维度必须是 `unknown`。
 
-`packages/core/src/session/runner/llm.ts` 的 context-overflow recovery 已使用新的物理 provider attempt 重建同一逻辑 turn，
-且只在没有 durable assistant output/tool execution 时允许。它可作为 SafeRetry 的本地结构参考：
+Legacy 若要在提供本地工具时自动恢复，必须先把 `tools.ts` 的 AI SDK `execute()` 与 `SessionProcessor` 连接成 durable-before-execute handshake：先创建并提交 owning assistant 的 running tool part，提交失败则不得调用 `item.execute()`。若不做这项架构修改，只能 ManualStop。
 
-- 新 provider attempt 由 runner 发起；
-- 旧 attempt 不在原 publisher 内重试；
-- bounded recovery；
-- durable output/side effect 是 recovery fence。
+该 fence 不仅约束 `SafeRetry`，也约束 `ContinueAfterSettledTools`。即使所有“已观察工具”都结算，也不能排除断流前还有一个未观察到的 hosted action 或 Legacy local action。
 
-Incomplete-stream recovery 需要更细的 tool-settlement分类，但不能复用 context-overflow 的“完全无 durable output”判定替代。
+### 2.4 V2 内存 tool flags 不是持久化证据
 
-### 3.4 V2 Session spec 的现有约束
+publisher 当前有多类“先改内存、后发布 durable event”的状态：
+
+- `assistantMessageID` / `assistantActive` 在 `Step.Started` 发布前设置：`packages/core/src/session/runner/publish-llm-event.ts:74-84`；
+- tool map 与 fragment start state 在 `Tool.Input.Started` 发布前创建：`packages/core/src/session/runner/publish-llm-event.ts:165-183`；
+- `assistantActive=false` / `assistantFailed=true` 在 `Step.Failed` 发布前设置：`packages/core/src/session/runner/publish-llm-event.ts:199-210`；
+- `called = true` 在 `Tool.Called` 发布前：`packages/core/src/session/runner/publish-llm-event.ts:319-334`；
+- `settled = true` 在 `Tool.Success` / `Tool.Failed` 发布前：`packages/core/src/session/runner/publish-llm-event.ts:342-373`、`376-393`；
+- `failUnsettledTools()` 也在 `Tool.Failed` 发布前标记 settled：`packages/core/src/session/runner/publish-llm-event.ts:213-231`。
+
+如果 `events.publish()` 失败，内存状态可能表示 assistant/tool/fragment 已开始或已结算，但 durable event 与 projection 并未成功提交。
+
+结论：
+
+1. 表示 durable 生命周期的内存状态必须在 publish 成功后更新，或在失败时显式回滚；不仅是 called/settled；
+2. 恢复分类的权威输入必须来自 publish 成功后的 durable projection reload；
+3. 任一必需持久化失败时，当前执行直接 fail closed，不能调用新的 provider attempt；
+4. failure-injection 测试必须覆盖 `Step.Started`、`Step.Failed`、`Tool.Input.Started`、fragment start、`Tool.Called` 与 tool settlement；
+5. 如果存储本身不可用，就不能声称已经“持久化 ManualStop”。此时只能保证当前进程不重试；持久化恢复状态必须等存储恢复后才能记录。
+
+### 2.5 V2 会丢失 interrupted / uncertain 来源
+
+V2 tool error schema 只有普通 `error`，没有 interruption/uncertainty 标记：
+
+- `packages/schema/src/session-message.ts:110-138`。
+
+两条 cleanup 路径都需要纳入设计：
+
+- 当前 turn 的 `failUnsettledTools()`：`packages/core/src/session/runner/publish-llm-event.ts:213-231`；
+- 新进程/新 run 启动前的 `failInterruptedTools()`：`packages/core/src/session/runner/llm.ts:119-137`，调用点 `packages/core/src/session/runner/llm.ts:390`。
+
+如果 pending/running 工具只被投影成普通 terminal error，后续分类器可能把它误认为“已安全结算”。必须持久化区分：
+
+- 工具明确返回的 error；
+- runner 中断执行形成的 error；
+- provider 未返回 hosted result 形成的 uncertain error。
+
+后两者都必须阻止自动恢复。
+
+### 2.6 attempt identity 在 Legacy 与 V2 中含义不同
+
+必须区分三个层级：
+
+1. **logical recovery chain**：同一份用户工作触发的一串 incomplete-stream 恢复；
+2. **assistant attempt**：一个持久化 assistant message 及其外层 processor/runner 执行；
+3. **physical provider request**：实际发给 provider 的一次 HTTP/stream 请求。
+
+Legacy 的一个 assistant message / `SessionProcessor.process()` 可能因 AI SDK client-side tool continuation 发出多个 physical provider requests。因此 Legacy assistant ID 不能被描述为“一个物理 provider attempt ID”。
+
+V2 当前每个 runner turn 明确调用一次 `llm.stream(request)`：`packages/core/src/session/runner/llm.ts:205-233`，其 assistant attempt 与 physical request 更接近一一对应。
+
+恢复上限应按 logical recovery chain 中的自动恢复次数计数，而不是把 Legacy assistant ID 当作 physical request 计数器。本修复不新增独立的全局 physical-request budget；当前本地代码也没有证明 AI SDK 内部 multi-step physical requests 受外层 Prompt step counter 约束。测试应记录具体 fixture 的 provider hit 数以发现意外 replay，但不能把 recovery ordinal 误称为 physical request 上限。若产品需要 physical-request hard limit，必须另行设计 dispatch-level counter/guard。
+
+### 2.7 缺少 durable recovery-chain 与实际 dispatch 证据
+
+V2 assistant schema 当前没有 `parentID`、logical-turn ID、recovery-chain ID、retry ordinal 或 replay fence：
+
+- `packages/schema/src/session-message.ts:164-189`。
+
+V2 `Step.Started` 只保存 assistant ID、agent、model 与 snapshot：`packages/schema/src/session-event.ts:148-159`。但工具 definitions 与 provider options 是 dispatch 前动态组装的：`packages/core/src/session/runner/llm.ts:199-214`。
+
+Legacy assistant 同样没有 recovery chain/replay fence；实际工具集合在 Prompt 中动态解析。若 failure 与 decision 之间发生进程退出，不能用后来可能已经变化的配置、插件、权限或 tool registry 重算原请求的安全围栏。
+
+`session.next.retried` 虽然有 `attempt`，但没有 assistant/logical-chain 关联，并且 projector 当前忽略它。仅靠现有 history 无法证明跨重新进入的 retry budget或原请求的 replay safety。
+
+结论：在 provider dispatch 前、且在实际请求与工具能力完成 materialization 后，必须随 assistant attempt 持久化不可变 dispatch evidence，例如：
+
+```ts
+type RecoveryChain = {
+  chainID: string
+  ordinal: number // 首次 incomplete 为 0；每次 incomplete-triggered dispatch 递增
+}
+
+type AttemptDispatchEvidence = {
+  target: DispatchTarget
+  replayFence: AttemptReplayFence
+  capabilities: {
+    localToolsOffered: boolean
+    providerSideEffectsOffered: boolean
+  }
+  recovery?: RecoveryChain
+  recoveryProof?: ProviderRecoveryProof
+}
+```
+
+分类器必须读取该 attempt 自己的 durable dispatch evidence，不能根据当前配置重新计算。第一次 incomplete failure 可用该失败 assistant ID 确定性创建 `chainID`、`ordinal=0`；后续 ordinary tool continuation 传播相同 recovery chain 但不递增 ordinal，只有 incomplete-triggered 新 dispatch 才递增。新用户输入创建新 chain。若进程在 `Step.Started`/dispatch evidence 已持久化后、terminal settlement 之前崩溃，重新进入时看到的是 dispatch ambiguity，必须 `ManualStop`，不能静默再次发送。
+
+该设计只解决已持久化 attempt 的链、预算与请求前围栏，不声称解决任意时刻的 provider-dispatch crash recovery。`specs/v2/session.md:165` 已明确把一般 post-crash continuation recovery 延后；本修复应保留该边界。
+
+### 2.8 当前模型上下文 lowering 无法表达恢复语义
+
+Legacy 对普通非 abort 的 errored assistant 整体跳过：
+
+- `packages/opencode/src/session/message-v2.ts:248-255`。
+
+这适合 `SafeRetry`，但会同时丢掉 `ContinueAfterSettledTools` 所需的完整 tool call/result。
+
+V2 当前保留 errored assistant 的 text/reasoning，只是在有 error 时不复用 provider metadata：
+
+- `packages/core/src/session/runner/to-llm-message.ts:71-99`。
+
+这会把 incomplete attempt 的 partial prose/reasoning 注入下一次请求。
+
+但也不能简单“删除全部 reasoning”。仓库已有证据表明 provider-native reasoning metadata 需要按模型复用：
+
+- V2 reasoning 持久化包含 `providerMetadata` 与 completion time：`packages/schema/src/session-message.ts:147-157`；
+- V2 测试验证 signed/encrypted reasoning 会在后续请求恢复：`packages/core/test/session-runner.test.ts:1511-1565`；
+- V2 spec 规定 provider-native reasoning 只在历史模型与 continuation 模型一致时复用：`specs/v2/session.md:50-52`。
+
+但当前 durable `completed/end` 也不足以证明 reasoning 是 provider 正常结束：
+
+- Legacy 正常 `reasoning-end`、`step-finish` 强制收尾与 cleanup 都会写 `time.end`：`packages/opencode/src/session/processor.ts:229-235`、`459-465`、`625-631`；
+- V2 `step-finish` 会调用 generic `flush()`，stream ensuring/cleanup 也调用同一 flush；开放 reasoning 都通过与正常 end 相同的 `Reasoning.Ended` event 持久化：`packages/core/src/session/runner/publish-llm-event.ts:109-117`、`132-162`、`396-401`；
+- projector 对这些来源都设置 `time.completed`：`packages/core/src/session/message-updater.ts:364-370`；
+- reasoning schema 没有 `provider-end` / `step-boundary-flush` / `cleanup-flush` provenance：`packages/schema/src/session-message.ts:147-157`。
+
+因此需要 sequence-aware 的“工具续传闭包”，并新增三态 durable reasoning completion provenance。只有明确由 provider `reasoning-end` 关闭、且具有协议要求的最终 signature/encrypted metadata 的 block 才默认可进入闭包；step-boundary/cleanup 强制 flush 的 block 必须排除，除非具体 protocol 提供独立、可测试的完整性证明。仅检查 `time.completed` 不充分。
+
+### 2.9 StructuredOutput 状态跨 attempt 泄漏
+
+Legacy `structured` 定义在主 while loop 外：`packages/opencode/src/session/prompt.ts:1084`，成功回调会写入该变量：`packages/opencode/src/session/prompt.ts:1252-1258`，随后在 `packages/opencode/src/session/prompt.ts:1303-1307` 被晋升为成功结果。
+
+如果 incomplete-stream 恢复在同一个 Prompt loop 中创建新 attempt，旧 attempt 的 structured 值可能被新 attempt 误用。恢复前必须把 attempt-local StructuredOutput 状态重置，最好把变量移入 attempt 作用域。
+
+---
+
+## 3. 参考对照
+
+本次不查看上游仓库。参考只包括当前本地实现、当前测试、V2 spec 与 Issue #7 正文。
+
+### 3.1 Issue #3 已建立的本地不变量
+
+本地 Legacy 实现与测试已经建立：
+
+- incomplete stream 不能报告成功；
+- partial text/reasoning/tool state 要保留；
+- completed tool 不能因错误而再次执行；
+- StructuredOutput incomplete 不能晋升为成功；
+- canonical incomplete-stream 不走通用 retry。
+
+相关测试位于：
+
+- `packages/opencode/test/session/prompt.test.ts`；
+- `packages/opencode/test/session/processor-effect.test.ts`；
+- `packages/opencode/test/session/message-v2.test.ts`；
+- `packages/opencode/test/session/retry.test.ts`；
+- `packages/opencode/test/cli/run/run-process.test.ts`。
+
+Issue #7 必须在这些 fail-stop 不变量上增加“经过证明的自动恢复”，不能撤销它们。
+
+### 3.2 V2 本地契约
 
 `specs/v2/session.md` 已声明：
 
-- 每个 provider turn 只调用一次 `llm.stream(request)`；
-- complete local tool call 在 side effect 开始前持久化；
-- provider stream 关闭后等待本地 tool fiber；
-- abandoned side effects 不得静默重放；
-- post-crash continuation recovery 与 provider retry policy 目前是明确 deferred 的 future slice。
+- complete local tool call 在副作用开始前持久化：`specs/v2/session.md:50`；
+- runner 等待已启动工具，并禁止静默重放 abandoned side effects：`specs/v2/session.md:50`；
+- provider-native reasoning metadata 的复用受模型一致性约束：`specs/v2/session.md:52`；
+- provider retry/watchdog policy 当前延后：`specs/v2/session.md:153`；
+- 一般 post-crash continuation recovery 当前延后：`specs/v2/session.md:165`。
 
-Issue #7 正好是该 future slice 的一个有界子集，因此 V2 spec 必须同步更新，不能只改 runner code。
+因此本修复必须：
 
-## 四、修复方案
+- 复用 durable-before-side-effect 的本地工具边界；
+- 不把 incomplete recovery 混入通用 provider retry；
+- 不声称顺带解决所有 crash/distributed ownership 问题；
+- 若修改 V2 语义，同步修改该 spec。
 
-### 4.0 范围与流程分类
+---
 
-本问题跨越公共 LLM failure classification、Legacy SessionProcessor/Prompt、V2 SessionRunner、持久化错误模型和
-model-context lowering，属于 workflow §7 的接口/架构层面问题。
+## 4. 修正方案
 
-本文件经确认后，应先进入 workflow §4 的架构/细化阶段，再编码。建议将实现拆成五个串行单元，每个单元独立红测、
-实现、局部回归和审核；不得一次性跨所有模块修改。
+### 4.1 必需不变量与可选策略
 
-Issue #7 是 bug follow-up，因此不自动套用“新增子计划必须走 §6 v2”的硬性规则；但其契约跨度较大，最终仍应执行
-独立 subagent 审核与五维审核作为质量门。
+**必需不变量：**
 
-### 4.1 公共 provider failure classification
+1. incomplete attempt 永远保留 terminal error；
+2. 实际请求 materialize 后、dispatch 前，attempt identity、capability summary 与 replay fence 已持久化；
+3. 下一次 provider 调用前，失败 attempt、工具结算、恢复 decision 与新 attempt identity 均已持久化；
+4. 自动恢复不得重放已执行工具；
+5. pending/running/interrupted/uncertain 工具不得自动恢复；
+6. provider 或 local-tool replay fence 任一维度为 `unknown` 时不得自动恢复；
+7. Legacy AI SDK 提供本地工具时，必须先建立 durable-before-execute handshake，否则只能 ManualStop；
+8. 恢复分类只读 durable projection；
+9. 持久化失败时当前执行 fail closed；
+10. 每次恢复使用新 assistant ID；
+11. 自动恢复次数有显式、可持久化的上限；该上限不冒充 physical provider request 上限；
+12. incomplete attempt 的 partial prose/reasoning 不得无条件进入下一次模型上下文；step-boundary/cleanup-flushed reasoning 不得被当作 provider-completed reasoning。
 
-修改 `packages/llm/src/schema/errors.ts`：
+**建议默认值，需架构确认：**
+
+- `MAX_INCOMPLETE_RECOVERY_RETRIES = 2`，含义是原始 attempt 之外最多再自动发起 2 个 recovery attempts；
+- 无 provider 幂等证明时，provider 维度只允许 `no-provider-side-effects-offered`；local-tool 维度只允许 `none-offered` 或已经落实并测试的 `durable-before-execute`；
+- recovery decision 对用户可见，但是否在 UI 中默认折叠旧失败 attempt 属于展示策略。
+
+### 4.2 统一 failure classification
+
+扩展：
 
 ```ts
-ProviderFailureClassification =
-  | "context-overflow"
-  | "incomplete-stream"
+export const ProviderFailureClassification = Schema.Literal(
+  "context-overflow",
+  "incomplete-stream",
+)
 ```
 
-修改 `packages/opencode/src/session/llm/ai-sdk.ts`：
+Legacy adapter 在 canonical 分支填写：
 
-```text
-finishReason="other" && rawFinishReason=undefined
-  -> provider-error(
-       classification="incomplete-stream",
-       message=canonical message
-     )
+```ts
+LLMEvent.providerError({
+  message: incompleteStreamMessage,
+  classification: "incomplete-stream",
+  retryable: false,
+})
 ```
 
-建议删除该事件上的固定 `retryable:false`，而不是改成 `true`。原因是该布尔值会再次诱导 consumer 把 transport
-transience 当成 agent replay safety。Session 层只根据 `classification` 进入副作用恢复分类；其它 provider-error 维持现有
-行为。
+Legacy 还必须把 `SessionProcessor.settleIncomplete()` 识别的“没有可信 final step settlement”从 generic UnknownError 升级为同一 typed classification；不能只修 adapter canonical 分支。
 
-### 4.2 统一 recovery evidence 与纯分类器
+V2 必须有两种来源：
 
-在 core session 层增加一个无副作用的共享模块，例如：
+1. route/protocol 能识别的 provider/transport failure 保留 classification；
+2. stream 成功 drain 后若 `stepSettlement === undefined`，runner 合成 `incomplete-stream`，包括空流、partial text/reasoning、完整工具后缺少 `step-finish` 等情况。
 
-```text
-packages/core/src/session/incomplete-stream-recovery.ts
+不是所有 `TransportReason` 都是 incomplete stream。若要让 raw `LLMError` 携带 classification，应显式扩展相应 reason schema 或增加统一 helper，不能通过 message string 猜测。
+
+### 4.3 Durable recovery model
+
+建议把 recovery metadata 持久化到 assistant attempt，而不是只存在于进程内：
+
+```ts
+type RecoveryChain = {
+  chainID: string
+  ordinal: number
+}
+
+type AttemptDispatchEvidence = {
+  target: DispatchTarget
+  replayFence: AttemptReplayFence
+  capabilities: {
+    localToolsOffered: boolean
+    providerSideEffectsOffered: boolean
+  }
+  recovery?: RecoveryChain
+  recoveryProof?: ProviderRecoveryProof
+}
+
+type ManualStopReason =
+  | "provider-replay-unknown"
+  | "provider-continuation-unavailable"
+  | "local-tool-replay-unknown"
+  | "dispatch-evidence-inconsistent"
+  | "recovery-binding-stale"
+  | "open-tool-input"
+  | "unsettled-tool"
+  | "interrupted-tool"
+  | "uncertain-tool-result"
+  | "continuation-context-unavailable"
+  | "retry-budget-exhausted"
+  | "dispatch-ambiguous"
+
+type RecoverySourceVersion = {
+  digest: string // 完整 settled recovery input/model digest；明确排除 recovery decision 记录自身
+  providerPrefixVersion?: string // 若使用 provider cursor，显式记录其祖先 prefix
+}
+
+type RecoveryBinding = {
+  target: DispatchTarget
+  recoverySourceVersion: RecoverySourceVersion
+  closureDigest?: string
+  providerProof: ProviderRecoveryProof
+}
+
+type IncompleteStreamRecovery =
+  | { type: "safe-retry"; binding: RecoveryBinding }
+  | { type: "continue-after-settled-tools"; binding: RecoveryBinding }
+  | { type: "manual-stop"; reasons: ManualStopReason[] }
+
+type IncompleteStreamFailure = {
+  classification: "incomplete-stream"
+  message: string
+  chain: RecoveryChain
+  recovery: IncompleteStreamRecovery
+}
 ```
 
-数据结构：
+Legacy 与 V2 可以使用不同 schema 封装，但字段语义必须一致。
+
+每个 assistant attempt 都必须先 materialize 实际 request/tool capabilities，再在 provider dispatch 前持久化 `AttemptDispatchEvidence`。replay fence 是该次实际请求的不可变事实，不能在 failure 后从当前配置重新计算。普通初始 attempt 的 `recovery` 可以为空；若它第一次发生 incomplete，则以失败 assistant ID 确定性创建 `RecoveryChain { chainID, ordinal: 0 }` 并随 failure/decision 持久化。incomplete-triggered 新 attempt 在 dispatch evidence 中携带相同 chainID 与递增 ordinal；后续普通 tool continuation 传播该 chain 但不递增。新用户输入或明确 operator intervention 创建新 chain。
+
+### 4.4 权威 evidence model
+
+分类器不直接读取 publisher 临时 flags，而读取 durable projection：
 
 ```ts
 type ToolRecoveryEvidence = {
@@ -388,446 +548,549 @@ type ToolRecoveryEvidence = {
   name: string
   state: "pending" | "running" | "completed" | "error"
   providerExecuted: boolean
-  interrupted: boolean
+  interruption:
+    | undefined
+    | "execution-interrupted"
+    | "provider-result-missing"
 }
 
-type IncompleteStreamRecovery =
-  | { type: "safe-retry" }
-  | { type: "continue-after-settled-tools" }
-  | {
-      type: "manual-stop"
-      unsettled: Array<{
-        id: string
-        name: string
-        state: ToolRecoveryEvidence["state"]
-        providerExecuted: boolean
-      }>
-    }
+type AttemptRecoveryEvidence = {
+  source: "durable-projection"
+  dispatch: AttemptDispatchEvidence
+  chain: RecoveryChain
+  plannedBinding: RecoveryBinding
+  currentRecoverySourceVersion: RecoverySourceVersion
+  providerContinuation?: {
+    domain: ProviderSafetyDomain
+    cursor: string
+    providerPrefixVersion: string
+  }
+  tools: ToolRecoveryEvidence[]
+  continuationClosure:
+    | { type: "not-needed" }
+    | {
+        type: "constructible"
+        target: DispatchTarget
+        digest: string
+      }
+    | { type: "unavailable"; reason: string }
+}
 ```
 
-分类规则：
+`pending` 已覆盖未完成 tool input；不应仅因为没有完整 `Tool.Called` 就忽略它。
+
+`continuationClosure` 必须由 durable 内容序列、原模型/目标模型与具体 provider protocol 做无副作用验证：只有能够构造协议合法的 settled tool continuation request 时才是 `constructible`。缺少必需 reasoning signature/encrypted state、hosted-tool item ID、provider metadata，或模型不兼容时为 `unavailable`；无工具的 SafeRetry 为 `not-needed`。provider continuation cursor 不能在 dispatch 前凭空声明，必须来自 stream 并绑定当时的 immutable `providerPrefixVersion`。工具 settlement 会在该 prefix 后追加 durable facts，因此不能要求 prefix version 等于最终 recovery source；`RecoverySourceVersion` 必须显式携带其 `providerPrefixVersion` 祖先链接，并与 cursor 的 prefix 完全相等。`recoverySourceVersion` 是 failed attempt/tool settlements、影响 planned request 的输入与模型选择所形成的 recovery-relevant digest，不是会被 recovery decision 自身递增的“最新 aggregate sequence”；持久化 decision 本身不得让 binding 立刻失效。constructible 结论必须绑定目标 model/protocol、recoverySourceVersion、closure digest 与实际 provider proof（none/idempotency key/continuation cursor + providerPrefixVersion）。自动 dispatch 前必须重新 reload 并验证 `RecoveryBinding`；目标、历史版本、闭包 digest 或 provider proof 任一变化都要重新分类并持久化新 decision，不能复用旧结论。
+
+V2 实现顺序：
+
+1. 实际 request/tool capabilities materialize 后，先持久化 owning assistant 的 dispatch evidence，再调用 provider；
+2. publisher 中所有代表 durable lifecycle 的内存状态只在对应 event publish 成功后更新，或在失败时回滚；
+3. stream terminal 后等待本地 tool fibers；
+4. 持久化所有明确 tool results；
+5. 对未结算工具持久化带 interruption/uncertainty 来源的 error；
+6. reload durable projection，包括该 attempt 原始 dispatch evidence；
+7. 以目标模型与 provider protocol 验证 continuation closure 是否可构造；
+8. 构造 `AttemptRecoveryEvidence`；
+9. 分类并持久化 `IncompleteStreamFailure`；
+10. 只有第 9 步成功且 action 为自动恢复时，才重新 materialize；actual target/recoveryProof 与 durable binding 完全一致且 recoverySourceVersion/closureDigest 仍有效后，才能持久化并 dispatch 新 assistant attempt。
+
+Legacy 使用现有 message/part 持久化边界执行同一顺序。若任一步持久化失败，返回当前错误并停止，不 materialize 或 dispatch 新 provider attempt。
+
+### 4.5 保守分类器
 
 ```text
-hasCompleteToolCall
-:= exists tool where state in {running, completed, error}
-   or providerExecuted=true
+evidenceConsistent
+:= every providerExecuted tool implies dispatch.capabilities.providerSideEffectsOffered
+   and every non-providerExecuted tool implies dispatch.capabilities.localToolsOffered
+   and replayFence 与 capability summary 不矛盾
+   and every domain-bearing provider fence covers dispatch.target
+
+precondition
+:= evidence.source = durable-projection
+   and evidenceConsistent
+   and incomplete failure 已确认
+   and 当前 attempt 未处于 dispatch ambiguity
+
+budgetAvailable
+:= chain.ordinal < MAX_INCOMPLETE_RECOVERY_RETRIES
+
+localReplaySafe
+:= dispatch.replayFence.localTools.type in {
+     none-offered,
+     durable-before-execute
+   }
+
+safeRetryProviderSafe
+:= (
+     dispatch.replayFence.provider.type = no-provider-side-effects-offered
+     and plannedBinding.providerProof.type = none-needed
+   )
+   or (
+     dispatch.replayFence.provider.type = provider-idempotency-protected
+     and plannedBinding.providerProof.type = idempotency
+     and plannedBinding.providerProof.domain = dispatch.replayFence.provider.domain
+     and plannedBinding.providerProof.key = dispatch.replayFence.provider.key
+     and plannedBinding.target belongsTo plannedBinding.providerProof.domain
+   )
+
+continueProviderSafe
+:= (
+     dispatch.replayFence.provider.type = no-provider-side-effects-offered
+     and plannedBinding.providerProof.type = none-needed
+   )
+   or (
+     dispatch.replayFence.provider.type = provider-continuation-capable
+     and providerContinuation is present
+     and plannedBinding.providerProof.type = continuation
+     and providerContinuation.domain = dispatch.replayFence.provider.domain
+     and providerContinuation.domain = plannedBinding.providerProof.domain
+     and providerContinuation.cursor = plannedBinding.providerProof.cursor
+     and providerContinuation.providerPrefixVersion = plannedBinding.providerProof.providerPrefixVersion
+     and currentRecoverySourceVersion.providerPrefixVersion = providerContinuation.providerPrefixVersion
+     and plannedBinding.target belongsTo providerContinuation.domain
+   )
+
+bindingCurrent
+:= plannedBinding.recoverySourceVersion = currentRecoverySourceVersion
+   and (
+     continuationClosure.type != constructible
+     or (
+       continuationClosure.target = plannedBinding.target
+       and continuationClosure.digest = plannedBinding.closureDigest
+     )
+   )
+
+hasToolEvidence
+:= tool count > 0
+
+hasUnsafeTool
+:= exists tool where
+     state in {pending, running}
+     or interruption is defined
 
 allToolsSettled
-:= tool count > 0
-   and every tool.state in {completed,error}
-   and every tool.interrupted=false
+:= hasToolEvidence
+   and not hasUnsafeTool
+   and every tool.state in {completed, error}
 
 SafeRetry
-:= not hasCompleteToolCall
-   and no providerExecuted evidence
-   and no persistence failure
+:= precondition
+   and budgetAvailable
+   and localReplaySafe
+   and safeRetryProviderSafe
+   and bindingCurrent
+   and not hasToolEvidence
+   and continuationClosure.type = not-needed
 
 ContinueAfterSettledTools
-:= hasCompleteToolCall
+:= precondition
+   and budgetAvailable
+   and localReplaySafe
+   and continueProviderSafe
+   and bindingCurrent
    and allToolsSettled
-   and no persistence failure
+   and continuationClosure.type = constructible
+   and plannedBinding.closureDigest is defined
 
 ManualStop
 := otherwise
 ```
 
-说明：
+解释：
 
-- 仅 `pending` 且无 providerExecuted 表示 tool input 尚未形成完整调用，不构成外部副作用，可 SafeRetry；
-- 真实 tool `error` 是已结算结果，可 continuation；
-- cleanup/interruption 形成的 error 不是可信结算，必须 ManualStop；
-- 任一 persistence/projection failure 直接 fail closed 到 ManualStop；
-- 多工具中只要有一个不确定，整体 ManualStop。
+- durable tool evidence、capability summary、replay fence 或原 `dispatch.target` 的 domain 关系任一矛盾时，以 `dispatch-evidence-inconsistent` fail closed 到 ManualStop；
+- partial text/reasoning 本身不构成 tool side effect，但只有 provider 与 local-tool 两个 fence 都安全且无 tool evidence 时才能 SafeRetry；
+- `pending` tool input 也属于不确定工具状态，必须 ManualStop；
+- provider idempotency fence 只证明 SafeRetry 对原 attempt 的重放安全；不同请求形态的 Continue 需要 pre-dispatch `provider-continuation-capable` 加 stream 产生的 durable cursor，或原请求根本没有 provider-side effects；
+- 明确返回的 tool error 属于 settled，但仍须 local fence、provider continuation fence 与 provider-valid closure 同时成立才能 Continue；
+- planned target 不属于 fence domain，或 providerPrefixVersion 祖先链接、recoverySourceVersion、closure digest、provider proof 已变化时，旧 decision 失效，必须重新分类；
+- provider continuation capability 存在但 durable cursor/source binding 缺失时，`provider-continuation-unavailable` 并 ManualStop；
+- settled tools 所需的 signature/encrypted state/item ID 缺失或模型不兼容时，`continuation-context-unavailable` 并 ManualStop；
+- cleanup 产生的 interrupted/error 不是 settled proof，必须 ManualStop；
+- Legacy AI SDK 未建立 durable-before-execute handshake 时，只要实际请求提供了本地工具，local-tool fence 就是 unknown；
+- 达到上限后保持最后一次 incomplete error，不再调用 provider。
 
-Legacy 与 V2 分别把自己的 tool part/publisher state 映射成该 evidence，但不得各自重新实现分类表。
+### 4.6 新 attempt 与恢复顺序
 
-### 4.3 持久化 incomplete recovery error
+#### Legacy
 
-必须为 failed assistant 持久化稳定分类，不能依赖 canonical message 文本比较。
+1. Prompt materialize 实际工具与 provider capabilities；
+2. 若提供 AI SDK 本地工具，调用新增的 processor/tool handshake，在 `item.execute()` 前持久化 running tool part；handshake 失败则不执行工具；
+3. 在 provider dispatch 前把该 attempt 的 capability summary、replay fence，以及可选 recovery chain 持久化到 assistant；
+4. adapter 或 `settleIncomplete()` 产生 typed incomplete signal；
+5. `SessionProcessor` 保留 classification，不再在 `provider-error` 分支丢成普通 `Error`；
+6. processor 等待工具并完成 part 持久化；
+7. Prompt 从刚完成的 assistant message 构造 durable evidence；
+8. 若有 settled tools，先验证目标模型/provider protocol 的 continuation closure 可构造；
+9. 分类并持久化 recovery decision；
+10. `ManualStop` 返回现有 break；
+11. 自动 action 清空 attempt-local 状态，重新 materialize planned request；仅当新 dispatch evidence.target/providerProof 与 durable binding 一致时持久化 assistant 并进入 processor；
+12. 不使用 `SessionRetry.policy()` 重跑旧 processor。
 
-建议共享 payload：
+#### V2
 
-```ts
-type IncompleteStreamFailure = {
-  classification: "incomplete-stream"
-  recovery: "safe-retry" | "continue-after-settled-tools" | "manual-stop"
-  message: string
-  unsettledTools?: Array<{
-    id: string
-    name: string
-    state: "pending" | "running" | "error"
-    providerExecuted: boolean
-  }>
-}
-```
+1. materialize 实际 request/tool capabilities，并在 dispatch 前随 `Step.Started` 或等价 event 持久化 replay fence；
+2. publisher/runner 识别 typed provider failure 或缺少 `step-finish` 的 clean EOF；
+3. 禁止立即 continuation；
+4. 等待本地工具，持久化明确 settlement；
+5. 用带来源的状态处理 unresolved/interrupted 工具；
+6. reload 原 attempt 的 projection 与 dispatch evidence；若有 settled tools，验证 continuation closure；
+7. 分类并发布 `Step.Failed`；
+8. `ManualStop` 返回；
+9. 自动 action 重新 materialize 新 request；仅当实际 target/providerProof/recoverySourceVersion/closureDigest 与 durable binding 一致时，才持久化新的 `Step.Started`/dispatch evidence（同 chain、ordinal + 1）并调用 `llm.stream(request)`。
 
-Legacy 在 `packages/schema/src/v1/session.ts` 增加 `IncompleteStreamError` named error；V2 在
-`packages/schema/src/session-message.ts`/`session-event.ts` 增加对应 error union，而不是把字段塞进 generic
-`UnknownError.message`。
+对于普通 provider error、用户 interrupt、权限拒绝、context overflow 等非 incomplete 错误，保持各自现有语义，不经过本分类器。
 
-持久化该 payload 有三个目的：
-
-1. same-process 和 crash/re-enter 使用同一 recovery decision；
-2. message lowering 可以区分 SafeRetry、tool continuation 和普通 error；
-3. ManualStop 可以向用户稳定列出 unresolved call ID/name/state。
-
-### 4.4 Legacy SessionProcessor
-
-修改 `packages/opencode/src/session/processor.ts`：
-
-1. `provider-error` 不再丢弃结构化 event；使用专用内部 error 或 terminal state 保留
-   `classification/retryable/providerMetadata`；
-2. 对 `classification="incomplete-stream"`，在旧 attempt 内不进入 `SessionRetry.policy()`；
-3. 从当前 assistant 已持久化 tool parts 生成 `ToolRecoveryEvidence`；若读取/写入失败则 fail closed；
-4. 在 cleanup 把 unresolved tool 改写为 interrupted error 之前冻结 recovery decision，或在分类时明确读取
-   `interrupted=true`，防止把 cleanup 结果误判为 settled；
-5. 持久化 `IncompleteStreamError`；原 assistant 的 partial reasoning/text/tool/usage/snapshot 保留；
-6. `process()` 返回值扩展为能表达 recovery transition，例如：
-
-```ts
-type Result =
-  | "compact"
-  | "stop"
-  | "continue"
-  | "retry-incomplete"
-  | "continue-after-settled-tools"
-```
-
-7. 现有 generic `Effect.retry()` 只处理普通 API/rate-limit error，不处理 incomplete-stream；
-8. ordinary provider error、context overflow、length、content-filter、blocked 和 compaction 优先级保持不变。
-
-### 4.5 Legacy Prompt loop
-
-修改 `packages/opencode/src/session/prompt.ts`：
+### 4.7 Recovery-aware model lowering
 
 #### SafeRetry
 
-- 当前 turn 收到 `retry-incomplete` 后，不复用当前 `SessionProcessor`；
-- 下一 while iteration 按现有路径创建新的 `MessageID.ascending()` assistant；
-- 同一 user message 最多允许 2 次自动 retry，即最多 3 个失败/成功 physical assistant attempts；
-- retry count 从 durable history 中同一 `parentID` 的连续 incomplete SafeRetry error 计算，不能只用进程内局部计数，
-  以免 crash/resume 后重置上限；
-- 使用短指数退避，建议 1s、2s；不要复用无上限的 generic `SessionRetry.policy()`；
-- 达到上限后 terminal stop，错误日志明确说明自动重试次数已耗尽；
-- 每次 retry 使用新的 assistant ID；原 attempt 不改写、不删除。
+- 完全排除失败 assistant 的 text、reasoning、tool fragments；
+- 从失败 attempt 之前的上下文重新构造请求；
+- 保留失败 attempt 在 durable history/UI 中，但不放入 model request。
 
 #### ContinueAfterSettledTools
 
-- 当前 turn 返回 `continue-after-settled-tools` 后直接进入下一 while iteration；
-- persisted-error entry guard 识别相同 recovery classification，允许 crash/re-enter 后继续；
-- 不重放旧 provider request，不重新执行旧工具；
-- 现有 loop step 计数继续递增，保持 agent max-step/doom-loop 约束。
+只构造“工具续传闭包”：
 
-#### ManualStop
+1. durable、settled 的 tool call/result；
+2. provider protocol 为验证这些 tool items 所必需的 signed/encrypted reasoning block，但必须具有 durable `provider-end` provenance；仅有 `time.completed/end` 不够；
+3. provider protocol 所需的结构分隔与最终 provider metadata（例如最终 signature/encrypted state）；
+4. provider-executed tool call/result 保持 inline 表示；本地 tool result 保持协议要求的 tool message 表示；
+5. 只在 continuation model 与历史模型兼容时复用 provider-native metadata。
 
-- current-turn 与 persisted-entry 两个 guard 均停止；
-- error message 列出 unsettled tool call IDs、names、states 和 providerExecuted 标志；
-- 用户发送新消息后仍可按现有 ID ordering 继续会话，但不能自动把旧 partial prose 当成成功历史。
+明确排除：
 
-#### StructuredOutput
+- 未结束、step-boundary-flushed 或 cleanup-flushed 的 reasoning；
+- 缺少 provider-end provenance/最终协议元数据的 reasoning；
+- incomplete trailing text/prose；
+- 未结束 tool input；
+- pending/running/interrupted/uncertain tool；
+- 与 tool 续传无关的旧 partial text。
 
-`structured` 必须改为 attempt-local，或在进入任何 recovery transition 时清空。前一 failed attempt 的
-StructuredOutput 值不能被下一 attempt 的正常 stop 分支提升为成功。
+这不是“保留全部 errored assistant”，也不是“无条件删除全部 reasoning”。Legacy reasoning part 与 V2 `Reasoning.Ended`/assistant reasoning schema 必须新增 natural provider end 与 forced-flush 的 durable provenance；lowering 再按内容顺序和 provider 协议计算最小闭包。
 
-### 4.6 Legacy model-context lowering
+闭包可构造性必须在分类前验证，而不是在决定 Continue 后再尝试：Anthropic 会把 reasoning signature 与 tool call 置于同一 assistant sequence：`packages/llm/src/protocols/anthropic-messages.ts:442-469`；OpenAI Responses 会复用 reasoning item/encrypted state 与 hosted-tool item IDs：`packages/llm/src/protocols/openai-responses.ts:385-423`；`store:false` 时缺少最终 encrypted state 的 incomplete reasoning 不能安全 replay：`packages/llm/src/protocols/openai-responses.ts:446-453`。无法构造协议合法闭包时必须 ManualStop。
 
-修改 `packages/opencode/src/session/message-v2.ts`：
+### 4.8 StructuredOutput 与其他 attempt-local 状态
 
-- 普通 errored assistant：维持当前整条删除；
-- incomplete SafeRetry：整条删除，包括 partial prose/reasoning/pending tool input；
-- incomplete ContinueAfterSettledTools：只降低真实 terminal 的 tool call/result；不包含 text、reasoning、step-start、
-  pending/running/interrupted tool；
-- incomplete ManualStop：自动路径不会调用 provider；用户显式继续时，默认不注入 partial prose/reasoning。若存在可信
-  settled tool 与 unresolved tool 混合，也不应只注入部分 settled 子集，因为整体 side-effect history 不完整。
+每个新 recovery attempt 前必须重置：
 
-该 lowering 只根据 persisted error/recovery 与 persisted tool parts，不读取 processor 内存 evidence。
+- `structured`；
+- 当前 attempt 的临时 output accumulator；
+- processor-local provider evidence；
+- 未完成 fragment buffers；
+- 与上一 assistant ID 绑定的 toolcall map。
 
-### 4.7 V2 publisher 与 SessionRunner
+建议将 `structured` 移入 while-loop 内部的 attempt scope，而不是依赖分支手工清空。
 
-修改：
+### 4.9 max-step 与 crash 边界
 
-- `packages/core/src/session/runner/publish-llm-event.ts`
-- `packages/core/src/session/runner/llm.ts`
-- `packages/core/src/session/runner/to-llm-message.ts`
-- `packages/schema/src/session-message.ts`
-- `packages/schema/src/session-event.ts`
+- 同一进程内，recovery request 仍受现有 agent max-step guard 约束；
+- 当前 V2 `step` 是 run-loop 内状态，新的 `run()` 会从 1 开始：`packages/core/src/session/runner/llm.ts:393-400`；
+- 本修复不应声称现有 max-step 已跨 crash 持久化；
+- durable recovery ordinal 只限制 incomplete-stream 自动恢复，不等价于完整 agent step budget；
+- 新 attempt 已持久化但没有 terminal settlement 时属于 ambiguous dispatch，重新进入必须 ManualStop。
 
-方案：
+---
 
-1. publisher 保留完整 `ProviderErrorEvent`，并暴露 tool evidence snapshot；
-2. provider-error 后仍等待已经启动的本地 tool fibers：
-   - 本地工具全部真实 settled 后可 ContinueAfterSettledTools；
-   - provider-executed 工具没有 result 时保持 unresolved；
-3. 在 `failUnsettledTools()` 把状态投影为 error 前冻结 recovery decision，或给 interruption error 增加明确 uncertain 标记；
-4. runner 的单 turn 返回值从单一 `needsContinuation` 扩展为显式 transition；
-5. SafeRetry 使用新 publisher，因此自然产生新的 assistant ID；
-6. V2 retry count 同样从 durable projected history 计算，最多 2 次，不能因 `run`/进程重启重新获得预算；
-7. ContinueAfterSettledTools 复用现有 inner continuation loop，但 recovery decision 不得被
-   `hasProviderError()` 一律压成 false；
-8. V2 `toLLMMessages()` 对 incomplete failed assistant 使用与 Legacy 相同 lowering：
-   - SafeRetry 不注入旧 attempt；
-   - Continue 只注入 settled tools；
-   - partial text/reasoning 不注入；
-9. raw provider stream failure 若能映射为 incomplete-stream，也走相同分类；其它 LLMError 保持普通 terminal failure。
+## 5. 正确性论证
 
-### 4.8 用户可观察错误
+### 5.1 不会把 incomplete attempt 伪装成成功
 
-ManualStop 建议固定 diagnostic：
+- 每次 incomplete attempt 都保留 typed terminal failure；
+- recovery 成功会产生新的 assistant attempt；
+- 旧 attempt 的错误不会被清除或改写成 success；
+- V2 clean EOF 缺少 `step-finish` 也会进入 failure，而不是成功返回。
 
-```text
-Provider stream ended before the attempt could be safely recovered.
-Unsettled tool calls:
-- <id> <name> state=<state> providerExecuted=<true|false>
-Inspect side effects before continuing.
-```
+### 5.2 不会重放已执行的本地工具
 
-SafeRetry 达到上限：
+- V2 local tool 已有完整 call durable-before-execute 契约；
+- Legacy AI SDK 必须通过新增 handshake 建立同一契约，否则 local-tool fence 为 unknown；
+- SafeRetry 要求没有 tool evidence，且实际请求的 provider/local-tool replay fence 均安全；
+- Continue 只把 settled call/result 作为历史上下文，不重新放入可执行队列，同时仍要求整个 attempt replay fence 安全；
+- pending/running/interrupted 状态直接 ManualStop。
 
-```text
-Provider stream remained incomplete after 2 automatic retries.
-No tool side effects were detected, but the retry limit was reached.
-```
+### 5.3 不会从“缺少事件”推导副作用安全
 
-ContinueAfterSettledTools 不隐藏原错误：旧 assistant transcript 仍显示 incomplete error；新的 assistant turn 继续完成
-用户任务。
+- 自动 action 依赖实际请求 materialize 后、dispatch 前持久化的 `AttemptReplayFence`；
+- observed `providerExecuted=false/undefined` 或缺少 Legacy tool part 都不是充分条件；
+- provider/local-tool 任一 fence unknown 时 ManualStop；
+- provider 幂等/续传 fence 只在 planned target 匹配其 safety domain 时有效；
+- 因此断流丢失 hosted-tool 事件、跨 provider/model domain 重试或 Legacy AI SDK 在 event 前执行本地工具，都不会被误判为安全。
 
-### 4.9 明确不采用的方案
+### 5.4 不会依赖未提交内存状态
 
-#### 只把 `retryable:false` 改成 `true`
+- classifier 只接受 `source: "durable-projection"`；
+- 原 attempt 的 replay fence 也来自 dispatch 前持久化事实，不从当前配置重算；
+- publisher 的 assistant/tool/fragment lifecycle 状态在 publish 成功后更新，或失败时回滚；
+- 分类前 reload projection；
+- 自动 decision 持久化 target/recoverySourceVersion/closureDigest/providerProof，dispatch 前再次校验；stale binding 不执行；
+- 任一 publication 失败会停止当前执行，不会触发下一次 provider 调用。
 
-Legacy 会丢字段；若接入 generic retry，还会在同一个 assistant/processor 上重放并混写 parts。
+需要明确限制：如果存储不可用，系统无法保证把 ManualStop 本身写入 durable history；能保证的是当前进程 fail closed。本文不作逻辑上无法兑现的“持久化失败也一定能持久化错误”承诺。
 
-#### 对所有 incomplete 直接 Effect.retry
+### 5.5 不会把 interrupted error 当作 settled error
 
-无法隔离 attempt ID，可能重复工具和 provider-executed side effect。
+- schema 持久化 interruption/uncertainty 来源；
+- classifier 对任何带该来源的 tool 强制 ManualStop；
+- 当前 turn cleanup 与 startup cleanup 使用同一语义。
 
-#### 只要看到 tool-call 就 continuation
+### 5.6 恢复次数有界
 
-running、provider-executed 无 result、部分结算都缺少可信 model-facing result。
+- chainID 将同一逻辑恢复链关联起来；
+- ordinal 在新 assistant dispatch 前持久化；
+- 原始 attempt ordinal 0，最多自动创建 ordinal 1 和 2；
+- ordinal 达上限时持久化 `retry-budget-exhausted` 并停止；
+- Legacy 测试记录每个 fixture 的实际 provider hits，以发现意外 replay；但本修复只保证 recovery assistant 次数有界，不新增独立的 physical-request budget。
 
-#### cleanup 后检查 `status in {completed,error}`
+### 5.7 模型上下文既不污染，也不破坏 provider 工具协议
 
-会把 `interrupted=true` 的 uncertain side effect 错判为 settled。
+- SafeRetry 不注入失败 attempt；
+- Continue 只有在 provider-specific continuation closure 已验证可构造时才成立；
+- Continue 排除 partial prose/reasoning；
+- 仅保留 settled tool continuation 所需且具有 durable provider-end provenance 与最终协议元数据的 provider-native reasoning；
+- 模型不兼容时不复用 provider-native metadata，沿用 V2 spec 现有约束。
 
-#### 仅修改 Prompt 顶部 error guard
+### 5.8 StructuredOutput 不跨 attempt 泄漏
 
-当前 turn 的 post-process error guard仍会 break；message lowering 也仍然错误。
+- attempt-local 变量在新 assistant 前重新初始化；
+- 旧 incomplete attempt 的 structured 值不能触发新 attempt 的成功分支；
+- 每次成功只属于产生该值的 assistant attempt。
 
-#### 只实现 Legacy 或只实现 V2
+### 5.9 明确未解决的边界
 
-会让相同 LLM failure 在两条 runner 上产生不同安全语义，不满足 Issue 验收标准。
+本方案不宣称解决：
 
-## 五、正确性论证
+- 任意时刻进程崩溃后的 provider request 精确一次执行；
+- clustered/distributed Session ownership；
+- provider 没有幂等或续传契约时的 hosted-tool 自动恢复；
+- 全局 durable max-step budget；
+- 独立的全局 physical provider request budget；
+- provider timeout/watchdog 的通用策略。
 
-### 5.1 根因消除
+这些边界与 `specs/v2/session.md:153`、`specs/v2/session.md:165` 的 deferred scope 一致。
 
-- provider adapter 产生稳定 `incomplete-stream` classification，消除基于文案猜测；
-- 共享 classifier 把 transport failure 与 side-effect safety 分离；
-- runner 外层创建新 assistant attempt，消除 same-message replay；
-- persisted recovery payload 保证 same-process、crash/re-enter 和 model lowering 使用同一事实；
-- recovery-aware lowering 防止 partial prose 污染，同时保留 settled tool result；
-- interrupted/persistence failure fail closed，避免把状态不明误判为安全。
+---
 
-### 5.2 核心不变量
+## 6. 测试方案
 
-```text
-SafeRetry
-=> no complete tool call
-and no provider-executed side effect
-and no persistence failure
-```
+当前环境缺少 Bun，因此以下均为待执行测试。
 
-```text
-SafeRetry transition
-=> new assistant ID
-and old assistant remains error
-and old partial prose/reasoning absent from new model request
-```
+### 6.1 纯分类器测试
 
-```text
-ContinueAfterSettledTools
-=> tool count > 0
-and every tool has a durable terminal result/error
-and no interrupted/uncertain tool
-```
+为同一 classifier 建表驱动测试：
 
-```text
-ContinueAfterSettledTools transition
-=> every old tool executes at most once
-and next model request contains the settled tool call/result
-and old incomplete prose/reasoning is absent
-```
+| Tool evidence | Replay fence | Closure | Budget | 预期 |
+|---|---|---|---|---|
+| none | provider safe + local none | not-needed | available | SafeRetry |
+| none | provider unknown + local none | not-needed | available | ManualStop |
+| none | provider safe + local unknown | not-needed | available | ManualStop |
+| none | idempotency domain mismatch | not-needed | available | ManualStop |
+| none | both safe | not-needed | exhausted | ManualStop |
+| completed | safe | constructible | available | ContinueAfterSettledTools |
+| explicit error | safe | constructible | available | ContinueAfterSettledTools |
+| completed | safe | unavailable | available | ManualStop |
+| completed | safe | constructible but binding stale | available | ManualStop |
+| pending | safe | unavailable | available | ManualStop |
+| running | safe | unavailable | available | ManualStop |
+| interrupted error | safe | unavailable | available | ManualStop |
+| provider-result-missing | safe | unavailable | available | ManualStop |
+| completed | unknown | constructible | available | ManualStop |
+| completed | continuation-capable but cursor missing | constructible | available | ManualStop |
+| mixed settled + pending | safe | unavailable | available | ManualStop |
+| providerExecuted tool + capability says none | contradictory | constructible | available | ManualStop |
+| original dispatch target outside fence domain | contradictory | not-needed | available | ManualStop |
 
-```text
-exists uncertain tool or persistence failure
-=> ManualStop
-```
+表中的 `safe` 表示 provider 与 local-tool 两个维度均安全。另测：classifier 拒绝非 durable source，并拒绝缺少该 attempt 原始 dispatch evidence 的输入。
 
-```text
-ManualStop
-=> no automatic provider retry
-and no automatic continuation
-```
+### 6.2 LLM schema / adapter 测试
 
-```text
-SafeRetry failures for one logical user turn > 2 retries
-=> terminal stop
-```
+- `ProviderFailureClassification` 编解码 `incomplete-stream`；
+- Legacy canonical adapter 发出 classification 且 `retryable: false`；
+- 非 canonical `finishReason="other"` 不误判；
+- V2 protocol 已知 incomplete failure 保留 classification；
+- 普通 Transport/InvalidProviderOutput 不按 message string 误判。
 
-```text
-same evidence in Legacy and V2
-=> same recovery classification
-```
+### 6.3 Legacy 集成回归
 
-### 5.3 副作用安全
+在现有 session tests 上补：
 
-SafeRetry 的前置条件排除所有完整 tool call 和 provider-executed evidence，因此 replay 最多增加 provider token/cost，不会重放
-已知外部工具操作。
+1. partial text + safe fence：新 assistant 自动恢复，旧 assistant 保持 error；
+2. reasoning-only + safe fence：同上；
+3. completed local tool + incomplete：工具只执行一次，新 attempt 收到 tool continuation closure；
+4. explicit tool error + incomplete：可 continuation，工具不重放；
+5. pending/running/interrupted tool：ManualStop；
+6. hosted/provider replay fence unknown：ManualStop；
+7. AI SDK 请求提供本地工具但尚未建立 durable-before-execute：即使没有 tool event 也 ManualStop；
+8. Legacy AI SDK multi-step 只有单次 HTTP request 级 idempotency、没有 entire-attempt 保证 => provider fence unknown，ManualStop；
+9. 新 handshake 在 running tool part commit 成功后才调用 `item.execute()`；commit 失败时副作用执行次数为 0；
+10. 连续 incomplete：原始 + 最多 2 个 recovery attempts；
+11. 分别记录 assistant attempts 与具体 fixture 的 provider hits，验证没有额外 replay；不声称二者共享同一上限；
+12. StructuredOutput 第一次 attempt 产生 partial/旧值、第二次 attempt 未产生值：不得成功；
+13. persisted-error 重新进入时只恢复明确、durable、未 dispatch 的 action；ambiguous attempt 停止；
+14. failure 后配置/tool registry 改变时，分类仍使用原 attempt 持久化的 replay fence；
+15. generic `SessionRetry.policy()` 仍不处理 canonical incomplete-stream；
+16. reasoning 仅被 `step-finish` 或 cleanup 强制写入 `time.end` 时，不得当作 provider-end reasoning 进入 continuation closure。
 
-ContinueAfterSettledTools 不 replay provider request，也不执行旧工具，只消费持久化 result。真实 completed/error 结果是自然 agent
-loop 已有 continuation 所需的完整上下文。
+继续保留 Issue #3 现有测试，防止 fail-stop 语义回归。
 
-ManualStop 对所有不确定状态 fail closed；即使工具实际上已经成功，也宁可要求人工检查，不冒重复执行风险。
+### 6.4 V2 集成回归
 
-### 5.4 Attempt identity 与 bounded retry
+补充 `packages/core/test/session-runner.test.ts`：
 
-新 assistant message 是每个 physical provider attempt 的 durable identity。按同一 user `parentID` 从历史计算 retry count，保证进程重启
-或显式 resume 不会绕过上限。
+1. clean EOF + partial text + no `step-finish` => typed incomplete failure；
+2. clean EOF + reasoning-only => typed incomplete failure；
+3. empty stream / finish-only => typed incomplete failure；
+4. completed local tool + no `step-finish` => 等待 settlement 后分类，工具只执行一次；
+5. hosted call 无 result + EOF => uncertainty marker + ManualStop；
+6. explicit provider-error + completed local tool => continuation closure，不重放工具；
+7. raw stream failure若无 incomplete classification => 保持普通错误，不误入本分类器；
+8. 分别注入 `Step.Started`、`Step.Failed`、`Tool.Input.Started`、fragment start、`Tool.Called`、`Tool.Success/Failed` publication failure => 内存 lifecycle 不得冒充 durable state，且不发起下一 request；
+9. startup `failInterruptedTools()` 保留 interruption marker；
+10. provider 正常 `reasoning-end` + settled tool => 只有具备 provider-end provenance 与最终协议元数据的 signed/encrypted reasoning 被保留；
+11. step-boundary/cleanup-flushed reasoning 即使有 `time.completed` 也不进入 continuation request；
+12. settled tools 缺少必需 signature/encrypted state/hosted item ID 或目标模型不兼容 => `continuation-context-unavailable` + ManualStop；provider 声明 continuation capability 但没有 durable cursor/source binding => `provider-continuation-unavailable` + ManualStop；
+13. incomplete trailing reasoning/text => 不进入 continuation request；
+14. 模型切换 => 不复用不兼容 provider metadata；
+15. recovery ordinal 达上限 => 不再调用 `llm.stream()`；
+16. 已持久化新 Step.Started/dispatch evidence 但无 terminal settlement => re-entry ManualStop；
+17. failure 后动态 tool registry/config 改变 => 分类仍读取原 attempt 持久化的 capability summary/replay fence；
+18. SafeRetry planned target 切换到不同 provider safety domain => 原 idempotency fence 失效，重新分类或 ManualStop；
+19. decision 后 providerPrefixVersion 祖先链接、recoverySourceVersion、target、closure digest 或 provider proof 改变 => dispatch 前重新 load/reclassify，不执行 stale decision；
+20. 原 dispatch.target 不属于持久化 fence domain => `dispatch-evidence-inconsistent` + ManualStop；
+21. 持久化 recovery decision 本身不改变 recoverySourceVersion；真正相关的 history/input/model 变化才使 binding stale。
 
-原 attempt 的 audit transcript 保持不变；新 attempt 的 request 不包含旧 partial output，因此不会把失败内容当成完成历史。
+### 6.5 CLI / child session 回归
 
-### 5.5 无回归引入
+扩展 `packages/opencode/test/cli/run/run-process.test.ts`：
 
-必须保持：
+- 最终成功只来自 recovery assistant；
+- 旧 incomplete assistant 仍可见为 error；
+- ManualStop 仍返回非成功状态；
+- child/subtask 不因父层 retry 重放已执行工具；
+- 达到 recovery 上限后 CLI 不挂起、不循环。
 
-- Issue #3：incomplete stream 永远不是成功；
-- normal `stop`、`tool-calls`、`length`、`content-filter` 和明确 API error 行为不变；
-- context-overflow compaction recovery 不被 incomplete retry 取代；
-- ordinary API/rate-limit retry 继续使用现有 policy；
-- compaction cutoff 继续保留 canonical provider-error；
-- completed tool 不重复执行；
-- StructuredOutput 只由当前成功 attempt 提升；
-- 用户在 ManualStop 后发送新消息仍可继续 session；
-- no-tool retry 达到上限后不无限循环。
+### 6.6 建议验证命令
 
-## 六、测试用例清单
-
-以下测试均需先以红测或现有行为锁证明差异，再实施 production code。当前环境缺少 Bun，尚未运行。
-
-| 类型 | 用例描述 | 状态 |
-|---|---|---|
-| Schema/LLM | `ProviderFailureClassification` 接受 `incomplete-stream`，拒绝未知值 | 待加 |
-| Adapter | raw-missing 产生 `provider-error(classification="incomplete-stream")` | 待改 |
-| Classifier | 无工具、只有 partial text/reasoning -> SafeRetry | 待加 |
-| Classifier | 只有 pending tool input、无 providerExecuted -> SafeRetry | 待加 |
-| Classifier | 单个 completed local tool -> ContinueAfterSettledTools | 待加 |
-| Classifier | 单个真实 tool error -> ContinueAfterSettledTools | 待加 |
-| Classifier | completed provider-executed tool result -> ContinueAfterSettledTools | 待加 |
-| Classifier | running/pending complete call -> ManualStop | 待加 |
-| Classifier | provider-executed 无 terminal result -> ManualStop | 待加 |
-| Classifier | `error + interrupted=true` -> ManualStop | 待加 |
-| Classifier | 多工具部分结算 -> ManualStop | 待加 |
-| Classifier | persistence failure -> ManualStop | 待加 |
-| Legacy/Processor | incomplete event 保留 classification，不降级为 generic UnknownError | 待加 |
-| Legacy/SafeRetry | no-tool incomplete 创建新 assistant ID 并自动重试 | 待加 |
-| Legacy/SafeRetry | partial reasoning/text 保留在旧 attempt，但不进入 retry request | 待加 |
-| Legacy/SafeRetry | retry 成功后自动完成，无需新 user message | 待加 |
-| Legacy/SafeRetry | 连续 3 次 incomplete 后停止；总自动 retry 为 2 | 待加 |
-| Legacy/SafeRetry | crash/re-enter 不重置 retry budget | 待加 |
-| Legacy/Continue | completed tool 只执行一次，下一 request 可见 tool result | 待加 |
-| Legacy/Continue | tool error 作为 settled result 进入下一 request | 待加 |
-| Legacy/Continue | incomplete assistant 仍为 error，partial prose 不进入 request | 待加 |
-| Legacy/Manual | running/interrupted tool 不 retry、不 continue，diagnostic 列出 ID/name/state | 待加 |
-| Legacy/Structured | failed attempt 的 StructuredOutput 不污染下一 attempt | 待加 |
-| Legacy/Context | 普通 errored assistant 过滤行为不变 | 待回归 |
-| V2/SafeRetry | no-tool provider-error 使用新 assistant ID 重试并受 2 次上限约束 | 待加 |
-| V2/Continue | provider error 后本地 tool fiber settled，只执行一次并 continuation | 待加 |
-| V2/Continue | completed hosted tool result 可 continuation，不重复 provider tool | 待加 |
-| V2/Manual | hosted tool 无 result -> ManualStop | 待改 |
-| V2/Manual | mixed settled/unsettled tools -> ManualStop | 待加 |
-| V2/Context | errored incomplete partial text/reasoning 不进入下一 request | 待加 |
-| Cross-runner | 同一 evidence 表驱动 Legacy/V2 得到相同 decision | 待加 |
-| Regression | Issue #3 原始 incomplete/compaction crossover 测试全绿 | 待回归 |
-| Regression | normal stop/tool-calls/length/content-filter/API error 全绿 | 待回归 |
-| E2E/CLI | no-tool incomplete 自动 retry 成功，CLI 无需用户输入 | 待加 |
-| E2E/CLI | retry exhaustion 非零退出且无无限请求 | 待加 |
-| E2E/Tool | completed bash side effect marker 只有一行，随后 continuation 成功 | 待加 |
-| E2E/Manual | uncertain tool 时无后续 provider request，错误含工具列表 | 待加 |
-| Static | `packages/llm`、`packages/schema`、`packages/core`、`packages/opencode` typecheck | 待运行 |
-
-计划验证命令需在 Bun 可用后按 package 执行，不能从仓库根目录运行测试：
+根 `package.json:23` 只明确禁止根 package 的 `bun run test` 脚本；不能据此声称所有从仓库根启动的定向 `bun test` 都被禁止。为避免歧义，建议在对应 package 内运行：
 
 ```bash
-cd packages/llm && bun test <target files>
-cd packages/schema && bun run typecheck
-cd packages/core && bun test test/session-runner.test.ts && bun run typecheck
-cd packages/opencode && bun test --timeout 30000 <target files> && bun run typecheck
+bun run --cwd packages/llm typecheck
+bun run --cwd packages/schema typecheck
+bun run --cwd packages/core typecheck
+bun run --cwd packages/opencode typecheck
+
+(cd packages/llm && bun test test/provider-error.test.ts)
+(cd packages/core && bun test test/session-runner.test.ts)
+(cd packages/opencode && bun test test/session/retry.test.ts)
+(cd packages/opencode && bun test test/session/processor-effect.test.ts)
+(cd packages/opencode && bun test test/session/message-v2.test.ts)
+(cd packages/opencode && bun test test/session/prompt.test.ts)
+(cd packages/opencode && bun test test/cli/run/run-process.test.ts)
 ```
 
-## 七、代码更新清单
+实现时若新增独立 classifier test，应加入对应命令。全部 targeted tests 通过后，再按 package 运行 package test script；不要运行根目录的 `bun run test`。
 
-以下为修复前计划，实际实施需在架构/细化确认后逐单元推进。
+---
 
-| 文件 | 函数/区域 | 计划改动 | 状态 |
-|---|---|---|---|
-| `packages/llm/src/schema/errors.ts` | `ProviderFailureClassification` | 增加 `incomplete-stream` | 待改 |
-| `packages/llm/src/schema/events.ts` | `ProviderErrorEvent` | 复用 classification 契约，保持 event 结构 | 待核对 |
-| `packages/opencode/src/session/llm/ai-sdk.ts` | raw-missing 分支 | 发出 stable classification，不决定 replay | 待改 |
-| `packages/core/src/session/incomplete-stream-recovery.ts` | 新共享模块 | 定义 evidence、decision、纯分类器和诊断格式 | 待加 |
-| `packages/schema/src/v1/session.ts` | assistant error union | 增加 durable incomplete recovery error | 待改 |
-| `packages/schema/src/session-message.ts` | V2 assistant error | 增加 durable incomplete recovery payload | 待改 |
-| `packages/schema/src/session-event.ts` | `Step.Failed` | 允许投影 typed incomplete error | 待改 |
-| `packages/opencode/src/session/processor.ts` | provider-error/halt/process/cleanup | 保留结构化 error、计算 decision、返回 transition | 待改 |
-| `packages/opencode/src/session/prompt.ts` | entry/post-process/attempt loop | 新 attempt retry、tool continuation、manual stop、bounded count | 待改 |
-| `packages/opencode/src/session/message-v2.ts` | assistant lowering | recovery-aware tool-only context | 待改 |
-| `packages/core/src/session/runner/publish-llm-event.ts` | publisher evidence/failure | 暴露 tool evidence，保留 provider classification | 待改 |
-| `packages/core/src/session/runner/llm.ts` | turn transition/run loop | 统一 decision、bounded new-attempt retry/continuation | 待改 |
-| `packages/core/src/session/runner/to-llm-message.ts` | errored assistant lowering | 丢 partial prose；Continue 只保留 settled tools | 待改 |
-| `packages/core/src/session/message-updater.ts` | Step.Failed projection | 投影 typed incomplete error | 待核对/可能改 |
-| `packages/opencode/test/session/llm.test.ts` | adapter tests | classification contract | 待改 |
-| `packages/opencode/test/session/processor-effect.test.ts` | processor tests | decision/persistence/interrupted/persistence-failure | 待加 |
-| `packages/opencode/test/session/prompt.test.ts` | loop tests | SafeRetry/Continue/Manual/StructuredOutput | 待加/翻转 |
-| `packages/opencode/test/session/message-v2.test.ts` | lowering tests | tool-only recovery context | 待加 |
-| `packages/opencode/test/session/retry.test.ts` | retry contract | 保证 incomplete 不进入 same-message generic retry | 待改 |
-| `packages/core/test/session-runner.test.ts` | V2 runner tests | 三类 recovery、retry bound、context isolation | 待加/翻转 |
-| `packages/opencode/test/cli/run/run-process.test.ts` | E2E | 自动恢复、tool exactly-once、ManualStop | 待加 |
+## 7. 代码更新检查清单
 
-建议串行实施单元：
+### 7.1 `packages/llm`
 
-1. **共享契约单元**：classification、typed error、纯 classifier 与表驱动测试；
-2. **Legacy Processor 单元**：结构化 error、decision、persistence 与 processor 红测；
-3. **Legacy Prompt/context 单元**：new-attempt retry、tool continuation、bounded count、StructuredOutput 与 E2E；
-4. **V2 Runner 单元**：publisher evidence、turn transition、context lowering 与 runner 测试；
-5. **整体验证单元**：CLI/tool E2E、Issue #3 全回归、四 package typecheck、独立审核与文档回填。
+- [ ] 扩展 `ProviderFailureClassification`；
+- [ ] 明确哪些 `LLMError` reason 可携带 classification；
+- [ ] 不用 message string 猜测 incomplete；
+- [ ] 保持 classification 与 retryable 正交；
+- [ ] 添加 schema/protocol tests。
 
-每个单元完成后停止，报告结果并等待确认，再进入下一单元。
+### 7.2 Legacy `packages/opencode`
 
-## 八、文档更新清单
+- [ ] `session/llm/ai-sdk.ts` 发出 typed incomplete classification；
+- [ ] `session/processor.ts` 的 provider-error 与 `settleIncomplete()` 都保留 typed classification；
+- [ ] `session/tools.ts` 与 processor Handle 增加 durable-before-execute handshake；running part commit 失败时不调用本地工具；
+- [ ] Prompt 在实际 tools/provider capabilities materialize 后、dispatch 前持久化 capability summary 与 replay fence；
+- [ ] 通用 retry policy 不处理 incomplete-stream；
+- [ ] processor 完成工具 drain 后再交给 recovery classifier；
+- [ ] `session/prompt.ts` 支持新 assistant recovery attempt；
+- [ ] 添加 durable chainID / ordinal / replay fence / recovery decision binding（target、recoverySourceVersion、closureDigest、providerProof）；
+- [ ] `structured` 与其他 attempt-local 状态按 attempt 重置；
+- [ ] `session/message-v2.ts` 实现 recovery-aware lowering，并在 Continue decision 前提供 protocol-valid closure 可构造性检查；
+- [ ] 修正持久化错误 entry guard，只允许证据完整且未 dispatch 的自动 action；
+- [ ] 更新 CLI / child session 错误传播测试。
 
-| 文档路径 | 计划更新 | 状态 |
-|---|---|---|
-| `docs/fixes/session-fix-incomplete-stream-recovery.md` | 本修复八部分计划、实施状态、测试证据和最终审核 | 已创建草案，待确认 |
-| `docs/fixes/session-fix-incomplete-provider-stream.md` | 增加 Issue #7 follow-up 链接，说明 no-retry 契约被有界恢复扩展但 Issue #3 安全不变量不变 | 待改 |
-| `specs/v2/session.md` | 将 provider incomplete recovery 从 deferred 更新为明确三态契约、attempt isolation 和 bounded retry | 待改 |
-| `docs/test-reports/session-incomplete-stream-recovery.md` | 记录分层测试、回归、请求/副作用计数和 typecheck 结果 | 实施后待加 |
-| `CLAUDE.md` | 仅在实施中发现可复用的项目级经验教训时更新“已知限制”；不写代码可推导事实 | 条件性 |
-| `docs/devlog/2026-08-07-issue-7-incomplete-stream-recovery.md` | 完成关键里程碑后记录决策与度量 | 实施后待加 |
+### 7.3 V2 schema / event projection
 
-本次会改变 provider failure 后的可观察行为、持久化错误分类和 V2 recovery contract，因此不允许写“无文档更新”。
+- [ ] assistant/Step.Started 增加 recovery-chain identity、capability summary、replay fence 与实际 recoveryProof；
+- [ ] Step.Failed 或等价 typed error 支持 incomplete classification 与 target/recoverySourceVersion/closureDigest/providerProof-bound recovery decision；
+- [ ] tool error 增加 interruption/uncertainty provenance；
+- [ ] Reasoning.Ended/assistant reasoning 增加 provider-end / step-boundary-flush / cleanup-flush provenance；
+- [ ] 若 protocol 支持续传，event/projection 持久化 provider continuation cursor 及其 providerPrefixVersion/domain；
+- [ ] projector 持久化新增字段；
+- [ ] 检查 `session.next.retried`：若复用，补 assistant/chain 关联并投影；若不复用，说明其保留用途；
+- [ ] 更新 schema round-trip tests 与所有 exhaustive switches。
 
-## 确认门
+### 7.4 V2 runner / publisher
 
-在用户确认本方案前：
+- [ ] clean drain 缺少 `step-finish` 时合成 incomplete failure；
+- [ ] incomplete 后先禁止 continuation，再等待工具；
+- [ ] assistant/tool/fragment lifecycle state 只在对应 publish 成功后更新，或失败时回滚；
+- [ ] 分类前 reload durable projection；
+- [ ] 在分类前用目标模型与 provider protocol 验证 settled-tool continuation closure 可构造；
+- [ ] recovery decision 持久化 target、recoverySourceVersion、closureDigest 与 providerProof；recoverySourceVersion 排除 decision 自身，dispatch 前重新验证全部 binding；
+- [ ] idempotency/continuation target 必须匹配原 fence 的 provider safety domain；
+- [ ] actual request materialize 后、dispatch 前持久化 provider 与 local-tool replay fence；
+- [ ] `failUnsettledTools()` 保留 interruption/uncertainty 来源；
+- [ ] `failInterruptedTools()` 使用相同来源语义；
+- [ ] 持久化失败时不发起后续 provider request；
+- [ ] 新 Step.Started 在 dispatch 前持久化 chainID/ordinal，并证明 actual dispatch target/providerProof 与 durable binding 一致；
+- [ ] ambiguous dispatch 在 re-entry 时 fail closed；
+- [ ] publisher 分别发布 provider-end、step-boundary-flush 与 cleanup-flush durable provenance；
+- [ ] `to-llm-message.ts` 仅基于 provider-end provenance 实现 sequence-aware tool continuation closure。
 
-- 不修改 production code；
-- 不翻转或新增行为测试；
-- 不实现自动 retry/continuation；
-- 不提交或推送分支。
+### 7.5 回归与兼容性
 
-确认后下一步不是直接编码，而是按 workflow §4 先补充架构与函数级细化，重点确认：
+- [ ] 已完成工具不重复执行；
+- [ ] partial text/reasoning 不误报成功；
+- [ ] StructuredOutput 不跨 attempt 泄漏；
+- [ ] context-overflow compaction 行为不回归；
+- [ ] 用户 interrupt、permission decline、普通 provider error 语义不回归；
+- [ ] model switch 后 provider metadata 复用规则不回归；
+- [ ] max-step 的 same-process 语义不回归；
+- [ ] 未声称 durable global max-step、独立 physical-request budget 或任意 crash exact-once。
 
-1. durable incomplete error 的具体 schema；
-2. retry budget 的历史计算规则；
-3. Legacy/V2 共用 classifier 的模块位置和导出边界；
-4. ManualStop 的用户可见诊断；
-5. StructuredOutput 在 ContinueAfterSettledTools 下的精确语义。
+---
+
+## 8. 文档更新检查清单
+
+- [ ] 更新本文状态、最终字段名、分类表与实际测试结果；
+- [ ] 更新 `specs/v2/session.md`：
+  - [ ] incomplete stream 的 terminal-settlement 判定；
+  - [ ] provider/local-tool replay fence 与 dispatch 前持久化；
+  - [ ] Legacy AI SDK durable-before-execute 前置条件；
+  - [ ] recovery chain 与 retry budget；
+  - [ ] tool interruption/uncertainty 持久化；
+  - [ ] reasoning provider-end/step-boundary-flush/cleanup-flush provenance；
+  - [ ] provider-specific continuation closure 可构造性前置条件；
+  - [ ] recovery-aware context lowering；
+  - [ ] 与 deferred post-crash/provider-timeout scope 的边界；
+- [ ] 若公共 Session event/message schema 改变，更新相关 API/schema 文档；
+- [ ] 更新测试说明，明确根 `bun run test` 与 package-level targeted tests 的区别；
+- [ ] 实现完成后新增 `docs/devlog/YYYY-MM-DD-<简述>.md`，包含 workflow 要求的度量；
+- [ ] 将实现中发现的非显然限制同步回项目规范的“已知限制与注意事项”；
+- [ ] 在 Bun 可用环境记录实际 typecheck/test 命令、通过数与失败数。
+
+---
+
+## 实现前仍需确认的架构决策
+
+1. **Attempt replay fence 的来源与持久化**：provider capability 由 `LLMRequest`/route 还是各 protocol adapter 提供；local-tool capability 由 runtime 提供；二者都必须基于实际 materialized request，并在 dispatch 前随 attempt 持久化，默认是 `unknown`。Legacy AI SDK 的幂等 fence 必须覆盖其整个内部 physical-request sequence，不能只覆盖第一条 HTTP request；所有幂等/续传 fence 还必须声明 provider/route/protocol/model safety domain，planned target 必须匹配。
+2. **Legacy durable-before-execute**：是否在 `SessionProcessor.Handle` 增加 begin/start tool call API，并由 AI SDK `tools.ts execute()` 在副作用前调用；若不实施，Legacy 只要提供本地工具就不能自动恢复。
+3. **Durable recovery metadata 的承载位置**：扩展现有 assistant error/Step events，还是新增专用 recovery event；无论选择哪一种，都必须持久化 planned target、recoverySourceVersion、closureDigest 与 providerProof；continuation proof 还必须绑定 providerPrefixVersion，并在下一次 dispatch 前可重放和重新验证。
+4. **Reasoning completion provenance**：Legacy part metadata 与 V2 Reasoning event/schema 如何统一表达 provider-end、step-boundary-flush 与 cleanup-flush；仅 provider-end 默认可进入 continuation closure。
+5. **Continuation closure validator**：由公共 LLM protocol 层提供 dry-run/validation API，还是由 Legacy/V2 lowering 共享 helper；必须在 recovery decision 前得出 constructible/unavailable。
+6. **默认预算**：本文建议原始 attempt 外最多 2 次自动恢复；需要确认这是产品默认还是可配置项。该预算不等于 physical request budget。
+7. **Legacy 序列化兼容**：新增 dispatch/recovery/reasoning metadata 时需确认旧 Session message decoder 的兼容方式。
+8. **UI 展示**：旧失败 attempt 必须保留；UI 是否折叠、如何展示自动恢复原因属于后续展示设计，不影响核心安全不变量。
+
+在这些决策确认、设计细化并通过审查前，不应开始生产代码实现。
