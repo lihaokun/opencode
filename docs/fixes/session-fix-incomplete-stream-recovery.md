@@ -6,7 +6,7 @@
 >
 > 审视日期：2026-08-12。
 >
-> 产品范围：本方案仅覆盖常规 `opencode run`、TUI 及其内部 unprefixed `/session/...` SDK/HTTP 路径使用的 Legacy Session execution。不会修改或启用 Native V2 Session runner 的 recovery 行为、专属 tests 或 spec；但 Legacy recovery 所需的 shared LLM contracts、Session SQLite schema/migrations 与 EventV2 plumbing 会做向后兼容的 shared 修改，并必须运行 Native V2/shared regression，Native V2 不纳入 recovery 产品验收。外部直接 Session API/SDK consumer 与独立 V2 preview 也不属于本次产品验收。
+> 产品范围：本方案仅覆盖常规 `opencode run`、TUI 通过公开 unprefixed `/session/...` SDK/HTTP operations 使用的 Legacy Session execution。不会修改或启用 Native V2 Session runner 的 recovery 行为、专属 tests 或 spec；但 Legacy recovery 所需的 shared LLM contracts、Session SQLite schema/migrations 与 EventV2 plumbing 会做向后兼容的 shared 修改，并必须运行 Native V2/shared regression，Native V2 不纳入 recovery 产品验收。外部直接 Session API/SDK consumer 与独立 V2 preview 也不属于本次产品验收，但公开 Legacy route/wire compatibility 仍必须保持。
 >
 > 证据范围：当前本地仓库与 Issue #7 正文；未查看上游仓库、上游分支或上游实现。
 >
@@ -16,7 +16,7 @@
 >
 > 验证状态：本轮在确认 branch/HEAD/Bun 后，重新实际执行 46 个 Bun tests 与 4 个精确单选的范围内 Legacy HttpApi exerciser scenarios，共 50 个范围内检查；50/50 通过，0 failed，0 skipped。另有一次 selector 过宽的辅助 exerciser 运行执行了 37 个 scenarios（全部通过），但不计入这 50 项验收。当前 Legacy fail-stop、partial/error 持久化、普通 tool continuation、child failure propagation 与 outer `SessionRetry` 的第二次 provider HTTP 请求已有运行时证据；本文提出的 automatic recovery、dispatch ledger/CAS、durable-before-execute、provider closure、budget、wire/replay compatibility 与 recovery TUI 展示尚未实现，仍是设计义务和实施后验收项。
 
-### 证据等级与本轮运行记录
+## 证据等级与本轮运行记录
 
 本文使用以下等级，避免把不同强度的证据混写：
 
@@ -45,18 +45,14 @@
 
 **当前运行时证据：**本轮新执行的 A 级真实 CLI subprocess 已确认 Legacy incomplete fail-stop、CLI stdout/JSON events 的 partial text 保留、SQLite read-back 的 reasoning 与 assistant error、普通 tool continuation、child failure propagation，以及已覆盖 fixtures 中 completed tool 未重放；C 级 Legacy Processor + TCP provider integration 已由测试 TCP server 直接观察到 recognized 429/503 会触发 outer `SessionRetry` 的第二次 provider 请求；D 级 policy unit test 确认 canonical incomplete 不进入该通用 policy。后两项不是 CLI 产品路径 E2E；静态源码与 pinned dependency 只用于解释 request/step 边界，不能替代这些运行时结果。
 
-**拟实现的恢复 contract（当前尚未实现）：**Issue #7 不能通过“把 incomplete-stream 改成普通可重试错误”安全解决。未来恢复决策必须独立于通用 transport retry，并且必须在以下事实已经确定后执行：
+**拟实现的恢复 contract（当前尚未实现）：**Issue #7 不能通过“把 incomplete-stream 改成普通可重试错误”安全解决。未来恢复独立于通用 transport retry，且仅在下表全部成立后执行：
 
-1. 本次 provider turn 确实以 incomplete stream 结束；
-2. 已启动的本地工具均已等待并完成持久化；
-3. 分类依据来自持久化投影，而不是尚未提交的内存布尔值；
-4. provider 侧不存在未观测副作用，或对应 action 受覆盖整个 attempt replay 的幂等契约/覆盖 durable prefix 的续传契约保护；
-5. 本地工具没有被提供，或 runtime 已证明 durable-before-execute；
-6. settled-tool continuation context 可以按目标 provider protocol 合法构造；
-7. 自动恢复 recoveryOrdinal 与同进程 max-step guard 均未耗尽；
-8. planned request 的完整 canonical digest、target endpoint/authority、proof 与 durable binding 一致；
-9. recovery decision 通过唯一 consumption link 原子创建新的 assistant attempt，同一 chain recoveryOrdinal 不会重复创建；
-10. 下一次 provider 调用使用新的 assistant attempt，并且不会覆盖失败 attempt。
+| Gate | 已确定事实 |
+|---|---|
+| terminal/tool | provider turn 确实 incomplete；已启动本地工具均已等待并持久化，分类来自 durable projection而非内存布尔值 |
+| replay/closure | provider 无未观测副作用或 action受覆盖 entire-attempt replay 的幂等/覆盖 durable prefix 的续传契约保护；本地工具未提供或 runtime 已证明 durable-before-execute；settled-tool continuation 可按目标 protocol合法构造 |
+| admission/binding | recoveryOrdinal与同进程 max-step均未耗尽；planned canonical digest、endpoint/authority、proof与 durable binding一致；decision经唯一 consumption link原子创建新 assistant，chain ordinal不重复 |
+| outcome | 下一 provider call使用新 assistant且不覆盖失败 attempt |
 
 本方案的具体实现只落到 CLI/TUI 会话执行实际使用的 Legacy 路径。真实 CLI subprocess 已覆盖 normal prompt、tool continuation 与 child/subtask；in-process route exerciser 已覆盖 unprefixed Legacy prompt/command/shell handler wiring。当前源码调用链显示 TUI prompt/command/shell 使用 Legacy SDK 操作，但仓库尚无完整 TUI submission route 端测。Legacy 路径实现本文 contract 并通过相应 CLI/TUI 会话验收后，方可在当前产品范围内验收 Issue #7。
 
@@ -70,8 +66,6 @@ IncompleteStreamRecovery
 ```
 
 其中“没有观察到 `providerExecuted`”不能证明“provider 没有执行副作用”。在缺少 provider 级安全围栏时必须降级为 `ManualStop`。
-
----
 
 ## 1. 现象与复现
 
@@ -118,13 +112,7 @@ if (event.finishReason === "other" && event.rawFinishReason === undefined) {
 
 Legacy processor 还会对没有可信 final step settlement 的 clean EOF 做路径无关检查：`packages/opencode/src/session/processor.ts:580-600`。本轮实际执行的 `session.processor rejects every stream without a credible final step settlement` 与 `session.processor gives no-step settlement priority over an earlier empty unknown` 均通过，覆盖 empty、final-only、multi-step-incomplete 与 unknown-then-incomplete：`packages/opencode/test/session/processor-effect.test.ts:856-893`。
 
-Legacy tool part 的关键持久化位置是：
-
-- pending：`packages/opencode/src/session/processor.ts:258-274`；
-- running：`packages/opencode/src/session/processor.ts:353-374`；
-- completed：`packages/opencode/src/session/processor.ts:182-205`；
-- error：`packages/opencode/src/session/processor.ts:208-225`；
-- cleanup/interrupted：`packages/opencode/src/session/processor.ts:602-660`。
+Legacy tool part 的关键持久化位置是 pending `processor.ts:258-274`、running `:353-374`、completed `:182-205`、error `:208-225`、cleanup/interrupted `:602-660`（均位于 `packages/opencode/src/session/`）。
 
 但是这些位置不能证明 Legacy AI SDK 路径“先持久化 call、后执行工具”。AI SDK 当前负责 tool dispatch：`packages/opencode/src/session/llm.ts:279-283`；本地工具副作用发生在 SDK 调用的 `execute()` 回调中：`packages/opencode/src/session/tools.ts:102-129`。`packages/opencode/test/session/snapshot-tool-race.test.ts:4-12` 的注释记录了这一历史竞态，其现有断言验证工具副作用、completed part 与 session diff 等用户可见后果，但没有用 latch/独立 storage reader 机械断言 `execute()` 与 processor durable commit 的 happens-before。故该文件是风险 reproducer/harness，不是 durable-before-execute 的充分证明。因此 Legacy 要安全自动恢复，必须新增专门的 durable-before-execute handshake 与 failure-injection 测试，或在提供了可执行本地工具时把 replay fence 视为 unknown。
 
@@ -143,46 +131,18 @@ Legacy tool part 的关键持久化位置是：
 | StructuredOutput partial 后 incomplete | 保持错误 | 不得把旧 attempt 的值晋升为成功 |
 | 持久化失败 | 当前执行失败 | 当前进程 fail closed，绝不自动发起下一次 provider 调用 |
 
----
-
 ## 2. 根因分析
 
-### 2.1 incomplete-stream 信号没有形成 Legacy 类型化契约
+### 2.1–2.2 信号与 retry 边界根因
 
-当前 `ProviderFailureClassification` 只有 `context-overflow`：
-
-- `packages/llm/src/schema/errors.ts:4-5`。
-
-`ProviderErrorEvent` 支持可选 classification，但 canonical Legacy adapter 没有填写。Legacy processor 的 clean EOF 检查也只落为 generic `UnknownError`。因此需要把 `incomplete-stream` 纳入单一类型化 contract，并由 Legacy AI SDK canonical adapter 与 `SessionProcessor.settleIncomplete()` 共同接入；不能通过 message string 猜测 classification。
-
-### 2.2 transport retryability 与 agent replay safety 被混为一谈
-
-“网络错误可重试”不等于“整个 agent attempt 可安全重放”。
-
-一个 attempt 可能已经：
-
-- 持久化 partial text / reasoning；
-- 发出完整本地 tool call；
-- 执行有副作用的本地工具；
-- 触发 provider-hosted 工具；
-- 产生了 provider 侧操作，但相关事件在断流中未到达客户端。
-
-因此不能把 incomplete stream 加入 `SessionRetry.policy()` 后直接重跑同一个 processor。通用 retry 位于 `packages/opencode/src/session/processor.ts:727-745`，它发生在 Prompt 层检查持久化工具状态之前，无法证明整个 attempt 的重放安全。
-
-本方案明确决定：
-
-- 保留 incomplete-stream 的 `retryable: false`，阻止通用 transport retry；
-- 由专用恢复分类器决定是否创建新的 assistant attempt；
-- classification 与 `retryable` 是正交信息。
-
-删除 `retryable: false` 不是实现 Issue #7 的必要条件，也不应在没有新的 retry 边界证明前执行。
+| 根因 | 当前事实 | 修正约束 |
+|---|---|---|
+| incomplete-stream 未形成 Legacy typed contract | `ProviderFailureClassification` 只有 `context-overflow`（`packages/llm/src/schema/errors.ts:4-5`）；canonical adapter 未填写可选 classification，clean EOF 也落为 generic `UnknownError` | 将 `incomplete-stream` 纳入单一 typed contract，由 canonical adapter 与 `SessionProcessor.settleIncomplete()` 共同接入；禁止按 message string 猜测 |
+| transport retryability 与 agent replay safety 混同 | attempt 可能已持久化 partial text/reasoning、发出并执行本地 tool call、触发 hosted tool，或 provider 已产生但流未送达的副作用；通用 retry 位于 `processor.ts:727-745`，早于 Prompt 的 durable tool-state 检查 | canonical incomplete 保持 `retryable:false`，classification 与 retryable 正交；由专用 classifier 创建新 assistant attempt。不得删除 `retryable:false` 或让 `SessionRetry.policy()` 直接重跑旧 processor |
 
 ### 2.3 “没有观察到工具事件”不能证明没有副作用
 
-存在两类独立的不确定性。
-
-**Provider-hosted 副作用：**只有收到相应 tool event 后才能知道 `providerExecuted`，而 LLM 事件 schema 的 `providerExecuted` 是可选字段。
-
+存在两类独立的不确定性。**Provider-hosted 副作用：**只有收到相应 tool event 后才能知道 `providerExecuted`，而 LLM 事件 schema 的 `providerExecuted` 是可选字段。
 如果 provider 已执行 hosted tool，但承载 call/result 的流片段丢失，客户端看到的仍可能是“没有 providerExecuted 证据”。
 
 **Legacy 本地工具副作用：**源码 ownership 与 `snapshot-tool-race.test.ts` 的历史竞态注释表明 AI SDK 可能在 processor durable observation 之前调用本地工具；现有测试验证了副作用与最终 tool/session 状态，却没有机械断言两者的严格先后。因此这里是可信的安全风险与待证明时序，不把该 fixture 夸大为 happens-before 端测。Legacy 的“没有 durable tool part”仍不能作为本地工具尚未执行的安全证明。
@@ -207,7 +167,6 @@ type DispatchTarget = {
   modelID: string
   modelFamily?: string
 }
-
 type ProviderSafetyDomain = {
   providerID: string
   routeID: string
@@ -217,7 +176,6 @@ type ProviderSafetyDomain = {
   modelID?: string // provider 契约若只在单一 model 内有效则必填
   modelFamily?: string // provider 契约若只在单一 model family 内有效则必填
 }
-
 type DurableProviderPrefixVersion = {
   aggregateID: string // Legacy 中必须等于 sessionID
   assistantID: string
@@ -225,13 +183,11 @@ type DurableProviderPrefixVersion = {
   hashVersion: "recovery-event-chain-v1"
   hashChainDigest: string
 }
-
 type SealedRecoveryMaterialRef = {
   refID: string
   digest: string // canonical comparison 只使用 digest
   keyVersion: string // sealed-at-rest key version；不含 raw secret/token
 }
-
 type ProviderRecoveryProof =
   | { type: "none-needed" }
   | {
@@ -245,7 +201,6 @@ type ProviderRecoveryProof =
       cursor: SealedRecoveryMaterialRef
       providerPrefixVersion: DurableProviderPrefixVersion
     }
-
 type AttemptReplayFence = {
   provider:
     | { type: "no-provider-side-effects-offered" }
@@ -300,32 +255,26 @@ Legacy 若要在提供本地工具时自动恢复，必须先把 `tools.ts` 的 
 
 这意味着同一 assistant 在当前架构下**可能已经经历多个 semantic dispatches**。本方案不为这些旧 dispatch 补造单一 attempt fence：canonical incomplete 必须继续保持 `retryable:false`，且 automatic recovery 的额外 admission 条件是该 assistant 的 durable dispatch ledger 恰好只有一次 authorized semantic dispatch。若 `SessionRetry.policy()` 已开始第二次 dispatch、ledger 缺失/计数不明，或任一 dispatch fence/capability 不一致，classifier 固定 `dispatch-ambiguous`/ManualStop。另一种等价的保守实现是让 normal conversation 在首次 provider dispatch 后不再由外层 policy 重发；在没有逐-dispatch durable ledger 与覆盖全部 dispatch 的 replay proof 前，禁止 automatic recovery。
 
-
 恢复上限按 logical recovery chain 中的 incomplete-triggered child 数计数；**本方案拟新增的** Prompt hard max-step guard 按 assistant admission 计数；当前 Legacy 只有 last-step prompt injection，没有该 hard admission guard。二者都不是 semantic-dispatch 或 physical-request budget。本文不新增独立的 transport request budget。实施后测试必须同时记录 assistant IDs、durable semantic-dispatch ledger entries、`streamText()` invocations 与 provider transport hits；注入“首次 dispatch 已可能产生副作用、retryable failure 触发外层第二次 dispatch、随后 incomplete”时必须 ManualStop 且 recovery provider hits 为 0。若产品需要全局 physical-request hard limit，必须另行设计 transport-level counter/guard。
 
 ### 2.5 缺少 durable recovery-chain 与实际 dispatch 证据
 
 Legacy assistant 当前没有 recovery lineage/replay fence；实际工具集合在 Prompt 中动态解析。若 failure 与 decision 之间发生进程退出，不能用后来可能已经变化的配置、插件、权限或 tool registry 重算原请求的安全围栏。仅靠现有 history 无法证明跨重新进入的 retry budget 或原请求的 replay safety。
 
-结论：在 provider network release 前、且 exact request/tool capabilities 已由 paused preparation 确定后，必须随 assistant attempt 持久化不可变 source dispatch evidence。以下只给出概念字段；唯一 canonical 完整定义见 §4.3，避免两处类型镜像漂移：
+结论：在 provider network release 前、且 exact request/tool capabilities 已由 paused preparation 确定后，必须随 assistant attempt 持久化不可变 source dispatch evidence。以下只给出概念字段；唯一 canonical 完整定义见 §3.3，避免两处类型镜像漂移：
 
 ```text
 RecoveryLineage
   └── chainID + recoveryOrdinal（只统计 incomplete-triggered child）
-
 AssistantAttemptIdentity
   └── assistantID + chain 内单调 assistantSequence
-
 DispatchAttemptContext
   └── 每条 dispatch 公共持有 lineage + 当前 attempt identity
-
 RecoveryDecisionLink
   └── 仅 incomplete-triggered child 持有 source assistant + decision/binding；ordinary continuation 不复用
-
 AttemptDispatchEvidence
   ├── available dispatch（origin 区分 initial / ordinary continuation / incomplete recovery）
   └── opaque initial / ordinary-continuation dispatch
-
 每条 ledger entry 都携带独立 dispatchOrdinal；available entry 还绑定 exact target、
 semanticReplayDigest、preparedRequestDigest、replay fence 与 capability；opaque entry
 保留 provider/model 与不可 introspect 原因，但不能伪造 target/digest。
@@ -348,17 +297,15 @@ automatic proposal 必须由 source assistant、exact candidate `DispatchAttempt
 
 当前代码提供可复用的事务接缝：durable projector、`PublishOptions.commit(seq)`、sequence row 与 event row 位于同一 SQLite transaction（`packages/core/src/event.ts:239-352`），`EventV2Bridge` 会转发 publish options；replay 对新接受 event 运行相同 projector，而 exact same serialized event 在检测为 idempotent 后提前返回，原 callback 不会重放（`packages/core/src/event.ts:262-323`、`441-512`）。这只证明接缝存在，不证明 recovery schema/CAS/child protocol 已实现。
 
-在线/accepted-replay 的 `RecoveryTransitionProjector` 从一个 authoritative discriminated `operation` 幂等写 relation rows、child `MessageTable` projection 与 display projection；event 另带 `nextStateDigest`，pure folder 从 predecessor + operation 导出 next state并校验 digest，不同时序列化一份可漂移的完整 `nextState`。`PublishOptions.commit(seq)` 只执行在线 CAS heads。显式 repair/validation 的 `RecoveryReplayRebuilder` 则直接按 raw `EventTable` fold 已有 rows，重建 materializations 与 heads；它不是另一个 authority。
+持久化组件与约束：
 
-必须有三个独立 durable tail/CAS domain：`recovery_head(sessionID, sourceAssistantID)` 管 decision revision lifecycle；`assistant_chain_head(sessionID, chainID)` 管所有 initial/ordinary/recovery assistant immediate successor；`dispatch_ledger_head(sessionID, assistantID)` 管每个 assistant 的 semantic-dispatch ordinal。每个 head 都定义 canonical genesis、expected predecessor、next digest/state、missing-versus-corrupt handling 与 affected-row=1 SQL 规则。automatic child admission 的 predecessor 是已 committed active decision transition，不是 source fact predecessor；同一 transaction CAS recovery + chain heads、创建 exactly bound child、写 child ordinal 0 ledger、consume decision。ordinary continuation也必须推进 chain head；每次 dispatch 都推进 ledger head。
-
-关系表允许同一 `(sessionID, sourceAssistantID, sourceVersionDigest)` 存在 append-only decision revisions，但 folded state最多一个 active revision。`sourceVersionDigest` 是 §4.4.1 的完整 canonical envelope，明确绑定 `sourceAssistantID`。decision series 以 `(sessionID, decisionID, decisionRevision)` 唯一，decisionID 跨 revision 稳定；消费和 child relation 对 `(sessionID, decisionID)` 唯一。recoveryOrdinal 唯一性只作用于 incomplete-child relation；assistantSequence 作用于所有 attempt。
-
-child admission 使用单一 serialized composite control operation，其 nested child context/dispatch commitment 被明确视为该 control transition payload，不再作为第二个 source-fact event。首个 recovery child 不另行调用 `Session.updateMessage`；`RecoveryTransitionProjector` 在同一 transaction 写兼容的 `MessageTable` row、child relation/ledger/consumption，replay 同样重建。post-commit 如需兼容 `message.updated` live notification，必须是非 durable派生通知，不能形成第二 authority。若选择保留普通 durable `MessageUpdated`，则必须先设计 `EventV2.publishBatch`/multi-event atomic protocol并相应放宽 control-tail policy；本文首选 composite operation。
-
-`replayAll()` 当前逐 event commit；recovery replay 必须 suppress listener/global-bus/workspace live publication，直到所接受 prefix 全部 fold、materializations 与三个 heads 写入/验证完成。实现必须定义 partial-prefix crash marker/finalization 或提供 batch transaction；在 final head 之前不得发布可被 Session sync 消费的 recovery child。exact same serialized event 是 idempotent；same seq different payload/type 拒绝；同一 transitionID 出现在其他 event ID/seq 也必须拒绝，即使 operation payload相同。
-
-migration 必须支持 existing session/message 数据且不推断旧 assistant 为 safe authority。测试必须覆盖 projector 后任一 head CAS 失败时 relation/projection/sequence/event/head 全回滚、跨新数据库 replay 等价、prefix publication suppression、错误/缺失 head、分叉/缺口/duplicate transition，以及显式 session deletion cascade。若 backend 无法提供这些原子性和 replayability，automatic recovery 不可启用。
+| 组件/边界 | 规范 |
+|---|---|
+| `RecoveryTransitionProjector` / `RecoveryReplayRebuilder` | online/accepted replay 从 authoritative `operation` 幂等写 relations、child `MessageTable`与 projection，校验 `nextStateDigest`；repair直接 fold raw `EventTable`重建，不形成第二 authority |
+| 三 CAS heads | `recovery_head(sessionID, sourceAssistantID)` 管 revision；`assistant_chain_head(sessionID, chainID)` 管所有 immediate successors；`dispatch_ledger_head(sessionID, assistantID)` 管 semantic-dispatch ordinal。各自定义 genesis/predecessor/next state、missing/corrupt与 affected-row=1；automatic child事务同时 CAS所需 heads、写 child ordinal 0并 consume，ordinary continuation推进 chain，每次 dispatch推进 ledger |
+| revision/child relation | 同 source/version可有 append-only revisions但 folded state最多一个 active；decision series以 `(sessionID, decisionID, decisionRevision)` 唯一且 decisionID稳定；consumption/child对 decisionID唯一。recoveryOrdinal只约束 incomplete child，assistantSequence约束所有 attempt |
+| composite operation | child admission是单一 serialized control operation，其 nested child context/commitment不是第二 source event；projector同事务写 Message/relations/ledger/consumption。post-commit `message.updated`只能是非 durable signal；若保留 durable MessageUpdated，须先设计 atomic publishBatch并调整 tail policy |
+| replay/migration | `replayAll()` 在 accepted prefix fold/materializations/三 heads完成前 suppress live publication，并定义 prefix marker/batch transaction；same event幂等，same seq different payload/type或 transitionID跨 event拒绝。migration支持旧数据但不推断 safe authority；测试覆盖 head-CAS rollback、cross-db equivalence、publication suppression、corrupt heads/branch/gap/duplicate与 session cascade；无法原子/replay则禁用 automatic |
 
 该设计只解决已持久化 attempt 的链、预算、decision consumption 与请求前围栏，不声称解决任意时刻的 provider-dispatch crash recovery。
 
@@ -383,37 +330,11 @@ Legacy `structured` 定义在主 while loop 外：`packages/opencode/src/session
 
 如果 incomplete-stream 恢复在同一个 Prompt loop 中创建新 attempt，旧 attempt 的 structured 值可能被新 attempt 误用。恢复前必须把 attempt-local StructuredOutput 状态重置，最好把变量移入 attempt 作用域。
 
----
+Issue #3 已建立且不得撤销的本地 fail-stop 不变量已经纳入顶部证据表与 §1.2：incomplete 不报成功；partial text/reasoning/tool state 保留；已覆盖 persisted-error、length、missing-finish/high-usage 与 child/subtask fixtures 不重放 completed tool（但这不是通用 replay-safety/durable-before-execute 证明）；StructuredOutput incomplete 不晋升；canonical incomplete 不走通用 retry。相关回归文件为 `prompt.test.ts`、`processor-effect.test.ts`、`message-v2.test.ts`（本轮未执行）、`retry.test.ts` 与 `run-process.test.ts`；Issue #7 只能在这些不变量上增加经过证明的恢复。
 
-## 3. 参考对照
+## 3. 修正方案
 
-本次不查看上游仓库。参考只包括当前本地实现、当前测试与 Issue #7 正文。
-
-### 3.1 Issue #3 已建立的本地不变量
-
-本地 Legacy 实现与相关 tests 已经建立以下当前态基线；本轮 official 50 仅实际执行下列 `prompt.test.ts`、`processor-effect.test.ts`、`retry.test.ts` 与 `run-process.test.ts` 的上述定向用例：
-
-- incomplete stream 不能报告成功；
-- partial text/reasoning/tool state 要保留；
-- 在已覆盖的 persisted-error、length、missing-finish/high-usage 与 child/subtask fixtures 中，completed tool 没有再次执行；这不是任意未来 recovery 路径的通用 replay-safety 或 durable-before-execute 证明；
-- StructuredOutput incomplete 不能晋升为成功；
-- canonical incomplete-stream 不走通用 retry。
-
-相关测试位于：
-
-- `packages/opencode/test/session/prompt.test.ts`；
-- `packages/opencode/test/session/processor-effect.test.ts`；
-- `packages/opencode/test/session/message-v2.test.ts`（相关回归文件，本轮未执行）；
-- `packages/opencode/test/session/retry.test.ts`；
-- `packages/opencode/test/cli/run/run-process.test.ts`。
-
-Issue #7 必须在这些 fail-stop 不变量上增加“经过证明的自动恢复”，不能撤销它们。
-
----
-
-## 4. 修正方案
-
-### 4.0 当前实施范围决策
+### 3.0 当前实施范围决策
 
 兼容性说明：外部 API/SDK consumer 不属于 Issue #7 的产品行为验收，但 Legacy assistant schema、error discriminator 与 generated SDK 是公开 wire compatibility 面。新增 `dispatchSummary`、`incompleteRecovery` 必须采用旧数据可解码/新字段可选的兼容策略；公开 error 默认继续投影现有 `UnknownError`，typed terminal fact 先保持内部 durable contract。只有版本化 endpoint/schema 或明确接受 breaking change 后才暴露新 discriminator。补 OpenAPI/codegen drift、generated SDK type、Legacy HTTP round-trip 与旧客户端容忍性测试；不能以“外部 consumer 范围外”为由忽略 wire 影响。
 
@@ -428,30 +349,19 @@ Issue #7 必须在这些 fail-stop 不变量上增加“经过证明的自动恢
 
 该范围与当前证据支持的会话入口一致：真实 CLI subprocess 已覆盖 prompt、tool continuation 与 child/subtask；route exerciser 覆盖 Legacy prompt/command/shell handler wiring；TUI 提交到该 route 的边界当前仍以源码为证，尚缺完整 submission 端测。
 
-### 4.1 必需不变量与可选策略
+### 3.1 必需不变量与可选策略
 
-**必需不变量：**
+| 类别 | 约束 |
+|---|---|
+| 失败与身份 | incomplete attempt 永远保留 terminal error；每次恢复使用新 assistant ID；失败 attempt 不被覆盖；分类只读 durable projection，持久化失败时当前执行 fail closed |
+| dispatch authority | provider network release 前持久化 attempt identity 与 evidence：available 记录 exact target/authority、capability、replay fence 与 prepared digest，opaque 记录原因；下一次调用前 durable 写入失败 attempt、工具结算、decision/consumption 与新 identity |
+| 唯一性与预算 | incomplete child 的 `(sessionID, chainID, recoveryOrdinal)`、decision consumption 唯一；所有 assistant 的 `(sessionID, chainID, assistantSequence)` 唯一且是 immediate successor；自动恢复有 durable 参数 `N`，不冒充 physical-request budget |
+| 副作用安全 | 不重放已执行工具；pending/running/interrupted/uncertain 工具、provider/local fence 任一 unknown 均不得自动恢复；Legacy 本地工具必须先有 durable-before-execute handshake |
+| 上下文安全 | partial prose/reasoning 不得无条件进入下一请求；step-boundary/cleanup flush 不得冒充 provider-completed reasoning；StructuredOutput 等 attempt-local 状态必须隔离 |
 
-1. incomplete attempt 永远保留 terminal error；
-2. dispatch 前必须持久化 attempt identity 与 dispatch evidence：可 introspect provider 持久化 exact target/authority、capability summary、replay fence 与完整 prepared-request digest；不可 introspect provider 持久化 explicit opaque reason，并在 incomplete 时强制 ManualStop；
-3. 下一次 provider 调用前，失败 attempt、工具结算、恢复 decision、decision-consumption link 与新 attempt identity 均已持久化；仅在 incomplete-recovery-child relation 中，同一 `(sessionID, chainID, recoveryOrdinal)` 只能创建一个 child，同一 decisionID 只能消费一次；所有 assistant 另由 `(sessionID, chainID, assistantSequence)` 唯一标识 immediate successor，ordinary continuation 不占用 recoveryOrdinal child 唯一键；
-4. 自动恢复不得重放已执行工具；
-5. pending/running/interrupted/uncertain 工具不得自动恢复；
-6. provider 或 local-tool replay fence 任一维度为 `unknown` 时不得自动恢复；
-7. Legacy AI SDK 提供本地工具时，必须先建立 durable-before-execute handshake，否则只能 ManualStop；
-8. 恢复分类只读 durable projection；
-9. 持久化失败时当前执行 fail closed；
-10. 每次恢复使用新 assistant ID；
-11. 自动恢复次数有显式、可持久化的上限；该上限不冒充 physical provider request 上限；
-12. incomplete attempt 的 partial prose/reasoning 不得无条件进入下一次模型上下文；step-boundary/cleanup-flushed reasoning 不得被当作 provider-completed reasoning。
+策略参数：candidate 仅在 `candidateRecoveryOrdinal <= N` 时 admission；`N=2` 只是建议默认而非已批准 contract，测试必须覆盖 `N=0/1/2`。无 provider 幂等证明时仅接受 `no-provider-side-effects-offered`；local-tool 仅接受 `none-offered` 或已实现并测试的 `durable-before-execute`。decision 对用户可见，是否折叠旧失败 attempt 属于 UI 策略。
 
-**策略参数与建议默认值，均需架构确认：**
-
-- 将 recovery limit 表示为产品参数 `N`；candidate recovery 仅在 `candidateRecoveryOrdinal <= N` 时 admission。`N=2` 只是建议默认值，不是本文已确认的 contract；实现/测试必须覆盖 `N=0`、`N=1`、`N=2`；
-- 无 provider 幂等证明时，provider 维度只允许 `no-provider-side-effects-offered`；local-tool 维度只允许 `none-offered` 或已经落实并测试的 `durable-before-execute`；
-- recovery decision 对用户可见，但是否在 UI 中默认折叠旧失败 attempt 属于展示策略。
-
-### 4.2 统一 failure classification
+### 3.2 统一 failure classification
 
 扩展：
 
@@ -476,7 +386,7 @@ Legacy 还必须把 `SessionProcessor.settleIncomplete()` 识别的“没有可�
 
 不是所有 transport failure 都是 incomplete stream；classification 必须来自 canonical adapter 或 Legacy processor 的可信 settlement 检查，不能通过 message string 猜测。
 
-#### 4.2.1 Shared type ownership 与依赖方向
+#### 3.2.1 Shared type ownership 与依赖方向
 
 本次必须固定单一 source of truth，避免 `packages/schema` 与 `packages/llm` 形成 cycle：
 
@@ -494,13 +404,13 @@ Legacy 还必须把 `SessionProcessor.settleIncomplete()` 识别的“没有可�
 
 这样 schema codec、LLM protocol semantics 与 Legacy durable projection 各有唯一职责，且 import 方向与当前 package 依赖一致。
 
-#### 4.2.2 Provider preparation/introspection 边界
+#### 3.2.2 Provider preparation/introspection 边界
 
 当前 `LLMRequestPrep.Prepared` 只包含高层 system/messages/tools/params/options/headers（`packages/opencode/src/session/llm/request.ts:38-51`），后续 AI SDK middleware、动态 provider factory 或 transport fetch wrapper 仍可能改变最终 lowering/endpoint。`Provider.getLanguage()` 也只返回 opaque language model（`packages/opencode/src/provider/provider.ts:1868-1890`）；任意动态安装 provider factory 同样存在（`packages/opencode/src/provider/provider.ts:1814-1834`）。因此不能声称简单拆分现有 `prepare()` 就能对全部 Legacy provider 得到 exact wire request/authority。
 
 本次必须新增**显式、allowlisted、版本化的 declarative preparation/introspection contract**：只有 provider/protocol adapter 能在发送前返回稳定 `DispatchTarget`、authority、effective storage mode、replay capability、semantic prepared representation 与 digest inputs 时，才能产生 automatic-safe fence。更重要的是，closure validator、digest materializer 与实际 dispatch 必须共享同一个 no-send audited final-body lowerer，或实际 transport 在网络 release 前捕获该次 exact normalized URL/body/tool/options，先用捕获结果完成 durable authorization，再允许发送。有限的 captured golden fixtures 只能做版本回归和已知样例对照，不能证明任意运行时请求经过 `ProviderTransform.message()`、AI SDK provider lowering、middleware/fetch wrapper 后都与 validator 表示等价，也不能单独让 adapter 变为 available。authorization commit 后若仍有 middleware、动态 provider factory 或 transport rewrite 能改变 tool/reasoning/history/storage semantics，则该 adapter 不得标记 available。transport fetch wrapper 若可改写 endpoint/account authority，也必须在 contract 中提前声明有效最终 target；若只能在实际 fetch 时才知道，则必须使用上述 per-request pre-release capture/authorization gate；没有该 gate、dynamic factory 未实现 contract、或 opaque model 无法证明 target 时，resolver 必须写 opaque evidence，incomplete 后 ManualStop。该保守降级不要求一开始支持所有 provider。
 
-### 4.3 Durable recovery model
+### 3.3 Durable recovery model
 
 recovery contract 必须区分四类对象，不能沿用旧架构稿中把它们合并的 historical `AttemptRecoveryEvidence`：
 
@@ -516,24 +426,20 @@ type RecoveryLineage = {
   chainID: string
   recoveryOrdinal: number // 只统计 incomplete-triggered recovery child
 }
-
 type AssistantAttemptIdentity = {
   assistantID: string
   assistantSequence: number // chain 内每个 admitted assistant 单调递增
 }
-
 type DispatchAttemptContext = {
   lineage: RecoveryLineage
   attempt: AssistantAttemptIdentity
 }
-
 type RecoveryDecisionLink = {
   sourceAssistantID: string
   decisionID: string
   decisionRevision: number
   bindingDigest: string
 }
-
 type DispatchOrigin =
   | { type: "initial-user" }
   | { type: "ordinary-continuation" }
@@ -541,7 +447,6 @@ type DispatchOrigin =
       type: "incomplete-recovery"
       decision: RecoveryDecisionLink
     }
-
 type AvailableDispatchEvidence = {
   type: "available"
   dispatchOrdinal: number
@@ -556,7 +461,6 @@ type AvailableDispatchEvidence = {
     providerSideEffectsOffered: boolean
   }
 }
-
 type OpaqueDispatchEvidence = {
   type: "opaque"
   dispatchOrdinal: number
@@ -570,7 +474,6 @@ type OpaqueDispatchEvidence = {
   modelID: string
   localToolsOffered: boolean | "unknown"
 }
-
 type AttemptDispatchEvidence = AvailableDispatchEvidence | OpaqueDispatchEvidence
 ```
 
@@ -578,7 +481,7 @@ type AttemptDispatchEvidence = AvailableDispatchEvidence | OpaqueDispatchEvidenc
 
 每个 semantic dispatch 必须在 provider network release 前写入 authoritative ledger，并区分两条轴：semantic introspection 为 `available | opaque`，mechanical send gate 为 `implemented | unavailable`。普通初始请求遇到 opaque/dynamic provider 只有在 mechanical gate implemented、`OpaqueDispatchEvidence` commit 后才可发送；若 gate unavailable，covered execution 必须 fallback/disable，不能先发送后补 evidence。若 opaque request 随后 incomplete，固定 ManualStop。自动 recovery child 同时要求 gate implemented 与 `AvailableDispatchEvidence`。
 
-#### 4.3.1 Durable source snapshot
+#### 3.3.1 Durable source snapshot
 
 ```ts
 type IncompleteStreamTerminalFact = {
@@ -587,7 +490,6 @@ type IncompleteStreamTerminalFact = {
   lineage: RecoveryLineage
   attempt: AssistantAttemptIdentity
 }
-
 type RecoverySourceVersion = {
   sourceAssistantID: string
   factsDigest: string
@@ -598,7 +500,6 @@ type RecoverySourceVersion = {
   sourceSequenceHashChainDigest: string
   providerPrefixVersion?: DurableProviderPrefixVersion
 }
-
 type RecoveryControlTailVersion = {
   aggregateID: string
   sourceAssistantID: string
@@ -610,7 +511,6 @@ type RecoveryControlTailVersion = {
   allowedEventTypesDigest: string
   tailHashChainDigest: string // empty tail 也有固定 canonical genesis encoding
 }
-
 type ToolRecoveryEvidence = {
   id: string
   name: string
@@ -623,13 +523,11 @@ type ToolRecoveryEvidence = {
     | "execution-interrupted"
     | "provider-result-missing"
 }
-
 type DurableProviderContinuation = {
   domain: ProviderSafetyDomain
   cursor: SealedRecoveryMaterialRef
   providerPrefixVersion: DurableProviderPrefixVersion
 }
-
 type DurableRecoverySnapshot = {
   source: "durable-recovery-snapshot"
   sourceAssistantID: string
@@ -662,7 +560,6 @@ sourceAssistantID
 = authorizedDispatch.context.attempt.assistantID
 = frozenRecoverySourceVersion.sourceAssistantID
 = sourceDecisionState.current.sourceAssistantID（若当前 source 自己已有 decision）
-
 originConsumption（若 source 本身是 recovery child）另行满足：
 childAssistantID = sourceAssistantID，且其 parent source/decision/revision/binding
 精确等于 authorizedDispatch.origin.decision；不得要求 parent sourceAssistantID = childAssistantID
@@ -672,7 +569,7 @@ childAssistantID = sourceAssistantID，且其 parent source/decision/revision/bi
 
 工具 evidence 不得把可选 `providerExecuted` 缺失解码为 `false`。只有 durable call 与 dispatch definition 能证明 local/provider execution 时才能使用对应值；旧数据缺字段、tool definition 不可解析或二者冲突时必须是 `unknown`。`open`、`pending/running`、interruption、call 未 durable 或 execution kind unknown 都 fail closed。
 
-#### 4.3.2 Planned no-send materialization
+#### 3.3.2 Planned no-send materialization
 
 planning 结果必须由 runtime adapter 针对**一个具体候选 action**产生，并与 durable snapshot 分开：
 
@@ -680,7 +577,6 @@ planning 结果必须由 runtime adapter 针对**一个具体候选 action**产�
 type AutomaticRecoveryAction =
   | "safe-retry"
   | "continue-after-settled-tools"
-
 type PlannedRecoveryUnavailableCause =
   | "planned-target-unavailable"
   | "planned-authority-unavailable"
@@ -689,7 +585,6 @@ type PlannedRecoveryUnavailableCause =
   | "planned-runtime-proof-unavailable"
   | "provider-proof-unavailable"
   | "dispatch-lowering-unverifiable"
-
 type ContinuationClosureUnavailableCause =
   | "provider-end-reasoning-missing"
   | "reasoning-signature-missing"
@@ -701,20 +596,17 @@ type ContinuationClosureUnavailableCause =
   | "continuation-item-kind-unsupported"
   | "model-incompatible"
   | "protocol-unsupported"
-
 type PlannedRecoveryUnavailable =
   | { phase: "planning"; cause: PlannedRecoveryUnavailableCause }
   | {
       phase: "continuation-closure"
       cause: ContinuationClosureUnavailableCause
     }
-
 type RecoveryAuthorization = {
   sourceAssistantID: string
   sourceDispatchOrdinal: number
   providerProof: ProviderRecoveryProof
 }
-
 type PlannedRecoveryMaterialization =
   | {
       type: "available"
@@ -754,7 +646,7 @@ planning 顺序固定为：
 
 current provider configuration 参与的是第 2–3 步 planned materialization，不会倒灌进 frozen source snapshot。captured golden fixtures 只证明固定样例稳定，不能代替每次 paused request 的 runtime authorization。
 
-#### 4.3.3 内部权威 decision 与公开 projection
+#### 3.3.3 内部权威 decision 与公开 projection
 
 ```ts
 const MANUAL_STOP_REASON_ORDER = [
@@ -783,14 +675,11 @@ const MANUAL_STOP_REASON_ORDER = [
   "superseded-by-new-user-input",
   "internal-classification-failure",
 ] as const
-
 type ManualStopReason = (typeof MANUAL_STOP_REASON_ORDER)[number]
-
 type RecoveryDecisionAction =
   | { type: "safe-retry" }
   | { type: "continue-after-settled-tools" }
   | { type: "manual-stop"; reasons: ManualStopReason[] }
-
 type RecoveryAdmissionPlan = {
   nextContext: DispatchAttemptContext
   normalizedMaxSteps: number
@@ -802,7 +691,6 @@ type RecoveryAdmissionPlan = {
   allowedControlTailPolicyDigest: string
   policyDigest: string // N/M + control policy + candidate context 的 canonical digest
 }
-
 type RecoveryBinding = {
   sourceAssistantID: string
   nextContext: DispatchAttemptContext
@@ -814,7 +702,6 @@ type RecoveryBinding = {
   closureDigest?: string
   authorization: RecoveryAuthorization
 }
-
 type RecoveryDecisionProposal = {
   sourceAssistantID: string
   sourceVersionDigest: string
@@ -822,19 +709,16 @@ type RecoveryDecisionProposal = {
   bindingDigest: string
   binding?: RecoveryBinding
 }
-
 type RecoveryDecisionStatus =
   | "active"
   | "consumed"
   | "superseded"
   | "finalized"
-
 type RecoveryDecisionRecord = RecoveryDecisionProposal & {
   decisionID: string // 同一 decision series 的 revisions 间稳定
   decisionRevision: number
   status: RecoveryDecisionStatus
 }
-
 type RecoveryDecisionState = {
   current: RecoveryDecisionRecord
   child?: {
@@ -842,12 +726,10 @@ type RecoveryDecisionState = {
     terminal: "none" | "incomplete" | "success" | "other-error"
   }
 }
-
 type DispatchSummaryProjection = {
   dispatchCount: number
   evidence: "available" | "opaque" | "inconsistent"
 }
-
 type IncompleteRecoveryProjection = {
   terminal: {
     classification: "incomplete-stream"
@@ -869,9 +751,9 @@ assistant optional `incompleteRecovery` / `dispatchSummary` 分别只使用 `Inc
 
 internal decision 的 active/consumed/superseded/finalized 生命周期由 append-only transition 关系表示，不在同一 mutable JSON object 上覆盖。first revision 为 0；reclassification、budget/max-step exhaustion 或 new-user supersession append revision + 1，并把旧 active revision标为 superseded；新 ManualStop revision 直接 finalized，不能改写旧 automatic action。同一 source version 最多一个 active revision。公开 projection 总是指向 latest effective committed revision。`recovery_head` 只指向当前 folded transition，具体 authority/replay 规则见后续 persistence 段。
 
-### 4.4 权威 evidence 与 paused dispatch protocol
+### 3.4 权威 evidence 与 paused dispatch protocol
 
-#### 4.4.1 Source checkpoint 与 control tail
+#### 3.4.1 Source checkpoint 与 control tail
 
 不能只写“allowlisted events/fields”。实现必须在 shared schema 中声明以下**版本化 canonical sets**；这些名称是 future internal serialized recovery event kinds，不是当前已存在的生产事件：
 
@@ -883,13 +765,11 @@ const RECOVERY_SOURCE_FACT_EVENT_TYPES_V1 = [
   "session.recovery.provider-prefix-recorded",
   "session.recovery.incomplete-terminal-recorded",
 ] as const
-
 const RECOVERY_CONTROL_EVENT_TYPES_V1 = [
   "session.recovery.decision-revision-activated",
   "session.recovery.decision-finalized",
   "session.recovery.child-admitted-and-consumed",
 ] as const
-
 const RECOVERY_SOURCE_FACT_FIELDS_V1 = {
   "session.recovery.dispatch-recorded": [
     "sessionID", "assistantID", "dispatchOrdinal", "context", "origin",
@@ -913,7 +793,6 @@ const RECOVERY_SOURCE_FACT_FIELDS_V1 = {
     "lineage", "attempt",
   ],
 } as const
-
 const RECOVERY_CONTROL_TAIL_FIELDS_V1 = {
   "session.recovery.decision-revision-activated": [
     "sessionID", "transitionID", "expectedPredecessor",
@@ -940,6 +819,8 @@ const RECOVERY_CONTROL_TAIL_FIELDS_V1 = {
 - online persistence 与 replay rebuild：`packages/core`；
 - Legacy `packages/opencode` 只提供 typed runtime values/event payload，不复制 canonical field lists 或 hash implementation；
 - Legacy runtime 只生产 typed payload，不自行维护另一份 field list。
+
+这些 recovery transition 只允许进入 raw `EventTable` 与内部 projector/rebuilder 输入；不得作为普通 Session sync/global bus 事件经 `EventV2Bridge` 暴露。实现必须提供 internal-only durable publish seam，或在 bridge/publication 层明确 suppress/filter `session.recovery.*` payload，只对外发布不含 authority fields 的 `IncompleteRecoveryProjection` / `DispatchSummaryProjection` 和既有 message/session signals。验收必须证明公开 Legacy sync、generated SDK/TUI event surfaces 与 Native V2/shared subscribers 都不会收到 ledger、proof、digest、decision link、CAS predecessor、sealed ref 或 canonical transition operation。
 
 `recovery-event-chain-v1` 对 session aggregate 中**每个** `seq <= sourceEventSequenceHighWater` 的 durable serialized event 按原始 sequence 计算完整 hash chain；即使是与 recovery 无关的普通事件，也通过 full-payload digest 影响 `sourceSequenceHashChainDigest`。`factsDigest` 则只提取 `RECOVERY_SOURCE_FACT_EVENT_TYPES_V1` 中且 assistantID 等于 `RecoverySourceVersion.sourceAssistantID` 的 event，并严格按 event sequence 使用 `RECOVERY_SOURCE_FACT_FIELDS_V1` 生成 canonical fact envelopes。terminal/tool settlement 完成后冻结 `RecoverySourceVersion`。
 
@@ -973,22 +854,18 @@ recovery-source-version-v1({
 
 `RecoveryControlTailVersion` 同理绑定 aggregate/source assistant、hash version、control event-types/fields version、from/to sequence、canonical type digest 与 tail hash；空 tail 使用固定 genesis encoding。不能只比较调用者复制的 digest string。`recovery-event-chain-v1` 必须直接按 raw `EventTable` 的 aggregate sequence 读取，并 hash canonical `{id, aggregateID, seq, type, data, previousDigest, hashVersion}`；manifest-filtered API 不足以覆盖每个 durable event。source fact extraction 只选该 `sourceAssistantID` 的 recovery facts，而完整 aggregate chain 仍绑定所有事件。
 
-实现前必须规划以下 golden/mutation tests：
+实现前 canonical/replay tests 必须覆盖：
 
-1. 四个 canonical sets 的 exact membership/order golden；
-2. 每个 event kind 的 required/nullable/forbidden field golden；
-3. object insertion order 改变不改变 digest，任一 canonical field 值改变必须改变相应 digest；
-4. unknown recovery event、missing required field、forbidden authority field、source/control set overlap 均拒绝；
-5. duplicate sequence、sequence gap、same sequence/different payload/type 均拒绝；
-6. unknown hash/event-types/field-set version 均拒绝；
-7. source high-water 后出现 user/config/history/tool event 使 control tail stale；
-8. prefix missing/extra/mismatch 与 ancestry mutation 均拒绝；
-9. serialized events 跨新数据库 replay 后，source facts/version、control tail、decision revisions、consumption、child ledger、projection 与 derived head 完全等价；
-10. online fold 与 replay rebuilder 的 final head/active revision 相同；故意制造 predecessor branch/gap 时二者都失败而不是择一修复。
+| 类别 | Cases |
+|---|---|
+| set/field golden | 四个 sets exact membership/order；每个 event required/nullable/forbidden fields；object insertion order不改 digest，任一 canonical field mutation改变 digest |
+| reject | unknown recovery event、missing/forbidden authority field、source/control overlap；duplicate/gap/same-seq-different payload/type；unknown hash/event-types/field-set version |
+| stale/prefix | source high-water后 user/config/history/tool event使 tail stale；prefix missing/extra/mismatch与 ancestry mutation拒绝 |
+| replay | serialized events到新数据库后 source/control、revisions、consumption、child ledger、projection与 heads等价；online folder与 rebuilder final state相同，predecessor branch/gap均失败而不择一修复 |
 
 有限 golden fixtures 只证明这些固定 canonical samples，不证明任意 runtime transport lowering；后者仍由 paused-request authorization integration 负责。
 
-#### 4.4.2 Prepare → authorize → release / cancel
+#### 3.4.2 Prepare → authorize → release / cancel
 
 network send 必须有机械上的 staged lifecycle：
 
@@ -1002,17 +879,14 @@ type RecoveryAdmissionReceipt = {
   dispatchOrdinal: 0
   preparedRequestDigest: string
 }
-
 interface PreparedRequestHandle {
   authorize(receipt: RecoveryAdmissionReceipt): AuthorizedRequestHandle
   cancel(): Promise<void> // prepared → cancelled；先机械关闭 gate，再做 cleanup
 }
-
 interface AuthorizedRequestHandle {
   release(): Promise<Stream<LLMEventBatch>> // authorized → released；单次返回 processor 消费的 stream
   cancel(): Promise<void> // authorized → cancelled；release 后拒绝
 }
-
 preparePausedRequest(input): Promise<{
   normalizedRequest: CanonicalPreparedRequest
   digestInputs: PreparedRequestDigestInputs
@@ -1034,61 +908,36 @@ preparePausedRequest(input): Promise<{
 
 进程重启后不存在可恢复的内存 handle。re-entry 必须重新 prepare；若 immutable request、admission plan 或 policy 已变化，cancel 旧 handle并 append 新 decision revision，不能让旧 decision 静默授权新 request。仅凭 durable old decision 不得直接发送。若进程在 child/ledger/consumption commit 后、可观察 release/settlement 前崩溃，仍属于 ambiguous dispatch boundary，不能声称 exactly-once；按 crash policy fail closed。
 
-#### 4.4.3 Durable persistence authority
+#### 3.4.3 Durable persistence authority
 
 权威关系固定为：
 
 ```text
 raw EventTable serialized recovery transition events
   = sole canonical replay authority
-
 append-only relations / decision / ledger / projection rows
   = transactional rebuildable materializations
-
 recovery_head + assistant_chain_head + dispatch_ledger_head
   = derived online CAS indexes
-
 assistant incompleteRecovery / dispatchSummary
   = public/user projection
 ```
 
 四层不能互相替代。任一 materialized relation/head 缺少 matching raw event 时不能 authorize；任一 head 与从 raw chain fold 的结果不一致时 runtime fail closed。
 
-当前 `EventV2` 的 durable transaction 顺序是 projector(s) → `commit(seq)` → sequence/event row insert。accepted replay 对新 event 也运行相同 projectors；exact replay 在 equality check 后返回；callback 不会序列化或重放。因此组件固定为：
+当前 `EventV2` 顺序为 projectors → `commit(seq)` → sequence/event row；accepted replay运行同 projectors，exact replay equality后返回，callback不序列化/重放。组件规范：
 
-##### RecoveryTransitionProjector
-
-- 同时服务 online publish 与 accepted replay；从 authoritative discriminated `operation` 幂等写 immutable relations、decision/consumption、child `MessageTable`/ledger 与 rebuildable public projection；
-- 校验 `nextStateDigest = fold(predecessor, operation)`，不接受 independently serialized full nextState；
-- 不覆盖三个 CAS heads；同 transitionID 在其他 event ID/seq 一律拒绝；
-- composite child operation 是唯一 durable child creation authority；post-commit live notification 只能是派生非 durable signal。
-
-##### RecoveryHeadsCommit
-
-- online publish 时由 `PublishOptions.commit(seq)` 原子 CAS `recovery_head`、`assistant_chain_head`、`dispatch_ledger_head` 中该 operation 需要的集合；
-- 每个 head 使用 explicit genesis/predecessor/next digest，affected rows 必须恰为预期；missing genesis 可以初始化，非 genesis missing 或 digest 不符视为 corrupt；
-- 任一失败使 projector rows、projection、event sequence/event row 与所有 head mutation 全部 rollback。
-
-##### RecoveryReplayRebuilder
-
-- explicit repair/validation 时直接按 raw `EventTable` aggregate sequence fold authoritative operations；重建 relations/projection 与三个 heads；
-- `replayAll()` 导入新数据库时必须 suppress publication，直到完整 accepted prefix fold 和 head finalization 成功；定义 prefix marker/batch transaction，不能逐 event 暴露半成品 child；
-- 分叉、缺口、same seq different payload/type、same transitionID different event、two-active revisions、orphan child/consumption、sequence/hash mismatch 都失败而不择一修复。
+| 组件 | 职责 |
+|---|---|
+| `RecoveryTransitionProjector` | online/accepted replay从 discriminated `operation` 幂等写 immutable relations、decision/consumption、child Message/ledger与 projection；校验 fold所得 `nextStateDigest`；不写 heads；transitionID跨 event拒绝；composite operation是唯一 durable child authority |
+| `RecoveryHeadsCommit` | online `PublishOptions.commit(seq)` 原子 CAS operation需要的三 heads，使用 explicit genesis/predecessor/next digest且 affected rows精确；任一失败回滚 projector/projection/event sequence/event row/heads |
+| `RecoveryReplayRebuilder` | repair/validation按 raw aggregate sequence fold并重建 relations/projection/heads；新库 replay在完整 prefix/head finalization前 suppress publication并有 marker/batch；branch/gap/payload conflict/duplicate transition/two-active/orphan/sequence-hash mismatch均失败 |
 
 `RecoveryTransitionProjector` 与 `RecoveryReplayRebuilder` 可复用 pure folder，但前者是 transaction projector，后者是对 raw authority 的 explicit rebuild。migration 必须支持 existing data且不推断旧 assistant 为 safe authority；live aggregate 内 individual transitions immutable，显式 session deletion 可按现有 cascade 删除整个 aggregate/materializations。
 
-必须有以下 persistence/replay tests：
+persistence/replay tests 覆盖 empty/existing migration、unique/cascade；online atomic happy path与 head-CAS full rollback；duplicate idempotency/conflict；revision/consume/supersede race；cross-db authority/materialization/digest/head equivalence；event deletion/reorder/tamper、branch/gap/bad head fail closed；tampered public projection不能授权且只能由 rebuilder恢复。
 
-- empty database schema、existing-data upgrade、unique index 与 cascade compatibility；
-- online happy path：projector rows + head CAS + event row 同时 commit；
-- projector 完成后 head CAS 失败：所有 rows/projection/event sequence/event row/head 全部回滚；
-- duplicate same transition/same payload 幂等，same transition/different payload 拒绝；
-- concurrent revision/consume/supersede race 只有一个 head CAS 成功；
-- serialized events replay 到新数据库后 authority relations、active revision、consumption、child ledger、projection、canonical source/control digests 与 derived head 全部一致；
-- 删除/重排/篡改单个 event、制造 predecessor branch/gap、预置错误 head 均 fail closed；
-- public projection 被篡改时不能作为 authority dispatch；rebuilder从 transition chain重建后才能恢复一致 projection。
-
-#### 4.4.4 Legacy 执行顺序
+#### 3.4.4 Legacy 执行顺序
 
 1. initial/ordinary semantic dispatch 先 `preparePausedRequest()`；available adapter 计算并 durable 写入 exact dispatch evidence，opaque adapter durable 写入 opaque evidence；事务成功后才 release 初始请求；
 2. stream terminal 后等待已登记工具并持久化 executionKind、input/call phase、settlement/interruption 与 reasoning provenance；
@@ -1103,7 +952,7 @@ assistant incompleteRecovery / dispatchSummary
 
 这套协议不声称解决 provider 已收到 request、但客户端尚未观察到 response/settlement 时的任意 crash exactly-once 问题。
 
-### 4.5 保守分类器
+### 3.5 保守分类器
 
 pure classifier 的输入固定为：
 
@@ -1137,14 +986,12 @@ sourceConsistent
        providerSideEffectsOffered=false/no-provider-side-effects 时不得出现 provider tool evidence；
        localToolsOffered=false/none-offered 时不得出现 local tool evidence
    and dispatchOrdinal/ledger envelope 可解码且无重复/缺口
-
 originalDispatchAvailable
 := sourceConsistent
    and dispatch.type = available
    and replayFence 与 capability summary 不矛盾
    and every domain-bearing fence structurally covers dispatch.target
    and semantic/prepared digest version 可识别
-
 recoveryOriginConsistent
 := dispatch.origin.type != incomplete-recovery
    or (
@@ -1168,25 +1015,21 @@ recoveryOriginConsistent
           originConsumption.decision.binding.authorization
         )
       )
-
 planAvailableFor(action)
 := plannedMaterialization.type = available
    and plannedMaterialization.action = action
    and preparedRequest ownership 仍由当前 coordinator 持有
-
 bindingFor(action)
 := canonical binding constructed from
    durableSnapshot + plannedMaterialization(action) + admissionPlan
    where admissionPlan.nextContext.attempt.assistantSequence
          = source attempt.assistantSequence + 1
    and admissionPlan.expectedChainHeadAssistantID = sourceAssistantID
-
 localReplaySafe
 := dispatch.replayFence.localTools.type in {
      none-offered,
      durable-before-execute
    }
-
 safeRetryProviderSafe
 := (
      dispatch.replayFence.provider.type = no-provider-side-effects-offered
@@ -1199,7 +1042,6 @@ safeRetryProviderSafe
      and gated unseal 后 raw key digest 重新匹配
      and planned target belongsTo proof domain
    )
-
 continuationPrefixConsistent
 := durableSnapshot.providerContinuation is present
    and frozenRecoverySourceVersion.providerPrefixVersion is present
@@ -1207,7 +1049,6 @@ continuationPrefixConsistent
    and planned authorization.providerProof.providerPrefixVersion is present
    and three prefix checkpoints canonical equal
    and prefix ancestry/hash/source assistant checks 成立
-
 continueProviderSafe
 := (
      dispatch.replayFence.provider.type = no-provider-side-effects-offered
@@ -1218,7 +1059,6 @@ continueProviderSafe
      and continuationPrefixConsistent
      and sealed cursor ref/digest/keyVersion、unsealed digest、domain/target membership 全部匹配
    )
-
 hasUnsafeTool
 := exists tool where
      executionKind = unknown
@@ -1226,7 +1066,6 @@ hasUnsafeTool
      or callState != durable
      or state in { pending, running }
      or interruption is defined
-
 allToolsSettled
 := tool count > 0
    and not hasUnsafeTool
@@ -1234,7 +1073,6 @@ allToolsSettled
    and every tool.inputState = complete
    and every tool.callState = durable
    and every tool.state in { completed, error }
-
 SafeRetry
 := sourceConsistent
    and originalDispatchAvailable
@@ -1247,7 +1085,6 @@ SafeRetry
    and planned semanticReplayDigest = source dispatch.semanticReplayDigest
    and planned continuationClosure.type = not-needed
    and tool count = 0
-
 ContinueAfterSettledTools
 := sourceConsistent
    and originalDispatchAvailable
@@ -1260,7 +1097,6 @@ ContinueAfterSettledTools
    and allToolsSettled
    and planned continuationClosure.type = constructible
    and closure target/digest 与 binding 一致
-
 ManualStop
 := otherwise
 ```
@@ -1293,56 +1129,25 @@ continuation-closure/*                               → continuation-context-un
 # recovery-action-inapplicable 由 action 与 tool/closure shape 不相容的 classifier predicate 产生
 ```
 
-统一 reason 顺序为：
-
-```text
-dispatch-evidence-inconsistent
-→ dispatch-ambiguous
-→ provider-introspection-unavailable
-→ planned-target-unavailable
-→ planned-authority-unavailable
-→ planned-request-materialization-failed
-→ planned-request-digest-failed
-→ planned-runtime-proof-unavailable
-→ provider-replay-unknown
-→ provider-continuation-unavailable
-→ provider-proof-unavailable
-→ recovery-action-inapplicable
-→ local-tool-replay-unknown
-→ open-tool-input
-→ unsettled-tool
-→ interrupted-tool
-→ uncertain-tool-result
-→ dispatch-lowering-unverifiable
-→ continuation-context-unavailable
-→ recovery-binding-stale
-→ recovery-budget-exhausted
-→ same-process-max-step-exhausted
-→ superseded-by-new-user-input
-→ internal-classification-failure
-```
+统一 reason 顺序只由 §3.3.3 的 `MANUAL_STOP_REASON_ORDER` 定义，不在此复制第二份列表。
 
 classifier 不负责把低层 exception 猜成任意 reason；runtime adapter 必须返回 typed unavailable cause。`planned-runtime-proof-unavailable` 表示 runtime adapter 根本无法建立 paused authorization contract；`dispatch-lowering-unverifiable` 表示 adapter 声称可 preparation，但该次 exact lowerer/transport mutation 无法与 captured representation 建立等价。二者不可互换。ManualStop decision 不构造假 target、proof 或 binding。
 
-### 4.6 新 attempt 与恢复顺序
+### 3.6 新 attempt 与恢复顺序
 
-#### Legacy
+§3.4.4 是唯一 authoritative prepare/authorize/release/cancel 顺序；Session 层补充约束如下：
 
-§4.4.4 已定义 authoritative prepare/authorize/release/cancel 顺序；这里补充 Session 层语义：
+| 阶段 | Legacy 约束 |
+|---|---|
+| tool 与 terminal | 本地工具在 `item.execute()` 前提交 complete input 与 durable call/running part，失败则不执行；adapter/`settleIncomplete()` 保留 typed classification；processor drain 后持久化 execution/input/call/settlement/interruption/reasoning provenance，再写 terminal fact并 reload snapshot |
+| proposal 与 activation | runtime 针对候选 action prepare paused request；pure classifier 结合 admission plan 生成 proposal。ManualStop commit 为 finalized 后 cancel并 break；automatic transaction 重查 N/M/policy、attempt-local ownership、source/control/binding |
+| child release | 只有三 heads CAS、decision consumption、exact child 与 ordinal-0 ledger 原子 commit并返回 receipt，same handle 才 authorize/release；所有 stale/CAS/persistence/ownership failure 均 cancel且 recovery provider hits 为 0 |
+| re-entry | 仅同进程且原 runner ownership/fiber 活跃可 attach nonterminal child；跨进程/ownership 丢失为 `dispatch-ambiguous`；matching terminal child 只观察/分类；active decision 无 child 才能消费；link/ordinal/version 冲突 fail closed |
+| 非 recovery | incomplete 不重跑旧 processor且继续排除于 `SessionRetry.policy()`；outer policy 若已产生第二 semantic dispatch则 ledger 多条、后续 incomplete fail closed（或实现选择首次 dispatch 后禁用 outer resend）。普通 provider error、interrupt、permission decline、context overflow 保持现有语义 |
 
-1. 若请求提供 AI SDK 本地工具，新增 processor/tool handshake 必须在 `item.execute()` 前提交 complete input、durable call/running tool part；handshake 失败则不执行工具；
-2. adapter 或 `settleIncomplete()` 产生 typed incomplete signal，`SessionProcessor` 保留 classification，不在 `provider-error` 分支丢成普通 `Error`；
-3. processor 等待已登记工具并完成 executionKind、input/call phase、part/reasoning provenance 持久化；
-4. Prompt 持久化 terminal fact 后 reload `DurableRecoverySnapshot`，再由 runtime adapter prepare 当前候选 action 的 paused request；durable snapshot 与 planned materialization 不得混合；
-5. pure classifier 结合 typed admission plan 生成 `RecoveryDecisionProposal`；ManualStop 只有 commit 为 finalized record 后才作为 durable finalization，handle 随后 cancel并保持现有 break；
-6. automatic proposal 的 activation transaction 重查 budget/max-step/policy、清空 attempt-local state 的 ownership计划、reload source/control tail并验证 exact binding；
-7. 只有三 heads CAS + committed decision consumption + exact unique child/ordinal-0 ledger transaction 成功并返回 receipt 后，same handle 才能 authorize/release child stream；CAS、persistence、stale binding 或 ownership failure 全部 cancel，provider recovery hits 为 0；
-8. re-entry 按互斥 durable state matrix 处理：仅同一进程且 runner ownership/fiber 仍明确存活时可 attach/await 匹配 nonterminal child；跨进程或 ownership 已丢失时，child/evidence 存在但无 terminal settlement一律 `dispatch-ambiguous`；matching terminal child 只观察/分类；active decision 无 child 时才可 CAS 消费一次；冲突 link、重复 ordinal 或 decision/source-version mismatch 均 fail closed；
-9. incomplete-triggered recovery 不直接重跑旧 processor；canonical incomplete 继续不进入 `SessionRetry.policy()`。普通 retryable error 的 outer policy 若已产生第二 semantic dispatch，则 source ledger 多条使后续 incomplete fail closed；若实现选择首次 dispatch 后禁用 outer resend，则 policy 在该边界停止。新用户输入 supersede active recovery 的具体 transition/CAS 规则见后续 identity/sequence 段。
+新用户输入的 supersession/CAS 规则见 §3.9。
 
-对于普通 provider error、用户 interrupt、权限拒绝、context overflow 等非 incomplete 错误，保持各自现有语义，不经过本分类器。
-
-### 4.7 Recovery-aware model lowering
+### 3.7 Recovery-aware model lowering
 
 #### SafeRetry
 
@@ -1390,142 +1195,42 @@ golden/recorded fixtures 只做回归或 provider 接受性样例，不替代 pe
 - 该 transport 发生 incomplete 时固定 ManualStop，不能因为它名称含 “native” 而套用 Native V2 non-goal，也不能在缺少 runtime proof 时声称 parity；
 - `packages/opencode/test/session/llm-native.test.ts` 的未来相关用例首先是 fail-closed compatibility test；若后续要为该 transport启用 automatic recovery，必须另行扩展 scope并补相同 release/cancel/provider-hit integration。
 
-### 4.8 StructuredOutput 与其他 attempt-local 状态
+### 3.8 StructuredOutput 与其他 attempt-local 状态
 
-每个新 recovery attempt 前必须重置：
+每个 recovery attempt 必须重新初始化 `structured`、临时 output accumulator、processor-local provider evidence、未完成 fragment buffers 和绑定旧 assistant ID 的 toolcall map；建议把 `structured` 移入 while-loop 内的 attempt scope，而不是依赖分支清空。
 
-- `structured`；
-- 当前 attempt 的临时 output accumulator；
-- processor-local provider evidence；
-- 未完成 fragment buffers；
-- 与上一 assistant ID 绑定的 toolcall map。
+### 3.9 identity、admission、supersession 与 crash 边界
 
-建议将 `structured` 移入 while-loop 内部的 attempt scope，而不是依赖分支手工清空。
+| 边界 | 规范 |
+|---|---|
+| `dispatchOrdinal` | 每 assistant 从0开始，每个 semantic dispatch是唯一 immediate successor；unique `(sessionID, assistantID, dispatchOrdinal)`并由 `dispatch_ledger_head` CAS；duplicate/gap/unknown fail closed，automatic source必须只有 ordinal 0 |
+| `assistantSequence` | 每 chain从0开始，initial/recovery/ordinary均占连续序号；unique `(sessionID, chainID, assistantSequence)`；candidate = source+1且 `assistant_chain_head` CAS source仍为 head |
+| `recoveryOrdinal` | 只计 incomplete child：initial/new-user=0，recovery child=source+1，ordinary保持；unique key只作用 incomplete-child relation，不阻止同 ordinal ordinary continuation |
+| max-step `M` | 当前 Legacy只有提示而无 hard admission，必须新增。合法 sequence `0..M-1`，candidate `<M`；M=1仅 initial、M=2最多一 successor；ordinary/recovery共用 budget，`MAX_STEPS_PROMPT`不能超额。配置规范化须细化；顺序为 plan/proposal→transaction重查→revision+三heads CAS→child/consumption→receipt release。exhausted不建 child/不release并以新 revision finalized `ManualStop(["same-process-max-step-exhausted"])`；写失败只保证当前进程 fail closed |
+| recovery budget `N` | candidate ordinal=source+1且 `<=N`；N=0/1/2分别允许0/1/2 child，2仅建议；exhausted append `recovery-budget-exhausted`。N与M独立，任一失败均 cancel且 provider hits=0；无 global physical-request预算声明 |
+| revision/supersession | first revision=0；reclassification append +1不覆盖；同 `(sessionID, sourceAssistantID, sourceVersionDigest)`最多一 active，new revision/consume/supersede经同 `recovery_head` predecessor CAS竞争。新 user lineage前先 finalize unresolved source为 `ManualStop(["superseded-by-new-user-input"])`，必要时 supersede automatic，commit后才新 chain `{recoveryOrdinal:0, assistantSequence:0}`；child先 consume则 steering/queue；CAS/persistence failure不release也不admit |
+| crash | child dispatch evidence durable但无 settlement时，仅同进程且原 runner ownership活跃可 attach；restart/ownership loss为 ambiguous并关联唯一 child ManualStop，不可再次 consume/release/create same sequence。replay验证 revision、assistant、ledger无 branch/gap，不能从 public projection选分支 |
 
-### 4.9 identity、admission、supersession 与 crash 边界
+## 4. 正确性论证
 
-#### 4.9.1 三类连续序列
+以下是**实现并通过 §5 验收后**应成立的 obligations，不是当前生产保证；当前基线见顶部证据表与 §1.2。
 
-- `dispatchOrdinal`：每个 assistant 内从 0 开始，每次 semantic dispatch 必须是唯一 immediate successor；`(sessionID, assistantID, dispatchOrdinal)` 唯一，由 `dispatch_ledger_head(sessionID, assistantID)` CAS 当前 tail。重复、缺口或未知 count 均 fail closed；automatic recovery 要求 source ledger 只有 ordinal 0；
-- `assistantSequence`：每个 chain 从 0 开始，所有 initial/recovery/ordinary-continuation assistant 都占一个连续序号；`(sessionID, chainID, assistantSequence)` 唯一。candidate admission 必须满足 `candidateAssistantSequence = source.assistantSequence + 1`，并由 `assistant_chain_head(sessionID, chainID)` CAS 验证 source 仍是 current chain head；
-- `recoveryOrdinal`：只统计 incomplete-triggered child。initial/new-user lineage 为 0；recovery child 为 `source + 1`；ordinary continuation 保持 source ordinal。`(sessionID, chainID, recoveryOrdinal)` 只约束 incomplete-child relation，不能阻止同 ordinal 下后续 ordinary continuation。
+| Obligation | 成立条件 |
+|---|---|
+| incomplete 不伪装成功 | typed terminal failure 留在原 attempt；成功只属于新 assistant；旧 error 不清除；adapter canonical incomplete 与 processor clean EOF 进入同一 typed failure |
+| 不重放本地工具 | Legacy handshake 建立 complete-call durable-before-execute，否则 local fence unknown；SafeRetry 要求无 tool evidence且两类 replay fence 安全；Continue 仅把 settled call/result 当历史闭包，不重新排入执行；pending/running/interrupted 直接 ManualStop |
+| 不从缺事件推导安全 | 自动 action 依赖 source 在 release 前 durable 的 `AttemptReplayFence` 与 candidate 的 exact no-send materialization；`providerExecuted=false/undefined` 或缺 part 不充分，缺字段投影 `executionKind:"unknown"`；任一 fence unknown 或 target/domain 不匹配均停止 |
+| 不依赖未提交内存 | classifier 只读 transaction-consistent snapshot、planned materialization 与 admission；source fence 不从当前配置重算；proposal 绑定 next context、target/authority、semantic/prepared digest、source/control versions、N/M policy、closure 与 authorization；activation 才产生 record。stale request cancel并新 revision planning；SafeRetry 另要求 semantic digest equality |
+| authority 不漂移 | public projections 仅 display；child 只引用 source/decision/revision/binding commitment，完整 proof 留在 consumed internal decision；任一 classification/publication/CAS/persistence failure cancel staged handle。storage unavailable 时只保证当前进程 fail closed，不承诺 ManualStop 一定 durable |
+| interrupted 不冒充 settled | schema 保留 interruption/uncertainty provenance；任何该来源强制 ManualStop；Legacy cleanup 不得丢 provenance |
+| 次数有界且无分叉 | chain/assistant/recovery/dispatch 四类 identity 各自连续唯一；`candidateRecoveryOrdinal <= N`（测 0/1/2，2 非默认合同）；`candidateAssistantSequence < M`，ordinary/recovery 共用 budget；exhaustion 写对应 reason并 cancel；三 heads CAS、unique keys与 consumption/binding 阻止并发 successor；无独立 physical-request budget |
+| 模型上下文协议有效 | SafeRetry 排除整个 failed assistant；Continue 仅在 provider-specific settled-tool closure 可构造时成立，排除 partial prose/reasoning，只保留 provider-end provenance 与所需签名/加密 metadata；模型不兼容不复用。OpenAI Responses 必须区分 normalized `store:true` references 与 `store:false` exact typed stateless allowlist，后者须先证明无 item ID lowering |
+| StructuredOutput 不泄漏 | attempt-local 值在新 assistant 前重置；旧值不能触发新 attempt 成功；成功只属于产生该值的 assistant |
+| 明确不解决 | 任意 crash 后 provider exact-once、clustered/distributed Session ownership、无幂等/续传契约的 hosted-tool 自动恢复、global durable max-step、独立 global physical-request budget、通用 provider timeout/watchdog |
 
-#### 4.9.2 hard max-step admission
+## 5. 测试方案
 
-- 当前 Legacy **没有 hard max-step admission guard**：它只递增内存 `step`、计算 `isLastStep` 并注入 `MAX_STEPS_PROMPT`，仍会创建 assistant 和调用 provider（`packages/opencode/src/session/prompt.ts:1141-1142`、`1187-1210`、`1281-1295`）。因此必须新增显式 admission predicate；
-- max-step 统一按 admitted assistant attempt 定义，不使用 `completedSteps`：initial assistant 的 `assistantSequence=0`。规范化后 `maxSteps=M` 时，合法 sequence 为 `0 .. M-1`，candidate 仅在 `candidateAssistantSequence < M` 时 admission；因此 `M=1` 只允许 initial assistant，`M=2` 最多允许一个 successor；
-- ordinary continuation 与 incomplete recovery 消费同一 assistant admission budget。`MAX_STEPS_PROMPT` 只能附加到最后一个已获准 assistant，不能借提示再超额创建 attempt；
-- 0、负数、非整数、Infinity/缺失配置如何规范化必须在 detailed design 固定并测试；无论规范化策略为何，都不能绕过 `candidateAssistantSequence < M` 的 admission rule；
-- automatic 顺序固定为：`typed admission plan + classifier proposal → activation transaction 重查 budget/max-step/policy → decision revision + recovery/chain/ledger heads CAS → exact bound child/consumption commit → receipt-authorized network release`；
-- max-step exhausted 时不创建 child、不 release provider，并以同一 decision series 的新 revision supersede旧 automatic proposal/active revision，直接 finalized `ManualStop(["same-process-max-step-exhausted"])`。finalization 写入失败时只能保证当前进程 cancel/fail closed，不能声称 durable stop 已成功；
-- 本修复不声称现有 max-step 已跨 crash 持久化；durable recovery ordinal 也不等价于完整 agent step 或 physical-request budget。
-
-#### 4.9.3 参数化 recovery budget
-
-- recovery limit 使用产品参数 `N`，而不是在 proof 中写死 2；candidate recovery 满足 `candidateRecoveryOrdinal = source.recoveryOrdinal + 1`，且仅当 `candidateRecoveryOrdinal <= N` 才 admission；
-- `N=0` 禁止 automatic recovery，`N=1` 最多一个 recovery child，`N=2` 最多两个。本文只建议 `N=2` 作为可能默认，需另行确认；
-- ordinal exhausted append ManualStop `recovery-budget-exhausted`。budget 与 max-step 是独立 predicates，任一不满足都必须 cancel paused request 且 provider hits 为 0。
-
-#### 4.9.4 Decision revision 与 new-user supersession
-
-- first decision revision 为 0；同一 source version 的 reclassification 必须 append `decisionRevision + 1`，不能覆盖旧 row；
-- 同一 `(sessionID, sourceAssistantID, sourceVersionDigest)` 最多一个 active revision。创建新 revision 的 transition必须把旧 revision从 active 变为 superseded/finalized；consume 与 supersede 都以同一 `recovery_head` predecessor CAS 竞争；
-- admission 新 user lineage 前，任何 unresolved incomplete source（包括 terminal 已 durable 但 crash 后尚无 decision，或 active unconsumed decision）都必须先通过 `recovery_head` CAS 形成/append finalized `ManualStop(["superseded-by-new-user-input"])`；若已有 automatic revision，则新 ManualStop revision supersede旧 revision。该 transition commit 后才创建新 chain `{ recoveryOrdinal: 0, assistantSequence: 0 }`；
-- 若 recovery child consumption 已先赢得 CAS，新 user input 不得回写或“取消”已 consumed decision，而是遵循现有 steering/queue semantics；
-- supersession persistence/CAS 失败时 fail closed：不 release recovery handle，也不在未记录 supersession 的情况下 admission 新 lineage。
-
-#### 4.9.5 Crash boundary
-
-- child dispatch evidence 已持久化但没有 terminal settlement 时，只有同一进程且原 runner ownership 仍活跃可 attach/await；进程重启或 ownership 丢失后属于 ambiguous dispatch，必须关联到唯一 child 并 ManualStop，不能重新消费 decision、再次 release 或创建相同 ordinal/sequence；
-- replay 必须验证 revision transition chain、assistant immediate-successor chain 和 dispatch ledger 均无分叉/缺口；不能从 public projection 选择一个分支修复。
-
----
-
-## 5. 正确性论证
-
-本节是**方案实现并通过 §6 验收后**应成立的 proof obligations，不描述当前生产代码已经提供的保证。当前已验证基线见文档顶部证据表与 §1.2。
-
-### 5.1 实施后不会把 incomplete attempt 伪装成成功
-
-- 每次 incomplete attempt 都保留 typed terminal failure；
-- recovery 成功会产生新的 assistant attempt；
-- 旧 attempt 的错误不会被清除或改写成 success；
-- 本次 Legacy 的 adapter canonical incomplete 与 processor clean EOF 都进入同一 typed failure；
-
-### 5.2 实施后不会重放已执行的本地工具
-
-- Legacy AI SDK 必须通过新增 handshake 建立 complete-call durable-before-execute 契约，否则 local-tool fence 为 unknown；
-- SafeRetry 要求没有 tool evidence，且实际请求的 provider/local-tool replay fence 均安全；
-- Continue 只把 settled call/result 作为历史上下文，不重新放入可执行队列，同时仍要求整个 attempt replay fence 安全；
-- pending/running/interrupted 状态直接 ManualStop。
-
-### 5.3 实施后不会从“缺少事件”推导副作用安全
-
-- 自动 action 依赖 original request 在 network release 前持久化的 `AttemptReplayFence`，以及本次 candidate request 经 `preparePausedRequest()` 得到的 exact no-send materialization；
-- observed `providerExecuted=false/undefined` 或缺少 Legacy tool part 都不是充分条件；缺失字段必须投影为 `executionKind: "unknown"`，不能补成 local；
-- provider/local-tool 任一 fence unknown 时 ManualStop；
-- provider 幂等/续传 fence 只在 planned target 的 provider/route/protocol/endpoint/authority 及可选 model/model-family 全部匹配其 safety domain 时有效；
-- 因此断流丢失 hosted-tool 事件、跨 provider/model domain 重试或 Legacy AI SDK 在 event 前执行本地工具，都不会被误判为安全。
-
-### 5.4 实施后不会依赖未提交内存状态
-
-- classifier 只接受 `DurableRecoverySnapshot` 与独立的 `PlannedRecoveryMaterialization`；projection/relational/event checkpoint 必须 transaction-consistent，planned values 不得倒灌为 source facts；
-- 原 attempt 的 replay fence 来自 release 前持久化事实，不从当前配置重算；
-- 本次 Legacy classifier 在分类前 reload message/part/ledger/decision durable state；
-- classifier proposal 绑定 exact `nextContext`、target/authority、semantic/prepared digest、冻结 source/control versions、N/M admission policy、closure 与唯一 authorization；activation transaction 生成 committed `RecoveryDecisionRecord`。pre-commit stale request 必须 cancel 并用新 revision重新 planning，不能在 release 前悄悄 re-prepare 后复用旧 decision；SafeRetry 另要求 source/planned semantic digest 相等；
-- public `incompleteRecovery`/minimal `dispatchSummary` 只保存稳定 display summary，不保存 proof、cursor、request material、digests、decision link 或 CAS predecessor，也不参与 authorization；
-- recovery child dispatch evidence 只反向引用 sourceAssistantID/decisionID/decisionRevision/bindingDigest 和 authorization commitment；完整 provider proof 只存在 consumed internal decision binding，不复制为第二 authority；
-- 任一 classification、publication、CAS 或 persistence failure 都 cancel staged handle，保证当前 recovery path 不触发 provider release。
-
-需要明确限制：如果存储不可用，系统无法保证把 ManualStop 本身写入 durable history；能保证的是当前进程 fail closed。本文不作逻辑上无法兑现的“持久化失败也一定能持久化错误”承诺。
-
-### 5.5 实施后不会把 interrupted error 当作 settled error
-
-- schema 持久化 interruption/uncertainty 来源；
-- classifier 对任何带该来源的 tool 强制 ManualStop；
-- Legacy 当前 attempt cleanup 必须保留 interruption provenance。
-
-### 5.6 实施后恢复次数有界且 assistant admission 无分叉
-
-- chainID 将同一逻辑链关联起来；assistantSequence、recoveryOrdinal、decision revision 与 dispatchOrdinal 各有独立连续性/唯一性约束；
-- initial assistant 的 `assistantSequence=0`、`recoveryOrdinal=0`、首个 `dispatchOrdinal=0`；每个 successor assistantSequence 精确加 1，recovery child 的 recoveryOrdinal 加 1，ordinary continuation 保持 recoveryOrdinal；
-- 参数 `N` 约束 `candidateRecoveryOrdinal <= N`；`N=0/1/2` 分别允许 0/1/2 个 recovery child，`N=2` 不是本文已确认默认；
-- `maxSteps=M` 约束 `candidateAssistantSequence < M`；ordinary continuation 与 recovery child 共用该 admission budget；
-- ordinal/max-step exhausted 分别 append `recovery-budget-exhausted` / `same-process-max-step-exhausted` 并 cancel paused request；
-- `assistant_chain_head` CAS、assistantSequence 唯一键、`recovery_head` decision consumption 与 child binding 保证同一 source 不会并发创建两个 immediate successors；
-- Legacy 测试记录 assistant IDs、ledger entries 与 provider hits，以发现意外 replay；本修复不新增独立 physical-request budget。
-
-### 5.7 实施后模型上下文既不污染，也不破坏 provider 工具协议
-
-- SafeRetry 不注入失败 attempt；
-- Continue 只有在 provider-specific continuation closure 已验证可构造时才成立；
-- Continue 排除 partial prose/reasoning；
-- 仅保留 settled tool continuation 所需且具有 durable provider-end provenance 与最终协议元数据的 provider-native reasoning；
-- 模型不兼容时不复用 provider-native metadata；OpenAI Responses 在 normalized `store === true` 时可使用最终保留且已授权的 hosted/stored references；normalized `store === false` 时只允许 exact hosted-item-kind 已由 actual Legacy lowerer证明完整 typed stateless representation 的 allowlisted 分支，首批可全部 fail closed。stateless encrypted reasoning 还要求先修改/证明当前 lowerer 可在无 persisted item ID 时形成 exact wire representation。
-
-### 5.8 实施后 StructuredOutput 不跨 attempt 泄漏
-
-- attempt-local 变量在新 assistant 前重新初始化；
-- 旧 incomplete attempt 的 structured 值不能触发新 attempt 的成功分支；
-- 每次成功只属于产生该值的 assistant attempt。
-
-### 5.9 明确未解决的边界
-
-本方案不宣称解决：
-
-- 任意时刻进程崩溃后的 provider request 精确一次执行；
-- clustered/distributed Session ownership；
-- provider 没有幂等或续传契约时的 hosted-tool 自动恢复；
-- 全局 durable max-step budget；
-- 独立的全局 physical provider request budget；
-- provider timeout/watchdog 的通用策略。
-
-
----
-
-## 6. 测试方案
-
-### 6.0 本轮已执行的当前态基线
+### 5.0 本轮已执行的当前态基线
 
 本轮使用 PATH 中的 Bun 1.3.14，在 branch `yixiao-issue-7-new`、HEAD `0ea5c2959` 上重新实际执行并通过 46 个 Bun tests 与 4 个精确单选的范围内 Legacy HttpApi exerciser scenarios，共 50 个范围内检查：50 pass，0 fail，0 skip。另一次 selector 过宽的辅助 exerciser 运行执行了 37 个 scenarios 且全部通过，但不计入该 50 项验收。详细测试名、等级和证据边界见文档顶部证据表。核心当前态结论是：Legacy incomplete fail-stop、partial/error preservation、普通 tool continuation、child failure propagation 与 outer retry provider hit 已有运行时证据；automatic recovery 尚未实现，不能从这些基线测试外推。
 
@@ -1571,13 +1276,13 @@ golden/recorded fixtures 只做回归或 provider 接受性样例，不替代 pe
 
 TUI 当前只有 synthetic data/sync/render 基线。真实 Legacy transcript 端测与 synthetic renderer 测试组合可作为两层 contract acceptance 的准备，但不是 keyboard → production Prompt → Legacy endpoint → provider incomplete → real events → Session renderer 的完整 TUI E2E。
 
-以下 §6.1–§6.4 均为**实现后必须新增或扩展的 recovery 验收项**；§6.5 仅列建议验证命令。当前不存在的测试文件不得写成已执行。
+以下 §5.1–§5.4 均为**实现后必须新增或扩展的 recovery 验收项**；§5.5 仅列建议验证命令。当前不存在的测试文件不得写成已执行。
 
-### 6.1 Pure classifier 与 runtime gate 测试
+### 5.1 Pure classifier 与 runtime gate 测试
 
 测试必须按 action/ownership 分组，不能再用一列含义不明的 `safe` 同时代表 provider replay、local-tool replay、continuation proof 和 runtime lowering。
 
-#### 6.1.1 SafeRetry classifier matrix
+#### 5.1.1 SafeRetry classifier matrix
 
 | Source provider fence | Source local fence | Tool count | Planned action/proof | Semantic digest | Budget/admission | 预期 |
 |---|---|---:|---|---|---|---|
@@ -1595,7 +1300,7 @@ TUI 当前只有 synthetic data/sync/render 基线。真实 Legacy transcript �
 
 每行必须明确 source fence、planned proof kind、mutation phase、expected exact ordered reasons，不用 `safe` shorthand。
 
-#### 6.1.2 ContinueAfterSettledTools classifier matrix
+#### 5.1.2 ContinueAfterSettledTools classifier matrix
 
 | Tool evidence | Local fence | Provider fence | Planned continuation proof/prefix | Closure | 预期 |
 |---|---|---|---|---|---|
@@ -1612,33 +1317,16 @@ TUI 当前只有 synthetic data/sync/render 基线。真实 Legacy transcript �
 | settled | durable-before-execute | matching proof | adapter 无 mechanical paused contract | unavailable | `planned-runtime-proof-unavailable` |
 | settled | durable-before-execute | matching proof | exact lowerer/capture 不可验证 | unavailable | `dispatch-lowering-unverifiable` |
 
-#### 6.1.3 ManualStop/source-consistency matrix
+#### 5.1.3 ManualStop、revision 与 supersession matrix
 
-覆盖：
+| 类别 | 必测边界 |
+|---|---|
+| source consistency | non-durable marker、empty/multi/duplicate/gap ledger；source/terminal/dispatch/version/decision identity mismatch；opaque dispatch；fence/capability/target/domain 矛盾；child link 与 consumed decision action/revision/binding mismatch；old tool rows 缺字段投影 unknown |
+| reason contract | 每个 phase-tagged unavailable cause exhaustive 一对一映射；closure subcause保留 typed diagnostic并映射 `continuation-context-unavailable`；single/multiple failures 固定排序、去重、non-empty fallback；input/tool/ledger 排序置换不改变结果 |
+| revision/CAS | first revision 0，reclassification append +1；同 source version 最多一个 active；consume/supersede/new revision race 只有一个 predecessor CAS 成功 |
+| supersession/admission | `superseded-by-new-user-input` commit 后才 admission 新 chain；child consumption 先赢则走 steering/queue；`N=0/1/2`、`M=1/2` 精确 admission；dispatchOrdinal/assistantSequence duplicate/gap/branch fail closed，ordinary continuation 保持 recoveryOrdinal 合法 |
 
-- non-durable source marker、empty ledger、多 dispatch ledger、ordinal duplicate/gap；
-- sourceAssistantID 与 terminal/dispatch/source-version/decision 任一 identity mismatch；
-- explicit opaque source dispatch；
-- replay fence/capability/target/domain 内部矛盾；
-- child origin link 与 consumed decision ID/revision/binding/action 不匹配；
-- old tool rows 缺 execution/provider phase 字段时投影为 unknown，不补成 false/local；
-- each phase-tagged `PlannedRecoveryUnavailable` 的 exhaustive mapping：planning cause 一对一 reason；continuation closure subcause 保持 typed diagnostic并稳定映射 `continuation-context-unavailable`；
-- single/multiple failures 的 exact global ordering、dedup、non-empty fallback；
-- input/tool/ledger object order permutation 不改变结果。
-
-#### 6.1.4 Decision revision/CAS/supersession matrix
-
-覆盖：
-
-- first revision 0，reclassification append revision + 1；
-- 同 source version 最多一个 active revision；
-- consume、supersede、new revision 三方 predecessor CAS race 只有一个成功；
-- `superseded-by-new-user-input` transition commit 后才能 admission 新 chain；
-- child consumption 先赢时 new user input 走 steering/queue，不覆盖 consumed decision；
-- `N=0/1/2` 与 `M=1/2` 的 ordinal/assistantSequence exact admission；
-- dispatchOrdinal 对每个 assistant、assistantSequence 对每个 chain 的 duplicate/gap/replay branch 全部 fail closed；recoveryOrdinal 的唯一/连续检查只针对 incomplete-child relation，ordinary continuation 保持相同 recoveryOrdinal 是合法的。
-
-#### 6.1.5 Runtime adapter/transport gate integration
+#### 5.1.4 Runtime adapter/transport gate integration
 
 这些不是 pure classifier tests，ownership 在 `packages/opencode`：
 
@@ -1649,7 +1337,7 @@ TUI 当前只有 synthetic data/sync/render 基线。真实 Legacy transcript �
 - authorization 后 middleware/provider/fetch mutation 必须被 exact digest/binding revalidation 捕获并零 release；
 - classifier 只接收 typed planned result，不能通过 mock 让它自行证明 target/transport equivalence。
 
-### 6.2 LLM schema / adapter / Legacy protocol-closure 测试
+### 5.2 LLM schema / adapter / Legacy protocol-closure 测试
 
 - `ProviderFailureClassification` 编解码 `incomplete-stream`；
 - Legacy canonical adapter 发出 classification 且 `retryable: false`；
@@ -1663,75 +1351,43 @@ TUI 当前只有 synthetic data/sync/render 基线。真实 Legacy transcript �
 - provider-end positive case 与 step-boundary/cleanup negative case分别测试，避免所有 completed reasoning 都被排除或都被接受；
 - 以上 protocol closure 测试是当前 Legacy correctness 的依赖，不得推迟。
 
-### 6.3 Legacy 集成回归
+### 5.3 Legacy 集成与入口验收
 
-入口 applicability 必须先固定，避免“产品范围包含所有入口、测试却只覆盖 prompt”：
-
-| 入口 | 是否可能触发 provider incomplete | recovery 验收要求 |
+| 入口 | provider incomplete | 验收边界 |
 |---|---|---|
-| normal prompt / `opencode run` | 是 | 完整 SafeRetry/Continue/ManualStop CLI + Legacy HTTP 回归 |
-| command | command 最终进入 Legacy prompt/model 时是 | 至少一组 command 入口 incomplete recovery E2E，不能只测 handler wiring |
-| shell | 否；`SessionPrompt.shell()` 只执行/持久化本地 shell，不调用 provider | incomplete recovery 标 N/A；只验 SDK/route、durable transcript、side effect 一次，以及后续**独立** prompt/command recovery 不重放既有 shell side effect |
-| ordinary tool continuation | 是 | 新 assistant identity、closure、工具不重放 |
-| child/subtask | 是 | child transcript、父 task error/continuation、recovery budget 与副作用不重放 |
-| TUI prompt/command | 与对应 Legacy 入口相同 | production submission route test + backend recovery + sync/render contract；完整 E2E 声称需贯通全部边界 |
-| TUI shell | 否 | 只验 production shell SDK call 与 transcript/sync；不计入 provider-incomplete E2E |
+| normal prompt / `opencode run` | 是 | SafeRetry/Continue/ManualStop CLI + unprefixed Legacy HTTP |
+| command | 进入 Legacy model 时是 | 至少一组 command incomplete E2E，不能只验 handler wiring |
+| shell | 否 | recovery N/A；只验 SDK/route、transcript、side effect 一次及后续独立 prompt/command recovery 不重放 |
+| ordinary continuation | 是 | 新 assistant identity、closure、工具不重放 |
+| child/subtask | 是 | child transcript、父 task error/continuation、budget 与副作用不重放 |
+| TUI prompt/command | 同对应 Legacy 入口 | production submission + backend recovery + sync/render；贯通全部边界后才称完整 E2E |
+| TUI shell | 否 | production shell SDK + transcript/sync，不计 provider-incomplete E2E |
 
-在现有 session tests 上补：
+实现后 Legacy regression 必须覆盖以下分组，继续保留 Issue #3 fail-stop tests：
 
-1. partial text + safe fence：新 assistant 自动恢复，旧 assistant 保持 error；
-2. reasoning-only + safe fence：同上；
-3. completed local tool + incomplete：工具只执行一次，新 attempt 收到 tool continuation closure；
-4. explicit tool error + incomplete：可 continuation，工具不重放；
-5. pending/running/interrupted tool：ManualStop；
-6. hosted/provider replay fence unknown：ManualStop；
-7. AI SDK 请求提供本地工具但尚未建立 durable-before-execute：即使没有 tool event 也 ManualStop；opaque/dynamic provider 的普通初始请求仍可发送，但 incomplete 后固定 ManualStop，且不会伪造 target/digest；
-8. 当前 conversation 配置保持 AI SDK `maxRetries=0`、default `stopWhen=stepCountIs(1)`；外层 `SessionRetry` 触发第二个 `streamText()` invocation 时 durable ledger 变为多 semantic-dispatch，后续 incomplete 必须 `dispatch-ambiguous`/ManualStop。若配置/依赖变化引入 AI SDK 内层 retry或 multi-step而 adapter只证明单次 physical request，semantic-request replay fence 降为 unknown；
-9. 新 handshake 在 running tool part commit 成功后才调用 `item.execute()`；commit 失败时副作用执行次数为 0；
-10. 连续 incomplete 使用参数化 budget table：`N=0/1/2` 分别断言原始 + 0/1/2 个 recovery attempts，并验证 candidate ordinal 不超过 `N`；
-11. 分别记录 assistant attempts 与具体 fixture 的 provider hits，验证没有额外 replay；不声称二者共享同一上限；
-12. StructuredOutput 第一次 attempt 产生 partial/旧值、第二次 attempt 未产生值：不得成功；
-13. persisted-error 重新进入时按互斥 matrix：active decision revision 无 child/consumption 时才可 CAS 消费；同进程 live runner 可 attach；跨进程 nonterminal child、冲突 link/ordinal/sequence 或 ownership 丢失均 ambiguous 停止；terminal child 只观察/分类；
-14. failure 后配置/tool registry 改变时，分类仍使用原 attempt 持久化的 replay fence；
-15. generic `SessionRetry.policy()` 仍不处理 canonical incomplete-stream；
-16. reasoning 仅被 `step-finish` 或 cleanup 强制写入 `time.end` 时，不得当作 provider-end reasoning 进入 continuation closure；
-17. durable terminal fact 已写、final decision 未写时 re-entry 重新分类，不直接 dispatch；
-18. 新用户输入 admission 前，若旧 source 有 unresolved incomplete terminal（包括 no-decision crash state 或 active unconsumed decision），先以 `recovery_head` CAS 创建/append finalized `ManualStop(["superseded-by-new-user-input"])`；若已有 automatic revision则 supersede它。若 child consumption 已先获胜则走现有 steering/queue semantics，supersession persistence/CAS 失败时不得 admission 新 lineage；
-19. planned target/proof unavailable 时 ManualStop，不伪造 target/binding；recovery attempt 再次 incomplete 时继承 lineage/recoveryOrdinal，不能重置预算；ordinary continuation 只递增 assistantSequence；
-20. empty stream、finish-only/no credible settlement、multi-step incomplete 均由 `settleIncomplete()` 持久化 typed `classification: "incomplete-stream"`；safe evidence 进入专用 recovery，unsafe/unavailable evidence 形成 ManualStop，且均不进入 `SessionRetry.policy()`；
-21. SafeRetry 中 plugin、tool schema、effective provider option、model parameter、lowered history/body 改变时 semanticReplayDigest 必须变化并拒绝 replay；proof/fence/closure envelope 或 authorization 后 exact request 改变时 preparedRequestDigest/binding 变化并 `recovery-binding-stale`，不 dispatch。若 validator 与 actual dispatch 的运行时 proof 无法建立，则 original 阶段写 opaque、planned continuation 阶段 `dispatch-lowering-unverifiable`；
-22. endpoint/account/project/tenant/credential authority 改变时 domain mismatch；即使 providerID/routeID/modelID 相同也不得复用 key/cursor；
-23. 旧 tool row 缺 providerExecuted/phase 字段、complete/error row 缺 durable call proof、或 execution kind 冲突时投影为 unknown 并 ManualStop；
-24. durable decision 后 crash/re-entry：incomplete-child relation 对 `(sessionID, chainID, recoveryOrdinal)` 唯一，所有 assistant 对 `(sessionID, chainID, assistantSequence)` 唯一，candidate 必须是 source 的 immediate successor；同一 decisionID 只能消费并关联一个 child；child origin link 与 consumed decision binding 必须匹配，actual dispatch 另须满足其 authorization；active decision 无 child 才 CAS 消费；同进程 live runner 可 attach；跨进程/ownership 丢失的 nonterminal child、冲突 link、重复/缺口 ordinal/sequence 为 `dispatch-ambiguous`；matching terminal child 只观察/分类；
-25. max-step 按 assistant admission 测试：`M=1` 只允许 sequence 0，`M=2` 只允许 sequence 0/1；ordinary continuation 与 recovery 都要求 `candidateAssistantSequence < M`，耗尽时不创建 child、不 release provider并 durable finalize `same-process-max-step-exhausted`；
-26. failure injection 覆盖全部 fail-closed 边界：dispatch evidence commit；durable-before-execute tool call/running-part commit；tool settlement/provenance commit；incomplete terminal fact commit；terminal 后 durable reload；decision revision/ManualStop transition + projection event commit；same-process max-step finalization；active-revision predecessor CAS；atomic child Message/dispatch-evidence/consumption commit；provider release gate。每个注入点分别断言后续 provider 调用数为 0；tool gate 之前的失败还断言本地副作用执行数为 0。对每个 transaction/commit failure，必须新建 storage reader reload并断言 projector row、relational decision/consumption row、child message、dispatch ledger/evidence、event row与唯一键 residue 全部回滚到前态；随后 re-entry 仍不得 dispatch。不能只断言“当前进程 provider calls=0”。ManualStop/terminal 持久化失败时只声称当前进程停止，不伪称 durable finalization 成功；
-27. 默认 `experimentalNativeLlm=false` 的 AI SDK Legacy transport 必须有共享 no-send final-body lowerer integration，或 final-transform 后、fetch/`doStream` 前的 exact per-request gate；测试明确证明仅构造 `streamText()`/运行 middleware 后 fake underlying fetch 仍为 0，matching receipt release 后才命中。captured golden fixture 只做回归，不能单独让 adapter available。`experimentalNativeLlm=true` 是 Legacy alternate transport，不是 Native V2；缺 mechanical evidence-before-send gate 时必须 fallback/disable，不能以 opaque evidence 为由 ungated 发送；有 gate但 semantic opaque 时 incomplete 固定 ManualStop；
-28. OpenAI-family 覆盖 normalized `store:true` reference 分支与 normalized `store:false` typed-stateless 分支。测试 transform 删除/保留 reasoning item ID、reasoning provider metadata、hosted-tool item reference 与 encrypted state 的组合；`store:true` 只有所需 identity/metadata 最终保留且运行时 lowering 已授权时可 reference Continue；`store:false` 首先验证当前 lowerer 的 item-ID dependency，只有实现无 ID 的 encrypted-reasoning lowering 并通过 exact wire proof 后才允许 settled local-tool continuation。hosted item 逐 kind allowlist，unsupported kind 固定零 release；
-29. provider proof/binding mismatch table 独立覆盖 providerID、routeID、protocol、endpointID、authorityID、modelID、modelFamily、proof kind、idempotency key、cursor、proof domain、prefix aggregateID/assistantID/event high-water/hash version/hash digest/append-only ancestry。每个 fixture 必须同时标注 mutation phase，并一次只改变一个维度：original dispatch/fence 内部矛盾 → `dispatch-evidence-inconsistent`；planned proof construction/domain unavailable → `provider-proof-unavailable`；persisted decision 后 revalidation 改变 → `recovery-binding-stale`。三类都断言 exact reason 与 provider 调用数 0；
-30. classifier exact-reason suite 覆盖多失败组合、重复 predicate 去重、tool/evidence 输入顺序置换、全局固定顺序、每个 cause/discriminator 的 exhaustive mapping 与 ManualStop 非空保证；
-31. TUI acceptance 至少拆成三层并分别命名：(a) `packages/opencode` Legacy integration 通过常规 TUI 使用的 unprefixed prompt/command endpoint 注入 incomplete，证明 recovery child、durable events 与 final idle；(b) `packages/tui/test/cli/cmd/tui/session-recovery-sync.test.tsx` 与 `packages/tui/test/cli/tui/session-recovery-render.test.tsx` 分别使用真实 transcript/event shapes 验证 sync 与 Session renderer；(c) `packages/tui/test/cli/tui/prompt-submit.test.tsx` 挂载 production Prompt component，实际触发 normal prompt/command SDK 调用并断言 unprefixed Legacy route。shell 只测 submission/transcript，不纳入 provider-incomplete E2E。前两层只能称 backend recovery + TUI sync/render contract acceptance；只有 submission、provider/events/renderer 贯通后才称完整 TUI product E2E。ManualStop 对照不创建 child、不隐藏原错误。
+| 分组 | 必测场景与断言 |
+|---|---|
+| 基本 action | partial text/reasoning-only + safe fence 创建新 assistant，旧 assistant 保持 error；completed local tool 或 explicit tool error + incomplete 可 continuation且只执行一次；pending/running/interrupted、unknown hosted/provider fence、无 handshake 的 local-tools、opaque/dynamic provider均 ManualStop |
+| dispatch 与 tool gate | 当前 `maxRetries=0`/`stepCountIs(1)`；outer retry 形成多 ledger 后 incomplete 为 `dispatch-ambiguous`（若依赖变化带来 inner retry/multi-step且 proof 只覆盖单 physical request则 fence unknown）；running part commit 后才 `item.execute()`，commit failure side effect=0；记录 assistant IDs、ledger、invocations 与 provider hits，不混同预算 |
+| budget/state | `N=0/1/2` 产生原始 +0/1/2 recovery attempts；`M=1/2` 只允许 sequence `0` / `0,1`；ordinary continuation与 recovery 共用 M，exhaustion 不创建 child、不 release并 finalize exact reason；recovery 再 incomplete 继承 lineage/ordinal，ordinary continuation只递增 sequence |
+| re-entry/supersession | active unconsumed decision才可 CAS consume；同进程 live runner可 attach；跨进程 nonterminal child、ownership loss、冲突 link/ordinal/sequence ambiguous；terminal child只观察。terminal 无 decision时重分类；新 input先 finalize `ManualStop(["superseded-by-new-user-input"])`，automatic revision被 supersede；child先 consume则 steering/queue；CAS failure不得 admission新 lineage |
+| typed terminal与状态隔离 | empty、finish-only、multi-step incomplete由 `settleIncomplete()` 写 typed classification且排除于 generic retry；StructuredOutput旧值不晋升；reasoning forced flush不进入 closure；配置/tool registry变化仍读 source durable fence |
+| digest/domain compatibility | plugin/tool schema/provider option/model/lowered history/body变化使 semantic digest不同并拒绝 SafeRetry；proof/fence/closure或授权后 exact request变化使 prepared/binding stale；endpoint/account/project/tenant/credential authority 任一变化都 domain mismatch；旧 tool row缺字段或 execution冲突投影 unknown |
+| identity/crash | child relation、assistant sequence、decision consumption唯一且 immediate-successor；origin link与 consumed binding/actual authorization一致；crash 后只有 active-no-child 可消费，同进程 live可 attach，跨进程 nonterminal 或重复/缺口为 ambiguous |
+| persistence failure injection | 覆盖 dispatch evidence、tool-call gate、settlement/provenance、terminal fact、reload、decision/finalization event、max-step、predecessor CAS、atomic child/message/ledger/consumption与 provider release gate；每点后续 provider hits=0，tool gate前 side effect=0。用新 reader确认 projector/relations/child/ledger/event/unique-key residue全部 rollback，re-entry仍不 dispatch；terminal/ManualStop commit failure只承诺当前进程停止 |
+| transport proof | 默认 AI SDK transport必须共享 no-send final-body lowerer或 final-transform 后、fetch/`doStream` 前 exact gate；构造 `streamText()` 后 underlying fetch仍为0，matching receipt后才命中。golden不能授权。experimental native 是 Legacy alternate transport而非 Native V2；无 gate必须 fallback/disable，有 gate但 opaque则 incomplete ManualStop |
+| provider closure | OpenAI normalized `store:true` reference与 `store:false` typed-stateless分支分测：transform 删除/保留 item ID、metadata、hosted reference、encrypted state；无-ID encrypted reasoning须先有 exact wire proof；hosted kind逐项 allowlist，unsupported zero release。proof/binding mismatch逐项覆盖 provider/route/protocol/endpoint/authority/model/family/proof kind/key/cursor/prefix aggregate/assistant/high-water/hash/ancestry，并按 mutation phase区分 inconsistent、proof-unavailable、binding-stale |
+| exact reasons 与 TUI | cause/discriminator exhaustive mapping、多 failure去重/排序/non-empty；TUI 三层分别为 backend unprefixed endpoint recovery+idle、真实 transcript/event sync、Session renderer，以及 production Prompt normal prompt/command submission。shell只测 submission/transcript；ManualStop不建 child、不隐藏 error；只有 submission→endpoint→provider/events→renderer贯通才称产品 E2E |
 
-继续保留 Issue #3 现有测试，防止 fail-stop 语义回归。
+### 5.4 CLI / TUI / child session 回归
 
-### 6.4 CLI / TUI / child session 回归
+| 层级 | 通过条件 |
+|---|---|
+| CLI/child | success 只来自 recovery assistant；旧 incomplete assistant 仍是 error；ManualStop 非成功；child/subtask 不因父层 retry 重放；budget exhausted 不挂起/循环 |
+| TUI sync/render | 新增 recovery acceptance（当前不存在且本轮 22 tests 不能计入）：同步/展示 recovery child，保留旧 error，成功 child成为最终结果且 busy/idle/order正确，ManualStop不建 child |
+| 产品声明 | backend transcript + TUI sync/render 只是两层 contract；另需 production Prompt submission route。仅当 submission、Legacy endpoint、provider incomplete、real events、renderer 全贯通才称完整 TUI E2E |
 
-扩展 `packages/opencode/test/cli/run/run-process.test.ts`：
-
-- 最终成功只来自 recovery assistant；
-- 旧 incomplete assistant 仍可见为 error；
-- ManualStop 仍返回非成功状态；
-- child/subtask 不因父层 retry 重放已执行工具；
-- 达到 recovery 上限后 CLI 不挂起、不循环。
-
-在 `packages/tui/test/cli/cmd/tui/` 按现有 sync/live-hydration harness 新增 recovery acceptance test。当前该文件不存在；本轮通过的 22 个 TUI tests 只覆盖 synthetic sync/render，不能计作以下验收：
-
-- 常规 TUI Legacy prompt 收到原 assistant incomplete error 后，能继续同步并展示 recovery child；
-- 原失败 attempt 保留且可见为 error，不被成功 child 覆盖或删除；
-- recovery child 的最终内容成为当前成功结果，session busy/idle 与消息顺序正确；
-- ManualStop 对照不产生 child，并保留原错误；
-- backend transcript + TUI data/sync/render 是两层 contract acceptance，不能只把 `packages/opencode` CLI 集成测试改名当作 TUI 验收；另需 production Prompt component submission route test。若要宣称完整 TUI E2E，还必须把 submission、Legacy endpoint、provider incomplete、real events 与 renderer 串成一条测试链。
-
-### 6.5 建议验证命令与 test ownership
+### 5.5 建议验证命令与 test ownership
 
 本仓库禁止从根目录运行全量测试。所有命令必须从对应 package 执行。以下分为：
 
@@ -1821,124 +1477,51 @@ TUI 当前只有 synthetic data/sync/render 基线。真实 Legacy transcript �
   test/cli/tui/prompt-submit.test.tsx) # all [future/new]
 ```
 
-Ownership 与 acceptance boundary：
+Ownership 与 acceptance boundary（所有 `[future/new]` 文件创建前不得运行或计数）：
 
-- `packages/schema/test/session-recovery.test.ts`：internal/public schemas、old-row decode、canonical source/control event/field sets；
-- `packages/llm/test/recovery-canonicalizer.test.ts`：`semantic-replay-v1`、`prepared-request-v1`、`recovery-binding-v1` golden/mutation vectors；
-- `packages/opencode/test/session/recovery-classifier.test.ts`：Legacy durable snapshot + admission policy 的 pure action-specific matrices 和 exact ManualStop reasons；不得 mock transport 后声称 runtime proof；
-- `packages/core/test/recovery-event-canonicalizer.test.ts`：`recovery-event-chain-v1`、source facts/version、control-tail golden/mutation/sequence tests；
-- `packages/core/test/session-recovery-persistence.test.ts`：raw-event authority、live-aggregate immutable transitions、三 heads CAS、rollback、unique constraints、composite child projection、prefix publication suppression 与 explicit `RecoveryReplayRebuilder`；
-- `packages/opencode/test/session/recovery-runtime-proof.test.ts`：default AI SDK Legacy transport 的 final-transform-before-fetch gate、typed prepared/authorized handle、receipt、stream-returning release/cancel/provider hits；
-- `packages/opencode/test/session/recovery-coordinator.test.ts`：decision revision、budget/max-step、supersession、child admission、crash/re-entry state matrix；
-- `packages/opencode/test/session/recovery-replay.test.ts`：serialized Legacy recovery events 跨新数据库后 authority/head/projection/ledger/digests 等价；
-- `packages/opencode/test/server/httpapi-session-recovery-actions.test.ts`：HTTP/generated-SDK prompt_async 与 command incomplete recovery actions；shell 只验 N/A wiring/transcript/side-effect boundary；
-- `packages/opencode/test/session/recovery-continuation.test.ts`：ordinary continuation、child/subtask 与既有 shell side effect 不被后续独立 recovery 重放；
-- existing `httpapi-sdk.test.ts`：扩展 live listener/generated SDK incomplete recovery 与 optional wire projection round-trip；
-- existing `run-process.test.ts`：扩展真实 CLI SafeRetry/Continue/ManualStop、old/new assistant visibility、budget termination；
-- `packages/sdk/js`：generated Legacy SDK type/test compatibility；不把外部 consumer 变成产品场景，但必须防止 wire break；
-- `packages/tui/test/cli/cmd/tui/session-recovery-sync.test.tsx`：真实 backend transcript/event shapes 的 sync/hydration contract；
-- `packages/tui/test/cli/tui/session-recovery-render.test.tsx`：挂载 Session route/assistant renderer，验证 recovery child/error/order/final state；
-- `packages/tui/test/cli/tui/prompt-submit.test.tsx`：挂载 production Prompt component，触发 normal prompt/command SDK calls；shell 只验本地 submission/transcript。只有 prompt/command submission、Legacy endpoint、provider incomplete、real events 与 renderer 全链路贯通后才称完整 TUI product E2E。
+| Owner/test | 唯一职责 |
+|---|---|
+| schema `session-recovery.test.ts` | internal/public schemas、old-row decode、canonical source/control event/field sets |
+| llm `recovery-canonicalizer.test.ts` | `semantic-replay-v1`、`prepared-request-v1`、`recovery-binding-v1` golden/mutation |
+| core canonicalizer/persistence tests | `recovery-event-chain-v1`、source/control versions；raw-event authority、三 heads、rollback、constraints、composite projection、publication suppression、rebuilder |
+| opencode classifier/runtime/coordinator/replay | pure action matrices与 exact reasons（不得 mock transport冒充 runtime proof）；final-transform gate、typed handles/receipt/release；revision/budget/supersession/crash；跨数据库等价 |
+| opencode HTTP/continuation + existing tests | prompt_async/command actions；shell N/A boundary；ordinary/child与既有 shell side effect不重放；扩展 live generated-SDK round-trip和 real CLI action/visibility/budget |
+| sdk/js | generated Legacy types/tests兼容；外部 consumer非产品场景但不得 wire break |
+| TUI sync/render/submit | real transcript hydration；Session renderer；production Prompt normal prompt/command SDK，shell仅 submission/transcript；全链贯通才称产品 E2E |
 
 `packages/schema` 当前只有 `typecheck` script，schema suite 必须显式 `(cd packages/schema && bun test)`。所有 `[future/new]` 文件创建前不得执行或计入通过数。targeted tests 通过后，再分别执行 `(cd packages/llm && bun run test)`、`(cd packages/core && bun run test)`、`(cd packages/opencode && bun run test)`、`(cd packages/tui && bun run test)`、`(cd packages/sdk/js && bun run test)`；migration artifacts 另执行 core `bun run migration --check`。始终不运行根目录 test。
 
----
+### 5.6 代码更新与验收 ownership
 
-## 7. 代码更新检查清单
+| Owner | 实现与验收清单 |
+|---|---|
+| `packages/schema` | [ ] `src/llm.ts` 是 classification、target/domain、fence/proof、chain/link、terminal/decision、digest envelopes 的单一 wire source且不依赖 llm/opencode；[ ] `src/v1/session.ts` 组合 Legacy durable evidence/terminal/decision/consumption与 optional public `dispatchSummary`/`incompleteRecovery`，不复制 proof；[ ] tool execution/input/call/interruption与 reasoning provider-end/forced-flush provenance；old rows缺字段→unknown/ineligible；[ ] 四个 `RECOVERY_*_V1` canonical sets唯一来源及 membership/field/overlap/compatibility/hygiene tests |
+| `packages/llm` | [ ] 从 schema import/re-export classification，不按 message猜测且 retryable正交；[ ] target/domain binder，authority/endpoint不稳定→unknown且不存 secret；[ ] 实现三个 versioned digest canonicalizers与 golden/mutation；[ ] allowlisted protocol adapter必须共享 audited final-body lowerer或 exact pre-release gate，golden不授权，未证明→opaque/ManualStop；[ ] Legacy adapter及 Anthropic/OpenAI closure/storage tests |
+| `packages/core` | [ ] `session/sql.ts` raw-event-backed materializations与 `recovery_head`/`assistant_chain_head`/`dispatch_ledger_head`，生成 migration/schema；[ ] event-chain/source/control canonicalizer、`RecoveryTransitionProjector`、`RecoveryHeadsCommit`、explicit `RecoveryReplayRebuilder`，raw `EventTable` sole authority；[ ] canonicalizer/persistence/migration tests覆盖三 heads、rollback、composite child、publication suppression、replay/repair、existing-data、unique/cascade |
+| Legacy `packages/opencode` transport | [ ] allowlisted declarative target/authority/storage adapter；dynamic/opaque fail closed；[ ] `preparePausedRequest → digests → durable authorization/CAS → release/cancel` typed gate，默认 AI SDK exact final-transform-before-fetch；experimental native Legacy无 gate则 fallback/disable、有 gate但 opaque则 incomplete ManualStop；[ ] failure injection证明 AI SDK/native stream均未调用；[ ] 每个 semantic dispatch前 ledger，outer retry第二 dispatch后只ManualStop或首 dispatch后禁用 resend |
+| Legacy processor/tools/prompt | [ ] adapter与 `settleIncomplete()` 保留 typed classification，通用 retry不处理 incomplete；[ ] durable-before-execute handshake，running commit失败不执行；[ ] drain后写 tool/reasoning provenance、terminal fact、reload snapshot；[ ] 使用 internal-only durable publish seam，或在 `EventV2Bridge`/public publication 层 suppress/filter `session.recovery.*` authority payload，仅发布安全 projection/既有 signals；[ ] Prompt创建新 assistant、处理 pre-decision re-entry/finalization，reset attempt-local state；[ ] lineage/sequence/ledger/digests/proposal/record/binding/revision/authorization完整且 SafeRetry semantic digest equality；[ ] hard max-step admission与 entry guard；[ ] recovery-aware history、Anthropic/OpenAI store分支和 exact runtime closure proof |
+| Wire/entrypoint | [ ] public error默认仍为 `UnknownError`，新 discriminator只经 versioned/breaking批准；optional projections需 OpenAPI/generated SDK/old-client compatibility；[ ] public Legacy sync/generated SDK/TUI events 与 Native V2/shared subscribers 不得泄漏 internal recovery event、ledger、proof、digest、decision link、CAS/sealed material；[ ] core验证 authority/CAS/rebuilder；opencode验证 runtime gate、coordinator、cross-db、prompt_async/command、continuation/child，shell N/A；[ ] existing live SDK与 CLI tests扩展；sdk/js正式 codegen后 typecheck/tests；TUI分别验证 sync/render/production submission，全链才称产品 E2E |
+| 回归边界 | [ ] completed tool不重复；partial/StructuredOutput不误成功/泄漏；context-overflow、interrupt、permission decline、普通 provider error、model-switch metadata、same-process max-step不回归；[ ] digest检测 plugin/tool/options/history/authority/fence/proof/closure变化；decision/ordinal/crash不产生重复 child；[ ] 不声称 global durable max-step、独立 physical-request budget或任意 crash exact-once；[ ] 所有 `[future/new]` 创建前不得运行/计入 current 50 |
 
-### 7.1 `packages/llm`
+## 6. 文档与实施前决策
 
-- [ ] 从 `@opencode-ai/schema` import/re-export 单一 `ProviderFailureClassification` source，覆盖 Legacy adapter/processor 所需的 `incomplete-stream`；不在 llm 内保留第二套 schema；
-- [ ] 不用 message string 猜测 incomplete；
-- [ ] 保持 classification 与 retryable 正交；
-- [ ] 实现 provider target/domain binder，authority/endpoint 无法稳定解析时返回 unknown，不保存 secret；
-- [ ] 实现 versioned `semantic-replay-v1`、`prepared-request-v1`、`recovery-binding-v1` canonical encoding 与 golden/mutation tests；不得复制 schema envelopes，object insertion order 不影响 digest，任一 canonical field mutation 必须改变对应 digest；
-- [ ] 为默认 AI SDK 路径实现 allowlisted protocol adapter：actual dispatch 必须复用 audited no-send final-body lowerer，或使用 exact per-request pre-release capture/authorization gate；captured final-request golden 只做回归，不能单独授权；未证明时只允许 opaque/ManualStop；
-- [ ] 添加 Legacy adapter integration tests，以及 Anthropic/OpenAI Responses 当前 Legacy 所需的 closure/storage-mode tests；共享 `packages/llm` serializer tests 只能作为结构单测，不能替代实际 AI SDK dispatch proof。
+### 6.1 文档检查
 
-### 7.2 Shared / Legacy durable schema `packages/schema`
+| 项目 | 要求 |
+|---|---|
+| 本文与旧架构 | [ ] 当前唯一 Issue #7 proposal authority 为本文；旧 `docs/design/session-recovery/architecture.md` 虽仍保留历史标题/内容，但明确无实施授权；[ ] 生产实现前单独 rewrite/supersede 其旧 lifecycle/source-version/binding/`AttemptRecoveryEvidence`/Native V2 scope/module-interface 并重新架构审查；旧稿本轮不修改 |
+| contract 与测试文档 | [ ] shared LLM/schema变化时更新 Legacy API/schema；[ ] 区分根 `bun run test` 与 package targeted tests |
+| 完成记录 | [ ] 实现后新增 workflow 要求且含度量的 devlog；[ ] 非显然限制回写项目规范；[ ] Bun 1.3.14环境记录全部 Legacy typecheck/test与 pass/fail，并与本轮基线分开 |
 
-- [ ] `src/llm.ts` 作为跨 package wire contract 的单一 source，拥有 classification、target/domain、fence/proof、chain/link、terminal/decision 与 digest envelope schemas；不得依赖 llm/opencode；
-- [ ] `src/v1/session.ts` 组合 shared schemas，为 Legacy 持久化 dispatch evidence、pre-decision terminal fact、internal `RecoveryDecisionRecord`/consumption link 与 recovery chain/binding；assistant public wire 只增加 optional `IncompleteRecoveryProjection` summary，不复制内部 proof/request/CAS unions；
-- [ ] Legacy tool evidence 持久化 executionKind、input/call phase 与 interruption provenance，reasoning part 持久化 provider-end / step-boundary-flush / cleanup-flush provenance；
-- [ ] old Session rows 缺失新增字段时按 unknown/closure-ineligible 解码，不补成 false/local/safe；新增 projection 字段保持 optional，评估 closed-union 新 discriminator 对 exhaustive consumer 的兼容影响；
-- [ ] 定义 `RECOVERY_SOURCE_FACT_EVENT_TYPES_V1`、`RECOVERY_CONTROL_EVENT_TYPES_V1`、`RECOVERY_SOURCE_FACT_FIELDS_V1`、`RECOVERY_CONTROL_TAIL_FIELDS_V1` 的唯一 schema source；添加 exact membership/order、required/nullable/forbidden fields、source/control overlap rejection、旧数据 compatibility 与 dependency/duplicate-contract hygiene tests；用 §6.5 显式 schema test 命令执行。
+### 6.2 仍需确认的架构决策
 
-### 7.3 Shared persistence `packages/core`
-
-- [ ] 在 `packages/core/src/session/sql.ts` 定义 raw-event-backed recovery materializations，以及 `recovery_head`、`assistant_chain_head`、`dispatch_ledger_head` 三个 CAS indexes；生成 migration/schema artifacts；
-- [ ] 实现 `recovery-event-chain-v1`、source facts/version、control-tail extractor、`RecoveryTransitionProjector`、`RecoveryHeadsCommit` 与 explicit `RecoveryReplayRebuilder`；raw `EventTable` 是 sole replay authority，operation + nextStateDigest 不复制完整 next state；
-- [ ] `packages/core/test/recovery-event-canonicalizer.test.ts` 覆盖 exact raw-event hash envelope、source/control membership、assistant scope、golden/mutation；`packages/core/test/session-recovery-persistence.test.ts` 覆盖三 heads、rollback、composite child projection、prefix publication suppression、replay/repair、cascade；
-- [ ] 运行 `packages/core/test/database-migration.test.ts` 与 `bun run migration --check`，覆盖 existing-data upgrade、unique indexes 与显式 session deletion cascade。
-
-### 7.4 Legacy `packages/opencode`
-
-- [ ] 为 allowlisted provider/protocol 新增 declarative preparation/introspection adapter，在选择实际 API mode/base URL/model、storage mode 与可能的 fetch endpoint rewrite 后返回稳定 target/route/protocol/endpoint/authority 及 semantic dispatch representation；opaque/dynamic/unregistered adapter 一律 unknown/ManualStop，不从 `LanguageModelV3` 事后推断，不持久化 secret；
-- [ ] `session/llm.ts` 拆分 `preparePausedRequest → canonical semantic/prepared digest → durable authorization/event + online CAS → release/cancel`，确保默认 AI SDK Legacy transport 只能在 admission transaction 成功后 release，且 authorization 后仍可能改变 wire semantics 的 middleware/fetch rewrite 会使 planned result typed unavailable；experimental native Legacy transport 在实现同一 contract 前只写 opaque evidence并 fail closed；
-- [ ] 为上述接缝注入 digest/evidence commit failure，断言 AI SDK `streamText()` 与 native provider stream 均未被调用；
-- [ ] `session/llm/ai-sdk.ts` 发出 typed incomplete classification；
-- [ ] `packages/schema/src/v1/session.ts` 增加 optional explicit `dispatchSummary` / `incompleteRecovery` projection 字段；完整多 entry ledger 留在 authoritative relation；公开 error 默认继续投影 `UnknownError`，只有版本化/明确 breaking 决策后才加入 `MessageIncompleteStreamError` discriminator；同步 OpenAPI/generated SDK compatibility；
-- [ ] `session/processor.ts` 的 provider-error 与 `settleIncomplete()` 都保留 typed classification；
-- [ ] `session/tools.ts` 与 processor Handle 增加 durable-before-execute handshake；running part commit 失败时不调用本地工具；
-- [ ] 扩展 Legacy Session/EventV2Bridge 接缝传递 `PublishOptions.commit`，发布 schema-defined recovery operations；每次 semantic dispatch 前必须通过 mechanical evidence-before-send gate。semantic evidence 可 `available | opaque`，mechanical gate 则独立为 `implemented | unavailable`：opaque 初始请求只有 gate implemented 且 opaque evidence commit 后才能发送；automatic recovery 还要求 semantic available；experimental native 若缺 gate 必须 fallback/disable covered execution，不能 ungated 发送后再补 opaque evidence；
-- [ ] 通用 retry policy 不处理 incomplete-stream；每次进入 `llm.streamBatches()` 前原子追加 semantic-dispatch ledger。若外层 policy 已产生第二次 dispatch，该 assistant 后续只允许 ManualStop；或在首次 conversation provider dispatch 后禁用外层重发；
-- [ ] processor 完成工具 drain 后，Prompt 先持久化 `IncompleteStreamTerminalFact`、reload durable state，再交给 recovery classifier；
-- [ ] `session/prompt.ts` 支持新 assistant recovery attempt，以及 pre-decision terminal 的 re-entry/finalization；
-- [ ] 添加 durable RecoveryLineage、AssistantAttemptIdentity、逐 semantic-dispatch ledger/replay fence、semantic/prepared digests，以及 classifier `RecoveryDecisionProposal`、committed `RecoveryDecisionRecord` 与完整 automatic binding；binding 必须覆盖 exact `nextContext`、admission N/M/policy digest、冻结 source/control versions、closure 与唯一 authorization；decision link 含 revision；SafeRetry source/planned semantic digest 必须相等；
-- [ ] `packages/opencode/test/session/recovery-replay.test.ts` 覆盖 serialized Legacy events 跨新数据库后的 Legacy message/projection/coordinator reload 行为；core authority/head/materialization 等价由 §7.3 的 core tests 负责。
-- [ ] `structured` 与其他 attempt-local 状态按 attempt 重置；
-- [ ] `session/message-v2.ts` 实现 recovery-aware history selection；Continue decision 前由与 actual dispatch 复用的 audited lowerer，或 exact per-request pre-release authorization adapter，检查 protocol/storage-mode closure；OpenAI Responses 分开处理 normalized `store:true` reference 与 `store:false` typed-stateless 分支：当前 lowerer 在 reasoning replay 上仍依赖 item ID，必须先修改并以 exact wire test 证明无 ID encrypted reasoning；hosted item 按 exact kind allowlist，首批 unsupported kind fail closed；settled local tool 仍使用普通 tool messages，并要求 provider-end provenance、model compatibility 与运行时 lowering proof；
-- [ ] 新增 Legacy hard max-step admission guard（当前只有 last-step prompt injection），修正持久化错误 entry guard，只允许 binding 完整、hard admission 未耗尽且未被唯一消费的自动 action；
-- [ ] 更新 CLI / child session 错误传播测试。
-
-### 7.5 Wire / entrypoint test ownership
-
-- [ ] `packages/core` 实现并测试 migration、raw-event sole authority、live-aggregate append-only materializations、三 heads CAS/rollback、canonical source/control extraction 与 explicit replay rebuilder；
-- [ ] `packages/opencode` 实现并测试 default AI SDK Legacy runtime proof、typed prepared→authorized→released/cancelled gate、classifier/coordinator/revision/supersession、cross-database reload，以及 prompt_async/command HTTP actions与 ordinary continuation/child；shell recovery 为 N/A，只验 route/transcript/side-effect boundary；
-- [ ] `packages/opencode/test/server/httpapi-sdk.test.ts` 扩展 live listener + generated SDK incomplete recovery/wire round-trip，不把当前 smoke test误称 recovery evidence；
-- [ ] `packages/sdk/js` 在正式 codegen 后执行 typecheck/tests，验证 optional public projection 与旧 Legacy consumer compatibility；
-- [ ] `packages/tui` 分开验证 recovery transcript sync/render 与 production Prompt submission；只有全链路贯通才声明 TUI product E2E；
-- [ ] 所有 `[future/new]` 测试创建前不得运行或计入当前 50 项通过数。
-
-### 7.6 回归与兼容性
-
-- [ ] 已完成工具不重复执行；
-- [ ] partial text/reasoning 不误报成功；
-- [ ] StructuredOutput 不跨 attempt 泄漏；
-- [ ] context-overflow compaction 行为不回归；
-- [ ] 用户 interrupt、permission decline、普通 provider error 语义不回归；
-- [ ] Legacy HTTP/OpenAPI/generated SDK round-trip 与旧客户端容忍新增 optional projection fields 的兼容性不回归；本次不新增 public error discriminator，若未来另行批准则使用独立 versioned/breaking compatibility suite；
-- [ ] model switch 后 provider metadata 复用规则不回归；
-- [ ] max-step 的 same-process 语义不回归，recovery dispatch 不绕过 guard；
-- [ ] semantic/prepared/binding digest 按各自边界检测 plugin/tool/provider-option/history/authority/fence/proof/closure 变化，SafeRetry 不会把新语义请求误当 source replay；
-- [ ] decision/ordinal 唯一消费与 crash re-entry 不产生重复 child；
-- [ ] 未声称 durable global max-step、独立 physical-request budget 或任意 crash exact-once。
-
----
-
-## 8. 文档更新检查清单
-
-- [ ] 更新本文状态、最终字段名、分类表与实际测试结果；
-- [ ] 在生产实现前单独 rewrite/supersede `docs/design/session-recovery/architecture.md` 的旧 lifecycle/source-version/binding/AttemptRecoveryEvidence/module-interface 段，并重新架构审查；该旧稿本轮不修改且不得作为实施 authority；
-- [ ] 若本次共享 LLM/schema contract 改变，更新对应 Legacy API/schema 文档；
-- [ ] 更新测试说明，明确根 `bun run test` 与 package-level targeted tests 的区别；
-- [ ] 实现完成后新增 `docs/devlog/YYYY-MM-DD-<简述>.md`，包含 workflow 要求的度量；
-- [ ] 将实现中发现的非显然限制同步回项目规范的“已知限制与注意事项”；
-- [ ] 在正式 Bun 1.3.14 验收环境记录所有 Legacy typecheck/test 命令、通过数与失败数；已执行的范围核验测试与后续 recovery 验收结果分开记录。
-
----
-
-## 实现前仍需确认的架构决策
-
-1. **Attempt replay fence、target authority 与双 digest 的来源**：选择首批 allowlisted declarative provider/protocol adapters；opaque dynamic factory、未声明 middleware 或无法进入 pre-release authorization gate 的 fetch-time endpoint rewrite 必须 unknown。provider capability/domain 由 adapter 提供，local-tool capability 由 runtime 提供；二者都必须基于该次可证明的 semantic prepared dispatch，并在 dispatch 前随 attempt 持久化。当前 conversation 每次 `streamText()` invocation 是一个 semantic dispatch，AI SDK `maxRetries=0` / `stepCountIs(1)`；但外层 `SessionRetry` 可在同一 assistant 下创建第二 invocation，因此 automatic recovery 必须要求 ledger 恰好一次，或在首次 dispatch 后禁用该外层重发。幂等 fence必须覆盖原 semantic dispatch payload 与 recovery replay，且未来若内层 retry/multi-step 开启，必须覆盖 invocation 内所有 model steps/physical requests，否则降级 unknown。所有幂等/续传 fence还必须声明 provider/route/protocol/endpoint/account-authority/model safety domain。`semanticReplayDigest` 只绑定可比较的 semantic payload，SafeRetry 要求 source/planned 相等；`preparedRequestDigest` 额外绑定 fence/proof/closure 的 exact dispatch envelope，Continue 通过显式 source+closure transform 而非 digest equality。两者 canonicalizer 都必须有版本与 golden vectors；golden 不替代运行时 proof。
-2. **Legacy durable-before-execute 与外层 retry**：是否在 `SessionProcessor.Handle` 增加 begin/start tool call API，并由 AI SDK `tools.ts execute()` 在副作用前调用；若不实施，Legacy 只要提供本地工具就不能自动恢复。同时必须选择：(a) normal conversation 首次 dispatch 后禁用外层 `SessionRetry` 重发，或 (b) 持久化逐 semantic-dispatch ledger；只有 ledger 恰好一次且 fence 一致时才允许 automatic recovery，多次/未知 dispatch 一律 ambiguous ManualStop。
-3. **Legacy durable recovery metadata 与唯一消费的承载位置**：raw `EventTable` serialized recovery operations 是 sole replay authority；relations/projection 是 rebuildable materializations，`recovery_head`、`assistant_chain_head`、`dispatch_ledger_head` 是 derived online CAS indexes。必须持久化 decision action/revision/status/source version、exact child/admission binding/authorization 与 operation + nextStateDigest；runtime handle 永不持久化。实现分为 `RecoveryTransitionProjector`、`RecoveryHeadsCommit` 与 explicit `RecoveryReplayRebuilder`，accepted replay使用同 projector，repair 从 raw rows 重建；replay publication在完整 prefix/head finalization前抑制。另须固定 canonical sets 的 schema/core API。旧 `docs/design/session-recovery/architecture.md` 在实施前必须单独 supersede/update 并重新审查。
-4. **Legacy reasoning completion provenance**：在 Legacy explicit part field 中表达 provider-end、step-boundary-flush 与 cleanup-flush；仅 provider-end 默认可进入 continuation closure。
-5. **Continuation closure validator 与实际发送绑定**：Legacy allowlisted adapter 必须让 validator/digest 与 actual dispatch 复用同一 no-send final-body lowerer，或在 transport network release 前对该次 exact request capture并完成 durable authorization；公共 `packages/llm` serializer 与 captured golden fixtures只能作为结构/回归证据，不能单独证明任意请求等价。必须在 recovery decision 前得出 constructible/unavailable，并保证 authorization 后无 middleware/provider rewrite 改变语义；否则按 original/planned 阶段分别 opaque 或 `dispatch-lowering-unverifiable`/ManualStop。
-6. **Recovery budget 参数 `N`**：contract 只规定 `candidateRecoveryOrdinal <= N`，并要求测试 `N=0/1/2`；本文仅建议 `N=2` 作为可能默认，需要确认配置入口、默认值与兼容策略。该预算不等于 assistant max-step 或 physical request budget。
-7. **Legacy 序列化兼容与 wire envelope**：新增 assistant optional `dispatchSummary`/`incompleteRecovery` projection fields，以及 tool/reasoning provenance；完整 ledger 不压入单数 message 字段。对 terminal error 的公开 wire 采用兼容优先策略：旧 Legacy endpoint/SDK 继续投影现有 `UnknownError` + canonical message/classification projection；内部 durable classifier 使用 typed terminal fact。只有确认版本化 endpoint/schema 或接受 breaking change 后，才把新的 `MessageIncompleteStreamError` discriminator 暴露给 public closed union。必须补旧数据 decoder、OpenAPI/generated SDK与 exhaustive consumer compatibility tests。
-8. **UI 展示与验收**：旧失败 attempt 必须保留；本次不要求新增折叠样式或恢复原因文案，但必须通过 TUI-level acceptance 证明 recovery child 会被继续同步/展示、原 error 不被覆盖、最终 session 状态正确。更丰富的视觉分组属于后续展示设计。
-9. **Shared contract ownership**：确认 `packages/schema/src/llm.ts` 是 wire schema 单一 source，`packages/llm` 只拥有 binder/validator/digest implementation 并 import schema，Legacy 只组合/消费；不得通过复制 types 规避 dependency cycle。
-10. **same-process max-step integration**：当前 Legacy 不存在 hard guard。contract 已固定为 initial `assistantSequence=0`、合法 sequence `0..M-1`、candidate 必须 `< M`，并由 `assistant_chain_head` immediate-successor CAS admission；仍需确认配置规范化入口和与现有 `MAX_STEPS_PROMPT` 的集成。ordinary continuation 与 recovery 共用该 assistant budget，exhausted finalization 写入失败时只保证当前进程 cancel/fail closed。
+| 决策 | 已固定边界与待确认项 |
+|---|---|
+| replay fence/target/digests | 首批 allowlisted adapter；dynamic/middleware/fetch rewrite无法进 gate→unknown。provider capability/domain由adapter、local capability由runtime提供并 dispatch前持久化；automatic要求唯一 semantic dispatch，inner retry/multi-step未被幂等 fence覆盖则unknown。domain含 provider/route/protocol/endpoint/authority/model；SafeRetry semantic digest相等，prepared digest绑定 fence/proof/closure，Continue用 source+closure transform；待选首批 adapters |
+| durable-before-execute与outer retry | 决定 processor begin/start tool API；不实施则提供本地工具时不得 automatic。并选择首次 dispatch 后禁用 outer resend，或逐 dispatch ledger且只有一次时 automatic |
+| persistence/consumption | raw `EventTable` operations sole authority；relations/projections rebuildable；三 heads derived CAS；operation+nextStateDigest，handle不持久化；projector/heads/rebuilder及 replay suppression；固定 canonical sets API。旧架构须先 supersede/re-review |
+| reasoning与closure | Legacy part表达 provider-end/step-boundary/cleanup；仅 provider-end默认可进入 closure。validator/digest必须共享 actual no-send lowerer或 exact pre-release capture；golden不证明 runtime；分类前得出 constructible/unavailable，授权后 rewrite则 fail closed |
+| budgets | `candidateRecoveryOrdinal <= N`，测 `N=0/1/2`，2仅建议；确认配置入口/default/compatibility。max-step合法 sequence `0..M-1`、candidate `<M`，ordinary/recovery共用，确认规范化入口与 `MAX_STEPS_PROMPT` 集成 |
+| wire/UI/ownership | optional projections，完整 ledger不进 message；public terminal仍 `UnknownError`，新 discriminator需 versioned/breaking批准；旧 error保留，TUI必须证明 child sync/render与 final state但无需新折叠样式；确认 schema是 wire source、llm仅实现 binder/validator/digest、Legacy组合消费，禁止复制 types |
 
 在其余架构决策确认、设计细化并通过审查前，不应开始生产代码实现。
