@@ -3,6 +3,7 @@
 **子计划**: `sessrec-1-contract-canonicalization`（Issue #7，M1 Shared Recovery Contracts and Canonical Semantics）
 **契约 review 时间**: `2026-08-15`
 **Step 0 完成时间**: `2026-08-15`
+**D0 contract sync / review**: `2026-08-16；0 P0 / 0 P1`
 **Step 5 验证时间**: `待 Step 5 填`
 
 > 证据边界：本文仅从允许读取的设计契约独立抽取。所有实现、测试、schema、脚本、migration、codegen 与 Step 5 结果均为 `[F — planned; not created; not run]`。当前 A/B/C/D 与 `[S — source seam only]` 证据不证明本子计划 future contract 已实现或通过。
@@ -67,7 +68,8 @@
 | `CompatibilityToolEvidenceV1` | `version;authorityClass:"compatibility-only";legacyPartOrdinal;callID?;name?;executionKind;inputState;callObservation;settlement;interruption;providerExecuted;phase;arguments?;terminalPayload?;causes` | branch-dependent | SESSREC-1 §4.4.5 | 待 Step 5 填 | 待 Step 5 验证 |
 | `CanonicalToolEvidencePartitionV1` | truly-empty = both empty；authoritative-only = auth nonempty/compat empty；compatibility-only inverse；mixed = both nonempty | branch-exact | SESSREC-1 §4.4.5 | 待 Step 5 填 | 待 Step 5 验证 |
 | `ReasoningEvidence` | `version;blockID;provenance;continuationMode;protocol;targetDigest;content?;textDigest?;stateRefs;publicMetadata;sourceRange` | branch-dependent | SESSREC-1 §4.4.6 | 待 Step 5 填 | 待 Step 5 验证 |
-| `RecoveryEventRegistryV1` | `eventTypeSetVersion;fieldSetRegistryVersion;definitions;fieldSets;sourceEntries;controlEntries;sourceAllowedEventSetDigest;controlAllowedEventSetDigest` | yes | SESSREC-1 §4.5.1 | 待 Step 5 填 | 待 Step 5 验证 |
+| `RecoveryEventDefinitionSetV1` | `eventTypeSetVersion;fieldSetRegistryVersion;definitions;fieldSets;sourceEntries;controlEntries`；schema-owned exact frozen raw set；禁止digest fields | yes | SESSREC-1 §4.5.1/F3 | 待 Step 5 填 | 待 Step 5 验证 |
+| `RecoveryEventRegistryV1` | raw definition-set fields + exact `sourceAllowedEventSetDigest;controlAllowedEventSetDigest`；LLM E1唯一enrichment owner | yes | SESSREC-1 §4.5.1/E1 | 待 Step 5 填 | 待 Step 5 验证 |
 | Public event carriers | public definition/durable definition/committed event；cursor `{version;aggregateID;sequence}`；four coarse read errors；listener/unsubscribe/subscription；public/public-durable manifests；`PublicEventServiceV1` exact methods | branch-exact | SESSREC-1 §4.5.1a | 待 Step 5 填 | 待 Step 5 验证 |
 | `ProviderPrefixCheckpoint` | `version;aggregateID;sessionID;sourceAssistantID;sourceHighWater;hashVersion;prefixDigest;ancestryDigest;protocol;targetDigest;content` | yes | SESSREC-1 §4.5.2 | 待 Step 5 填 | 待 Step 5 验证 |
 | `RecoverySourceVersion` | `version;aggregateID;sourceAssistantID;highWater;eventChain:{hashVersion;headDigest};factsDigest;eventTypeSetVersion;fieldSetRegistryVersion;allowedEventSetDigest;fieldSets;providerPrefix?;versionDigest` | branch-dependent | SESSREC-1 §4.5.3 | 待 Step 5 填 | 待 Step 5 验证 |
@@ -171,7 +173,7 @@
 | 24 | `source-allowed-event-set-v1` | registry versions + exactly seven recursive source entries | `SourceAllowedEventSetDigest` | `buildSourceAllowedEventSetDigestInput` |
 | 25 | `control-allowed-event-set-v1` | registry versions + exactly three recursive control entries | `ControlAllowedEventSetDigest` | `buildControlAllowedEventSetDigestInput` |
 
-**共享 import 纪律**：25 specs/builders必须来自 `CanonicalCommitmentRegistryV1` 单一 owner；禁止 generic `buildCommitment(domain:string,...)`、consumer registry、cast builder、未版本化 alias或隐藏第26 domain。计划物理 import path为 M1 单一 schema/LLM barrel，`[F — planned; not created]`，最终路径待实现并在 Step 5 回填。
+**共享 import 纪律**：25 specs/builders必须来自LLM-owned `CanonicalCommitmentRegistryV1`单一owner barrel；schema只导出raw F1–F4/F31 surfaces。禁止generic `buildCommitment(domain:string,...)`、consumer registry、cast builder、未版本化alias或隐藏第26 domain。精确物理import path仍为`[F — planned; not created]`，待实现并在Step 5回填。
 
 ---
 
@@ -181,14 +183,14 @@
 |---|---|---|---|---|
 | P1 publication | F1 | `// # Step P1: normalize source-level publication metadata` | 待 Step 5 填 | 计划 grep（未创建） |
 | P2 partition | F2 | `// # Step P2: partition public and internal definitions exactly once` | 待 Step 5 填 | 计划 grep（未创建） |
-| P3 registry | F3 | `// # Step P3: build ten internal durable recovery definitions` | 待 Step 5 填 | 计划 grep（未创建） |
+| P3 raw definitions | schema F3 | `// # Step P3: build ten internal durable recovery definitions without digest` | 待 Step 5 填 | 计划 grep（未创建） |
 | P4 field sets | F4 | `// # Step P4: validate recursive exact field membership` | 待 Step 5 填 | 计划 grep（未创建） |
 | P5 row decode | F5 | `// # Step P5: decode owner-qualified durable recovery row` | 待 Step 5 填 | 计划 grep（未创建） |
 | P6 source/control | F6/F7 | `// # Step P6: freeze source facts and exact control tail` | 待 Step 5 填 | 计划 grep（未创建） |
 | P7 old rows | F8/F14/F15 | `// # Step P7: retain legacy evidence as compatibility-only` | 待 Step 5 填 | 计划 grep（未创建） |
 | P8 normalization | F9–F13/F16a | `// # Step P8: normalize exact target capability and policy inputs` | 待 Step 5 填 | 计划 grep（未创建） |
 | P9 replay refs | F14–F16 | `// # Step P9: validate replay carriers sealed references and owner commitments` | 待 Step 5 填 | 计划 grep（未创建） |
-| P10 input builder | §4.1.3a | `// # Step P10: build one closed canonical commitment input` | 待 Step 5 填 | 计划 registry coverage（未创建） |
+| P10 input builder / registry enrichment | §4.1.3a/E1 | `// # Step P10: build one closed canonical input and enrich the exact recovery registry` | 待 Step 5 填 | 计划 registry coverage（未创建） |
 | P11 encode | F17 | `// # Step P11: canonical-encode exact secret-safe input` | 待 Step 5 填 | 计划 vectors（未创建） |
 | P12 digest | F21/F22 | `// # Step P12: digest or verify the matching branded commitment` | 待 Step 5 填 | 计划 vectors（未创建） |
 | P13 causes | F23 | `// # Step P13: map causes to stable nonempty ManualStop reasons` | 待 Step 5 填 | 计划 `M1-T19` |
@@ -207,6 +209,7 @@
 | 契约 | 来源 | 验证方式（未来；未创建） | 一致 |
 |---|---|---|---|
 | M1是shared recovery schema/canonical semantics唯一owner；dependency保持 `schema ← llm ← opencode` | architecture M1；SESSREC-1 §1 | `M1-T24/T38` + import review | 待 Step 5 验证 |
+| Schema F3只产owner-held frozen singleton `RecoveryEventDefinitionSetV1`且不hash/import LLM；LLM E1按top-level/member identity只接受该same set并附加两个existing allowed-set digests；F5–F7归LLM消费enriched registry；F31对E1零依赖 | SESSREC-1 §4.5.1/F3/E1/F5–F7/F31 | `M1-T03/T26/T28/T38` + dependency/import review | 待 Step 5 验证 |
 | 除F12外M1 pure callable使用exact `ContractResult<A,E>`；无throwing/Effect/undefined overload | SESSREC-1 §3.1/§5.0 | signature/type tests | 待 Step 5 验证 |
 | Unknown version/event/field-set、extra authority field、owner/digest mismatch、partial/non-foldable authority fail closed | SESSREC-1 §3.2/F4–F7 | `M1-T02/T17/T18/T28` | 待 Step 5 验证 |
 | Old rows only compatibility/opaque/unknown；缺providerExecuted不当false，缺provenance不当provider-end | F8/F14/F15 | `M1-T16/T33/T34` | 待 Step 5 验证 |
@@ -243,7 +246,7 @@
 | Types8–10 record只从raw payload+envelope deterministic rebuild，不从clock/runtime/projection补字段 | §4.8.1–§4.8.3 | 待 Step 5 填 | `M1-T27` |
 | First apply重验current policy/heads；exact replay验证stored historical policy/post-state；current full-prefix validation独立 | §4.8.3/F26/F27/H3 | 待 Step 5 填 | `M1-T21/T31` |
 | applyMode只在ephemeral result；不进receipt/raw/folded/digest/public | §4.8.3 | 待 Step 5 填 | `M1-T29/T38` |
-| Public/internal必须在definition/source和manifest前分区；末端字符串filter只defense-in-depth | architecture §4.8；F1–F3/F31 | 待 Step 5 填 | `M1-T03/T04/T04a` |
+| Public/internal必须在schema definition/source和manifest前分区；F31只消费raw F3 definitions/publication metadata；末端字符串filter只defense-in-depth | architecture §4.8；F1–F3/F31 | 待 Step 5 填 | `M1-T03/T04/T04a` |
 | F28在M4 stable display-ID allocation之后；F28–F30不分配ID、不查表、不写DB | §4.7.4/F28–F30 | 待 Step 5 填 | `M1-T32` |
 | Global automatic 21-step runtime顺序由cross-owner持有；M1仅提供exact descriptor/input/receipt validators | architecture §5.1；detailed-design §3.1 | 待 Step 5 填 | Step 5 cross-owner review |
 
@@ -264,6 +267,7 @@
 | 同partition ordinal升序无duplicate；跨partition同callID保留两份 | §4.4.5 | `property_tool_partition_preserves_classes`（计划） |
 | 任意phase rerunBody/rerunAfterHook恒forbidden；仅final continue-only | §4.4.5 | `property_tool_phase_never_reruns`（计划） |
 | Replay carrier decode/re-encode byte-equal；trailing/duplicate/noncanonical/purpose/scope/HMAC mismatch失败 | §4.4.5–§4.6.1 | `property_replay_carrier_exact`（计划） |
+| F3每次成功返回同一owner-held frozen singleton，固定10 definitions/field specs与7/3 tuples且无digest；E1拒绝structural lookalike，保留same member identity/order并只附两个existing digest brands | §4.5.1/F3/E1 | `property_raw_enriched_registry_identity`（计划） |
 | Source/control sets固定7/3、互斥、并集10、brands不可互换 | §4.5.1 | `property_source_control_partition`（计划） |
 | Valid raw prefix sequence连续且chain逐项衔接；gap/duplicate/different payload失败 | F5/F6/H2/H3 | `property_event_chain_exact`（计划） |
 | Empty tail identity四条件恒成立 | §4.5.4 | `property_empty_control_tail_identity`（计划） |
@@ -286,7 +290,7 @@
 
 | 契约 | 来源 | 未来验证 | 实测 |
 |---|---|---|---|
-| F2/F6/F7/H2/H3对有限输入单调有限扫描，无无界retry/wait | §5.0–§5.1 | complexity/property counters（计划） | 待 Step 5 填 |
+| F2/F3/E1/F6/F7/H2/H3对有限输入单调有限扫描，无无界retry/wait | §5.0–§5.1 | complexity/property counters（计划） | 待 Step 5 填 |
 | F4/F17对finite acyclic tree终止；递归严格进入子值；object keys有限排序 | F4/F17 | generated finite-tree termination（计划） | 待 Step 5 填 |
 | F16a固定7 capability；F23扫描causes+固定24 tuple；registry固定25 | F16a/F23/§4.1.3 | operation-count assertions（计划） | 待 Step 5 填 |
 | Policy codecs最多2 nested objects/3 leaves；无I/O/retry/global scan | §4.6.3 | pure call-count test（计划） | 待 Step 5 填 |
@@ -302,7 +306,7 @@
 | Raw credential/token/key/cursor/reasoning/tool/prefix plaintext/runtime handle不进canonical、raw、materialization、receipt、public、log/error | architecture §4.2/§4.8；SESSREC-1 §4.3–§4.4 | `M1-T12/T30/T36` + grep/human review |
 | Low-entropy commitment必须HMAC-SHA-256；禁止SHA256(rawSecret)/truncation/dictionary-testable digest | §4.3.1/§4.3.4 | `M1-T30` |
 | refID由M4 CSPRNG opaque生成；M1不lookup/unseal/rotate/construct M4 proof | §4.3.4/F16 | store-call=0 + forged brand rejection |
-| M1 pure functions除module freeze外不dispatch/persist/publish/read current config/store/clock，不写log/cache/DB | architecture M1；§5 | capability-free tests + review |
+| M1 pure functions除module freeze外不dispatch/persist/publish/read current config/store/clock，不写log/cache/DB；schema F3 additionally不得hash或import LLM，E1不得bus/store/publish | architecture M1；§5 | capability-free tests + dependency review |
 | `session.recovery.*`全部internal，仅raw/private replay可读；所有public channels不可表示/解码 | architecture §4.8；§4.5.1a/F31 | `M1-T03/T04/T04a`，public notifications=0 |
 | Public read errors仅四coarse branches，不含authority details | §4.5.1a | schema leakage tests |
 | Public projection正向allowlist；禁止authority object spread、blacklist strip继续、display ID反查 | F28/F29 | `M1-T22/T32` |
@@ -321,7 +325,7 @@
 | 25 domains canonical bytes/SHA-256/envelope/brand在schema/llm/core bit-exact | §4.1.3/F17/F21/F22 | 计划 `recovery-canonical-registry.test.ts` vectors（未创建） |
 | Prefix exact UTF-8 `opencode-session-recovery\0v1\0${domain}\0`；NUL是单byte；keys按UTF-16 code units | F17 | byte vectors（未创建） |
 | V1 numeric only safe integer；无decimal/rounding/exponent/尾零；-0拒绝 | §4.1.1/F17 | cross-runtime vectors（未创建） |
-| 10 operation/event/payload/field-set/post-state/receipt一一对应；M4不得复制schema | §4.8；detailed-design owner index | `M1-T27/T38` + import audit（计划） |
+| 10 operation/event/payload/field-set/post-state/receipt一一对应；schema F3 raw set与LLM E1 enriched registry membership/order exact；M4不得复制schema或重建另一registry | §4.5.1/§4.8；detailed-design owner index | `M1-T03/T26/T28/T38` + import audit（计划） |
 | Type1 genesis/type10 branches/later reservation digest在M1/M4/M6 exact；no-reply无type1 reservation | architecture §5.8；§4.8.1 | operation vectors + cross-owner audit（计划） |
 | M2–M8只用M1 exports；private variants通过Extract/indexed surfaces | detailed-design §2；§5.0.1 | `M1-T38` compile tests（计划） |
 | Evidence/partition/phases/carriers/literals在M3 producer、M4 fold、M5 classifier、M7 lowering exact | §4.4/§6 | `M1-T33–T38` + cross-owner review（计划） |
@@ -353,6 +357,7 @@
 - [ ] 计划校验 `scripts/contract_audit/schemas/sessrec-1-contract-canonicalization.schema.json`；当前 `[F — planned; schema not created; not run]`。
 - [ ] 25-domain cardinality/builders/specs/brands exact。
 - [ ] 10 operation/event/field-set/post-state/receipt mappings exact。
+- [ ] Schema F3 owner-held singleton无digest/LLM import；LLM E1按identity exact enrichment only；F5–F7由LLM消费enriched registry；F31对E1/digest零依赖；raw/enriched membership与order exact。
 - [ ] TypeScript `// # Step P1:` 至 `// # Step P18:` markers完整且唯一。
 - [ ] Shared enum/union从M1 owner import，无duplicate definitions。
 - [ ] Public/internal source partition与zero-leakage通过。
@@ -383,4 +388,4 @@
 
 ---
 
-*本 expectations 由 Step 0 从契约文档独立抽取，未读取生产源码或测试。后续修改必须先改契约文档，再同步本表。Bug类契约修复走 `workflow.md §7`；feature类扩展按 `workflow.md §2.3` 判定。*
+*本 expectations 由 Step 0 从契约文档独立抽取；D0行仅在owner设计合同先修正后同步，未从production implementation或tests回填实现位置/结果。后续修改必须先改契约文档，再同步本表。Bug类契约修复走 `workflow.md §7`；feature类扩展按 `workflow.md §2.3` 判定。*

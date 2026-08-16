@@ -2,9 +2,9 @@
 
 > 子计划 owner：M1 Shared Recovery Contracts and Canonical Semantics。
 >
-> 权威输入：当前 revised `docs/design/session-recovery/architecture.md`、`detailed-design.md`与owner子计划集合。它们共同处于fresh independent design audit已达到`0 P0 / 0 P1`、等待用户再次批准的design candidate状态；此前批准与本机plan不得覆盖当前修订。本文不得改变 G1–G12、M1–M8、I1–I13、三个recovery heads plus aggregate event head/cursor、raw-event sole authority、mechanical gate、Legacy-only 或 public/internal 隔离；若实现发现这些合同不能成立，必须退回架构评审。
+> 权威输入：当前approved `docs/design/session-recovery/architecture.md`、`detailed-design.md`与owner子计划集合。原stable snapshot的fresh independent design audit达到`0 P0 / 0 P1`，用户批准与四份Step 0 expectations均已完成。本文不得改变 G1–G12、M1–M8、I1–I13、三个recovery heads plus aggregate event head/cursor、raw-event sole authority、mechanical gate、Legacy-only 或 public/internal 隔离。
 >
-> 状态：M1函数级详细设计review candidate；生产实现、future tests、expectations、audit、migration 均未开始；未经用户再次批准不得进入Step 0。
+> 状态：production implementation前的D0 package-ownership correction已完成机械检查与fresh independent review `0 P0 / 0 P1`。该修正只把schema-owned raw recovery definitions与LLM-owned allowed-set digest enrichment拆开，以保持`schema ← llm ← opencode`；本changeset等待commit/push，production implementation、future tests与Step 5 audit尚未开始。
 
 ## 1. 范围
 
@@ -38,6 +38,7 @@
 - `packages/schema/src/index.ts`
 - `packages/llm/src/schema/{ids,events,messages,options,index}.ts`
 - M1 新增源码文件应优先位于已有 `packages/llm/src/schema/` 或 `packages/schema/src/`；本文不预先批准跨 package 的第二套同义 union。
+- Package partition为normative：schema拥有wire/event codecs、F1–F4 raw definition construction与F31 manifests；LLM拥有25-domain canonical registry、E1 enrichment与依赖enriched registry/canonical digest的F5–F7。任何跨边界shared type只能由schema向LLM单向导入，不得让schema source/test反向import LLM。
 
 架构映射：M1 主责 G7、G8、G10 的共享合同基础，协作 G1–G6、G9、G11、G12；直接维护 I4、I6、I7、I10 的类型边界，并向 M2/M3/M4/M5/M6/M7/M8 提供单一 schema。
 
@@ -51,7 +52,7 @@
 - M7：Anthropic/OpenAI closure 的协议细节；M1 只定义 provenance、closure descriptor 与 digest membership。
 - M8：HTTP/SDK/CLI/TUI 行为；M1 只定义 public projection allowlist 与 shared codec。
 - 不设计 Native V2 recovery flow；Native V2 仅是 shared-schema/publication regression consumer。
-- 不创建或运行测试，不创建 `docs/audits/*`、expectations、audit、devlog，不修改 migration/OpenAPI/generated SDK。
+- D0不创建或运行测试，不新建audit-report/decisions/devlog，不修改migration/OpenAPI/generated SDK；仅在owner合同先修正后同步既有SESSREC-1 expectations，且不得回填future实现位置或通过状态。
 
 ### 1.3 证据边界
 
@@ -177,7 +178,7 @@ export type ReceiptValidationError = RecoveryDecodeError | FieldSetError | Norma
 export type SealedRefStructuralValidationError = RecoveryDecodeError | FieldSetError | NormalizationError
 ```
 
-函数标题中的`f(...) -> A`仅是导航标签，不是第二套raw-return API。§5.0.3是唯一完整callable inventory/ledger，规范签名分别由其signature anchor（§4.1.3 builders、§4.6.3 codecs、§4.9 helpers、§5.0.1 numbered F exports）唯一拥有：除F12这个total/trivial纯比较外，F1–F31/F16a、policy codecs、25个input builders及三个M1 helper全部返回`ContractResult<A,E>`；每个`E`必须是对应signature anchor写出的精确子union，禁止扩大成裸`RecoveryContractError`、缩成`unknown`，也禁止throwing/Effect/`undefined` overload。标题写`-> void`时仍返回`ContractResult<void,E>`；F28即使投影为空也返回`ContractResult<RecoveryPublicProjectionV1|undefined,PublicProjectionViolation>`，其中`undefined`只表示“无可公开字段”，不是失败。caller位于Effect runtime时只能在边界lift一次并原样保留`E`。§4.5.1a的existing `PublicEventServiceV1`/listener/subscription是保留的runtime Effect/Stream接口，不是M1 pure callable inventory，故继续使用其当前精确Effect error contract。
+函数标题中的`f(...) -> A`仅是导航标签，不是第二套raw-return API。§5.0.3是唯一完整callable inventory/ledger，规范签名分别由其signature anchor（§4.1.3 builders、§4.6.3 codecs、§4.9 helpers、§5.0.1 numbered F exports）唯一拥有：除F12这个total/trivial纯比较外，F1–F31/F16a、additional E1、policy codecs、25个input builders及三个M1 helper全部返回`ContractResult<A,E>`；每个`E`必须是对应signature anchor写出的精确子union，禁止扩大成裸`RecoveryContractError`、缩成`unknown`，也禁止throwing/Effect/`undefined` overload。标题写`-> void`时仍返回`ContractResult<void,E>`；F28即使投影为空也返回`ContractResult<RecoveryPublicProjectionV1|undefined,PublicProjectionViolation>`，其中`undefined`只表示“无可公开字段”，不是失败。caller位于Effect runtime时只能在边界lift一次并原样保留`E`。§4.5.1a的existing `PublicEventServiceV1`/listener/subscription是保留的runtime Effect/Stream接口，不是M1 pure callable inventory，故继续使用其当前精确Effect error contract。
 
 错误分类：
 
@@ -484,8 +485,8 @@ export const CanonicalCommitmentRegistryV1:readonly [
 | `buildReasoningTextDigestInput` | M3/M4 | provenance/mode/target exact；content为verified replay carrier projection，sealed text不进入unkeyed digest | `ReasoningTextDigestInputV1` |
 | `buildProviderPrefixDigestInput` | M4/M7 | prefix为verified replay carrier projection的exact protocol representation；secret state sealed且plaintext不进入unkeyed digest | `ProviderPrefixDigestInputV1` |
 | `buildProviderPrefixAncestryDigestInput` | M4 | genesis/extension ancestry inequalities exact | `ProviderPrefixAncestryDigestInputV1` |
-| `buildSourceAllowedEventSetDigestInput` | F3 module init | `set:"source"`且7 entries registry-fixed | `AllowedEventSetDigestInputV1 & {set:"source"}` |
-| `buildControlAllowedEventSetDigestInput` | F3 module init | `set:"control"`且3 entries registry-fixed | `AllowedEventSetDigestInputV1 & {set:"control"}` |
+| `buildSourceAllowedEventSetDigestInput` | LLM `buildRecoveryEventRegistry` | `set:"source"`且7 entries registry-fixed | `AllowedEventSetDigestInputV1 & {set:"source"}` |
+| `buildControlAllowedEventSetDigestInput` | LLM `buildRecoveryEventRegistry` | `set:"control"`且3 entries registry-fixed | `AllowedEventSetDigestInputV1 & {set:"control"}` |
 
 `entries`是按`operationType`固定排序的tuple；每项exact字段为`operationType,eventType,eventVersion,fieldSetVersion,exactFields`。`exactFields`递归列出每个JSON path的`presence(required|optional),specKind`及union branch literal，并按schema declaration order冻结；因此digest不只承诺top-level名字。source/control allowed-set digest因domain与`set`不同不可互换。
 
@@ -1172,19 +1173,21 @@ type InternalRecoveryDefinitionV1<T extends RecoveryOperationType> = Readonly<{
 type AnyInternalRecoveryDefinitionV1 = {
   [T in RecoveryOperationType]: InternalRecoveryDefinitionV1<T>
 }[RecoveryOperationType]
-export type RecoveryEventRegistryV1 = Readonly<{
+export type RecoveryEventDefinitionSetV1 = Readonly<{
   eventTypeSetVersion:RecoveryEventTypeSetVersion
   fieldSetRegistryVersion:RecoveryFieldSetRegistryVersion
   definitions:readonly AnyInternalRecoveryDefinitionV1[]
   fieldSets:readonly RecoveryFieldSetRefV1[]
   sourceEntries:readonly RecoveryFieldSetRefV1[]
   controlEntries:readonly RecoveryFieldSetRefV1[]
+}>
+export type RecoveryEventRegistryV1 = RecoveryEventDefinitionSetV1 & Readonly<{
   sourceAllowedEventSetDigest:SourceAllowedEventSetDigest
   controlAllowedEventSetDigest:ControlAllowedEventSetDigest
 }>
 ```
 
-`RecoveryEventTypeRegistryV1`冻结10个operation/event一一映射；`RecoveryFieldSetRegistryV1`冻结§4.8.2每个operation的递归exact schema。每个definition的durable selector精确读取envelope顶层`aggregateID`，该ID标识dedicated recovery aggregate；不得以payload/session的`sessionID`作为EventTable aggregate selector。M4拥有并验证`RecoveryAggregateOwnerV1 { aggregateID, sessionID }`的一对一owner mapping：row selector、envelope.aggregateID与owner mapping必须一致，payload中的每个sessionID必须等于mapped owner，否则authority invalid。source allowed tuple精确为operation 1–7，control tuple精确为8–10，顺序与§4.8.1一致。F3在module initialization通过closed canonical builders分别产生`SourceAllowedEventSetDigest`与`ControlAllowedEventSetDigest`；运行时不得从当前manifest临时排序重算另一集合。任一event-type-set version、field-set registry version、allowed-set digest变化都使既有source/control version不匹配并fail closed。
+`RecoveryEventTypeRegistryV1`冻结10个operation/event一一映射；`RecoveryFieldSetRegistryV1`冻结§4.8.2每个operation的递归exact schema。每个definition的durable selector精确读取envelope顶层`aggregateID`，该ID标识dedicated recovery aggregate；不得以payload/session的`sessionID`作为EventTable aggregate selector。M4拥有并验证`RecoveryAggregateOwnerV1 { aggregateID, sessionID }`的一对一owner mapping：row selector、envelope.aggregateID与owner mapping必须一致，payload中的每个sessionID必须等于mapped owner，否则authority invalid。source allowed tuple精确为operation 1–7，control tuple精确为8–10，顺序与§4.8.1一致。Schema-owned F3只构造并freeze `RecoveryEventDefinitionSetV1`，不计算digest且不得依赖LLM；LLM-owned `buildRecoveryEventRegistry`接收该exact frozen set，通过closed canonical builders分别产生`SourceAllowedEventSetDigest`与`ControlAllowedEventSetDigest`并返回enriched `RecoveryEventRegistryV1`。运行时不得从当前manifest临时排序重算另一集合。任一event-type-set version、field-set registry version、allowed-set digest变化都使既有source/control version不匹配并fail closed。
 
 #### 4.5.1a Public event owner surfaces 与 trusted private durable replay
 
@@ -1319,7 +1322,7 @@ type RecoverySourceVersion = Readonly<{
 }>
 ```
 
-不变量：绑定`0..highWater`完整aggregate event chain和仅source assistant的versioned source facts；`eventTypeSetVersion=1`、`fieldSetRegistryVersion=1`、`allowedEventSetDigest`必须与F3 source registry exact match；`fieldSets`按registry tuple顺序、无duplicate，且每个entry属于source set。`versionDigest`由`source-version-v1` exact builder覆盖前述全部字段（排除自身）。未知event/field-set/registry version、gap、duplicate、extra authority field失败。source facts冻结后不修改。
+不变量：绑定`0..highWater`完整aggregate event chain和仅source assistant的versioned source facts；`eventTypeSetVersion=1`、`fieldSetRegistryVersion=1`、`allowedEventSetDigest`必须与LLM-owned enriched `RecoveryEventRegistryV1` source digest exact match；`fieldSets`按registry tuple顺序、无duplicate，且每个entry属于source set。`versionDigest`由`source-version-v1` exact builder覆盖前述全部字段（排除自身）。未知event/field-set/registry version、gap、duplicate、extra authority field失败。source facts冻结后不修改。
 
 #### 4.5.4 `RecoveryControlTailVersion`
 
@@ -2729,7 +2732,8 @@ export function partitionDefinitionsByPublication<D extends Definition>(
   internal:readonly (D & Readonly<{publication:"internal"}>)[]
 }>,EventDefinitionError>
 
-export function buildRecoveryEventDefinitions():ContractResult<RecoveryEventRegistryV1,EventDefinitionError|FieldSetError|CanonicalizationError>
+export function buildRecoveryEventDefinitions():ContractResult<RecoveryEventDefinitionSetV1,EventDefinitionError|FieldSetError>
+export function buildRecoveryEventRegistry(definitionSet:RecoveryEventDefinitionSetV1):ContractResult<RecoveryEventRegistryV1,FieldSetError|CanonicalizationError>
 export function validateExactFieldSet<T>(value:unknown,specification:ExactFieldSetSpecification<T>,path?:string):ContractResult<void,FieldSetError>
 export function decodeRecoveryDurableRow(input:RecoveryDurableRowDecodeInputV1):ContractResult<DecodedRecoveryOperation,DecodeError>
 export function decodeRecoverySourceFieldSet(events:readonly DecodedRecoveryOperation[],sourceAssistantID:RecoveryAssistantID,highWater:SafeNonNegativeInt):ContractResult<RecoverySourceVersion,DecodeError>
@@ -2774,7 +2778,7 @@ export function decodeRecoveryPublicProjection(value:unknown):ContractResult<Rec
 export function assembleEventManifests<D extends Definition>(allDefinitions:readonly D[]):ContractResult<EventManifestSet,EventDefinitionError|FieldSetError|RecoveryDecodeError>
 ```
 
-F18/F19/F20的builder名称同时是25-domain inventory中的对应input builder，只有这一组exports，不存在第二个同名raw-return API。F1现有`Event.define`实现位置必须导出上面的签名；文中`Event.define`只是owner-qualified名称。
+F18/F19/F20的builder名称同时是25-domain inventory中的对应input builder，只有这一组exports，不存在第二个同名raw-return API。F1现有`Event.define`实现位置必须导出上面的签名；文中`Event.define`只是owner-qualified名称。`buildRecoveryEventRegistry`是additional exact M1 callable：它由LLM package唯一拥有，不占用新F编号、不新增digest domain，不接受generic domain/string或任意lookalike definition set；schema package只拥有F3 raw set construction。
 
 下表是consumer可命名的M1 owner/export inventory增量；这些都是type export，不新增callable、digest domain或runtime authority。任何实现把它们恢复为private alias、复制为consumer-local同义type，或在M1中加入snapshot-automatic/tool-eligibility/sealed-use-lease nominal proof均违反owner合同；既有owner-index/sealed-lookup proof inputs仍按§4.3.4/§4.9的窄用途保留。
 
@@ -2783,6 +2787,7 @@ F18/F19/F20的builder名称同时是25-domain inventory中的对应input builder
 | `RecoveryClosureDescriptor` | M1 owner；M7/M2/M5 consumer | Continue branch含snapshot `sourceBinding`及可重建tool/reasoning/prefix carriers+commitments；SafeRetry branch保持branch-exact；M4 nominal snapshot proof不在M1 |
 | `LegacyUserMessagePredecessorV1` | M1 operation schema owner；M3/M4 type-1 materialization consumer | consumer可命名exact Legacy predecessor，不得重声明或降为private structural lookalike |
 | `OperationSchemaByTypeV1` | M1 operation/field-set owner；M3/M4/F3/F5 consumer | 10 operation map可由consumer generic signature直接索引；field sets、ManualStop/type-10 branches保持exact |
+| `RecoveryEventDefinitionSetV1` / `RecoveryEventRegistryV1` | schema F3 owns raw set；LLM `buildRecoveryEventRegistry` owns enrichment；F5–F7/M4 consume enriched registry，F31 consumes raw definitions | raw carrier has versions/definitions/fieldSets/source/control only；enriched carrier adds exactly the two existing allowed-set digest brands；same membership/ordering，no schema→LLM dependency or duplicate canonicalizer |
 | `CanonicalWireValueV1` / `RecoveryReplayPayloadV1` / `RecoveryReplayPayloadCommitmentProjectionV1` / `ToolTerminalReplayPayloadV1` | M1 canonical payload/carrier owner；M3/M4/M7 consumer | digest仅commitment；inline/sealed均可重建并按purpose/scope/material+owner digest验证；public/raw secret exclusion保持 |
 | `AuthoritativeToolEvidenceV1` / `CompatibilityToolEvidenceV1` / `CanonicalToolEvidencePartitionV1` | M1 authority-class owner；M3/M4/M5/M7 consumer | partition total/disjoint/complete；compatibility-only不可省略成empty；SafeRetry/Continue eligibility branch exact |
 | `ToolExecutionPhaseV1` | M1 phase owner；M3/M4/M5/M7 consumer | planned/body-outcome/final-after-hook/reconciled/unknown闭合；仅final branch Continue-eligible；所有rerun authority forbidden |
@@ -2876,6 +2881,7 @@ F18/F19/F20的builder名称同时是25-domain inventory中的对应input builder
 | H1 | `deriveCommittedIdentity` | §4.9 supporting signatures | §5.0.2 H1；`[F — planned; proof present; review unchecked]` |
 | H2 | `foldOperationPostStateThroughSequence` | §4.9 supporting signatures | §5.0.2 H2；`[F — planned; proof present; review unchecked]` |
 | H3 | `validateCurrentRecoveryAggregatePrefixAndHeads` | §4.9 supporting signatures | §5.0.2 H3；`[F — planned; proof present; review unchecked]` |
+| E1 | `buildRecoveryEventRegistry` | §5.0.1 additional exact callable | §5.1.3a；`[F — planned; proof present; D0 review passed]` |
 | F1 | `define` | §5.0.1 | §5.1.1；`[F — planned; proof present; review unchecked]` |
 | F2 | `partitionDefinitionsByPublication` | §5.0.1 | §5.1.2；`[F — planned; proof present; review unchecked]` |
 | F3 | `buildRecoveryEventDefinitions` | §5.0.1 | §5.1.3；`[F — planned; proof present; review unchecked]` |
@@ -2906,7 +2912,7 @@ F18/F19/F20的builder名称同时是25-domain inventory中的对应input builder
 | F30 | `decodeRecoveryPublicProjection` | §5.0.1 | §5.4.7；`[F — planned; proof present; review unchecked]` |
 | F31 | `assembleEventManifests` | §5.0.1 | §5.5.1；`[F — planned; proof present; review unchecked]` |
 
-覆盖计数是25 builders（B01–B25，其中B01–B03同时覆盖F18–F20）+4 policy codecs+3 helpers+32 numbered labels（F1–F31加F16a，F18–F20不重复成行）。任何新增/删除/重命名必须同时改变本计数、signature owner anchor与proof anchor；当前所有status均unchecked。
+覆盖计数是25 builders（B01–B25，其中B01–B03同时覆盖F18–F20）+4 policy codecs+3 helpers+1 registry-enrichment callable E1+32 numbered labels（F1–F31加F16a，F18–F20不重复成行）。Ledger中的E1仅指`buildRecoveryEventRegistry`；各函数内部的E1/E2/... exit labels只在自身函数段内局部作用，不是callable ID。E1不占F编号且不增加digest domain；任何新增/删除/重命名必须同时改变本计数、signature owner anchor与proof anchor。D0 changed rows已完成fresh independent review。
 
 ### 5.1 Event definition、manifest 与 exact decode
 
@@ -2977,25 +2983,43 @@ export function partitionDefinitionsByPublication<D extends Definition>(
 - **callee引用**：`versionedType(type,version)` post为稳定`${type}.${version}`；F1保证publication闭集。
 - **正确性论证**：按循环不变量，结束时覆盖全部输入且互斥；duplicate先失败避免同一authority进入两surface。
 
-#### 5.1.3 F3 `buildRecoveryEventDefinitions() -> RecoveryEventRegistryV1`
+#### 5.1.3 F3 `buildRecoveryEventDefinitions() -> RecoveryEventDefinitionSetV1`
 
-- **功能描述**：创建10个internal durable recovery definitions、recursive exact field-set registry、互斥source/control tuple及其branded allowed-set digests。
-- **调用关系**：callers: schema event manifest、durable manifest、M4；callees: F1（pre/post见§5.1.1）、F2（见§5.1.2）、F4（见§5.1.4）、F17/F21（见§5.3.1/5.3.5）。
+- **Package owner**：`@opencode-ai/schema`。该package不得import `@opencode-ai/llm`。
+- **功能描述**：创建10个internal durable recovery definitions、recursive exact field-set registry与互斥source/control tuple；不计算digest。
+- **调用关系**：callers: schema event manifest、durable manifest、F31、LLM `buildRecoveryEventRegistry`；callees: F1（pre/post见§5.1.1）、F2（见§5.1.2）、F4（见§5.1.4）。明确不调用F17/F21或任何LLM callable。
 - **Requires**：§4.8.1的`OperationSchemaByTypeV1`完整且TypeScript exhaustive assertion证明10个operation type均有branch；每个nested type已有exact spec。
-- **Ensures**：返回值固定含`eventTypeSetVersion:1`、`fieldSetRegistryVersion:1`、10项type-indexed `InternalRecoveryDefinitionV1<T>`/spec、一项7-entry source tuple、一项3-entry control tuple、`SourceAllowedEventSetDigest`与`ControlAllowedEventSetDigest`；全部internal+durable、selector均为envelope `aggregateID`且无public项。
-- **Invariants**：operation type、event type、payload discriminator、field-set entry一一对应；source/control互斥且digest不可替换。
-- **副作用**：仅在module initialization创建并freeze内存registry/schema对象；不注册runtime bus、不持久化、不publish；这是穷尽副作用列表。
+- **Ensures**：成功调用均返回同一owner-held frozen singleton identity；该值固定含`eventTypeSetVersion:1`、`fieldSetRegistryVersion:1`、10项type-indexed `InternalRecoveryDefinitionV1<T>`/spec、一项7-entry source tuple与一项3-entry control tuple；全部internal+durable、selector均为envelope `aggregateID`且无public项；返回值没有allowed-set digest字段。
+- **Invariants**：operation type、event type、payload discriminator、field-set entry一一对应；source/control互斥、顺序固定且全集恰为10项。
+- **副作用**：仅在schema module initialization创建并freeze内存definition/spec对象；不注册runtime bus、不持久化、不publish、不hash；这是穷尽副作用列表。
 - **实现步骤 / intermediate facts**：
-  1. 从closed operation tuple逐项取得type/event/schema；由§4.8.1 pre得事实I1：每项有唯一exact predecessor/payload spec。
+  1. 从closed operation tuple逐项取得type/event/schema；由§4.8.1 pre得I1：每项有唯一exact predecessor/payload spec。
   2. 对每项调用F1；由F1 post得I2：definition metadata完整且publication internal、durable v1，不改变wire field set。
   3. 调F4自检spec可满足且字段名无duplicate；得I3：10项recursive exact spec可用于authority decode。
-  4. 调F2；由F2 post得I4：全部项恰分区且public为空，否则typed initialization failure，无半registry。
-  5. 按固定tuple切分1–7/8–10并检查cardinality、交集、全集；得I5：source/control allowed sets闭合。
-  6. 分别构造`AllowedEventSetDigestInputV1`，调用F17/F21；其post给出I6：两个domain-separated branded digest绑定event/field-set registry versions与recursive exact field paths。
-  7. freeze完整对象并一次性export。
-- **分支/退出**：schema/duplicate/public/cardinality/digest任一失败均在export前退出；成功只有单一路径。
-- **正确性论证**：前置closed tuple + I1–I4推出10项定义完整且不公开；I5推出allowed membership唯一；I6将membership/version变为不可替换commitment；freeze后返回值满足Ensures。
-- **副作用论证**：步骤1–6只分配内存对象/计算纯digest，步骤7只发布frozen module value；没有其它callee具备外部写入post，故副作用穷尽。
+  4. 调F2；由F2 post得I4：全部项恰分区且public为空，否则typed initialization failure，无半set。
+  5. 按固定tuple切分1–7/8–10并检查cardinality、交集、全集；得I5：source/control allowed membership闭合。
+  6. freeze `RecoveryEventDefinitionSetV1`并一次性export。
+- **分支/退出**：schema/duplicate/public/cardinality任一失败均在export前typed退出；成功只有单一路径。
+- **正确性论证**：前置closed tuple + I1–I4推出10项定义完整且不公开；I5推出membership唯一；freeze后返回值满足Ensures且不引入反向dependency。
+- **副作用论证**：步骤1–5只分配/验证schema objects，步骤6只发布frozen module value；callee均无外部写入或hash，故副作用穷尽。
+
+#### 5.1.3a E1 `buildRecoveryEventRegistry(definitionSet) -> RecoveryEventRegistryV1`
+
+- **Package owner**：`@opencode-ai/llm`；沿允许方向import schema-owned exact `RecoveryEventDefinitionSetV1`。
+- **功能描述**：在不改变raw definition membership/order的前提下，为exact frozen set附加两个existing allowed-set digest brands并返回enriched registry。
+- **调用关系**：callers: F5–F7、M4 reader/rebuilder；callees: F4、`buildSourceAllowedEventSetDigestInput`、`buildControlAllowedEventSetDigestInput`、F17、F21。
+- **Requires**：输入是F3导出的exact frozen set；versions为1，definitions/fieldSets/source/control tuple identity、cardinality、order、disjoint/exhaustive均与F3一致；不得接受structural lookalike、caller-provided digest或generic domain string。
+- **Ensures**：返回值是fresh frozen enriched object，保留输入全部raw field values以及`definitions/fieldSets/sourceEntries/controlEntries`的member identities/order，并只附加`sourceAllowedEventSetDigest:SourceAllowedEventSetDigest`和`controlAllowedEventSetDigest:ControlAllowedEventSetDigest`；两个digest分别由existing domains `source-allowed-event-set-v1`与`control-allowed-event-set-v1`构造，不新增第26个domain。
+- **Invariants**：raw/enriched membership完全相同；source/control digest不可互换；schema package不依赖本callable；所有downstream membership/digest consumer使用同一enriched value。
+- **副作用**：仅在LLM module initialization构造canonical inputs、计算pure digest并freeze内存对象；不注册bus、不持久化、不publish。
+- **实现步骤 / intermediate facts**：
+  1. 将输入的top-level与definitions/fieldSets/source/control member identities逐项比较schema导出的F3 owner-held frozen singleton，并以F4/cardinality/order guards复核，得到I1 exact F3 set；任一structural lookalike或identity mismatch均typed退出。
+  2. 从I1固定source tuple调用B24，得I2 source input；从固定control tuple调用B25，得I3 control input。
+  3. 分别调用F17/F21，得I4/I5两个domain-separated branded digests；任一失败不返回partial registry。
+  4. 以fresh allowlisted object复制raw fields、附加I4/I5并freeze；不得spread caller extra fields。
+- **分支/退出**：lookalike/stale/version/cardinality/field-set/canonical/hash failure均typed退出；成功单一路径。
+- **正确性论证**：I1固定membership；B24/B25+F17/F21保证digest分别绑定同一versions、tuple和recursive exact fields；步骤4只附加这两项，故Ensures成立且无duplicate canonical owner。
+- **副作用论证**：所有callee为pure `ContractResult`；只分配/冻结内存对象，副作用为空且穷尽。
 
 #### 5.1.4 F4 `validateExactFieldSet(value, specification, path="$" ) -> void`
 
@@ -3020,15 +3044,16 @@ export function partitionDefinitionsByPublication<D extends Definition>(
 
 #### 5.1.5 F5 `decodeRecoveryDurableRow(input) -> DecodedRecoveryOperation`
 
+- **Package owner**：`@opencode-ai/llm`；只向下依赖schema raw definitions/codecs与E1 enriched registry。
 - **功能描述**：从raw EventTable row与显式M4 owner-mapping proof严格解析known recovery base type/version/envelope/field set；unknown version fail closed。
-- **调用关系**：callers: M4 reader/rebuilder；callees仅为versioned type parser、F3 registry、Effect Schema decode、F4、F22与structural equality；**不调用M4/store**。
+- **调用关系**：callers: M4 reader/rebuilder；callees仅为versioned type parser、E1 enriched registry、Effect Schema decode、F4、F22与structural equality；**不调用M4/store**。
 - **Requires**：`input.row`提供id/type/aggregateID/seq/data且seq为DB读取值；`input.ownerProof`由M4在同一read authority scope内完成一对一owner-index lookup后构造，brand与lifecycle由M4拥有。
 - **Ensures**：成功返回已验证operation且event type/version/fieldSet/payloadDigest一致，输出owner精确来自proof；unknown/malformed/owner mismatch不返回部分operation。
 - **Invariants**：不读取owner mapping、materialization或public projection补字段；M1不能构造/refresh owner proof。
 - **副作用**：无；只读两个显式输入并pure compare。
 - **实现步骤**：
   1. 解析stored type最后一个`.`后的十进制version；无version、非safe positive integer→decode error。
-  2. 查F3 durable registry的exact versioned key；未找到时区分：known recovery base+unknown version→`unknown-event-version`；未知`session.recovery.*`→`unknown-event-type`；非recovery row→`not-recovery-event`供caller过滤。
+  2. 查E1 enriched registry的exact versioned key；未找到时区分：known recovery base+unknown version→`unknown-event-version`；未知`session.recovery.*`→`unknown-event-type`；非recovery row→`not-recovery-event`供caller过滤。
   3. 调用definition data codec；依赖codec post为typed shape，但尚不信任extra key。
   4. 调F4验证event data与operation envelope exact field set。
   5. F4验证`ownerProof` exact且owner/mapping literals固定；校验definition durable selector确为`aggregateID`，并要求`row.aggregateID==envelope.aggregateID==ownerProof.aggregate.aggregateID`、payload内所有sessionID等于`ownerProof.aggregate.sessionID`、row seq等于envelope.aggregateSequence。不得读取M4 mapping或以payload.sessionID选择aggregate。
@@ -3037,39 +3062,41 @@ export function partitionDefinitionsByPublication<D extends Definition>(
   8. 校验event type、operationType、payload discriminator、registry field-set ref一一对应。
   9. 返回decoded operation及已验证raw row sequence。
 - **分支/退出**：非recovery可由caller显式忽略；任何unknown recovery version/type、codec、field-set、aggregate、digest、discriminator mismatch均authority-invalid失败。
-- **callee引用**：F3 guarantees registry唯一；F4 guarantees exact fields；F22 guarantees digest对应canonical payload。
+- **callee引用**：F3 guarantees raw definition set唯一，E1 guarantees enriched registry唯一；F4 guarantees exact fields；F22 guarantees digest对应canonical payload。
 - **正确性论证**：前置row字段可读且M4已产出同scope owner proof；步骤1–4得到中间事实I1（known definition + recursive exact fields）；步骤5只比较显式proof并得到I2（row/envelope/owner/session/sequence一致）；步骤6得到I3（payload membership与commitment一致）；步骤7得到I4（previous head、sequence与公式计算的next digest一致）；步骤8得到I5（event/type/schema registry一致）。I1∧I2∧I3∧I4∧I5推出成功结果可作为raw authority decode输入。后置为完整decoded operation，无partial authority。
 - **副作用论证**：version parse、schema decode、F4/F22与proof equality均为纯读取/计算；签名没有M4/store capability，函数不写row、registry、DB或日志，副作用为空且穷尽。
 
 #### 5.1.6 F6 `decodeRecoverySourceFieldSet(events, sourceAssistantID, highWater) -> RecoverySourceVersion`
 
+- **Package owner**：`@opencode-ai/llm`；与F5共用E1 enriched registry，不向schema反向暴露canonical runtime callable。
 - **功能描述**：从已decode raw prefix提取版本化source facts并冻结source version。
 - **调用关系**：callers: M4 snapshot/rebuilder；callees: F5、F4、F16、F17、对应payload builders、F21/F22。
 - **Requires**：events按aggregate seq升序覆盖0..highWater；每项来自F5或已具有等价post。
 - **Ensures**：成功返回完整event-chain/facts digest/field sets；普通control事件不进入facts digest；未知/gap/duplicate/conflict失败。
 - **Invariants**：只选择指定source assistant的source set；source/control互斥。
 - **副作用**：无。
-- **实现步骤 / intermediate facts**：校验sequence从0连续并逐event复核F5 nextDigest，得到I1完整aggregate chain；按F3 membership分支：source且属于assistant→验证并纳入facts，source属于其它assistant/control/ordinary event只纳入aggregate chain；对tool/reasoning/prefix source fact要求authoritative class、reconstructible carrier与对应owner commitment；inline carrier在此strict decode/re-encode，sealed carrier验证exact ref/purpose/scope/commitment shape且保留给M4 snapshot materialization（不得在F6内unseal）；两branch都从secret-safe carrier projection调用owner builder/F22，得到I2 source-bound payload carrier+commitment；fold并检测冲突，得到I3唯一source facts；从F3复制而非caller提供`eventTypeSetVersion/fieldSetRegistryVersion/sourceAllowedEventSetDigest`，按registry tuple排序field-set refs，得到I4 registry-bound membership；构造`SourceFactsDigestInputV1`计算`SourceFactsDigest`，再构造`RecoverySourceVersionDigestInputV1`计算`versionDigest`，得到I5两个branded commitments；组装并F4复检后返回。
+- **实现步骤 / intermediate facts**：校验sequence从0连续并逐event复核F5 nextDigest，得到I1完整aggregate chain；按E1 enriched registry membership分支：source且属于assistant→验证并纳入facts，source属于其它assistant/control/ordinary event只纳入aggregate chain；对tool/reasoning/prefix source fact要求authoritative class、reconstructible carrier与对应owner commitment；inline carrier在此strict decode/re-encode，sealed carrier验证exact ref/purpose/scope/commitment shape且保留给M4 snapshot materialization（不得在F6内unseal）；两branch都从secret-safe carrier projection调用owner builder/F22，得到I2 source-bound payload carrier+commitment；fold并检测冲突，得到I3唯一source facts；从E1 enriched registry复制而非caller提供`eventTypeSetVersion/fieldSetRegistryVersion/sourceAllowedEventSetDigest`，按registry tuple排序field-set refs，得到I4 registry-bound membership；构造`SourceFactsDigestInputV1`计算`SourceFactsDigest`，再构造`RecoverySourceVersionDigestInputV1`计算`versionDigest`，得到I5两个branded commitments；组装并F4复检后返回。
 - **分支/退出**：gap/duplicate、多个terminal、dispatch gap、同fact冲突、compatibility tool混入raw source、payload carrier missing/unreadable/noncanonical、commitment mismatch、未知版本、secret marker均失败。
 - **循环**：不变量为已处理prefix连续、chain digest对应该prefix、facts仅来自source；每轮消费一项，有限数组终止。
 - **callee引用**：F5 ensures每event exact；F16只验证sealed ref structural/purpose/scope；F17 canonical bytes稳定；payload builders/F22验证两类carrier projection的owner commitment；F21 SHA-256 envelope正确。
 - **正确性论证**：前置为0..highWater exact prefix；I1保证aggregate chain完整，I2保证Continue所需carrier与owner commitment属于同一source fact（sealed actual material validation由snapshot boundary追加），I3保证facts仅属于指定committed source且无冲突，I4保证event/field-set version与source allowed-set commitment冻结，I5保证facts与source version不可被其它domain digest替换；五项合取推出Ensures。后置是完整`RecoverySourceVersion`，unknown/gap/conflict/payload loss无返回值。
-- **副作用论证**：只读event array与frozen F3 registry并执行纯fold/canonical/hash；不写event、snapshot或DB，副作用为空且穷尽。
+- **副作用论证**：只读event array与frozen E1 enriched registry并执行纯fold/canonical/hash；不写event、snapshot或DB，副作用为空且穷尽。
 
 #### 5.1.7 F7 `decodeRecoveryControlTail(events, sourceVersion) -> RecoveryControlTailVersion`
 
+- **Package owner**：`@opencode-ai/llm`；与F5/F6共用E1 enriched registry。
 - **功能描述**：验证source high-water之后的exact control range，不允许普通或source语义混入旧binding。
-- **调用关系**：callers: M4 snapshot/re-entry、M6 composite recheck；callees: F5、F3 membership、F17/F21。
+- **调用关系**：callers: M4 snapshot/re-entry、M6 composite recheck；callees: F5、E1 enriched registry membership、F17/F21。
 - **Requires**：events按seq覆盖`source.highWater+1..currentHighWater`，可为空。
 - **Ensures**：空tail产生固定empty genesis；非空只含allowed control set且hash/count/range exact。
 - **Invariants**：任何普通input/config/history/tool/source event都使旧binding stale/invalid，而非被忽略。
 - **副作用**：无。
-- **实现步骤 / intermediate facts**：先验证source version的registry versions/source allowed digest/versionDigest，得到I1可信source boundary；若空，令`emptyTailGenesis=tailHash=previousSourceHead`（空fold identity），得到I2 empty exact range；若非空，校验第一seq=highWater+1及连续，逐项要求F5成功且membership=control，得到I3 exact control range；两分支均从F3复制control event/field registry versions与`ControlAllowedEventSetDigest`、按registry顺序收集field refs，得到I4；构造`RecoveryControlTailDigestInputV1`计算`versionDigest`并F4复检，得到I5后返回。
+- **实现步骤 / intermediate facts**：先验证source version的registry versions/source allowed digest/versionDigest，得到I1可信source boundary；若空，令`emptyTailGenesis=tailHash=previousSourceHead`（空fold identity），得到I2 empty exact range；若非空，校验第一seq=highWater+1及连续，逐项要求F5成功且membership=control，得到I3 exact control range；两分支均从E1 enriched registry复制control event/field registry versions与`ControlAllowedEventSetDigest`、按registry顺序收集field refs，得到I4；构造`RecoveryControlTailDigestInputV1`计算`versionDigest`并F4复检，得到I5后返回。
 - **分支/退出**：空正常；非空allowed正常；gap/duplicate/source/ordinary/unknown/mismatched assistant失败。
 - **循环**：每轮消费一event，有限终止；不变量为已处理tail连续且仅control。
-- **callee引用**：F5/F3 post同上；F21保证hash。
+- **callee引用**：F5/E1 post同上；F21保证hash。
 - **正确性论证**：I1固定source边界；empty分支I2或nonempty分支I3恰覆盖全部输入；I4绑定control allowed set与field-set registry；I5绑定最终tail fields。故成功返回值代表exact tail，普通/source/unknown event不能被忽略，满足stale detection post。
-- **副作用论证**：函数只读输入与F3 registry并计算commitments；无持久化/publication/repair，副作用为空且穷尽。
+- **副作用论证**：函数只读输入与E1 enriched registry并计算commitments；无持久化/publication/repair，副作用为空且穷尽。
 
 #### 5.1.8 F8 `decodeLegacyRecoveryEvidence(rowSet) -> LegacyCompatibilityEvidence`
 
@@ -3269,7 +3296,7 @@ export function partitionDefinitionsByPublication<D extends Definition>(
 #### 5.3.5 F21 `digestCanonicalCommitment(spec, input) -> OutputOf<typeof spec>`
 
 - **功能描述**：为§4.1.3 closed registry中的全部25个domain计算versioned SHA-256 envelope并施加非可替换brand；semantic/prepared/binding仍是其中三项。
-- **调用关系**：callers: F3/F5–F7/F13/F18–F20、M2/M4/M5/M7；callees: F17（exact canonical bytes）、SHA-256 primitive、hex encoder、spec.brandDigest。
+- **调用关系**：callers: E1/F5–F7/F13/F18–F20、M2/M4/M5/M7；callees: F17（exact canonical bytes）、SHA-256 primitive、hex encoder、spec.brandDigest。
 - **Requires**：spec object identity来自frozen registry；input来自同spec `buildInput`成功post；credential/sealed/paused的raw secret不走本函数，sealed/paused input只含keyed builder产生的非secret描述。
 - **Ensures**：返回`version:1/algorithm:"sha256"/encoding:"recovery-canonical-json"/64-lowerhex`及spec-specific brand；相同spec+input相同digest，不同domain不能在typed API替换。
 - **Invariants**：完整SHA-256 32 bytes，不截断；brand只在digest成功与F4 envelope复检后施加。
@@ -3431,13 +3458,13 @@ export function decodeRecoveryPublicProjection(
 
 #### 5.5.1 F31 `assembleEventManifests(allDefinitions) -> EventManifestSet`
 
-- **功能描述**：生成exact `PublicEventManifestV1`、`PublicDurableEventManifestV1`、internal runtime recovery registry与trusted private all-durable replay registry。
-- **调用关系**：callers: schema manifest modules、core public manifest、trusted M4 replay registry；callees: F2、`Event.latest`、`Event.durable`、public/private brand constructors。
-- **Requires**：allDefinitions含F3 recovery definitions及现有definitions；现有未标publication的definitions经F1 default为public；brand constructors只接受F1 definition与F2分区事实。
-- **Ensures**：`result.publicDefinitions/publicLatest/publicServer`与`result.publicDurable.definitions`只含`publication:"public"` branded definitions；`result.durableReplay.definitions`的nominal type是`TrustedPrivateDurableReplayManifestV1`，精确含allDefinitions中全部durable definitions，允许internal但不导出public barrel；`result.internalRuntime`精确含10个F3 definitions。public manifest/listener/subscription/cursor/read-error/service type中不存在internal recovery variant。既有generic public EventTable definition/writer继续使用自身aggregate selector/schema，不被F3要求迁移为`RecoveryOperationEnvelope`或增加recovery chain字段；只有recovery/sealed aggregate definitions进入mandatory authority-chain assertion。
-- **Invariants**：public surface只由`publication:"public"` metadata和F2 proof构造brand，不由type prefix猜测；trusted private set与public durable set不可互相赋值。
-- **副作用**：模块初始化frozen arrays/maps/codecs；无event publication或DB读写。
-- **实现步骤**：1) F2分区；2) 仅对public partition逐项检查literal publication并brand为`PublicEventDefinitionV1`；3) 从该public branded array构造Latest/Server，并只过滤其中durable项、验证selector/version后brand为`PublicDurableEventDefinitionV1`并构造public durable codec；4) 从allDefinitions过滤全部durable项、保留其public/internal literal并brand为`TrustedPrivateDurableReplayDefinitionV1`，以versioned key构造private replay map；5) 从internal partition exact抽取F3 10项构造`internalRuntime`；6) 断言每个internal key不在public maps/public codecs，每个public durable key也存在private set，F3 10项只存在于internal/private对应集合；7) freeze并返回exact `EventManifestSet`。
+- **功能描述**：生成exact `PublicEventManifestV1`、`PublicDurableEventManifestV1`、internal runtime recovery definition map与trusted private all-durable replay registry；不计算canonical digest。
+- **调用关系**：callers: schema manifest modules、core public manifest、trusted M4 replay registry；callees: F2、schema-owned F3 raw definition set、`Event.latest`、`Event.durable`、public/private brand constructors。明确不调用E1/F17/F21。
+- **Requires**：allDefinitions含与F3 `RecoveryEventDefinitionSetV1.definitions` identity/order一致的10个recovery definitions及现有definitions；现有未标publication的definitions经F1 default为public；brand constructors只接受F1 definition与F2分区事实。
+- **Ensures**：`result.publicDefinitions/publicLatest/publicServer`与`result.publicDurable.definitions`只含`publication:"public"` branded definitions；`result.durableReplay.definitions`的nominal type是`TrustedPrivateDurableReplayManifestV1`，精确含allDefinitions中全部durable definitions，允许internal但不导出public barrel；`result.internalRuntime`精确含raw set的10个definitions且无allowed-set digest依赖。public manifest/listener/subscription/cursor/read-error/service type中不存在internal recovery variant。既有generic public EventTable definition/writer继续使用自身aggregate selector/schema，不被F3要求迁移为`RecoveryOperationEnvelope`或增加recovery chain字段；只有recovery/sealed aggregate definitions进入mandatory authority-chain assertion。
+- **Invariants**：public surface只由`publication:"public"` metadata和F2 proof构造brand，不由type prefix猜测；trusted private set与public durable set不可互相赋值；manifest assembly对E1 enriched registry零依赖。
+- **副作用**：schema模块初始化frozen arrays/maps/codecs；无hash、event publication或DB读写。
+- **实现步骤**：1) F2分区；2) 仅对public partition逐项检查literal publication并brand为`PublicEventDefinitionV1`；3) 从该public branded array构造Latest/Server，并只过滤其中durable项、验证selector/version后brand为`PublicDurableEventDefinitionV1`并构造public durable codec；4) 从allDefinitions过滤全部durable项、保留其public/internal literal并brand为`TrustedPrivateDurableReplayDefinitionV1`，以versioned key构造private replay map；5) 按definition identity/order从internal partition exact匹配F3 raw set的10项构造`internalRuntime`；6) 断言每个internal key不在public maps/public codecs，每个public durable key也存在private set，raw 10项只存在于internal/private对应集合；7) freeze并返回exact `EventManifestSet`。
 - **分支/退出**：duplicate latest/versioned key、unknown publication、brand precondition failure、internal public leak、missing private durable、private/public set equality误用、public codec可decode internal任一情况均初始化失败且不返回partial set。
 - **循环**：有限registry cross-check，终止。
 - **callee引用**：F2分区post保证互斥完备；`Event.latest`只接收public branded definitions；`Event.durable`分别对public-only与trusted-all输入构造不同map，返回值必须立即包入对应nominal type，禁止共享unbranded alias。
@@ -3454,6 +3481,7 @@ export function decodeRecoveryPublicProjection(
 | available/opaque evidence | M2/M4/M5 | provider hit=0、handle commitment已生成 | opaque无proof，available字段完整 | 从opaque升级available |
 | tool partition/phase/replay payload | M3/M4/M5/M7 | 同一snapshot收集全部authoritative+compatibility facts；payload inline或exact sealed ref；phase literal durable | four-way partition total/disjoint；SafeRetry仅truly-empty，Continue仅authoritative-only/all-final；arguments/result/error可重建且commitment可重算 | 省略compatibility、digest反推payload、重跑uncertain body/after-hook、M1自造M4 nominal proof |
 | provenance | M3/M4/M7 | durable source facts与reasoning content carrier | missing/forced/unknown保留；provider-end Continue content可重建并commit | metadata presence当provider-end或只存text digest |
+| raw event definition set / enriched registry | schema manifests/F31；LLM E1；M4/F5–F7 | schema consumers只用F3 raw definitions；E1只接收exact frozen `RecoveryEventDefinitionSetV1`；M4 decode使用enriched registry | raw set固定10 definitions/specs/7+3 tuples且无digest；enriched registry只附existing source/control digest brands，membership/order不变 | schema import LLM、manifest依赖digest、caller lookalike set、第二canonicalizer或generic domain builder |
 | source/control decode | M4/M6 | raw sequence exact；sealed payload material显式验证 | unknown/gap/extra/payload loss fail closed | public projection/current history补字段或内容 |
 | sealed-use lease key | M4/M2/M7 | 使用M1 exact structural input；M4拥有generation与nominal lease | ref/scope/purpose/material/handle/source/action/operation/session identity不可拆分 | M1持有lease registry/proof brand或把raw secret/handle写入key |
 | planned/admission/proposal | M2/M5/M6 | 来源分离；runtime available为`{descriptor,pausedHandle}`；manual提供canonical causes/planning/closure/handle-close evidence | PreparedDigest dispatch-kind branch exact；automatic/manual binding membership固定且manual不需available material；closure绑定snapshot payload carriers | 把pausedHandle塞入descriptor、proposal当authority、给manual虚构target/digests或从digest/history重建ModelMessage |
@@ -3471,7 +3499,7 @@ export function decodeRecoveryPublicProjection(
 |---|---|---|---|---|---|
 | M1-T01 | `packages/schema/test/recovery-contract.test.ts` | §4全部codec | 每个union合法最小/完整值 | round-trip保持discriminator、optional omission与brands | [F — planned; not created; not run] |
 | M1-T02 | 同上 | F4 | missing/extra/null/wrong discriminator/nested extra | 每个path typed failure；输入不被strip | [F — planned; not created; not run] |
-| M1-T03 | `packages/schema/test/recovery-event-manifest.test.ts` | F1–F3/F31 | 10个type-indexed recovery definitions、generic public durable definitions | recovery全部internal+durable且selector=`aggregateID`；public Latest/Server/OpenAPI source为0项 recovery event；public brands只能由`publication:"public"`构造；generic public aggregates无需recovery envelope/chain migration | [F — planned; not created; not run] |
+| M1-T03 | `packages/schema/test/recovery-event-manifest.test.ts` | F1–F3/F31 | schema-owned raw `RecoveryEventDefinitionSetV1`、10个type-indexed recovery definitions、generic public durable definitions | raw set精确10/7+3且无digest字段、recovery全部internal+durable且selector=`aggregateID`；schema package零LLM import；public Latest/Server/OpenAPI source为0项 recovery event；generic public aggregates无需recovery envelope/chain migration | [F — planned; not created; not run] |
 | M1-T04 | `packages/core/test/event.test.ts`（M4协作） | public carriers/service vs trusted private replay | publish/read/replay each internal definition及generic public durable definition | internal raw只可由trusted private durable replay读取；listen/all/typed/public durable/readAggregate/bridge/sync/SSE/SDK均0 notification/0 decode；private manifest不能赋给public surface；public cursor/error无authority字段 | [F — planned; not created; not run] |
 | M1-T04a | `packages/schema/test/recovery-public-event-types.test-d.ts` | §4.5.1a/F2/F31 nominal closure | internal definition/payload、trusted private manifest、arbitrary aggregate cursor的compile fixtures | 均不能构造`PublicEventDefinitionV1`/`PublicCommittedEventV1`/`PublicEventCursorV1`或进入`PublicEventServiceV1`；public definitions可通过owner constructors | [F — planned; not created; not run] |
 | M1-T04b | `packages/core/test/recovery-snapshot.test.ts`（M4协作） | `RecoveryAssistantPublicMappingV1` | same-WAL mapping、absent、duplicate、wrong-role、source high-water/digest/control-tail/latest-decision revision变化 | same snapshot mapping可lookup；其余分别closed absent/ambiguous/wrong-role/stale，不cast internal ID、不使用display ID/history猜测 | [F — planned; not created; not run] |
@@ -3487,19 +3515,19 @@ export function decodeRecoveryPublicProjection(
 | M1-T14 | 同上 | F10–F12 | URL大小写/default port/trailing slash/query/userinfo、authority/model scopes | canonical target稳定；domain membership仅结构完全匹配 | [F — planned; not created; not run] |
 | M1-T15 | `packages/core/test/config/config.test.ts` | external codec/F13 | nested `experimental.session_recovery.max_incomplete_recoveries/max_model_assistants` absent/0/1/2/64；camelCase/unknown leaf；agent.steps；negative/float/-0/unsafe/string/null | exact snake_case decode；omitted/default2/64 deterministic mapping与canonical omission；safe-integer refinement；effective min；alias/非法拒绝不clamp | [F — planned; not created; not run] |
 | M1-T16 | `packages/schema/test/recovery-old-row.test.ts` | F8/F14/F15 | 当前Legacy rows含0/1/N tool parts且缺providerExecuted/provenance/ledger；兼容payload完整/缺失 | 每个observed tool part均保留为compatibility-only且ordinal稳定；eligible=false；unknown保留；无available proof；非空compatibility不得投影成truly-empty | [F — planned; not created; not run] |
-| M1-T17 | 同上 | F5–F7 | known v1+M4 owner proof、unknown v2、unknown event type、gap/duplicate/extra field、owner proof missing/aggregate/session mismatch/forged brand | known+matching proof成功；其余authority-invalid；F5 M4/store调用计数=0且不downgrade | [F — planned; not created; not run] |
+| M1-T17 | `packages/llm/test/recovery-event-decode.test.ts` | F5–F7 | known v1+M4 owner proof、unknown v2、unknown event type、gap/duplicate/extra field、owner proof missing/aggregate/session mismatch/forged brand | known+matching proof成功；其余authority-invalid；F5 M4/store调用计数=0且不downgrade | [F — planned; not created; not run] |
 | M1-T18 | 同上 | source/control sets | 普通input/tool/source event混入tail、atomic child control | 非allowed全部stale/invalid；control exact通过 | [F — planned; not created; not run] |
-| M1-T19 | 同上 | F23 | 24 causes逆序、重复、空、malformed、unsafe-cast runtime unknown discriminator | 合法输出固定24顺序子序列、dedup、nonempty；empty/malformed/runtime unknown均`ok:true ["internal-classification-failure"]`且不throw；compile-time `never` exhaustiveness仍成立 | [F — planned; not created; not run] |
+| M1-T19 | `packages/llm/test/recovery-contract-validation.test.ts` | F23 | 24 causes逆序、重复、空、malformed、unsafe-cast runtime unknown discriminator | 合法输出固定24顺序子序列、dedup、nonempty；empty/malformed/runtime unknown均`ok:true ["internal-classification-failure"]`且不throw；compile-time `never` exhaustiveness仍成立 | [F — planned; not created; not run] |
 | M1-T20 | 同上 | F24/F25 | automatic/manual/superseded lifecycle矩阵；manual binding missing；superseded误用BindingDigest或缺supersession input/digest | 仅批准组合通过；manual binding mandatory；superseded只接受SupersessionBindingDigest；active-without-child无法表示 | [F — planned; not created; not run] |
 | M1-T21 | 同上 | F26/F27/`RecoveryOperationLookupKeyV1` | receipt跨handle/target/digest/context、historical policy quartet mismatch、目标stored sequence partial post-state、目标sequence heads与later current heads不同、current full-prefix corruption、同operationID跨aggregate/type collision | 目标sequence mismatch全部拒绝；合法历史receipt不因later head/policy变化失效；独立current full-prefix/head corruption检查拒绝；lookup必须session+aggregate+operation+expected kind exact，operationID-only拒绝；exact replay receipt通过 | [F — planned; not created; not run] |
 | M1-T22 | `packages/schema/test/recovery-public-projection.test.ts` | F28–F30 | safe optional字段、unknown enum/version、每个forbidden authority字段/shape | safe round-trip；unknown enum→unknown；unknown version omit/error；泄漏全部拒绝 | [F — planned; not created; not run] |
 | M1-T23 | `packages/schema/test/compatibility.test.ts` | Legacy V1/current assistant optional projection | old payload无recovery、新payload有V1、old decoder fixture | omission向后兼容；既有UnknownError discriminator/message字段不变 | [F — planned; not created; not run] |
 | M1-T24 | `packages/llm/test/exports.test.ts`、`packages/core/test/shared-schema.test.ts` | 单一export/依赖方向 | schema/llm/core import graph | 无循环、无第二套recovery union，Native V2/shared compile regression通过 | [F — planned; not created; not run] |
 | M1-T25 | `packages/llm/test/recovery-capability.test.ts` | §4.4.4、§4.6.1、F16a/F19 | Anthropic server/hosted、OpenAI store=true hosted、OpenAI store=false encrypted reasoning，以及未来supported descriptor | 本release均保留typed field并返回typed-unavailable；不得omit或进入available closure；未来descriptor version路径可表达但默认不启用 | [F — planned; not created; not run] |
-| M1-T26 | `packages/llm/test/recovery-canonical-registry.test.ts` | §4.1.3、F17/F21/F22 | 25个registry specs（含supersession binding与authorization/control/tool/reasoning/prefix等）、每项builder最小/完整input、model/no-reply supersession branches、forged domain/spec、cross-brand substitution、safe integer/decimal/-0 | registry cardinality精确25且每个normative brand有唯一constructible builder；supersession input只含durable source/control+pre-prepare facts、两branch可从type10 raw完整重算且不可替代BindingDigest/完整type1 payload digest；逐项domain/vector/brand exact；forged/cross-brand/decimal/-0拒绝 | [F — planned; not created; not run] |
-| M1-T27 | `packages/schema/test/recovery-operation-schema.test.ts` | §4.8.1–§4.8.3、F5/F20 | 10个operation最小/完整payload；type1 aggregate genesis/current-event两branch、post-type10 exact predecessor、assistant/dispatch genesis、Legacy user predecessor/assistant info；type10 model/no-reply完整supersessionBindingInput（含submissionPayloadDigest）/digest；type8 manual available/unavailable planning与no-handle/cancelled proof commitment；ops 8–10 decision material；payload/reservation/nextDigest向量 | type1始终model-lineage genesis但仅首aggregate op使用aggregate genesis；model supersession input/digest与later完整type1 payload digest分别验证；仅存digest/opID或丢submissionPayloadDigest拒绝；no-reply input/digest可重算且无reservation/type1；type8在无target/semantic/prepared digest时仍可从raw branch重建，automatic-only字段为extra；8–10 record可仅从raw+envelope确定重建；schema/event/digest bit-exact | [F — planned; not created; not run] |
-| M1-T28 | 同上 | §4.5.1–§4.5.4、F3/F6/F7 | event-type/field-set registry version变化、source/control allowed digest互换 | 任一version/digest变化fail closed；source/control brands不可替换 | [F — planned; not created; not run] |
-| M1-T29 | `packages/schema/test/recovery-identity-receipt.test.ts` | §4.2、§4.7.3、F26/F27 | candidate cast、transaction-local `deriveCommittedIdentity`、rollback/commit/read-back、closed `AuthorityReceiptV1`与`ReceiptForV1<T>`、ephemeral applyMode、initial/ordinary/subsequent/automatic operation post-state | derived值在commit前不可作为authority；commit/read-back才brand；immutable receipt无apply mode/materialization status；applyMode只在`OperationCommitResultV1<T>`；receipt逐raw/policy/head/N/M验证，partial拒绝 | [F — planned; not created; not run] |
+| M1-T26 | `packages/llm/test/recovery-canonical-registry.test.ts` | §4.1.3、E1、F17/F21/F22 | exact F3 frozen definition set、25个registry specs（含supersession binding与authorization/control/tool/reasoning/prefix等）、每项builder最小/完整input、model/no-reply supersession branches、forged domain/spec、cross-brand substitution、safe integer/decimal/-0 | registry cardinality精确25且每个normative brand有唯一constructible builder；supersession input只含durable source/control+pre-prepare facts、两branch可从type10 raw完整重算且不可替代BindingDigest/完整type1 payload digest；逐项domain/vector/brand exact；forged/cross-brand/decimal/-0拒绝 | [F — planned; not created; not run] |
+| M1-T27 | `packages/llm/test/recovery-operation-schema.test.ts` | §4.8.1–§4.8.3、F5/F20 | 10个operation最小/完整payload；type1 aggregate genesis/current-event两branch、post-type10 exact predecessor、assistant/dispatch genesis、Legacy user predecessor/assistant info；type10 model/no-reply完整supersessionBindingInput（含submissionPayloadDigest）/digest；type8 manual available/unavailable planning与no-handle/cancelled proof commitment；ops 8–10 decision material；payload/reservation/nextDigest向量 | type1始终model-lineage genesis但仅首aggregate op使用aggregate genesis；model supersession input/digest与later完整type1 payload digest分别验证；仅存digest/opID或丢submissionPayloadDigest拒绝；no-reply input/digest可重算且无reservation/type1；type8在无target/semantic/prepared digest时仍可从raw branch重建，automatic-only字段为extra；8–10 record可仅从raw+envelope确定重建；schema/event/digest bit-exact | [F — planned; not created; not run] |
+| M1-T28 | 同上 | §4.5.1–§4.5.4、F3/E1/F6/F7 | raw-set lookalike、event-type/field-set registry version变化、source/control allowed digest互换 | E1拒绝非exact frozen set；任一version/digest变化fail closed；source/control brands不可替换 | [F — planned; not created; not run] |
+| M1-T29 | `packages/llm/test/recovery-identity-receipt.test.ts` | §4.2、§4.7.3、F26/F27 | candidate cast、transaction-local `deriveCommittedIdentity`、rollback/commit/read-back、closed `AuthorityReceiptV1`与`ReceiptForV1<T>`、ephemeral applyMode、initial/ordinary/subsequent/automatic operation post-state | derived值在commit前不可作为authority；commit/read-back才brand；immutable receipt无apply mode/materialization status；applyMode只在`OperationCommitResultV1<T>`；receipt逐raw/policy/head/N/M验证，partial拒绝 | [F — planned; not created; not run] |
 | M1-T30 | `packages/llm/test/recovery-secret-commitment.test.ts` | §4.3.1/§4.3.4、F10/F15/F16/F18/F19 | provider non-secret version ID、vault HMAC、raw credential SHA、低熵material字典、structurally valid但无M4 lookup proof的ref、proof ref/scope/key mismatch、伪造proof brand | F16只给structural success且零store call；只有M4-produced registered-readable proof与ref逐字段equal时later M1 comparison通过；raw SHA/低熵unkeyed/missing或伪造proof拒绝；M1调用M4/store计数为0 | [F — planned; not created; not run] |
 | M1-T31 | `packages/core/test/recovery-policy.test.ts` | §4.6.3–§4.6.4、F13/F20/F26/F27 | absent N/M vs explicit 2/64、provenance变化、scopeKey/epoch/policyDigest/defaultSemanticsVersion变化、first application current policy变化、exact replay later policy变化 | 同值default/explicit policyDigest相等而provenance不同；quartet任一变化使binding/control proof不等；first application stale拒绝；exact replay按stored historical policy通过 | [F — planned; not created; not run] |
 | M1-T32 | `packages/schema/test/recovery-public-projection.test.ts` | §4.7.4、F28–F30 | M8尝试传authority、display ID非法/跨session、known/unsupported/malformed | 仅M4调用F28；M8只decode/assert；display ID非authority且三result精确区分 | [F — planned; not created; not run] |
@@ -3516,15 +3544,14 @@ export function decodeRecoveryPublicProjection(
 
 ### 8.1 Workflow §4.3.1 六条
 
-以下设计自检已由stable-snapshot independent design audit逐项复核并达到`0 P0 / 0 P1`，因此design-contract条目标为checked。用户批准、Step 0 expectations、implementation与future tests仍是独立后续gate，不因本节勾选而完成。
+原stable snapshot与D0 changed snapshot均已由independent reviewer复核并达到`0 P0 / 0 P1`。以下六条已按D0 F3/E1/F31 call graph重新签结；用户批准与Step 0已完成，但implementation/future tests仍是独立后续gate。
 
-- [x] 推导连续：F1–F31/F16a均有pre→编号/有序intermediate facts→post；不存在“调用后直接返回”的authority跳步。
-- [x] 分支覆盖：publication、public/private durable sets、public event known/unsupported/malformed/read-error、10 operation/version、type1 aggregate-genesis/current-head、type10 model/no-reply、source/control、storage、target/domain、tool四authority partitions、五execution phases、inline/sealed replay payload、result/error、reasoning/prefix、sealed-use key、25 canonical domains、proposal/record、closed `AuthorityReceiptV1`与SafeRetry mapping absent/ambiguous/wrong-role/stale均closed。
-- [x] 退出覆盖：成功、typed decode/normalization/canonical/digest/public failure与callee异常转换均有退出；无partial brand/receipt/projection或silent downgrade。
-- [x] callee契约引用：所有non-trivial F在§5.0及自身子节列出exact callee pre/post；F9/F12明确为trivial。
-- [x] 循环刻画：F2/F3/F4/F6/F7/F14/F15/F16a/F17/F18/F23/F29/F31的有限循环/递归均有终止依据与必要不变量。
-- [x] 显式假设链：final-transform、provider hits=0、raw sequence/formula exact、registry identity、source/planned/admission分离、transaction-local derive→M4 commit/read-back authority boundary、old-row/public非authority均显式。
-- [x] 副作用穷尽：每个non-trivial F的写入callee与外部状态影响在§5.0/函数段列尽；F28已恢复为pure projector，display mapping allocation/reuse只属于M4 transaction/rebuilder；M1 side effect仅registry module freeze。
+- [x] 推导连续：F1–F31/F16a与additional E1均有pre→编号/有序intermediate facts→post；F3 raw construction→E1 enrichment→F5–F7/M4 consumption连续且无反向dependency。
+- [x] 分支覆盖：publication、raw/enriched registry identity、public/private durable sets、public event known/unsupported/malformed/read-error、10 operation/version、source/control以及其余既有closed branches均覆盖。
+- [x] 退出覆盖：F3 schema/cardinality failure、E1 lookalike/field/canonical/digest failure、F31 manifest isolation failure与既有typed exits均无partial export或silent downgrade。
+- [x] callee契约引用：F3只引用F1/F2/F4；E1只引用F4/B24/B25/F17/F21；F31只引用F2/F3 raw set/Event helpers，不调用E1/F17/F21；其它non-trivial callables保持exact pre/post。
+- [x] 循环刻画：F2/F3/E1/F4/F6/F7/F14/F15/F16a/F17/F18/F23/F29/F31的有限循环/递归均有终止依据与必要不变量。
+- [x] 显式假设链与副作用穷尽：exact frozen raw-set identity、package direction、raw/enriched membership equality与module-init-only effects显式；schema无hash/LLM import，LLM E1无bus/store/publish。
 
 ### 8.2 合同覆盖 checklist
 
@@ -3538,35 +3565,35 @@ export function decodeRecoveryPublicProjection(
 - [x] tool phase闭合覆盖planned/body-outcome durable/final after-hook settled/reconciled terminal manual-only/unknown intermediate；unknown/intermediate不automatic且任何phase均不授权rerun uncertain body/after-hook。
 - [x] tool arguments/result/error、reasoning text、provider-prefix content均有reconstructible inline/sealed carrier、exact canonical encoding、owner commitment、lifecycle与decode/recompute validation；digest-only不能重建；raw cursor/credential/secret不进raw/public。
 - [x] tool/reasoning provenance覆盖missing/unknown、provider-end与两类forced flush。
-- [x] source/control version绑定event-type-set version、field-set registry version与各自allowed-set branded digest；empty tail identity与三处prefix（含content carrier）完整；F5只消费显式M4 owner-mapping proof且零M4/store read。
+- [x] source/control version绑定F3 raw versions/membership与E1各自allowed-set branded digest；raw/enriched membership/order exact equal；empty tail identity与三处prefix（含content carrier）完整；F5只消费显式M4 owner-mapping proof且零M4/store read。D0 review passed。
 - [x] `DurableRecoverySnapshot`不混入current plan/config；planned/admission来源分离；tools partition含同一snapshot全部authority/compatibility facts，Continue closure的sourceBinding与payload carriers/commitments绑定source+control versions；其M4-produced `RecoveryAssistantPublicMappingV1`绑定同一session/source/high-water/source+control digests/latest-decision revision，且不是display-ID map或history inference；available runtime materialization exact嵌套`{descriptor,pausedHandle}`而不污染descriptor。
 - [x] proposal无authority；automatic/manual binding均mandatory且manual在无target/semantic/prepared digest时可构造；record为exact lifecycle union，superseded只用`SupersessionBindingDigest`；`AuthorityReceiptV1`、`ReceiptForV1<T>`与`OperationCommitResultV1<T>`名称/索引唯一；immutable receipt证明raw/operation post-state/heads且不含apply mode，ephemeral result独占applyMode；operation lookup key至少为session+aggregate+operation+expected kind。
 - [x] external config仅接受nested snake_case `experimental.session_recovery`两leaf，omitted/default canonicalization、safe-integer refinement与deterministic camelCase internal mapping固定；N默认2、M默认64、effective min、N=0/M=1边界与default/explicit同值等价+separate provenance固定。
 - [x] 10个operation均有exact discriminated predecessor/payload schema、payload digest domain、event-chain genesis/nextDigest公式、type-indexed operation post-state/receipt；type1区分model-lineage/aggregate genesis并携Legacy predecessor/materialization；8–10 deterministic record material完整；type10 model/no-reply closed union均持久化可重算supersession binding input/digest，model才可被type1一次性消费。
-- [x] semantic/prepared/binding architecture digests保留；closed canonical registry精确覆盖25个domain，其中supersession-binding替代旧reservation-only domain并与authorization/control/tool/reasoning/prefix commitments同样具有exact input/builder/brand且不可替换；replay carrier复用既有owner commitments而不隐藏新增domain；V1 numbers只接受safe integer。
-- [x] `RecoveryClosureDescriptor`、`LegacyUserMessagePredecessorV1`、`OperationSchemaByTypeV1`、`DispatchAdmissionV1`、`TypedIncompleteTerminalFact`、`AssistantChainHeadV1`、`AggregateEventHeadV1`、`AutomaticRecoveryAction`、`RecoveryAdmissionPolicyBindingV1`及`CanonicalWireValueV1`/payload/partition/phase/lease-key owner types为exact M1 exports；M3/M4/M7可命名且不得复制同义private type；receipt variants与`OperationApplyModeV1`保持private，只可经`ReceiptForV1<T>`、`AuthorityReceiptV1`、`OperationCommitResultV1<T>["applyMode"]`或exact indexed/literal surface取得；M1不export M4 snapshot/tool/sealed-use nominal proof。
-- [x] internal Event source-level `publication:"internal"`且durable selector为dedicated recovery `aggregateID`；M4验证session owner mapping；`PublicEventDefinitionV1`/committed event/cursor/listener/subscription/read-error/service/public durable manifest只由literal public definitions构造，`session.recovery.*`不可表示；trusted private all-durable replay set与public durable set nominally分离；generic public EventTable aggregates不纳入recovery-chain migration。
+- [x] semantic/prepared/binding architecture digests保留；closed canonical registry仍精确覆盖25个domain；E1只复用B24/B25及existing source/control domains，不新增第26个domain或generic builder；其余commitments与V1 safe-integer约束不变。D0 review passed。
+- [x] `RecoveryEventDefinitionSetV1`为schema-owned raw export，`RecoveryEventRegistryV1`为LLM E1 enriched export；其余既有M1 exact exports/private receipt/apply-mode/nominal-proof边界不变。Schema不得import E1，consumer不得复制raw/enriched lookalike。D0 review passed。
+- [x] F3 raw internal Event source-level `publication:"internal"`且durable selector为dedicated recovery `aggregateID`；F31只消费raw definitions/publication metadata且对E1/digest零依赖；public/private nominal isolation与generic aggregate exclusion不变。D0 review passed。
 - [x] old-row与unknown-version fail closed；旧字段missing不推断false/safe。
 - [x] F28 authority projection仅M4可调用；M8只F30/F29 decode/assert already-safe projection；RecoveryChildDisplayID validation/ownership/non-authority固定。
 - [x] F30返回known/unsupported/malformed exact union，未知enum与未知structure version区分。
 - [x] 24个ManualStop reasons tuple保持原顺序；lower-level source-specific cause union不含reason/code；F23 compile-time穷尽、runtime total无throw、去重、非空，unexpected只返回internal singleton。
 
-### 8.3 Fresh workflow gate：review → approval → Step 0
+### 8.3 Current workflow gate：approved design + Step 0 + D0 review → commit/push → implementation
 
-本次修订已把M1函数级合同整理为通过stable-snapshot independent design audit的candidate；该结论不等于用户批准或future implementation proof。进入任何生产实现前仍必须严格按以下顺序，禁止并行或倒置：
+原M1合同已通过stable-snapshot independent design audit `0 P0 / 0 P1`，随后获得用户批准；`docs/audits/sessrec-1-contract-canonicalization/expectations.md`已完成并随`acc7d0bcf`推送。只读package dependency核查发现原F3会让schema调用LLM-owned F17/F21，因此当前D0按以下顺序收口：
 
-1. **Independent design review**：独立reviewer已逐项核对§5.0.3 consolidated callable inventory/ledger（25 builders、4 policy codecs、H1–H3、F1–F31/F16a各唯一一行）及其signature/proof anchors与§8.1/§8.2；blocking findings已清零。当前状态：已完成，stable snapshot为`0 P0 / 0 P1`。
-2. **User approval**：review结果与任何修订再次提交用户，取得针对当前文件revision的明确批准；旧批准、旧plan或“无异议”不得替代。当前状态：未取得。
-3. **Step 0 contract-audit planning**：批准后才创建`docs/audits/sessrec-1-contract-canonicalization/expectations.md`，按workflow §6.2/§6.3完成10节、机械化项与property invariants。当前状态：未创建；本任务明确禁止创建。
-4. **Implementation entry**：只有1→2→3全部完成才可进入Step 1；否则production/test/migration/audit实现继续禁止。
+1. **D0 contract correction**：F3改为schema-owned raw `RecoveryEventDefinitionSetV1`；additional E1 `buildRecoveryEventRegistry`由LLM唯一拥有；F31只消费raw definitions/publication metadata。当前状态：已完成。
+2. **Fresh D0 independent review**：逐项核对25 builders、4 policy codecs、H1–H3、E1、F1–F31/F16a及§8.1/§8.2。当前状态：`0 P0 / 0 P1`；两个P2 metadata/wording项已修正。
+3. **D0 commit/push**：本changeset只提交architecture、detailed design、本文与S1 expectations；push成功后才可进入生产源码。当前状态：待执行。
+4. **Implementation entry**：只有1→2→3全部完成才可进入SESSREC-1 Step 1；production/test/migration/Step 5 audit仍禁止提前开始。
 
-因此本文仅把design-review completion boxes标为checked；user approval、Step 0、implementation与future-test boxes仍保持unchecked。该状态不把未实现合同写成runtime proof。
+用户批准、Step 0与D0 review boxes已完成；implementation与future-test boxes保持unchecked。该状态不把未实现合同写成runtime proof。
 
 ### 8.4 架构不变量与正确性结论
 
 - I4：F5–F7只从raw known-version operations构造source/control；authoritative replay carrier与owner commitment同属raw source fact，compatibility只进入snapshot partition且不提升authority，public projection无输入路径；保持raw sole authority。
 - I6：F18/F19/F20分别构造semantic/prepared/binding，`DurableRecoverySnapshot`禁止current plan/config；Continue closure以sourceBinding及同snapshot payload carriers/commitments固定重建输入，sealed-use nominal lease仍由M4拥有；保持来源分离。
-- I7：F1–F3/F31提供definition-level internal分区、public-only nominal carriers/service/manifests与separate trusted private replay set；M4唯一调用F28并在publication前F29验证，M8仅F30/F29处理already-safe projection；`session.recovery.*`在public type/source/codec中不可表示，runtime逐通道抑制作为defense-in-depth不向M8暴露authority。
+- I7：Schema F1–F3/F31提供raw definition-level internal分区、public-only nominal carriers/service/manifests与separate trusted private replay set且不依赖digest；LLM E1只为same raw membership补allowed-set digests供F5–F7/M4消费。M4唯一调用F28并在publication前F29验证，M8仅F30/F29处理already-safe projection；`session.recovery.*`在public type/source/codec中不可表示。
 - I10：unknown version、field/payload/digest mismatch、owner mismatch、non-foldable/partial authority均无automatic available输出并由M4/M6 fatal stop；tool compatibility-only/mixed绝不等于empty，planned/body-outcome/reconciled/unknown phase绝不automatic。只有authority完整且独立classification得到canonical causes时才可走ManualStop。opaque/old row作为typed ineligible source可由M5产生ManualStop causes，但绝不修复authority corruption。
 
 在H1–H7及后续M2–M8 callee合同成立时，M1提供的核心结论是：任何可进入automatic classifier/release链的值，都已经通过known-version exact decode、secret-safe canonicalization、来源分离和typed invariant验证；任何unknown、extra field、old-row ambiguity、digest mismatch或public-only事实都不能被M1表示为available authority。本文不声称release后的provider exactly-once，也不把当前50/50运行证据外推为上述future合同已实现。

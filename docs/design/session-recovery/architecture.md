@@ -2,15 +2,15 @@
 
 > Issue：[#7](https://github.com/lihaokun/opencode/issues/7)
 >
-> 状态：owner contracts已修复并同步；stable six-document snapshot的fresh independent design audit已达到`0 P0 / 0 P1`，当前等待用户再次批准；未进入Step 0或production implementation。
+> 状态：详细设计已获用户批准；四份Workflow Step 0 expectations已随commit `acc7d0bcfd99623ffd2e0675b8d0cb75b7703688`推送。D0 package-ownership call-graph correction已完成机械检查与fresh independent review `0 P0 / 0 P1`；本changeset只含四份D0文档，production implementation与future tests尚未开始。
 >
-> 当前设计输入：branch `yixiao-issue-7-new`，HEAD `bc7811088db9cf6d856e656cc3c694ca8e7a3517`。
+> 当前设计输入：branch `yixiao-issue-7-new`，HEAD `acc7d0bcfd99623ffd2e0675b8d0cb75b7703688`。50/50运行证据仍只绑定source-equivalent `135f20215`。
 >
 > 实施提案：`docs/fixes/session-fix-incomplete-stream-recovery.md`。
 
 ## 0. 文档权威与状态
 
-文档权威层级固定：实施提案只对需求、根因、产品范围与原始证据清单具有规范性；它不拥有实现schema、接口、ordering、receipt/result或persistence contract。本文、`detailed-design.md`与owner子计划共同构成revised candidate；冲突时不得用proposal旧文本覆盖later design。Owner repair与fresh independent design audit `0 P0 / 0 P1`均已完成，但不构成用户批准、Step 0完成或production readiness；生产实现仍必须依次等待用户明确批准与workflow Step 0 expectations完成。
+文档权威层级固定：实施提案只对需求、根因、产品范围与原始证据清单具有规范性；它不拥有实现schema、接口、ordering、receipt/result或persistence contract。本文、`detailed-design.md`与owner子计划共同构成已批准implementation contract；冲突时不得用proposal旧文本覆盖later design。Owner repair、原设计fresh independent audit、用户批准、四份Workflow Step 0 expectations及D0 fresh independent review `0 P0 / 0 P1`均已完成。D0只修正M1内部真实package dependency对应的call graph，不证明production readiness；本D0 changeset push成功后才可进入production implementation。
 
 ## 1. 评审基线、证据与产品范围
 
@@ -19,12 +19,12 @@
 | 项目 | 结论 |
 |---|---|
 | 当前分支 | `yixiao-issue-7-new` |
-| 当前设计输入 HEAD | `bc7811088db9cf6d856e656cc3c694ca8e7a3517`；相对运行证据基线只新增本文，生产源码、测试与依赖未变。 |
+| D0 base HEAD / changed snapshot | base为`acc7d0bcfd99623ffd2e0675b8d0cb75b7703688`；当前changed snapshot只修改architecture、detailed design、SESSREC-1 owner与SESSREC-1 expectations四份文档，生产源码、测试与依赖未变。 |
 | 规范输入 | 已提交的 `docs/fixes/session-fix-incomplete-stream-recovery.md` |
 | 上游证据 | **No upstream**：未读取或引用上游仓库、上游分支或上游实现。当前 Git tracking remote 不构成架构证据。 |
 | 当前源码运行证据 | 在 source-equivalent HEAD `135f2021517a2d4ac6f3dfc8d5e175dd2c0da309`、Bun `1.3.14` 上新鲜执行：A=10 个 CLI，B=1 个 live HTTP/generated SDK，C=10（7 个 prompt + 3 个 TCP processor），D=29（2 个 synthetic processor + 1 个 retry + 22 个 TUI + 4 个 routes）；共 50 项，50 pass、0 fail、0 skip。不得把该结果改写为 future recovery 已验证。 |
 | 历史证据关系 | 实施提案记录的 commit `0ea5c2959` 运行结果仅作为更早历史交叉检查；`135f20215` 的新鲜重跑是当前源码行为证据基线。 |
-| 当前阶段 | 只编写函数级详细设计；不修改生产代码或测试，不创建或执行 future recovery tests，不执行 codegen、commit 或 push。 |
+| 当前阶段 | D0文档修正与fresh independent review已完成；等待本changeset commit/push。未修改生产代码或测试，未创建/执行future recovery tests，未执行migration/codegen。 |
 
 ### 1.2 A/B/C/D/S/F 证据追踪
 
@@ -409,10 +409,10 @@ Golden/recorded fixtures只能防回归，不能替代每次 exact pre-release r
 
 ### M1. Shared Recovery Contracts and Canonical Semantics
 
-- **Workflow**：定义typed classification、identity、target/domain、sealed refs、fence/proof、terminal、decision、canonical event sets与三类digest envelope；向LLM/core/Legacy提供单一schema。
-- **Requires**：dependency方向保持 `schema ← llm ← opencode`；所有authority字段可编码、版本化且不含raw secret。
-- **Ensures**：同一语义只有一套wire/durable定义；canonical membership、nullable/discriminator与digest输入可机械验证；明确导出`RecoveryClosureDescriptor`、`LegacyUserMessagePredecessorV1`、`OperationSchemaByTypeV1`、`CanonicalWireValueV1`、`RecoveryReplayPayloadV1`、`RecoveryReplayPayloadCommitmentProjectionV1`、`ToolTerminalReplayPayloadV1`、四路evidence partition、五phase types，以及`DispatchAdmissionV1`、`TypedIncompleteTerminalFact`、`AssistantChainHeadV1`、`AggregateEventHeadV1`、`AutomaticRecoveryAction`、`RecoveryAdmissionPolicyBindingV1`。Available/opaque dispatch admission variants、其它receipt variants与`OperationApplyModeV1`保持private；consumer只能经`Extract<DispatchAdmissionV1,...>`、`ReceiptForV1<T>`/`AuthorityReceiptV1`、`OperationCommitResultV1<T>["applyMode"]`或exact indexed/literal surface取得。向M4导出唯一带V1名称的closed `AuthorityReceiptV1`、type-indexed internal definition/receipt/operation commit result合同，并为authorization/control/tool/reasoning/provider-prefix/supersession commitments提供25-domain exact versioned registry/input/builder/brand；另导出exact nominal `M4RecoveryAggregateOwnerMappingProofV1`与`M4SealedRecoveryMaterialLookupProofV1`输入形状，proof brand只能由M4在对应lookup成功后构造，M1仅pure compare。
-- **Invariants**：schema不依赖llm/opencode；M1 pure函数只使用单一typed `ContractResult` carrier；source/control event sets互斥；unknown version fail closed；`assembleEventManifests`与cause→ManualStop mapping只由M1定义，本文与其它子计划只引用其合同而不复制。F23对runtime malformed/empty/future discriminator仍total返回唯一`internal-classification-failure` reason，不throw或留下空reason集合。
+- **Workflow**：定义typed classification、identity、target/domain、sealed refs、fence/proof、terminal、decision、canonical event sets与三类digest envelope；向LLM/core/Legacy提供单一schema。Schema-owned `buildRecoveryEventDefinitions`只构造十个internal durable definitions、recursive exact field-set specs及固定source/control tuples；LLM-owned `buildRecoveryEventRegistry`沿既有依赖方向导入该exact frozen set，并通过唯一25-domain canonical registry补齐两个allowed-set digests。
+- **Requires**：dependency方向保持 `schema ← llm ← opencode`；schema-owned构造不得调用LLM canonical functions；所有authority字段可编码、版本化且不含raw secret。
+- **Ensures**：同一语义只有一套wire/durable定义；canonical membership、nullable/discriminator与digest输入可机械验证；`RecoveryEventDefinitionSetV1`与enriched `RecoveryEventRegistryV1`分别只有schema/LLM一个构造owner，且后者不改变前者的10-operation membership。明确导出`RecoveryClosureDescriptor`、`LegacyUserMessagePredecessorV1`、`OperationSchemaByTypeV1`、`CanonicalWireValueV1`、`RecoveryReplayPayloadV1`、`RecoveryReplayPayloadCommitmentProjectionV1`、`ToolTerminalReplayPayloadV1`、四路evidence partition、五phase types，以及`DispatchAdmissionV1`、`TypedIncompleteTerminalFact`、`AssistantChainHeadV1`、`AggregateEventHeadV1`、`AutomaticRecoveryAction`、`RecoveryAdmissionPolicyBindingV1`。Available/opaque dispatch admission variants、其它receipt variants与`OperationApplyModeV1`保持private；consumer只能经`Extract<DispatchAdmissionV1,...>`、`ReceiptForV1<T>`/`AuthorityReceiptV1`、`OperationCommitResultV1<T>["applyMode"]`或exact indexed/literal surface取得。向M4导出唯一带V1名称的closed `AuthorityReceiptV1`、type-indexed internal definition/receipt/operation commit result合同，并为authorization/control/tool/reasoning/provider-prefix/supersession commitments提供25-domain exact versioned registry/input/builder/brand；另导出exact nominal `M4RecoveryAggregateOwnerMappingProofV1`与`M4SealedRecoveryMaterialLookupProofV1`输入形状，proof brand只能由M4在对应lookup成功后构造，M1仅pure compare。
+- **Invariants**：schema不依赖llm/opencode；M1 pure函数只使用单一typed `ContractResult` carrier；source/control event sets互斥；unknown version fail closed；`assembleEventManifests`只消费raw definitions/publication metadata而不计算digest，`buildRecoveryEventRegistry`与cause→ManualStop mapping只由M1对应owner定义，本文与其它子计划只引用其合同而不复制。F23对runtime malformed/empty/future discriminator仍total返回唯一`internal-classification-failure` reason，不throw或留下空reason集合。
 - **Side effects**：仅schema/codec与canonical contract变化；不dispatch、不持久化runtime state。
 
 ### M2. Legacy Dispatch Preparation and Transport Gate
@@ -488,7 +488,7 @@ Golden/recorded fixtures只能防回归，不能替代每次 exact pre-release r
 | M6 → M2 release/cancel | ordinary branches：complete result+same handle；automatic：complete type-9 result+exact proposal+original planned+same reservation/handle/leases；或cancel/no-handle barrier cause | delegated stream、released/unknown fatal或closed handle/leases | automatic先immediate K8，再F27+M2到authorized/open；exclusive latch保持authorized/held/not-delegated，boundary-only记录released，随后K9；任何pre-delegate failure先barrier→K9→cleanup | ordinary仅F26；automatic仅F27；known predelegation退latch再cancel；unknown不cancel/resend；K9 failure pre-cleanup fatal |
 | M7 → M2 prepared request | K3-scoped `LoweredRecoveryCandidate`、descriptor、same-view proof、reservation与live leases | one exact gate-bound request + original inspection；`PlannedRecoveryMaterialization` | K7已完成；plaintext-bearing messages不得逃逸callback；不得pre-prepare运行provider constraints | consume reservation exactly once；M7按inspection验证same object；actual send与authorized representation一致 |
 | M4 → M1 F28 → public field → M1 F30 → M8 | M4 validated `M1.RecoveryPublicAuthorityViewV1`含stable display mapping | F28 exact `ContractResult` → Legacy message/session signal → F30 exact `ContractResult` → M8 hydration/display | M4不把allocation委托给F28；M8不请求authority字段且只走F30 public decode path | F28/F30不写表/不分配ID；F28 error阻止publication，F30 malformed为typed hydration error；internal `session.recovery.*`永不泄漏 |
-| M1 F2/F31 → public event consumers / M4 private replay | all event definitions with source-level publication metadata | public-only nominal carriers/service/manifests；`PublicEventSubscriptionV1<D>` item exact为`PublicCommittedEventV1<D>`；separate trusted private all-durable manifest | public consumers不得cast generic/internal definitions、扩大item为broad union或按prefix过滤；private readers不得publish decoded raw payload | public brands只承诺literal public；private set可读internal但nominally不能进入listen/SSE/SDK |
+| M1 schema F3/F2/F31 → public event consumers；M1 LLM `buildRecoveryEventRegistry` → M4 private replay/rebuilder | schema-owned `RecoveryEventDefinitionSetV1` + all definitions with source-level publication metadata；LLM enrichment只接收same frozen set | public-only nominal carriers/service/manifests；`PublicEventSubscriptionV1<D>` item exact为`PublicCommittedEventV1<D>`；separate trusted private all-durable manifest；enriched `RecoveryEventRegistryV1`附加两个existing allowed-set digests | schema不得导入LLM或计算digest；public consumers不得cast generic/internal definitions、扩大item为broad union或按prefix过滤；private readers不得publish decoded raw payload | public brands只承诺literal public；private set可读internal但nominally不能进入listen/SSE/SDK；raw/enriched registry membership一致 |
 
 ## 8. 端到端流程
 
@@ -637,7 +637,7 @@ Complete nominal authority view and same-view automatic proof slice
 
 ### 9.6 Main theorem
 
-**Safety theorem（independent-design-audit accepted obligation）：**在H1–H7成立、处于H1限定的validated process-crash fault model且M1–M8满足其Requires/Ensures时，任何由Issue #7 automatic recovery触发的provider delegate boundary都对应一个新的、唯一的assistant child；其complete nominal authority view、same-view proof slice、four-way partition/final phases、recomputed replay commitments、stable no-send reservation、live K7 leases、planned request、closure、transaction-verified committed policy bound、O8 K8、decision consumption、三个recovery heads与aggregate cursor、immediate pre-release K8及F27/M2 exact validation由同一binding链确认。Authorization只建立authorized/open；exclusive latch保持authorized/held/not-delegated，只有exact delegate boundary可记录released/delegated或terminal released/unknown-delivery，绝不提前标released。Delegated后K9 close/zeroize先于empty attempt与ordinal-0 allocation；unknown-delivery在K9/cleanup后fatal且不得cancel/resend。否则系统不会执行automatic delegate。该设计义务已通过stable-snapshot independent audit `0 P0 / 0 P1`，但尚未获得用户批准，也不构成future implementation/runtime proof；它不覆盖host crash、power loss、filesystem/device-cache loss或storage corruption后的authority retention。
+**Safety theorem（independent-design-audit accepted obligation）：**在H1–H7成立、处于H1限定的validated process-crash fault model且M1–M8满足其Requires/Ensures时，任何由Issue #7 automatic recovery触发的provider delegate boundary都对应一个新的、唯一的assistant child；其complete nominal authority view、same-view proof slice、four-way partition/final phases、recomputed replay commitments、stable no-send reservation、live K7 leases、planned request、closure、transaction-verified committed policy bound、O8 K8、decision consumption、三个recovery heads与aggregate cursor、immediate pre-release K8及F27/M2 exact validation由同一binding链确认。Authorization只建立authorized/open；exclusive latch保持authorized/held/not-delegated，只有exact delegate boundary可记录released/delegated或terminal released/unknown-delivery，绝不提前标released。Delegated后K9 close/zeroize先于empty attempt与ordinal-0 allocation；unknown-delivery在K9/cleanup后fatal且不得cancel/resend。否则系统不会执行automatic delegate。该设计义务已通过stable-snapshot independent audit `0 P0 / 0 P1`并获用户批准，但尚未实现，也不构成future implementation/runtime proof；它不覆盖host crash、power loss、filesystem/device-cache loss或storage corruption后的authority retention。
 
 证明分解：
 
@@ -669,7 +669,7 @@ Complete nominal authority view and same-view automatic proof slice
 
 ## 11. 后续详细设计与四个非 V2 子计划
 
-本文、函数级`detailed-design.md`与四个owner子计划共同构成已通过independent design audit的revised design candidate；旧批准不得视为当前文本批准。Owner contracts已完成本轮合同修复，更新后的stable six-document snapshot已达到`0 P0 / 0 P1`。只有用户明确批准后，才可进入workflow Step 0；不得声称approval、Step 0、implementation或future tests已完成。
+本文、函数级`detailed-design.md`与四个owner子计划共同构成已通过independent design audit并获用户批准的implementation contract。四份Workflow Step 0 expectations已完成、commit并push。D0修正仅解决M1内部schema/LLM package dependency与F3/F31 call graph不一致的问题，fresh independent review已达到`0 P0 / 0 P1`；本D0 changeset commit/push前不得进入production implementation，且不得声称implementation或future tests已完成。
 
 四个全局唯一子计划均只覆盖Legacy/shared compatibility，不建立V2 recovery子计划：
 
@@ -680,7 +680,7 @@ Complete nominal authority view and same-view automatic proof slice
 
 ### 11.1 Repaired owner contracts accepted by independent design audit
 
-下列全部六项此前已验证的P0/P1 owner issues（R21–R26）均已修复并同步进入本architecture candidate；stable six-document snapshot的independent design audit结论为`0 P0 / 0 P1`。该结论表示当前设计未发现P0/P1 blocker，不等于用户已批准，也不证明future implementation/tests：
+下列全部六项此前已验证的P0/P1 owner issues（R21–R26）均已修复并同步进入本architecture contract；stable six-document snapshot的independent design audit结论为`0 P0 / 0 P1`。Audit结论本身不替代用户批准；针对该设计的用户批准已在后续gate完成。该结论也不证明future implementation/tests：
 
 1. **R21 / prior P0 — evidence partition**：M1四路`CanonicalToolEvidencePartitionV1`、M4 nominal `DurableRecoveryAuthorityViewV1`/same-view `AutomaticRecoveryProofSliceV1`已闭合SafeRetry/Continue eligibility；compatibility-only、mixed、manual-only与nonfinal phase fail closed。
 2. **R22 / prior P1 — reconstructible replay payload**：M1 inline/sealed replay carriers、M4 snapshot/proof materialization与M7 exact-order reconstruction/commitment recomputation合同已闭合；Legacy history/cache/public/current-provider fallback禁止。
@@ -689,11 +689,11 @@ Complete nominal authority view and same-view automatic proof slice
 5. **R25 / additional P1 — policy authority**：runtime只消费transaction-verified committed `NormalizedRecoveryPolicy.digestInput.effectiveMaxModelAssistants`；config/`agent.steps` reread、top-level direct access与runtime re-min均禁止。
 6. **R26 / additional P1 — owner export/call-order convergence**：M1现导出`DispatchAdmissionV1`、`TypedIncompleteTerminalFact`、`AssistantChainHeadV1`、`AggregateEventHeadV1`、`AutomaticRecoveryAction`、`RecoveryAdmissionPolicyBindingV1`及既有replay/closure/predecessor/operation-schema surfaces；private receipt variants与`OperationApplyModeV1`仍只经exported/indexed surfaces消费。M2 reservation/full prepare input、M4仅exported/indexed M1 references、O10 branded-authority two-stage supersession、M4 nominal view/O3a/K7–K10、M7 descriptor/reconstruction/validation与exact 21-step automatic order已对齐。
 
-这些是revised candidate obligations；fresh stable-snapshot independent design audit已确认`0 P0 / 0 P1`。仍需用户明确批准，才能进入Step 0。
+这些obligations已通过fresh stable-snapshot independent design audit、用户批准与Step 0 expectations抽取。D0 package-ownership correction及其fresh independent review也已完成；当前只剩本D0 changeset commit/push gate，之后才进入production implementation。
 
-## 12. 固定实施选择（independent design audit已通过，待用户再次批准）
+## 12. 固定实施选择（independent design audit、用户批准与Step 0均已完成）
 
-以下六项在当前revised design candidate中保持冻结，不是开放alternatives，也不是已批准实现决定。用户再次批准可以接受或整体退回修订，但implementation不得在其间自行改选：
+以下六项在当前implementation contract中保持冻结，不是开放alternatives；D0 package-ownership correction不得改变这些选择，implementation也不得自行改选：
 
 1. **首批available adapters**：built-in AI SDK Anthropic Messages、OpenAI Responses以及native HTTP JSON，只有在最终transform后、底层send前具备exact paused gate和完整target/authority/storage proof时available；dynamic/custom/WebSocket/unknown路径保持opaque、fallback或disable。
 2. **Outer retry策略**：保留现有429/503 generic retry行为，但每次重新进入provider execution前写独立semantic dispatch ordinal与ledger；canonical incomplete仍不重试，多dispatch source的incomplete固定ambiguous。Recovery-gated native transport首批不允许隐藏的内部HTTP resend。
