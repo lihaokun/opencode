@@ -107,6 +107,18 @@ function defer<T>() {
   return { promise, resolve }
 }
 
+function contextOverflowError() {
+  return new APICallError({
+    message: "request entity too large",
+    url: "https://example.com/v1/chat/completions",
+    requestBodyValues: {},
+    statusCode: 413,
+    responseHeaders: { "content-type": "application/json" },
+    responseBody: JSON.stringify({ error: { message: "request entity too large" } }),
+    isRetryable: false,
+  })
+}
+
 const waitFor = <A>(check: Effect.Effect<A | undefined>, message: string) =>
   Effect.gen(function* () {
     const stop = Date.now() + 500
@@ -195,11 +207,16 @@ function batchLLM(
   stream: LLM.Interface["stream"] = (input) =>
     streamBatches(input).pipe(Stream.flatMap((batch) => Stream.fromIterable(batch))),
 ) {
-  return LLM.Service.of({ stream, streamBatches })
+  return LLM.Service.of({
+    preparePayload: (input) => Effect.succeed({ system: input.system, messages: input.messages, tools: input.tools }),
+    stream,
+    streamBatches,
+  })
 }
 
 function singletonBatchLLM(stream: LLM.Interface["stream"]) {
   return LLM.Service.of({
+    preparePayload: (input) => Effect.succeed({ system: input.system, messages: input.messages, tools: input.tools }),
     stream,
     streamBatches: (input) => stream(input).pipe(Stream.map((event) => [event])),
   })
@@ -374,6 +391,26 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
         LLMEvent.stepStart({ index: 0 }),
         LLMEvent.providerError({ message: "specific provider failure", retryable: false }),
       )
+    case "context-overflow":
+      return Stream.fail(contextOverflowError())
+    case "context-overflow-after-text-start":
+      return Stream.make(LLMEvent.stepStart({ index: 0 }), LLMEvent.textStart({ id: "late-text" })).pipe(
+        Stream.concat(Stream.fail(contextOverflowError())),
+      )
+    case "context-overflow-after-reasoning-start":
+      return Stream.make(LLMEvent.stepStart({ index: 0 }), LLMEvent.reasoningStart({ id: "late-reasoning" })).pipe(
+        Stream.concat(Stream.fail(contextOverflowError())),
+      )
+    case "context-overflow-after-tool-input-start":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "late-tool", name: "lookup" }),
+      ).pipe(Stream.concat(Stream.fail(contextOverflowError())))
+    case "context-overflow-after-tool-call":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "late-tool-call", name: "lookup", input: {} }),
+      ).pipe(Stream.concat(Stream.fail(contextOverflowError())))
     case "blocked-permission":
       return Stream.make(
         LLMEvent.stepStart({ index: 0 }),
@@ -604,13 +641,21 @@ const boot = Effect.fn("test.boot")(function* () {
 const runSettlement = Effect.fn("test.runSettlement")(function* (
   dir: string,
   scenario: string,
-  options?: { limit?: { context: number; output: number } },
+  options?: {
+    limit?: { context: number; output: number }
+    recoverContextOverflow?: boolean
+    unfinished?: boolean
+  },
 ) {
   const { processors, session, provider } = yield* boot()
   const eventBridge = yield* EventV2Bridge.Service
   const chat = yield* session.create({})
   const parent = yield* user(chat.id, scenario)
   const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+  if (options?.unfinished) {
+    delete msg.finish
+    yield* session.updateMessage(msg)
+  }
   const base = yield* provider.getModel(ref.providerID, ref.modelID)
   const mdl = options?.limit ? { ...base, limit: options.limit } : base
   const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
@@ -621,22 +666,25 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
     return Effect.void
   })
   const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
-  const result = yield* handle.process({
-    user: {
-      id: parent.id,
+  const result = yield* handle.process(
+    {
+      user: {
+        id: parent.id,
+        sessionID: chat.id,
+        role: "user",
+        time: parent.time,
+        agent: parent.agent,
+        model: { providerID: ref.providerID, modelID: ref.modelID },
+      } satisfies SessionV1.User,
       sessionID: chat.id,
-      role: "user",
-      time: parent.time,
-      agent: parent.agent,
-      model: { providerID: ref.providerID, modelID: ref.modelID },
-    } satisfies SessionV1.User,
-    sessionID: chat.id,
-    model: mdl,
-    agent: agent(),
-    system: [],
-    messages: [{ role: "user", content: scenario }],
-    tools: {},
-  })
+      model: mdl,
+      agent: agent(),
+      system: [],
+      messages: [{ role: "user", content: scenario }],
+      tools: {},
+    },
+    { recoverContextOverflow: options?.recoverContextOverflow },
+  )
   yield* off
   return {
     result,
@@ -1023,6 +1071,92 @@ itSettlement.live("session.processor preserves a specific provider error instead
     { config: cfg },
   ),
 )
+
+itSettlement.live("session.processor recovers a context overflow when the attempt is eligible", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const result = yield* runSettlement(dir, "context-overflow", {
+          recoverContextOverflow: true,
+          unfinished: true,
+        })
+
+        expect(result.result).toBe("compact")
+        expect(result.message.finish).toBeUndefined()
+        expect(result.message.error).toBeUndefined()
+        expect(result.stored.info.role).toBe("assistant")
+        if (result.stored.info.role === "assistant") {
+          expect(result.stored.info.finish).toBeUndefined()
+          expect(result.stored.info.error).toBeUndefined()
+          expect(result.stored.info.time.completed).toBeNumber()
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor persists context overflow when attempt recovery is disabled", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const result = yield* runSettlement(dir, "context-overflow", {
+          recoverContextOverflow: false,
+          unfinished: true,
+        })
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("error")
+        expect(result.message.error).toMatchObject({
+          name: "ContextOverflowError",
+          data: {
+            message: expect.stringContaining("request entity too large"),
+            responseBody: JSON.stringify({ error: { message: "request entity too large" } }),
+          },
+        })
+        if (!result.message.error) throw new Error("expected context overflow error")
+        expect(result.message.time.completed).toBeNumber()
+        expect(result.stored.info.role).toBe("assistant")
+        if (result.stored.info.role === "assistant") {
+          expect(result.stored.info.finish).toBe(result.message.finish)
+          expect(result.stored.info.error).toEqual(result.message.error)
+          expect(result.stored.info.time.completed).toBe(result.message.time.completed)
+        }
+        expect(result.errors).toEqual([result.message.error])
+      }),
+    { config: cfg },
+  ),
+)
+
+for (const scenario of [
+  "context-overflow-after-text-start",
+  "context-overflow-after-reasoning-start",
+  "context-overflow-after-tool-input-start",
+  "context-overflow-after-tool-call",
+]) {
+  itSettlement.live(`session.processor does not recover ${scenario}`, () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const result = yield* runSettlement(dir, scenario, {
+            recoverContextOverflow: true,
+            unfinished: true,
+          })
+
+          expect(result.result).toBe("stop")
+          expect(result.message.finish).toBe("error")
+          expect(result.message.error?.name).toBe("ContextOverflowError")
+          expect(result.message.time.completed).toBeNumber()
+          expect(result.stored.info.role).toBe("assistant")
+          if (result.stored.info.role === "assistant") {
+            expect(result.stored.info.finish).toBe("error")
+            expect(result.stored.info.error).toEqual(result.message.error)
+            expect(result.stored.info.time.completed).toBe(result.message.time.completed)
+          }
+        }),
+      { config: cfg },
+    ),
+  )
+}
 
 itSettlement.live("session.processor does not replace a blocked tool turn with an incomplete-stream error", () =>
   provideTmpdirInstance(

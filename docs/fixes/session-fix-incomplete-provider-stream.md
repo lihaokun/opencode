@@ -541,8 +541,9 @@ follow-up。
 - 第十节除修正 raw-missing 的 batch/cutoff 顺序外，还把 persisted assistant error 与 blocked
   明确提升到正常返回时的 final `"stop"` 优先级；这会阻止 API/length error 或 permission deny 被
   usage compaction 结果覆盖。Abort 继续使用既有 Effect interruption 语义，不在本修订中承诺一个
-  正常返回值。Auto context-overflow recovery 不持久化 assistant error，仍保持
-  `"compact"`；其它 error-free compaction 路径不变。
+  正常返回值。只有 auto 开启、attempt recovery gate 允许且当前 attempt 尚无 assistant-starting
+  evidence 的 context overflow 不持久化 assistant error，并保持 `"compact"`；否则真实错误 terminal。
+  其它 error-free compaction 路径不变。
 
 函数规约：`SessionProcessor.process(streamInput)`
 
@@ -836,8 +837,9 @@ assistant.error is present ∨ blocked=true
 ⇒ SessionProcessor.process() = "stop"
 ```
 
-Recoverable context overflow 在 auto compaction 开启时不持久化 `assistant.error`，因此不与该不变量
-冲突，仍可返回 `"compact"`。
+Context overflow 只有在 auto compaction 开启、调用方允许本 attempt 恢复且当前 attempt 尚无
+assistant-starting evidence 时才是 recoverable；此时不持久化 `assistant.error`，因此不与该不变量
+冲突并可返回 `"compact"`。任一条件不满足时，真实 provider error 持久化为 terminal assistant。
 
 ### 5.3 Partial state 保持
 
@@ -1264,8 +1266,9 @@ Processor 的事件与 settlement 规则：
    else: "continue"
    ```
 
-   自动 context-overflow recovery 仍可返回 `"compact"`，因为该既有分支在 auto compaction 开启时
-   只设置 `needsCompaction`，不把 recoverable overflow 持久化为 `assistant.error`；compaction-summary
+   自动 context-overflow recovery 在 auto compaction 开启、attempt recovery gate 允许且当前 attempt
+   尚无 assistant-starting evidence 时仍可返回 `"compact"`；该分支只设置 `needsCompaction`，不把
+   recoverable overflow 持久化为 `assistant.error`。条件不满足时真实错误 terminal；compaction-summary
    assistant 还受既有 `!assistant.summary` usage-overflow guard 保护，不会仅因 summary usage 设置
    `needsCompaction`；
 
@@ -1301,7 +1304,8 @@ Processor 的事件与 settlement 规则：
     AI SDK emission 发起 demand；无 usable output 时 generic incomplete error 优先，返回 `"stop"`；
   - retryable failed attempt 设置过的 `needsCompaction` 不影响下一 attempt；
   - known stop/tool-calls 等 finish 的既有 compaction cutoff 不变；
-  - recoverable context overflow 在没有 persisted assistant error 时仍可返回 `"compact"`；
+  - auto 开启、attempt gate 允许且当前 attempt 尚无 assistant-starting evidence 的 recoverable context
+    overflow 在没有 persisted assistant error 时仍可返回 `"compact"`；否则返回 `"stop"`；
 - Side effects：保留已交付 partial part、usage、snapshot 和已执行 tool 事实；不创建新 schema 或
   额外 `LLM.Service` subscription，Processor 不对下一 runtime emission 发起 demand。失败路径不创建
   compaction marker、compaction-summary assistant、
@@ -1379,8 +1383,9 @@ array，空间不随累计 token 增长。实现审核需确认没有缓存 batc
 - 已执行工具不回滚，但当前 no-retry 路径不会因 compaction 自动发起 compaction summary、
   continuation、新的本地工具动作或相应的额外 model cost/usage；
 - raw-defined unknown high-usage 仍可正常 compaction，避免把兼容场景误判为 provider failure；
-- length/high-usage 由 persisted `MessageOutputLengthError` 得到 `"stop"`；recoverable context overflow
-  没有 persisted assistant error，仍得到 `"compact"`；
+- length/high-usage 由 persisted `MessageOutputLengthError` 得到 `"stop"`；满足 auto、attempt gate 与
+  no-assistant-evidence 三项条件的 recoverable context overflow 没有 persisted assistant error，仍得到
+  `"compact"`；不满足时真实错误得到 `"stop"`；
 - compaction disabled、context limit 为 0、未 overflow 的现有路径没有行为变化。
 
 **残余假设与边界**：正确性依赖 production AI SDK path 不在 `streamBatches()` 之后再次 flatten
@@ -1392,27 +1397,27 @@ Processor 不为分类目的 demand 下一 emission，不能把 runtime 内部 e
 
 ### 10.6 测试用例清单
 
-| 类型               | 用例描述                                                                                                                          | 状态（修复后回填）   |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| 契约/LLM           | raw-missing `finish-step` 的 `[step-finish, provider-error]` 保持在一个 batch，flat stream 顺序不变                               | 已通过（单元 1）     |
-| 契约/LLM           | raw-defined `finish-step` 是 singleton batch；consumer 停止后 source 的 next-emission demand count 为 0                           | 已通过（单元 1）     |
-| Wiring/Processor   | 注入 flat `stream()` 调用即失败的 service，证明 Processor 只调用一次 `streamBatches()`                                            | 已通过（单元 1）     |
-| 最小回归/Processor | raw-missing atomic batch + high usage + partial text：返回 stop、canonical error exactly once、保留 text/usage，subscription 为 1 | 已通过（单元 1）     |
-| 边界/Processor     | raw-missing atomic batch + high usage + reasoning-only：保留 canonical error，不降级为 generic fallback                           | 已通过（单元 1）     |
-| 兼容/Processor     | raw-defined unknown singleton + high usage + usable text：仍返回 compact、无 error、Processor next-batch demand count 为 0        | 已通过（单元 1）     |
-| Empty/Processor    | unknown singleton + high usage + no usable output：generic error 优先，返回 stop、Processor next-batch demand count 为 0          | 已通过（单元 1）     |
-| 优先级/Processor   | length + high usage 返回 stop；recoverable context overflow 无 persisted error 时仍返回 compact                                   | 已通过（单元 1）     |
-| 优先级/Processor   | blocked turn 即使已有 usage compaction 请求也返回 stop，不创建 compaction                                                         | 已通过（单元 1）     |
-| 隔离/Processor     | retryable failed batch 设置过 compaction 后，下一 attempt 重置 decision，不提前 cutoff                                            | 已通过（单元 1）     |
-| 回归/Prompt        | raw-missing + high usage + partial text：无 compaction marker/summary/continuation 或额外 compaction LLM 请求                     | 已通过（单元 2）     |
-| StructuredOutput   | high-usage raw-missing 在 StructuredOutput 后发生：structured 不提升、本地测试 tool 计数为 1、无 compaction/continuation 请求     | 已通过（单元 2）     |
-| Tool side effect   | high-usage raw-missing 在 completed tool 后发生：本地测试 tool 计数为 1、assistant/Task 失败且不 replay                           | 已通过（单元 2/3）   |
-| Event              | crossover 只发布一次 `Session.Event.Error`，不发布 `SessionCompaction.Event.Compacted`                                            | 已通过（单元 2）     |
-| Persistence        | 失败 assistant 的 `time.completed` 已定义、`finish="unknown"`、error name/message 为 canonical；重新进入 loop 不 replay           | 已通过（单元 2）     |
-| E2E/CLI            | 顶层 crossover 保留 partial 输出、记录一个 error、非零退出、无额外 compaction/continuation provider 请求                          | 已通过（单元 3）     |
-| E2E/Subagent       | child crossover 投影为 Task error 而非 completed；child tool 不重放                                                               | 已通过（单元 3）     |
-| 既有回归           | known stop high usage 仍立即请求 compaction；原 Issue #3 受影响集合全部通过                                                       | 已通过（单元 1/3）   |
-| 静态               | 两个受影响 package 与 workspace typecheck、格式和 batch-interface usage 检查                                                      | 已通过（单元 1/2/3） |
+| 类型               | 用例描述                                                                                                                          | 状态（修复后回填）                                |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| 契约/LLM           | raw-missing `finish-step` 的 `[step-finish, provider-error]` 保持在一个 batch，flat stream 顺序不变                               | 已通过（单元 1）                                  |
+| 契约/LLM           | raw-defined `finish-step` 是 singleton batch；consumer 停止后 source 的 next-emission demand count 为 0                           | 已通过（单元 1）                                  |
+| Wiring/Processor   | 注入 flat `stream()` 调用即失败的 service，证明 Processor 只调用一次 `streamBatches()`                                            | 已通过（单元 1）                                  |
+| 最小回归/Processor | raw-missing atomic batch + high usage + partial text：返回 stop、canonical error exactly once、保留 text/usage，subscription 为 1 | 已通过（单元 1）                                  |
+| 边界/Processor     | raw-missing atomic batch + high usage + reasoning-only：保留 canonical error，不降级为 generic fallback                           | 已通过（单元 1）                                  |
+| 兼容/Processor     | raw-defined unknown singleton + high usage + usable text：仍返回 compact、无 error、Processor next-batch demand count 为 0        | 已通过（单元 1）                                  |
+| Empty/Processor    | unknown singleton + high usage + no usable output：generic error 优先，返回 stop、Processor next-batch demand count 为 0          | 已通过（单元 1）                                  |
+| 优先级/Processor   | length + high usage 返回 stop；仅 auto + attempt gate + no assistant evidence 的 recoverable context overflow 返回 compact        | 已通过（单元 1）；新 gate 见 context-overflow fix |
+| 优先级/Processor   | blocked turn 即使已有 usage compaction 请求也返回 stop，不创建 compaction                                                         | 已通过（单元 1）                                  |
+| 隔离/Processor     | retryable failed batch 设置过 compaction 后，下一 attempt 重置 decision，不提前 cutoff                                            | 已通过（单元 1）                                  |
+| 回归/Prompt        | raw-missing + high usage + partial text：无 compaction marker/summary/continuation 或额外 compaction LLM 请求                     | 已通过（单元 2）                                  |
+| StructuredOutput   | high-usage raw-missing 在 StructuredOutput 后发生：structured 不提升、本地测试 tool 计数为 1、无 compaction/continuation 请求     | 已通过（单元 2）                                  |
+| Tool side effect   | high-usage raw-missing 在 completed tool 后发生：本地测试 tool 计数为 1、assistant/Task 失败且不 replay                           | 已通过（单元 2/3）                                |
+| Event              | crossover 只发布一次 `Session.Event.Error`，不发布 `SessionCompaction.Event.Compacted`                                            | 已通过（单元 2）                                  |
+| Persistence        | 失败 assistant 的 `time.completed` 已定义、`finish="unknown"`、error name/message 为 canonical；重新进入 loop 不 replay           | 已通过（单元 2）                                  |
+| E2E/CLI            | 顶层 crossover 保留 partial 输出、记录一个 error、非零退出、无额外 compaction/continuation provider 请求                          | 已通过（单元 3）                                  |
+| E2E/Subagent       | child crossover 投影为 Task error 而非 completed；child tool 不重放                                                               | 已通过（单元 3）                                  |
+| 既有回归           | known stop high usage 仍立即请求 compaction；原 Issue #3 受影响集合全部通过                                                       | 已通过（单元 1/3）                                |
+| 静态               | 两个受影响 package 与 workspace typecheck、格式和 batch-interface usage 检查                                                      | 已通过（单元 1/2/3）                              |
 
 所有请求数断言必须使用本地测试 provider 的专用 request marker，区分当前 turn、compaction summary
 与 synthetic continuation，并排除并发 title 请求；batch demand 断言使用 Deferred/counter 记录下一
@@ -1531,8 +1536,9 @@ subplan。其它设计/README 没有新的契约需要同步。
   单元 1 的主测试文件清单中，后者必须同步 required `streamBatches()` fixture 并由单元 1 typecheck
   锁定；
 - production `SessionProcessor.process()` 的 consumer 仅为 Prompt 与 SessionCompaction；Prompt 已有
-  persisted-error guard，compaction summary 的 usage cutoff 受 `!assistant.summary` 保护，而 recoverable
-  context overflow 不持久化 assistant error，因此 error-first 正常返回分类不会破坏 summary recovery；
+  persisted-error guard，compaction summary 的 usage cutoff 受 `!assistant.summary` 保护，而满足 auto、
+  attempt gate 与 no-assistant-evidence 条件的 recoverable context overflow 不持久化 assistant error，
+  因此 error-first 正常返回分类不会破坏 summary recovery；
 - 本地 `issue3-pre-rebase@ee41b4d28a` 与当前 `dbed80fccf` 的 tree 均为 `20027f1623`，两者
   `git diff` 为空，因此 pre-rebase 的分层测试报告可对应到当前 PR tree；
 - 原始六个 opencode 受影响测试文件重跑为

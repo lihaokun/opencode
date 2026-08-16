@@ -3,6 +3,7 @@ import { LLMError, ProviderErrorEvent } from "./schema"
 
 const patterns = [
   /prompt is too long/i,
+  /prompt exceeds (?:the )?max(?:imum)? length/i, // GLM / zhipuai: "Prompt exceeds max length"
   /request_too_large/i,
   /input is too long for requested model/i,
   /exceeds the context window/i,

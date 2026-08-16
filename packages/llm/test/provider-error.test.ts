@@ -18,6 +18,16 @@ describe("provider error classification", () => {
     expect(messages.every(isContextOverflow)).toBe(true)
   })
 
+  test("classifies GLM/zhipuai 'Prompt exceeds max length' as context overflow (regression #11)", () => {
+    const messages = [
+      "Prompt exceeds max length",
+      "AI_APICallError: Prompt exceeds max length",
+      "Prompt exceeds the maximum length",
+    ]
+
+    expect(messages.every(isContextOverflow)).toBe(true)
+  })
+
   test("does not classify rate limits as context overflow", () => {
     const messages = [
       "Throttling error: Too many tokens, please wait before trying again.",

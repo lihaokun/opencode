@@ -132,6 +132,12 @@ export interface Interface {
     tokens: SessionV1.Assistant["tokens"]
     model: Provider.Model
   }) => Effect.Effect<boolean>
+  readonly willOverflow: (input: {
+    system: string[]
+    messages: ReadonlyArray<unknown>
+    tools: unknown
+    model: Provider.Model
+  }) => Effect.Effect<boolean>
   readonly prune: (input: { sessionID: SessionID }) => Effect.Effect<void>
   readonly process: (input: {
     parentID: MessageID
@@ -175,6 +181,24 @@ const layer = Layer.effect(
         model: input.model,
         outputTokenMax: flags.outputTokenMax,
       })
+    })
+
+    // Estimate the canonical pre-transport payload before the request is sent.
+    // Unlike isOverflow (which reads the previous finished turn's reported
+    // tokens), this catches a single-step overshoot in the current payload.
+    const willOverflow = Effect.fn("SessionCompaction.willOverflow")(function* (input: {
+      system: string[]
+      messages: ReadonlyArray<unknown>
+      tools: unknown
+      model: Provider.Model
+    }) {
+      const cfg = yield* config.get()
+      if (cfg.compaction?.auto === false) return false
+      if (input.model.limit.context === 0) return false
+      const size = Token.estimate(
+        JSON.stringify({ system: input.system, messages: input.messages, tools: input.tools }),
+      )
+      return size >= usable({ cfg, model: input.model, outputTokenMax: flags.outputTokenMax })
     })
 
     const estimate = Effect.fn("SessionCompaction.estimate")(function* (input: {
@@ -429,7 +453,12 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             agent: original.agent,
             model: original.model,
-            format: original.format,
+            format:
+              original.format?.type === "json_schema"
+                ? new SessionV1.OutputFormatJsonSchema(original.format)
+                : original.format?.type === "text"
+                  ? new SessionV1.OutputFormatText(original.format)
+                  : undefined,
             tools: original.tools,
             system: original.system,
           })
@@ -537,6 +566,7 @@ const layer = Layer.effect(
 
     return Service.of({
       isOverflow,
+      willOverflow,
       prune,
       process: processCompaction,
       create,

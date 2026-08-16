@@ -32,6 +32,10 @@ const EMPTY_UNKNOWN_MESSAGE = "Provider stream ended with an unknown finish reas
 const UNSETTLED_STEP_MESSAGE = "Provider stream ended without a settled model step"
 export type Result = "compact" | "stop" | "continue"
 
+type ProcessOptions = {
+  readonly recoverContextOverflow?: boolean
+}
+
 export interface Handle {
   readonly message: SessionV1.Assistant
   readonly updateToolCall: (
@@ -47,7 +51,7 @@ export interface Handle {
       attachments?: SessionV1.FilePart[]
     },
   ) => Effect.Effect<void>
-  readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
+  readonly process: (streamInput: LLM.StreamInput, options?: ProcessOptions) => Effect.Effect<Result>
 }
 
 type Input = {
@@ -83,6 +87,7 @@ type ProviderTurnEvidence = {
   lastStepFinish: FinishReason | undefined
   hasCompletedVisibleText: boolean
   hasToolEvidence: boolean
+  hasAssistantStarted: boolean
 }
 
 function providerTurnEvidence(): ProviderTurnEvidence {
@@ -92,6 +97,7 @@ function providerTurnEvidence(): ProviderTurnEvidence {
     lastStepFinish: undefined,
     hasCompletedVisibleText: false,
     hasToolEvidence: false,
+    hasAssistantStarted: false,
   }
 }
 
@@ -135,6 +141,7 @@ const layer = Layer.effect(
       }
       let aborted = false
       let evidence = providerTurnEvidence()
+      let recoverContextOverflow = true
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -300,6 +307,7 @@ const layer = Layer.effect(
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
         switch (value.type) {
           case "reasoning-start":
+            evidence.hasAssistantStarted = true
             if (value.id in ctx.reasoningMap) return
             ctx.reasoningMap[value.id] = {
               id: PartID.ascending(),
@@ -335,6 +343,7 @@ const layer = Layer.effect(
             return
 
           case "tool-input-start":
+            evidence.hasAssistantStarted = true
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
@@ -351,6 +360,7 @@ const layer = Layer.effect(
           }
 
           case "tool-call": {
+            evidence.hasAssistantStarted = true
             evidence.hasToolEvidence = true
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
@@ -524,6 +534,7 @@ const layer = Layer.effect(
           }
 
           case "text-start":
+            evidence.hasAssistantStarted = true
             ctx.currentText = {
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
@@ -672,7 +683,9 @@ const layer = Layer.effect(
         }
         const error = parse(e)
         if (SessionV1.ContextOverflowError.isInstance(error)) {
-          if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
+          const canRecover =
+            (yield* config.get()).compaction?.auto !== false && recoverContextOverflow && !evidence.hasAssistantStarted
+          if (!ctx.assistantMessage.summary && !canRecover) {
             ctx.assistantMessage.error = error
             ctx.assistantMessage.finish = "error"
             yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
@@ -691,12 +704,16 @@ const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
-      const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
+      const process = Effect.fn("SessionProcessor.process")(function* (
+        streamInput: LLM.StreamInput,
+        options?: ProcessOptions,
+      ) {
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
         })
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        recoverContextOverflow = options?.recoverContextOverflow ?? true
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {

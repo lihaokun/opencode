@@ -1084,6 +1084,8 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        // This bounds one in-memory overflow-recovery episode and intentionally resets with this runLoop.
+        let compactionToken: "none" | "compacted" | "skip" = "none"
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1230,6 +1232,12 @@ const layer = Layer.effect(
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
+            const currentUserIndex = msgs.findLastIndex((message) => message.info.id === lastUser.id)
+            const canCompact = msgs
+              .slice(0, Math.max(0, currentUserIndex))
+              .some(
+                (message) => message.info.role === "user" && !message.parts.some((part) => part.type === "compaction"),
+              )
             const promptOps = yield* ops()
 
             const tools = yield* SessionTools.resolve({
@@ -1278,21 +1286,45 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-            const result = yield* handle.process({
+            const messages = [
+              ...modelMsgs,
+              ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+            ]
+            const streamInput: LLM.StreamInput = {
               user: lastUser,
               agent,
               permission: session.permission,
               sessionID,
               parentSessionID: session.parentID,
               system,
-              messages: [
-                ...modelMsgs,
-                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-              ],
+              messages,
               tools,
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
-            })
+            }
+            const preparedPayload = yield* llm.preparePayload(streamInput)
+            const token = compactionToken
+            const skipEstimate = token === "compacted"
+            if (token === "compacted") compactionToken = "skip"
+            if (token === "skip") compactionToken = "none"
+            const overflow = skipEstimate ? false : yield* compaction.willOverflow({ ...preparedPayload, model })
+            if (overflow && canCompact) {
+              compactionToken = "compacted"
+              yield* sessions.removeMessage({ sessionID, messageID: handle.message.id })
+              yield* compaction.create({
+                sessionID,
+                agent: lastUser.agent,
+                model: lastUser.model,
+                auto: true,
+                overflow: true,
+              })
+              return "continue" as const
+            }
+            if (overflow) compactionToken = "skip"
+            const result = yield* handle.process(
+              { ...streamInput, preparedPayload },
+              { recoverContextOverflow: compactionToken === "none" && canCompact },
+            )
 
             if (handle.message.error?.name === "MessageOutputLengthError" || handle.message.finish === "length") {
               return "break" as const
@@ -1333,12 +1365,14 @@ const layer = Layer.effect(
 
             if (result === "stop") return "break" as const
             if (result === "compact") {
+              const overflow = !handle.message.finish
+              if (overflow) compactionToken = "compacted"
               yield* compaction.create({
                 sessionID,
                 agent: lastUser.agent,
                 model: lastUser.model,
                 auto: true,
-                overflow: !handle.message.finish,
+                overflow,
               })
             }
             return "continue" as const
