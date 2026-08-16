@@ -4,7 +4,7 @@
 >
 > 权威输入：当前approved `docs/design/session-recovery/architecture.md`、`detailed-design.md`与owner子计划集合。原stable snapshot的fresh independent design audit达到`0 P0 / 0 P1`，用户批准与四份Step 0 expectations均已完成。本文不得改变 G1–G12、M1–M8、I1–I13、三个recovery heads plus aggregate event head/cursor、raw-event sole authority、mechanical gate、Legacy-only 或 public/internal 隔离。
 >
-> 状态：production implementation前的D0 package-ownership correction已完成机械检查与fresh independent review `0 P0 / 0 P1`。该修正只把schema-owned raw recovery definitions与LLM-owned allowed-set digest enrichment拆开，以保持`schema ← llm ← opencode`；本changeset等待commit/push，production implementation、future tests与Step 5 audit尚未开始。
+> 状态：D0 package-ownership correction已完成机械检查、fresh independent review `0 P0 / 0 P1`并随`085698426f466b6fc01215c4cb34d89b73ef8290`推送。SESSREC-1 production implementation已进入M1-A scalar/nominal foundation；F1–F31、LLM canonical registry/builders、其余future tests与Step 5 audit尚未开始。
 
 ## 1. 范围
 
@@ -241,7 +241,9 @@ export type NonEmptyReadonlyArray<T> = readonly [T,...T[]]
 
 ```ts
 declare const recoveryBrand: unique symbol
-export type Brand<Name extends string> = { readonly [recoveryBrand]:Name }
+export type Brand<Name extends string> = {
+  readonly [recoveryBrand]: { readonly [Key in Name]: Key }
+}
 
 export type SafeInteger = number & Brand<"SafeInteger">
 export type SafeNonNegativeInt = SafeInteger & Brand<"SafeNonNegativeInt">
@@ -264,6 +266,8 @@ export type ExactFieldSetSpecification<T> = Readonly<
   | { kind:"union"; discriminator:string; branches:Readonly<Record<string,ExactFieldSetSpecification<unknown>>> }
 >
 ```
+
+`Brand<Name>`的mapped key carrier只存在于TypeScript类型层，使`SafePositiveInt`/`SafeNonNegativeInt`在保留`SafeInteger` brand的同时仍彼此不可替换，并使25个commitment brands pairwise non-substitutable。禁止改回单一symbol字段直接存literal `Name`：多个brand相交时该字段会退化为`never`并错误扩大assignability。
 
 ID共同不变量：非空、NFC、无首尾空白、不得包含NUL/control characters；codec只验证并brand现有ID，创建策略由对应owner负责；M1不从display name或timestamp派生authority ID。canonical number **只允许safe integer**：`Number.isSafeInteger(x)`必须为true；拒绝`NaN`、Infinity、float、`-0`与超出`Number.MAX_SAFE_INTEGER`的值。V1不支持decimal，因此不存在跨语言小数格式、指数、舍入或尾零规则。
 
@@ -3493,11 +3497,11 @@ export function decodeRecoveryPublicProjection(
 
 ## 7. 测试映射
 
-以下均为未来 owner，统一状态：`[F — planned; not created; not run]`。本阶段不创建、不执行。
+除M1-T01的foundation subset外，以下仍为future owner，状态保持`[F — planned; not created; not run]`。`[P — partial foundation evidence]`只表示schema scalar/nominal子集已创建并运行，不表示完整M1-T01、任一F callable或Step 5通过。
 
 | Test ID | 未来 owner / 建议路径 | 覆盖函数/合同 | fixture / 输入 | 通过判据 | 状态 |
 |---|---|---|---|---|---|
-| M1-T01 | `packages/schema/test/recovery-contract.test.ts` | §4全部codec | 每个union合法最小/完整值 | round-trip保持discriminator、optional omission与brands | [F — planned; not created; not run] |
+| M1-T01 | foundation：`packages/schema/test/recovery-contract-foundation.test.ts` + `.types.ts`；其余§4 codec tests仍待创建 | 当前仅§3.1/§4.1 scalar、ID、unbranded digest/domain与type-only commitment brands | safe integer/ID/digest/domain合法与非法边界、FastCheck、compile-time cross-brand fixtures | foundation `8/8`、schema typecheck与non-manifest regression `21/21`；完整schema suite的既有manifest 2 failures在clean D0 HEAD同样复现；剩余§4未覆盖 | [P — partial foundation evidence; remaining planned] |
 | M1-T02 | 同上 | F4 | missing/extra/null/wrong discriminator/nested extra | 每个path typed failure；输入不被strip | [F — planned; not created; not run] |
 | M1-T03 | `packages/schema/test/recovery-event-manifest.test.ts` | F1–F3/F31 | schema-owned raw `RecoveryEventDefinitionSetV1`、10个type-indexed recovery definitions、generic public durable definitions | raw set精确10/7+3且无digest字段、recovery全部internal+durable且selector=`aggregateID`；schema package零LLM import；public Latest/Server/OpenAPI source为0项 recovery event；generic public aggregates无需recovery envelope/chain migration | [F — planned; not created; not run] |
 | M1-T04 | `packages/core/test/event.test.ts`（M4协作） | public carriers/service vs trusted private replay | publish/read/replay each internal definition及generic public durable definition | internal raw只可由trusted private durable replay读取；listen/all/typed/public durable/readAggregate/bridge/sync/SSE/SDK均0 notification/0 decode；private manifest不能赋给public surface；public cursor/error无authority字段 | [F — planned; not created; not run] |
@@ -3544,7 +3548,7 @@ export function decodeRecoveryPublicProjection(
 
 ### 8.1 Workflow §4.3.1 六条
 
-原stable snapshot与D0 changed snapshot均已由independent reviewer复核并达到`0 P0 / 0 P1`。以下六条已按D0 F3/E1/F31 call graph重新签结；用户批准与Step 0已完成，但implementation/future tests仍是独立后续gate。
+原stable snapshot与D0 changed snapshot均已由independent reviewer复核并达到`0 P0 / 0 P1`。以下六条已按D0 F3/E1/F31 call graph重新签结；用户批准、Step 0与D0 commit/push已完成。当前M1-A foundation只有partial implementation evidence，其余implementation/future tests仍是独立后续gate。
 
 - [x] 推导连续：F1–F31/F16a与additional E1均有pre→编号/有序intermediate facts→post；F3 raw construction→E1 enrichment→F5–F7/M4 consumption连续且无反向dependency。
 - [x] 分支覆盖：publication、raw/enriched registry identity、public/private durable sets、public event known/unsupported/malformed/read-error、10 operation/version、source/control以及其余既有closed branches均覆盖。
@@ -3584,10 +3588,10 @@ export function decodeRecoveryPublicProjection(
 
 1. **D0 contract correction**：F3改为schema-owned raw `RecoveryEventDefinitionSetV1`；additional E1 `buildRecoveryEventRegistry`由LLM唯一拥有；F31只消费raw definitions/publication metadata。当前状态：已完成。
 2. **Fresh D0 independent review**：逐项核对25 builders、4 policy codecs、H1–H3、E1、F1–F31/F16a及§8.1/§8.2。当前状态：`0 P0 / 0 P1`；两个P2 metadata/wording项已修正。
-3. **D0 commit/push**：本changeset只提交architecture、detailed design、本文与S1 expectations；push成功后才可进入生产源码。当前状态：待执行。
-4. **Implementation entry**：只有1→2→3全部完成才可进入SESSREC-1 Step 1；production/test/migration/Step 5 audit仍禁止提前开始。
+3. **D0 commit/push**：四份D0文档已随`085698426f466b6fc01215c4cb34d89b73ef8290`推送。当前状态：已完成。
+4. **Implementation entry**：1→2→3已完成，SESSREC-1 Step 1现仅进入M1-A scalar/nominal foundation；下一slice仍等待本slice verification/review/commit/push。
 
-用户批准、Step 0与D0 review boxes已完成；implementation与future-test boxes保持unchecked。该状态不把未实现合同写成runtime proof。
+用户批准、Step 0、D0 review与D0 commit/push boxes已完成；M1-A foundation为partial implementation，完整M1与future acceptance boxes保持unchecked。该状态不把未实现合同写成runtime proof。
 
 ### 8.4 架构不变量与正确性结论
 

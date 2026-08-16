@@ -6,7 +6,7 @@
 **D0 contract sync / review**: `2026-08-16；0 P0 / 0 P1`
 **Step 5 验证时间**: `待 Step 5 填`
 
-> 证据边界：本文仅从允许读取的设计契约独立抽取。所有实现、测试、schema、脚本、migration、codegen 与 Step 5 结果均为 `[F — planned; not created; not run]`。当前 A/B/C/D 与 `[S — source seam only]` 证据不证明本子计划 future contract 已实现或通过。
+> 证据边界：本文的expectations仍只来自允许读取的设计契约，Step 5实现位置/一致列尚未回填。M1-A scalar/nominal foundation已有partial production evidence：focused runtime/property tests `8/8`、schema typecheck通过、non-manifest schema regression `21/21`；完整schema suite仍有clean D0 HEAD可同样复现的`event-manifest.test.ts`既有2项失败。该partial evidence不证明完整M1-T01、F1–F31、automatic recovery或Step 5通过；其余实现、测试、schema、脚本、migration与codegen仍为`[F — planned; not created; not run]`。
 
 ---
 
@@ -35,7 +35,7 @@
 |---|---|---|---|---|---|
 | `ContractResult<A,E>` | success `{ok:true,value:A}`；failure `{ok:false,error:E}` | branch-exact | SESSREC-1 §3.1 | 待 Step 5 填 | 待 Step 5 验证 |
 | `RecoveryContractError` | closed union：`ConfigCodecError`、`EventDefinitionError`、`RecoveryDecodeError`、`FieldSetError`、`NormalizationError`、`CanonicalizationError`、`DigestMismatchError`、`PublicProjectionViolation`；各自 `kind/issue/path` 与 branch fields exact | yes | SESSREC-1 §3.1 | 待 Step 5 填 | 待 Step 5 验证 |
-| Primitive brands / IDs | `SafeInteger:number`；`SafeNonNegativeInt`；`SafePositiveInt`；`RecoveryChainID`、`RecoveryAssistantID`、`RecoveryDecisionID`、`RecoveryOperationID`、`RecoveryAggregateID`、`RecoveryPolicyScopeKey`、`RecoverySealedRefID:string` | yes | SESSREC-1 §4.1.1 | 待 Step 5 填 | 待 Step 5 验证 |
+| Primitive brands / IDs | mapped-key `Brand<Name>`累积nominal keys；`SafeInteger:number`；`SafeNonNegativeInt`；`SafePositiveInt`；`RecoveryChainID`、`RecoveryAssistantID`、`RecoveryDecisionID`、`RecoveryOperationID`、`RecoveryAggregateID`、`RecoveryPolicyScopeKey`、`RecoverySealedRefID:string`；scalar refinements保留SafeInteger且彼此/IDs均不可替换 | yes | SESSREC-1 §4.1.1 | 待 Step 5 填 | 待 Step 5 验证 |
 | `CanonicalDigestValue` | `version:1;algorithm:"sha256";encoding:"recovery-canonical-json";value:64-lowercase-hex` | yes | SESSREC-1 §4.1.2 | 待 Step 5 填 | 待 Step 5 验证 |
 | 25 commitment brands | `SemanticDigest`、`PreparedDigest`、`BindingDigest`、`OperationPayloadDigest`、`SupersessionBindingDigest`、`EventChainDigest`、`SourceFactsDigest`、`RecoverySourceVersionDigest`、`RecoveryControlTailDigest`、`RecoveryPolicyDigest`、`DispatchTargetDigest`、`SealedMaterialCommitment`、`PausedHandleCommitment`、`RecoveryClosureDigest`、`CredentialAuthorityVersionDigest`、`ProviderAuthorizationProofDigest`、`ControlPolicyDigest`、`ToolPlanDigest`、`ToolCallDigest`、`ToolResultDigest`、`ReasoningTextDigest`、`ProviderPrefixDigest`、`ProviderPrefixAncestryDigest`、`SourceAllowedEventSetDigest`、`ControlAllowedEventSetDigest` | yes；non-substitutable | SESSREC-1 §4.1.2–§4.1.3 | 待 Step 5 填 | 待 Step 5 验证 |
 | `RecoveryLineage` | `chainID:RecoveryChainID;recoveryOrdinal:SafeNonNegativeInt` | yes | SESSREC-1 §4.2.1 | 待 Step 5 填 | 待 Step 5 验证 |
@@ -382,10 +382,10 @@
 ### Step 5 回填约束
 
 - 所有实现位置单元格当前保持 `待 Step 5 填`，仅Step 5按实际diff回填。
-- Future test/schema/script path仅为计划，不表示文件存在。
+- 除已明确标为M1-A partial foundation evidence的两个`recovery-contract-foundation` test files外，future test/schema/script path仅为计划，不表示文件存在。
 - 不得把design audit、当前50/50 A/B/C/D或S seam写成implementation/Step 5 pass。
 - 若发现contract/implementation冲突，先修contract或实现并记录决策，再更新本文；禁止从代码反向改写expectation掩盖偏差。
 
 ---
 
-*本 expectations 由 Step 0 从契约文档独立抽取；D0行仅在owner设计合同先修正后同步，未从production implementation或tests回填实现位置/结果。后续修改必须先改契约文档，再同步本表。Bug类契约修复走 `workflow.md §7`；feature类扩展按 `workflow.md §2.3` 判定。*
+*本 expectations 由 Step 0 从契约文档独立抽取；D0行仅在owner设计合同先修正后同步。当前只记录M1-A foundation的行政状态与真实partial test evidence，不回填Step 5实现位置/一致结论。后续contract修改必须先改契约文档，再同步本表。Bug类契约修复走 `workflow.md §7`；feature类扩展按 `workflow.md §2.3` 判定。*

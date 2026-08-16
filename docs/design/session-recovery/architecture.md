@@ -2,15 +2,15 @@
 
 > Issue：[#7](https://github.com/lihaokun/opencode/issues/7)
 >
-> 状态：详细设计已获用户批准；四份Workflow Step 0 expectations已随commit `acc7d0bcfd99623ffd2e0675b8d0cb75b7703688`推送。D0 package-ownership call-graph correction已完成机械检查与fresh independent review `0 P0 / 0 P1`；本changeset只含四份D0文档，production implementation与future tests尚未开始。
+> 状态：详细设计与四份Workflow Step 0 expectations已批准并推送；D0 package-ownership correction已随commit `085698426f466b6fc01215c4cb34d89b73ef8290`推送且fresh independent review为`0 P0 / 0 P1`。SESSREC-1 production implementation已进入M1-A scalar/nominal foundation；其余M1 callables、future acceptance tests与Step 5 audit仍未开始。
 >
-> 当前设计输入：branch `yixiao-issue-7-new`，HEAD `acc7d0bcfd99623ffd2e0675b8d0cb75b7703688`。50/50运行证据仍只绑定source-equivalent `135f20215`。
+> 当前设计输入：branch `yixiao-issue-7-new`，D0 gate commit `085698426f466b6fc01215c4cb34d89b73ef8290`。50/50运行证据仍只绑定source-equivalent `135f20215`。
 >
 > 实施提案：`docs/fixes/session-fix-incomplete-stream-recovery.md`。
 
 ## 0. 文档权威与状态
 
-文档权威层级固定：实施提案只对需求、根因、产品范围与原始证据清单具有规范性；它不拥有实现schema、接口、ordering、receipt/result或persistence contract。本文、`detailed-design.md`与owner子计划共同构成已批准implementation contract；冲突时不得用proposal旧文本覆盖later design。Owner repair、原设计fresh independent audit、用户批准、四份Workflow Step 0 expectations及D0 fresh independent review `0 P0 / 0 P1`均已完成。D0只修正M1内部真实package dependency对应的call graph，不证明production readiness；本D0 changeset push成功后才可进入production implementation。
+文档权威层级固定：实施提案只对需求、根因、产品范围与原始证据清单具有规范性；它不拥有实现schema、接口、ordering、receipt/result或persistence contract。本文、`detailed-design.md`与owner子计划共同构成已批准implementation contract；冲突时不得用proposal旧文本覆盖later design。Owner repair、原设计fresh independent audit、用户批准、四份Workflow Step 0 expectations、D0 fresh independent review `0 P0 / 0 P1`及D0 commit/push均已完成。当前只进入SESSREC-1 M1-A foundation，不把该局部实现外推为M1或production readiness。
 
 ## 1. 评审基线、证据与产品范围
 
@@ -19,12 +19,12 @@
 | 项目 | 结论 |
 |---|---|
 | 当前分支 | `yixiao-issue-7-new` |
-| D0 base HEAD / changed snapshot | base为`acc7d0bcfd99623ffd2e0675b8d0cb75b7703688`；当前changed snapshot只修改architecture、detailed design、SESSREC-1 owner与SESSREC-1 expectations四份文档，生产源码、测试与依赖未变。 |
+| D0 gate / current implementation snapshot | D0已随`085698426f466b6fc01215c4cb34d89b73ef8290`推送。当前只实现SESSREC-1 M1-A scalar/nominal foundation及其focused runtime/property/type tests；未改Event/manifest、Legacy/V2 runtime、DB、依赖或lockfile。 |
 | 规范输入 | 已提交的 `docs/fixes/session-fix-incomplete-stream-recovery.md` |
 | 上游证据 | **No upstream**：未读取或引用上游仓库、上游分支或上游实现。当前 Git tracking remote 不构成架构证据。 |
 | 当前源码运行证据 | 在 source-equivalent HEAD `135f2021517a2d4ac6f3dfc8d5e175dd2c0da309`、Bun `1.3.14` 上新鲜执行：A=10 个 CLI，B=1 个 live HTTP/generated SDK，C=10（7 个 prompt + 3 个 TCP processor），D=29（2 个 synthetic processor + 1 个 retry + 22 个 TUI + 4 个 routes）；共 50 项，50 pass、0 fail、0 skip。不得把该结果改写为 future recovery 已验证。 |
 | 历史证据关系 | 实施提案记录的 commit `0ea5c2959` 运行结果仅作为更早历史交叉检查；`135f20215` 的新鲜重跑是当前源码行为证据基线。 |
-| 当前阶段 | D0文档修正与fresh independent review已完成；等待本changeset commit/push。未修改生产代码或测试，未创建/执行future recovery tests，未执行migration/codegen。 |
+| 当前阶段 | D0已commit/push。SESSREC-1 M1-A foundation已实现并完成focused `8/8`、schema typecheck与不含既有manifest红项的schema regression `21/21`；完整schema suite仍有clean D0 HEAD可复现的`event-manifest.test.ts`既有2项失败。其余future recovery tests、migration/codegen与Step 5未执行。 |
 
 ### 1.2 A/B/C/D/S/F 证据追踪
 
@@ -669,7 +669,7 @@ Complete nominal authority view and same-view automatic proof slice
 
 ## 11. 后续详细设计与四个非 V2 子计划
 
-本文、函数级`detailed-design.md`与四个owner子计划共同构成已通过independent design audit并获用户批准的implementation contract。四份Workflow Step 0 expectations已完成、commit并push。D0修正仅解决M1内部schema/LLM package dependency与F3/F31 call graph不一致的问题，fresh independent review已达到`0 P0 / 0 P1`；本D0 changeset commit/push前不得进入production implementation，且不得声称implementation或future tests已完成。
+本文、函数级`detailed-design.md`与四个owner子计划共同构成已通过independent design audit并获用户批准的implementation contract。四份Workflow Step 0 expectations与D0 correction均已完成、commit并push，D0 fresh independent review达到`0 P0 / 0 P1`。当前仅SESSREC-1 M1-A scalar/nominal foundation进入实现；不得把其partial evidence写成M1、automatic recovery或future acceptance已完成。
 
 四个全局唯一子计划均只覆盖Legacy/shared compatibility，不建立V2 recovery子计划：
 
@@ -689,7 +689,7 @@ Complete nominal authority view and same-view automatic proof slice
 5. **R25 / additional P1 — policy authority**：runtime只消费transaction-verified committed `NormalizedRecoveryPolicy.digestInput.effectiveMaxModelAssistants`；config/`agent.steps` reread、top-level direct access与runtime re-min均禁止。
 6. **R26 / additional P1 — owner export/call-order convergence**：M1现导出`DispatchAdmissionV1`、`TypedIncompleteTerminalFact`、`AssistantChainHeadV1`、`AggregateEventHeadV1`、`AutomaticRecoveryAction`、`RecoveryAdmissionPolicyBindingV1`及既有replay/closure/predecessor/operation-schema surfaces；private receipt variants与`OperationApplyModeV1`仍只经exported/indexed surfaces消费。M2 reservation/full prepare input、M4仅exported/indexed M1 references、O10 branded-authority two-stage supersession、M4 nominal view/O3a/K7–K10、M7 descriptor/reconstruction/validation与exact 21-step automatic order已对齐。
 
-这些obligations已通过fresh stable-snapshot independent design audit、用户批准与Step 0 expectations抽取。D0 package-ownership correction及其fresh independent review也已完成；当前只剩本D0 changeset commit/push gate，之后才进入production implementation。
+这些obligations已通过fresh stable-snapshot independent design audit、用户批准与Step 0 expectations抽取。D0 package-ownership correction、fresh independent review与commit/push gate也已完成；当前按依赖顺序进入SESSREC-1 M1-A foundation，下一production slice仍须等待本slice验证、审查、commit与push。
 
 ## 12. 固定实施选择（independent design audit、用户批准与Step 0均已完成）
 
