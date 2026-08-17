@@ -4,7 +4,7 @@
 >
 > 权威输入：当前approved `docs/design/session-recovery/architecture.md`、`detailed-design.md`与owner子计划集合。原stable snapshot的fresh independent design audit达到`0 P0 / 0 P1`，用户批准与四份Step 0 expectations均已完成。本文不得改变 G1–G12、M1–M8、I1–I13、三个recovery heads plus aggregate event head/cursor、raw-event sole authority、mechanical gate、Legacy-only 或 public/internal 隔离。
 >
-> 状态：D0 package-ownership correction已随`085698426f466b6fc01215c4cb34d89b73ef8290`推送，M1-A scalar/nominal foundation已随`deb84e90a9051511db3c9ca69f52cacdaf45af2e`推送。当前changeset实现F1 exact `Event.define`、F2 `partitionDefinitionsByPublication`、public manifest source partition与97个production/core caller迁移；F3–F31、LLM canonical registry/builders、recovery event set、future acceptance与Step 5 audit尚未完成。
+> 状态：D0 package-ownership correction已随`085698426f466b6fc01215c4cb34d89b73ef8290`推送，M1-A scalar/nominal foundation已随`deb84e90a9051511db3c9ca69f52cacdaf45af2e`推送，M1-B F1/F2、public manifest source partition与97个production/core caller迁移已随`8bcb26e5384a22804dd73da7aef85e5f0b4e99e8`推送。当前changeset实现并完成独立review的是M1-C F4 recursive exact field-set boundary；文档同步与commit/push仍在当前gate。F3、F5–F31、LLM canonical registry/builders、recovery event set、future acceptance与完整Step 5 audit尚未完成。
 
 ## 1. 范围
 
@@ -59,8 +59,8 @@
 | 等级 | 本文允许的表述 |
 |---|---|
 | 当前 A/B/C/D | 此前架构基线记录 source-equivalent `135f20215`、Bun `1.3.14` 上 scoped checks 精确为 A=10、B=1、C=10（7 个 prompt + 3 个 TCP processor）、D=29（2 个 synthetic processor + 1 个 retry + 22 个 TUI + 4 个 routes），总计 50/50；该数字只证明各测试直接断言的当前行为，不证明本文 future contract，也不构成当前修订批准。 |
-| 当前 S / partial implementation | `Event.Definition`现含frozen `type/publication/durable/data` metadata；F1 exact result、F2 owner-identity partition与现有public manifest source partition已实现并有runtime/type/core evidence。Durable row仍通过versioned type lookup和Effect Schema decode；Legacy `providerExecuted`、reasoning metadata与public assistant schema仍只是可扩展接缝。 |
-| Future F | Recovery-specific types/definitions（含tool partition/phase、reconstructible carrier、sealed-use lease input与新增owner exports）、F3/F4/F31、strict field-set、canonical builders/digest、old-row decode、N/M policy、projection allowlist及其future acceptance仍为 `[F — planned; not created; not run]`。 |
+| 当前 S / partial implementation | `Event.Definition`现含frozen `type/publication/durable/data` metadata；F1 exact result、F2 owner-identity partition与现有public manifest source partition已实现并有runtime/type/core evidence。F4 recursive exact field-set validator也已在schema canonical owner实现，完成focused/property/type、non-manifest、monorepo typecheck与独立review evidence。Durable row仍通过versioned type lookup和Effect Schema decode；Legacy `providerExecuted`、reasoning metadata与public assistant schema仍只是可扩展接缝。 |
+| Future F | Recovery-specific types/definitions（含tool partition/phase、reconstructible carrier、sealed-use lease input与新增owner exports）、F3、F5–F31、canonical builders/digest、old-row decode、N/M policy、projection allowlist及其future acceptance仍为 `[F — planned; not created; not run]`。 |
 
 ### 1.4 跨子计划依赖方向与 authority 单向性
 
@@ -266,6 +266,8 @@ export type ExactFieldSetSpecification<T> = Readonly<
   | { kind:"union"; discriminator:string; branches:Readonly<Record<string,ExactFieldSetSpecification<unknown>>> }
 >
 ```
+
+`ExactFieldSetSpecification<T>`中的`T`是descriptive caller contract，不由TypeScript从DSL结构反向推导，也不能单独证明schema↔spec equivalence；F3必须用`OperationSchemaByTypeV1` exhaustive registry parity与property tests把每个operation schema、event type和recursive exact spec逐项绑定。`string.validate`只允许owner-held total/deterministic/side-effect-free predicate；F4调用期间spec/value reflection必须稳定，stateful/mutating Proxy不满足Requires。
 
 `Brand<Name>`的mapped key carrier只存在于TypeScript类型层，使`SafePositiveInt`/`SafeNonNegativeInt`在保留`SafeInteger` brand的同时仍彼此不可替换，并使25个commitment brands pairwise non-substitutable。禁止改回单一symbol字段直接存literal `Name`：多个brand相交时该字段会退化为`never`并错误扩大assignability。
 
@@ -2849,7 +2851,7 @@ F18/F19/F20的builder名称同时是25-domain inventory中的对应input builder
 
 #### 5.0.3 Consolidated exact callable inventory and proof ledger（review待核）
 
-本表是本文**唯一完整callable inventory/ledger**。每个exported callable name在本表恰出现一次；F18/F19/F20同时是25-domain builders，分别以`B01/F18`、`B02/F19`、`B03/F20`单行计数，不在F组重复。规范签名仍只在“signature anchor”所指代码块定义；proof anchor包含Requires/Ensures、连续branches/exits、termination与side effects。状态统一保持unchecked，不把“anchor已写”误报为review已通过。
+本表是本文**唯一完整callable inventory/ledger**。每个exported callable name在本表恰出现一次；F18/F19/F20同时是25-domain builders，分别以`B01/F18`、`B02/F19`、`B03/F20`单行计数，不在F组重复。规范签名仍只在“signature anchor”所指代码块定义；proof anchor包含Requires/Ensures、连续branches/exits、termination与side effects。只有已完成的F1/F2/F4按各自partial slice记录真实implementation/review evidence；其它状态保持unchecked，不把“anchor已写”误报为review或完整Step 5已通过。
 
 | ID | callable（唯一行） | signature anchor | proof anchor / status |
 |---|---|---|---|
@@ -2889,7 +2891,7 @@ F18/F19/F20的builder名称同时是25-domain inventory中的对应input builder
 | F1 | `define` | §5.0.1 | §5.1.1；`[P — implemented; runtime/type evidence; full Step 5 pending]` |
 | F2 | `partitionDefinitionsByPublication` | §5.0.1 | §5.1.2；`[P — implemented; property/type/core evidence; full F31 closure pending]` |
 | F3 | `buildRecoveryEventDefinitions` | §5.0.1 | §5.1.3；`[F — planned; proof present; review unchecked]` |
-| F4 | `validateExactFieldSet` | §5.0.1 | §5.1.4；`[F — planned; proof present; review unchecked]` |
+| F4 | `validateExactFieldSet` | §5.0.1 | §5.1.4；`[P — implemented; runtime/property/type/package evidence; independent review clean; full Step 5 pending]` |
 | F5 | `decodeRecoveryDurableRow` | §5.0.1 | §5.1.5；`[F — planned; pure explicit-M4-proof proof present; review unchecked]` |
 | F6 | `decodeRecoverySourceFieldSet` | §5.0.1 | §5.1.6；`[F — planned; proof present; review unchecked]` |
 | F7 | `decodeRecoveryControlTail` | §5.0.1 | §5.1.7；`[F — planned; proof present; review unchecked]` |
@@ -3025,26 +3027,26 @@ export function partitionDefinitionsByPublication<D extends Definition>(
 - **正确性论证**：I1固定membership；B24/B25+F17/F21保证digest分别绑定同一versions、tuple和recursive exact fields；步骤4只附加这两项，故Ensures成立且无duplicate canonical owner。
 - **副作用论证**：所有callee为pure `ContractResult`；只分配/冻结内存对象，副作用为空且穷尽。
 
-#### 5.1.4 F4 `validateExactFieldSet(value, specification, path="$" ) -> void`
+#### 5.1.4 F4 `validateExactFieldSet<T>(value, specification, path?) -> ContractResult<void,FieldSetError>`
 
-- **功能描述**：递归验证authority object的required/optional/forbidden字段、数组元素和closed discriminator；不依赖Effect Schema对extra key的默认策略。
-- **调用关系**：callers: F5–F8、F18–F20、F24–F27；callees: primitive validators、`Object.keys`。
-- **Requires**：specification自身无duplicate字段，且每个union discriminator值唯一。
-- **Ensures**：成功时value的每个object key恰属于spec、required全存在、optional absent/nullability符合、union选中唯一branch；失败返回首个或全部typed path errors，value不变。
-- **Invariants**：validator不删除/coerce字段。
-- **副作用**：无。
+- **功能描述**：在不依赖Effect Schema默认extra-key策略的前提下，先编译并验证完整recursive specification graph，再以显式frame stack验证authority value的required/optional/forbidden字段、数组元素与closed discriminator。`T`只描述caller声明的目标类型；F4不从`T`推导DSL，schema↔exact-spec等价由F3 registry parity/property tests建立。
+- **调用关系**：callers: F3、F5–F8、F18–F20、F24–F27；callees: primitive validators、`Reflect.getPrototypeOf`、`Reflect.ownKeys`、`Reflect.getOwnPropertyDescriptor`与`Reflect.has`。
+- **Requires**：specification的reachable graph使用六种closed kind，object required/optional无duplicate或交集，fields与branch membership exact，union discriminator非空且branch key唯一；所有`string.validate` predicate由owner持有且total、deterministic、side-effect-free并且不修改value/specification/captured authority state。调用期间value与specification的reflection view保持稳定：prototype、own keys、property descriptors、array length/entries与predicate结果不随读取次数或时点改变；stateful/mutating Proxy view不满足该前置条件。
+- **Ensures**：成功恰返回`{ok:true,value:undefined}`，且每个object own key恰属于spec、required全存在、optional own absence与present value按field spec区分、数组无hole/decorated authority key、union只选择exact discriminator branch；只有literal-null branch允许`null`。失败返回一个deterministic `FieldSetError`：missing/extra带当前object path与field，forbidden null带child path，wrong primitive/literal/range/discriminator、accessor、cycle、hostile reflection或malformed spec为`wrong-set`。value与specification均不被删除、coerce、freeze或修改。
+- **Invariants**：只读取own data descriptors；不调用value/spec accessor或`Symbol.toStringTag`；active value/union frames阻断cycle；completed `(value object,specification object)` pair只在Requires的stable reflection下复用。
+- **副作用**：无；只分配调用局部compiled-spec map、frame stack、active/completed sets与lazy path nodes。
 - **实现步骤**：
-  1. 根据spec kind分支：primitive/object/array/union/literal。
-  2. primitive：检查type/value constraint；失败退出。
-  3. object：确认非null普通object且非array；取keys，先检查extra，再required missing；按stable key顺序递归每个present字段。
-  4. array：确认array；按index递归。
-  5. union：先读取discriminator；missing/unknown失败；只递归匹配branch，禁止尝试多个branch后“最像的”降级。
-  6. literal：精确相等，否则失败。
-  7. 全部子项成功后返回void。
-- **分支/退出**：每种kind与每个validation failure均typed exit；无“忽略extra”路径。
-- **循环/递归**：对象/数组有限；每次递归进入严格子值；无cycle是Requires，故结构大小单调下降并终止。canonical输入若有cycle由F17单独检测。
-- **callee引用**：primitive validator requires unknown input并ensures不coerce；`Object.keys`只枚举own enumerable string keys，schema inputs禁止symbol/non-enumerable authority字段。
-- **正确性论证**：结构归纳：primitive/literal直接成立；object/array在所有直接成员通过且无extra/missing时满足exact spec；union由唯一discriminator选择唯一spec。因此成功蕴含field-set exact，且无修改副作用。
+  1. 校验optional path，默认root为`$`；对完整specification graph做一次iterative compile。每个spec object按identity只编译一次，reused spec不重复执行own-key compilation pass；unused optional field、empty-array element与unselected union branch中的malformed spec同样typed失败。
+  2. 将root value/spec pair压入显式frame stack；每次弹出一帧，先查compiled spec与已完成pair，再按literal/string/safe-integer/array/object/union分支。
+  3. literal用`Object.is`；string先验证primitive再调用owner predicate；safe-integer拒绝float、nonfinite、unsafe与`-0`并执行optional min/max。predicate throw转为当前path的typed `wrong-set`。
+  4. object验证ordinary structural prototype chain：中间prototype不得声明constructor，terminal constructor必须是其本身prototype identity对应的intrinsic `Object`；class、`Date`与constructor spoof均拒绝。以own descriptors线性选择lexicographically first extra，随后按required再optional的specification order逐字段推进；optional inherited字段按`extra`拒绝且不调用inherited accessor。
+  5. array snapshot finite safe length，拒绝symbol/non-enumerable/decorated key、hole与accessor；按numeric index一次推进一个continuation frame，不排序或改写input。
+  6. union只读取own enumerable data discriminator；missing、hidden/accessor、unknown branch分别typed失败，只压入唯一匹配branch，不做fallback。
+  7. 容器进入时登记active frame，成功离开时登记completed value/spec pair；active cycle返回typed `wrong-set`，shared acyclic DAG只重复已完成pair的O(1) lookup。成功耗尽frame stack后返回void result。
+- **分支/退出**：六种kind及每个validation/reflection/specification failure均只有typed `ContractResult.ok=false`出口；不暴露raw exception，不存在“忽略extra”、throwing、Effect或boolean shortcut。
+- **循环/递归**：实现不使用JavaScript递归栈。Spec compiler每轮完成一个尚未compiled的spec object；value loop每轮弹出一帧，array/object continuation index单调增加，active cycle即时失败，completed pair避免shared-DAG重复展开。有限stable graph与safe array length保证终止；12,000层finite value runtime regression通过。
+- **路径与顺序**：root默认`$`；identifier field为`.field`，其它field为JSON bracket notation，array为`[index]`。Extra field用线性minimum scan确定；missing与child validation按required→optional specification order，array按numeric order，因此首个error稳定。
+- **正确性论证**：完整spec compile先证明每个reachable branch可解释；value loop对frame做归纳：primitive/literal直接满足branch，object/array在local exact membership与所有continuation child成功后满足recursive spec，union由own discriminator唯一选择branch。Active-set保证cyclic value不能伪装成finite proof，completed-pair只复用已证明且reflection-stable的同一pair；故成功蕴含recursive exact field membership。所有读取均经descriptor/reflection并且不写input，故副作用为空。
 
 #### 5.1.5 F5 `decodeRecoveryDurableRow(input) -> DecodedRecoveryOperation`
 
@@ -3497,12 +3499,12 @@ export function decodeRecoveryPublicProjection(
 
 ## 7. 测试映射
 
-M1-T01 foundation与M1-T03/T04/T04a的F1/F2 subset已有partial evidence；其它行仍为future owner并保持`[F — planned; not created; not run]`。`[P — partial implementation evidence]`只表示明确列出的子集已创建并运行，不表示完整test ID、F3/F31、recovery event set、public/private runtime closure或Step 5通过。
+M1-T01 foundation、M1-T03/T04/T04a的F1/F2 subset与M1-T02 F4已有partial evidence；其它行仍为future owner并保持`[F — planned; not created; not run]`。`[P — partial implementation evidence]`只表示明确列出的子集已创建并运行，不表示F3/F31、recovery event set、public/private runtime closure或完整Step 5通过。
 
 | Test ID | 未来 owner / 建议路径 | 覆盖函数/合同 | fixture / 输入 | 通过判据 | 状态 |
 |---|---|---|---|---|---|
-| M1-T01 | foundation：`packages/schema/test/recovery-contract-foundation.test.ts` + `.types.ts`；其余§4 codec tests仍待创建 | 当前仅§3.1/§4.1 scalar、ID、unbranded digest/domain与type-only commitment brands | safe integer/ID/digest/domain合法与非法边界、FastCheck、compile-time cross-brand fixtures | foundation `8/8`（207 assertions）；当前schema typecheck与non-manifest regression `29/29`通过；完整schema suite既有manifest 2 failures在clean D0/M1-A同样复现；剩余§4未覆盖 | [P — partial foundation evidence; remaining planned] |
-| M1-T02 | 同上 | F4 | missing/extra/null/wrong discriminator/nested extra | 每个path typed failure；输入不被strip | [F — planned; not created; not run] |
+| M1-T01 | foundation：`packages/schema/test/recovery-contract-foundation.test.ts` + `.types.ts`；其余§4 codec tests仍待创建 | 当前仅§3.1/§4.1 scalar、ID、unbranded digest/domain与type-only commitment brands | safe integer/ID/digest/domain合法与非法边界、FastCheck、compile-time cross-brand fixtures | foundation `8/8`（207 assertions）；当前schema typecheck与含F4的non-manifest regression `43/43`（383 assertions）通过；完整schema suite既有manifest 2 failures在clean D0/M1-A同样复现；剩余§4未覆盖 | [P — partial foundation evidence; remaining planned] |
+| M1-T02 | `packages/schema/test/recovery-exact-field-set.test.ts` + `recovery-exact-field-set.types.ts` | F4 | 六种spec kind、missing/extra/null/literal/range/discriminator/nested extra、optional inherited、symbol/non-enumerable/accessor、hostile/revoked Proxy、malformed unused spec、class/constructor spoof、cycle、12,000层finite value、shared DAG、foreign realm、FastCheck exact mutations与compile-time closed surface | focused `14/14`（94 assertions）；schema typecheck；non-manifest `43/43`（383 assertions）；repository Turbo `30/30`；完整schema `43/45`（399 assertions）仅保留既有manifest 2 failures；独立review最终`[]`；输入不被strip/mutate | [P — F4 implemented/tested/reviewed; full Step 5 pending] |
 | M1-T03 | F1/F2 subset：`packages/schema/test/event.test.ts` + `event.types.ts`；F3/F31 future：`recovery-event-manifest.test.ts` | F1–F3/F31 | 已覆盖exact define result、publication metadata/default、partition order/identity/disjointness/duplicates/hostile inputs；raw 10-definition set仍future | F1/F2 subset schema focused `19/19`（267 assertions）与typecheck通过；10/7+3 recovery set、internal recovery definitions、F31 manifests/OpenAPI zero-leakage仍未创建 | [P — F1/F2 subset evidence; F3/F31 remaining planned] |
 | M1-T04 | F1/F2 compatibility subset：`packages/core/test/event.test.ts` + `session-history.test.ts`；F31/M4 private replay future | public definition metadata vs existing publish/replay payload；trusted private replay仍future | public definition与现有EventV2 publish/replay fixture；private replay fixture仍future | core focused `50/50`（93 assertions）与typecheck通过；publication不进入published payload；internal raw/private manifest/public service zero-notification closure仍未创建 | [P — compatibility subset evidence; private/public runtime closure planned] |
 | M1-T04a | F2 definition-brand subset：`packages/schema/test/event.types.ts`；full F31 carriers future：`recovery-public-event-types.test-d.ts` | §4.5.1a/F2/F31 nominal closure | 已覆盖raw/internal definition不能替代`PublicEventDefinitionV1`、F2 public output可用、publication不进入Data/Payload/Encoded；committed event/cursor/service/private manifest仍future | schema typecheck通过；仅definition-level nominal boundary有证据 | [P — F2 definition-brand subset; F31 carrier closure planned] |
@@ -3548,7 +3550,7 @@ M1-T01 foundation与M1-T03/T04/T04a的F1/F2 subset已有partial evidence；其�
 
 ### 8.1 Workflow §4.3.1 六条
 
-原stable snapshot与D0 changed snapshot均已由independent reviewer复核并达到`0 P0 / 0 P1`。以下六条已按D0 F3/E1/F31 call graph重新签结；用户批准、Step 0、D0与M1-A commit/push已完成。当前M1-A及M1-B F1/F2只有partial implementation evidence，其余implementation/future tests仍是独立后续gate。
+原stable snapshot与D0 changed snapshot均已由independent reviewer复核并达到`0 P0 / 0 P1`。以下六条已按D0 F3/E1/F31 call graph重新签结；用户批准、Step 0、D0、M1-A与M1-B commit/push已完成。当前M1-A、M1-B F1/F2与M1-C F4只有partial implementation evidence；F3、F5–F31及其future tests仍是独立后续gate。
 
 - [x] 推导连续：F1–F31/F16a与additional E1均有pre→编号/有序intermediate facts→post；F3 raw construction→E1 enrichment→F5–F7/M4 consumption连续且无反向dependency。
 - [x] 分支覆盖：publication、raw/enriched registry identity、public/private durable sets、public event known/unsupported/malformed/read-error、10 operation/version、source/control以及其余既有closed branches均覆盖。
@@ -3582,7 +3584,7 @@ M1-T01 foundation与M1-T03/T04/T04a的F1/F2 subset已有partial evidence；其�
 - [x] F30返回known/unsupported/malformed exact union，未知enum与未知structure version区分。
 - [x] 24个ManualStop reasons tuple保持原顺序；lower-level source-specific cause union不含reason/code；F23 compile-time穷尽、runtime total无throw、去重、非空，unexpected只返回internal singleton。
 
-### 8.3 Current workflow gate：approved design + Step 0 + D0 review → commit/push → implementation
+### 8.3 Current workflow gate：M1-C F4 docs → commit/push → F3
 
 原M1合同已通过stable-snapshot independent design audit `0 P0 / 0 P1`，随后获得用户批准；`docs/audits/sessrec-1-contract-canonicalization/expectations.md`已完成并随`acc7d0bcf`推送。只读package dependency核查发现原F3会让schema调用LLM-owned F17/F21，因此当前D0按以下顺序收口：
 
@@ -3590,9 +3592,10 @@ M1-T01 foundation与M1-T03/T04/T04a的F1/F2 subset已有partial evidence；其�
 2. **Fresh D0 independent review**：逐项核对25 builders、4 policy codecs、H1–H3、E1、F1–F31/F16a及§8.1/§8.2。当前状态：`0 P0 / 0 P1`；两个P2 metadata/wording项已修正。
 3. **D0 commit/push**：四份D0文档已随`085698426f466b6fc01215c4cb34d89b73ef8290`推送。当前状态：已完成。
 4. **M1-A implementation**：scalar/nominal foundation已验证、review并随`deb84e90a9051511db3c9ca69f52cacdaf45af2e`推送。
-5. **M1-B implementation**：当前changeset实现F1/F2、97个production/core caller boundary与public manifest source partition；F3/F4仍等待本slice verification/review/commit/push。
+5. **M1-B implementation**：F1/F2、97个production/core caller boundary与public manifest source partition已验证、review并随`8bcb26e5384a22804dd73da7aef85e5f0b4e99e8`推送。
+6. **M1-C implementation**：F4 recursive exact field-set boundary已完成实现、focused/property/type/package/monorepo验证及独立review `[]`；当前只待本文等状态文档、devlog、commit/push与远端/hook验证。该gate完成后才规划F3。
 
-用户批准、Step 0、D0与M1-A review/commit/push boxes已完成；M1-B F1/F2为partial implementation，完整M1、F31与future acceptance boxes保持unchecked。该状态不把未实现合同写成runtime proof。
+用户批准、Step 0、D0、M1-A与M1-B review/commit/push boxes已完成；M1-C F4为partial implementation且尚未commit/push。完整M1、F3、F5–F31与future acceptance boxes保持unchecked。该状态不把未实现合同写成runtime proof。
 
 ### 8.4 架构不变量与正确性结论
 

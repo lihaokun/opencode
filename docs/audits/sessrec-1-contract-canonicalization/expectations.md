@@ -6,7 +6,7 @@
 **D0 contract sync / review**: `2026-08-16；0 P0 / 0 P1`
 **Step 5 验证时间**: `待 Step 5 填`
 
-> 证据边界：本文仍未执行完整Step 5，未整体回填实现位置/一致列。M1-A已随`deb84e90a9051511db3c9ca69f52cacdaf45af2e`推送；当前M1-B F1/F2已有partial evidence：schema focused `19/19`（267 assertions）、schema typecheck、non-manifest `29/29`（289 assertions）、core focused `50/50`（93 assertions）与core typecheck通过；完整schema suite仍仅有clean D0/M1-A同样复现的`event-manifest.test.ts`既有2项失败。该evidence不证明F3–F31、recovery event set、automatic recovery、full public/private closure或Step 5通过。
+> 证据边界：本文仍未执行完整Step 5，未整体回填实现位置/一致列。M1-A已随`deb84e90a9051511db3c9ca69f52cacdaf45af2e`推送，M1-B F1/F2已随`8bcb26e5384a22804dd73da7aef85e5f0b4e99e8`推送。当前M1-C F4已有partial evidence：focused `14/14`（94 assertions）、schema typecheck、non-manifest `43/43`（383 assertions）、repository Turbo typecheck `30/30`与独立review `[]`；完整schema suite为`43/45`（399 assertions），仍仅有clean D0/M1-A同样复现的`event-manifest.test.ts`既有2项失败。该evidence不证明F3、F5–F31、recovery event set、automatic recovery、full public/private closure或完整Step 5通过。
 
 ---
 
@@ -27,7 +27,7 @@
 
 ## 2. Schema 字段（机械化 — JSON Schema / exact field-set 校验）
 
-> “字段”列给出 closed type/branch 的完整 top-level membership；nested type 按其自身行 recursive exact。未列字段为 extra-field failure；optional 只允许 omit，不允许用 `undefined` 占位。所有实现位置统一留待 Step 5 回填。
+> “字段”列给出 closed type/branch 的完整 top-level membership；nested type 按其自身行 recursive exact。未列字段为 extra-field failure；optional 只允许 omit，不允许用 `undefined` 占位。已完成的M1-A、F1/F2与F4 slice可记录实际实现位置及明确标注的partial evidence；未实现行与最终一致结论仍留待完整Step 5回填。
 
 ### 2.1 基础 carrier、identity、target 与 commitment
 
@@ -184,7 +184,7 @@
 | P1 publication | F1 | `// # Step P1: normalize source-level publication metadata` | `packages/schema/src/event.ts` | 当前grep恰1处；完整Step 5仍待执行 |
 | P2 partition | F2 | `// # Step P2: partition public and internal definitions exactly once` | `packages/schema/src/event.ts` | 当前grep恰1处；完整Step 5仍待执行 |
 | P3 raw definitions | schema F3 | `// # Step P3: build ten internal durable recovery definitions without digest` | 待 Step 5 填 | 计划 grep（未创建） |
-| P4 field sets | F4 | `// # Step P4: validate recursive exact field membership` | 待 Step 5 填 | 计划 grep（未创建） |
+| P4 field sets | F4 | `// # Step P4: validate recursive exact field membership` | `packages/schema/src/llm.ts` | 当前grep恰1处；focused/runtime/property/type/package/monorepo evidence与独立review已通过，完整P1–P18 Step 5仍待执行 |
 | P5 row decode | F5 | `// # Step P5: decode owner-qualified durable recovery row` | 待 Step 5 填 | 计划 grep（未创建） |
 | P6 source/control | F6/F7 | `// # Step P6: freeze source facts and exact control tail` | 待 Step 5 填 | 计划 grep（未创建） |
 | P7 old rows | F8/F14/F15 | `// # Step P7: retain legacy evidence as compatibility-only` | 待 Step 5 填 | 计划 grep（未创建） |
@@ -210,8 +210,9 @@
 |---|---|---|---|
 | M1是shared recovery schema/canonical semantics唯一owner；dependency保持 `schema ← llm ← opencode` | architecture M1；SESSREC-1 §1 | `M1-T24/T38` + import review | 待 Step 5 验证 |
 | Schema F3只产owner-held frozen singleton `RecoveryEventDefinitionSetV1`且不hash/import LLM；LLM E1按top-level/member identity只接受该same set并附加两个existing allowed-set digests；F5–F7归LLM消费enriched registry；F31对E1零依赖 | SESSREC-1 §4.5.1/F3/E1/F5–F7/F31 | `M1-T03/T26/T28/T38` + dependency/import review | 待 Step 5 验证 |
-| 除F12外M1 pure callable使用exact `ContractResult<A,E>`；无throwing/Effect/undefined overload | SESSREC-1 §3.1/§5.0 | F1 type fixture与97个caller boundary已通过typecheck；其余callables future | [P — F1一致；完整Step 5待验证] |
-| Unknown version/event/field-set、extra authority field、owner/digest mismatch、partial/non-foldable authority fail closed | SESSREC-1 §3.2/F4–F7 | `M1-T02/T17/T18/T28` | 待 Step 5 验证 |
+| 除F12外M1 pure callable使用exact `ContractResult<A,E>`；无throwing/Effect/undefined overload | SESSREC-1 §3.1/§5.0 | F1 type fixture与97个caller boundary、F4 `recovery-exact-field-set.types.ts` exact result/narrowing及boolean/raw-void negative fixtures均通过typecheck；其余callables future | [P — F1/F4一致；完整Step 5待验证] |
+| F4 malformed specification/value、missing/extra authority field、wrong discriminator、forbidden null/accessor/cycle/hostile reflection fail closed；首个typed path稳定且input不变 | SESSREC-1 §3.2/F4 | `M1-T02` focused `14/14`（94 assertions）+ type fixture + FastCheck；independent review `[]` | [P — F4一致；完整Step 5待验证] |
+| F5–F7 unknown version/event、owner/digest mismatch、partial/non-foldable authority fail closed | SESSREC-1 §3.2/F5–F7 | `M1-T17/T18/T28` | 待 Step 5 验证 |
 | Old rows only compatibility/opaque/unknown；缺providerExecuted不当false，缺provenance不当provider-end | F8/F14/F15 | `M1-T16/T33/T34` | 待 Step 5 验证 |
 | Storage exact三值；undefined→unknown；null/string/number非法；unknown不等于false | F9 | `M1-T13` | 待 Step 5 验证 |
 | Target/domain只按完整结构与audited contract；不得display/prefix/current config猜测 | F10–F12 | `M1-T14` | 待 Step 5 验证 |
@@ -254,10 +255,11 @@
 
 ## 7. 不变量契约（property-based）
 
-> 当前F1/F2 subset复用`effect/testing`导出的FastCheck；其余future property suites仍未创建。
+> 当前F1/F2与F4 subset复用`effect/testing`导出的FastCheck；其余future property suites仍未创建。
 
 | 不变量 | 来源 | 未来测试 |
 |---|---|---|
+| 任意生成的finite exact object恒通过；增加extra恒为typed extra，删除required恒为typed missing；value/spec不被修改 | F4 | `packages/schema/test/recovery-exact-field-set.test.ts` FastCheck 250 runs已通过；`[P — F4 subset；完整Step 5待验证]` |
 | Canonical bytes对object insertion order不变；对array order/presence/null/scalar/domain变化敏感 | F17 | `property_canonical_order_and_sensitivity`（计划） |
 | Canonical numbers恒safe integer且非-0；float/nonfinite/unsafe拒绝 | §4.1.1/F17 | `property_only_safe_integer_numbers_encode`（计划） |
 | Registry cardinality=25且domain/spec/builder/brand一一对应 | §4.1.3 | `property_registry_exact_25_bijection`（计划） |
@@ -291,7 +293,8 @@
 | 契约 | 来源 | 未来验证 | 实测 |
 |---|---|---|---|
 | F2/F3/E1/F6/F7/H2/H3对有限输入单调有限扫描，无无界retry/wait | §5.0–§5.1 | complexity/property counters（计划） | 待 Step 5 填 |
-| F4/F17对finite acyclic tree终止；递归严格进入子值；object keys有限排序 | F4/F17 | generated finite-tree termination（计划） | 待 Step 5 填 |
+| F4以显式frame stack处理finite stable graph；active cycle fail closed，spec按identity只编译一次且reused spec不重复own-key compilation pass，completed value/spec pair避免shared-DAG重复展开，extra key为线性minimum scan | F4 | 12,000层finite value、depth-20 shared DAG、100次reused spec与cycle regressions已通过 | [P — F4 finite-progress evidence；完整Step 5待验证] |
+| F17对finite acyclic canonical tree终止 | F17 | generated finite-tree termination（计划） | 待 Step 5 填 |
 | F16a固定7 capability；F23扫描causes+固定24 tuple；registry固定25 | F16a/F23/§4.1.3 | operation-count assertions（计划） | 待 Step 5 填 |
 | Policy codecs最多2 nested objects/3 leaves；无I/O/retry/global scan | §4.6.3 | pure call-count test（计划） | 待 Step 5 填 |
 | M1 pure functions external DB/network/store call count=0 | §3/§5 | spies/capability absence（计划） | 待 Step 5 填 |
@@ -381,11 +384,11 @@
 
 ### Step 5 回填约束
 
-- 所有实现位置单元格当前保持 `待 Step 5 填`，仅Step 5按实际diff回填。
-- 除已明确标为M1-A partial foundation evidence的两个`recovery-contract-foundation` test files外，future test/schema/script path仅为计划，不表示文件存在。
+- 已完成的M1-A、F1/F2与F4 slice可按实际diff记录实现位置和明确标注的partial evidence；其余实现位置单元格保持`待 Step 5 填`，最终一致结论只在完整Step 5回填。
+- 除已明确标为partial evidence的`recovery-contract-foundation`、F1/F2 event tests与`recovery-exact-field-set` runtime/type files外，future test/schema/script path仅为计划，不表示文件存在。
 - 不得把design audit、当前50/50 A/B/C/D或S seam写成implementation/Step 5 pass。
 - 若发现contract/implementation冲突，先修contract或实现并记录决策，再更新本文；禁止从代码反向改写expectation掩盖偏差。
 
 ---
 
-*本 expectations 由 Step 0 从契约文档独立抽取；D0行仅在owner设计合同先修正后同步。当前只记录M1-A foundation的行政状态与真实partial test evidence，不回填Step 5实现位置/一致结论。后续contract修改必须先改契约文档，再同步本表。Bug类契约修复走 `workflow.md §7`；feature类扩展按 `workflow.md §2.3` 判定。*
+*本 expectations 由 Step 0 从契约文档独立抽取；D0行仅在owner设计合同先修正后同步。当前记录M1-A、F1/F2与F4的行政状态、实际实现位置及真实partial test/review evidence，但不回填完整Step 5一致结论。后续contract修改必须先改契约文档，再同步本表。Bug类契约修复走 `workflow.md §7`；feature类扩展按 `workflow.md §2.3` 判定。*
