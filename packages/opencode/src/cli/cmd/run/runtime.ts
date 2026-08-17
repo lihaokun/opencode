@@ -365,7 +365,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
   })
   const footer = shell.footer
   const rememberLocal = (commit: StreamCommit, after?: LocalReplayAnchor) => {
-    state.localRows = [...state.localRows, { commit, after }].slice(-LOCAL_REPLAY_ROW_LIMIT)
+    state.localRows = [...state.localRows, { commit, createdAt: Date.now(), after }].slice(-LOCAL_REPLAY_ROW_LIMIT)
   }
 
   const loadCatalog = async (): Promise<void> => {
@@ -644,6 +644,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
 
         await state.switching?.catch(() => {})
 
+        let firstOutputAnchor: LocalReplayAnchor | undefined
         let outputAnchor: LocalReplayAnchor | undefined
         try {
           const next = await ensureStream()
@@ -655,6 +656,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
             files: input.files,
             includeFiles,
             onVisibleOutput: (anchor) => {
+              firstOutputAnchor ??= anchor
               outputAnchor = anchor
             },
             signal,
@@ -680,6 +682,13 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
             source: "system",
             messageID: prompt.messageID,
           } as const
+          if (firstOutputAnchor && prompt.messageID) {
+            state.localRows = state.localRows.map((row) =>
+              row.commit.kind === "user" && row.commit.messageID === prompt.messageID
+                ? { ...row, before: firstOutputAnchor }
+                : row,
+            )
+          }
           rememberLocal(commit, outputAnchor)
           footer.append(commit)
         }

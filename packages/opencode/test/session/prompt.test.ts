@@ -57,6 +57,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { Identifier } from "../../src/id/id"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -583,6 +584,78 @@ noLLMServer.instance(
       const result = yield* prompt.loop({ sessionID: chat.id })
       expect(result.info.role).toBe("assistant")
       if (result.info.role === "assistant") expect(result.info.finish).toBe("stop")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "loop exits without a provider request across the message ID rollover",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const before = 2 ** 36 - 2
+      const after = 2 ** 36 + 1
+      const preWrapUserID = MessageID.make(Identifier.create("msg", "ascending", before))
+      const preWrapAssistantID = MessageID.make(Identifier.create("msg", "ascending", before + 1))
+      const postWrapUserID = MessageID.make(Identifier.create("msg", "ascending", after))
+      const terminalAssistantID = MessageID.make(Identifier.create("msg", "ascending", after + 1))
+      yield* sessions.updateMessage({
+        id: preWrapUserID,
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: before },
+      })
+      yield* sessions.updateMessage({
+        id: preWrapAssistantID,
+        role: "assistant",
+        parentID: preWrapUserID,
+        sessionID: chat.id,
+        mode: "build",
+        agent: "build",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: before + 1 },
+        finish: "tool-calls",
+      })
+      yield* sessions.updateMessage({
+        id: postWrapUserID,
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: after },
+      })
+      yield* sessions.updateMessage({
+        id: terminalAssistantID,
+        role: "assistant",
+        // Production assistants created during the rollover inherited the
+        // pre-wrap user selected by the old raw-ID latest() implementation.
+        parentID: preWrapUserID,
+        sessionID: chat.id,
+        mode: "build",
+        agent: "build",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: after + 1 },
+        finish: "stop",
+      })
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(preWrapUserID > terminalAssistantID).toBe(true)
+      expect(preWrapAssistantID > terminalAssistantID).toBe(true)
+      expect(postWrapUserID).not.toBe(preWrapUserID)
+      expect(result.info.id).toBe(terminalAssistantID)
     }),
   { config: cfg },
 )

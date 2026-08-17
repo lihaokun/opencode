@@ -2,7 +2,7 @@ import type { Event, PermissionRequest, QuestionRequest } from "@opencode-ai/sdk
 import { bootstrapSessionData, createSessionData, reduceSessionData, type SessionData } from "./session-data"
 import { messagePrompt, type SessionMessages } from "./session.shared"
 import { messageTurnSummaryCommit } from "./turn-summary"
-import type { FooterPatch, LocalReplayRow, RunProvider, StreamCommit } from "./types"
+import type { FooterPatch, LocalReplayAnchor, LocalReplayRow, RunProvider, StreamCommit } from "./types"
 
 type ReplayInput = {
   messages: SessionMessages
@@ -266,36 +266,38 @@ export function replayLocalRows(
   rows: LocalReplayRow[],
 ): StreamCommit[] {
   const persisted = new Set(messages.map((message) => message.info.id))
+  const chronology = new Map(messages.map((message) => [message.info.id, message.info.time.created]))
+  const findAnchor = (commits: StreamCommit[], anchor: LocalReplayAnchor) => {
+    const exact = commits.findIndex(
+      (commit) =>
+        commit.kind === anchor.kind &&
+        commit.text === anchor.text &&
+        commit.phase === anchor.phase &&
+        commit.toolState === anchor.toolState &&
+        (anchor.partID ? commit.partID === anchor.partID : commit.messageID === anchor.messageID),
+    )
+    if (exact !== -1) return exact
+    return commits.findLastIndex((commit) =>
+      anchor.partID
+        ? commit.partID === anchor.partID
+        : commit.kind === anchor.kind && commit.messageID === anchor.messageID,
+    )
+  }
   return rows.reduce((out, local) => {
     const row = local.commit
-    if (row.kind === "user" && row.messageID && persisted.has(row.messageID)) {
+    const messageID = row.messageID
+    if (row.kind === "user" && messageID && persisted.has(messageID)) {
       return out
     }
 
-    if (!row.messageID) {
+    if (!messageID) {
       return [...out, row]
     }
 
-    const exact = local.after
-      ? out.findIndex(
-          (commit) =>
-            commit.kind === local.after?.kind &&
-            commit.text === local.after.text &&
-            commit.phase === local.after.phase &&
-            commit.toolState === local.after.toolState &&
-            (local.after.partID ? commit.partID === local.after.partID : commit.messageID === local.after.messageID),
-        )
-      : -1
-    const anchored =
-      exact !== -1
-        ? exact
-        : local.after
-          ? out.findLastIndex((commit) =>
-              local.after?.partID
-                ? commit.partID === local.after.partID
-                : commit.kind === local.after?.kind && commit.messageID === local.after.messageID,
-            )
-          : -1
+    const before = local.before ? findAnchor(out, local.before) : -1
+    if (before !== -1) return [...out.slice(0, before), row, ...out.slice(before)]
+
+    const anchored = local.after ? findAnchor(out, local.after) : -1
     if (anchored !== -1) {
       const commit = out[anchored]
       const visible = local.after?.visible
@@ -312,17 +314,23 @@ export function replayLocalRows(
       return [...out.slice(0, anchored + 1), row, ...out.slice(anchored + 1)]
     }
 
-    const after = out.findIndex((commit) => commit.kind === "user" && commit.messageID === row.messageID)
+    const after = out.findIndex((commit) => commit.kind === "user" && commit.messageID === messageID)
     if (after !== -1) {
       return [...out.slice(0, after + 1), row, ...out.slice(after + 1)]
     }
 
-    const before = out.findIndex((commit) => commit.messageID && row.messageID! < commit.messageID)
-    if (before === -1) {
+    const chronological = out.findIndex((commit) => {
+      if (!commit.messageID) return false
+      const createdAt = chronology.get(commit.messageID)
+      if (createdAt === undefined) return false
+      if (local.createdAt !== createdAt) return local.createdAt < createdAt
+      return messageID < commit.messageID
+    })
+    if (chronological === -1) {
       return [...out, row]
     }
 
-    return [...out.slice(0, before), row, ...out.slice(before)]
+    return [...out.slice(0, chronological), row, ...out.slice(chronological)]
   }, commits)
 }
 

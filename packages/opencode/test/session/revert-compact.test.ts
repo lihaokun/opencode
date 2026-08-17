@@ -16,6 +16,7 @@ import { provideTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Identifier } from "../../src/id/id"
 
 const it = testEffect(
   LayerNode.compile(
@@ -421,6 +422,81 @@ describe("revert + compact workflow", () => {
           expect(ids).toContain(a1.id)
           expect(ids).not.toContain(u2.id)
           expect(ids).not.toContain(a2.id)
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live(
+    "cleanup honors the exact revert boundary across the ID rollover",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const revert = yield* SessionRevert.Service
+          const info = yield* session.create({})
+          const before = 2 ** 36 - 2
+          const after = 2 ** 36 + 1
+          const u1 = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", before)),
+            role: "user",
+            sessionID: info.id,
+            agent: "default",
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
+            time: { created: before },
+          })
+          const a1 = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", before + 1)),
+            role: "assistant",
+            sessionID: info.id,
+            mode: "default",
+            agent: "default",
+            path: { cwd: dir, root: dir },
+            cost: 0,
+            tokens,
+            modelID: ModelV2.ID.make("gpt-4"),
+            providerID: ProviderV2.ID.make("openai"),
+            parentID: u1.id,
+            time: { created: before + 1 },
+            finish: "end_turn",
+          })
+          const u2 = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", after)),
+            role: "user",
+            sessionID: info.id,
+            agent: "default",
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
+            time: { created: after },
+          })
+          yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", after + 1)),
+            role: "assistant",
+            sessionID: info.id,
+            mode: "default",
+            agent: "default",
+            path: { cwd: dir, root: dir },
+            cost: 0,
+            tokens,
+            modelID: ModelV2.ID.make("gpt-4"),
+            providerID: ProviderV2.ID.make("openai"),
+            parentID: u2.id,
+            time: { created: after + 1 },
+            finish: "end_turn",
+          })
+          yield* session.setRevert({
+            sessionID: info.id,
+            revert: { messageID: u2.id },
+            summary: { additions: 0, deletions: 0, files: 0 },
+          })
+
+          yield* revert.cleanup(yield* session.get(info.id))
+
+          expect(u1.id > u2.id).toBe(true)
+          expect((yield* session.messages({ sessionID: info.id })).map((message) => message.info.id)).toEqual([
+            u1.id,
+            a1.id,
+          ])
+          yield* session.remove(info.id)
         }),
       { git: true },
     ),
