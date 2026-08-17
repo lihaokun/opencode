@@ -92,6 +92,11 @@ export type RunHandle = {
 
 export type SpawnOpts = { readonly timeoutMs?: number; readonly env?: Record<string, string> }
 
+// Full CI runs many real CLI subprocesses concurrently. Cold transpilation and
+// dependency contention can exceed 30s even when an isolated invocation is
+// healthy, so keep the child deadline below the outer 120s test deadline.
+export const CLI_PROCESS_TIMEOUT_MS = 60_000
+
 // Typed equivalent of constructing argv for `opencode run`. New flags should
 // land here so tests stay grep-able and refactor-safe.
 export type RunOpts = SpawnOpts & {
@@ -207,7 +212,7 @@ export function withCliFixture<A, E>(
 
     const spawn = Effect.fn("opencode.spawn")(function* (args: string[], opts?: SpawnOpts) {
       const start = Date.now()
-      const timeoutMs = opts?.timeoutMs ?? 30_000
+      const timeoutMs = opts?.timeoutMs ?? CLI_PROCESS_TIMEOUT_MS
       // stdin: "ignore" so the child doesn't see a piped stdin and block
       // on `Bun.stdin.text()` (see src/cli/cmd/run.ts — non-TTY stdin is
       // consumed as the prompt). The old Process.run wrapper defaulted to
