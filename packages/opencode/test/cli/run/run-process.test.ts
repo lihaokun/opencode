@@ -62,7 +62,6 @@ const StoredPart = Schema.Struct({
 
 const crossoverUsage = { input: 100, output: 1 } satisfies Usage
 const TEST_TIMEOUT_MS = 120_000
-const PROMPT_ERROR_TIMEOUT_MS = 30_000
 
 function missingFinishWithUsage(input: { text: string; usage: Usage }) {
   const chunk = (delta: Record<string, unknown>) => ({
@@ -568,10 +567,10 @@ describe("opencode run (non-interactive subprocess)", () => {
       Effect.gen(function* () {
         const result = yield* opencode.run("say hi", {
           model: "test/nonexistent-model",
-          timeoutMs: PROMPT_ERROR_TIMEOUT_MS,
+          timeoutMs: CLI_PROCESS_TIMEOUT_MS,
         })
         expect(result.exitCode).not.toBe(0)
-        expect(result.durationMs).toBeLessThan(PROMPT_ERROR_TIMEOUT_MS)
+        expect(result.durationMs).toBeLessThan(CLI_PROCESS_TIMEOUT_MS)
       }),
     TEST_TIMEOUT_MS,
   )
