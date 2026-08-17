@@ -5,12 +5,18 @@ import { optional } from "./schema"
 import { Event } from "./event"
 import { PositiveInt } from "./schema"
 import { SessionID } from "./session-id"
+import type { ContractResult, EventDefinitionError } from "./llm"
+
+function initializeEventDefinition<A>(result: ContractResult<A, EventDefinitionError>): A {
+  if (!result.ok) throw new globalThis.Error("Event definition initialization failed", { cause: result.error })
+  return result.value
+}
 
 const DEFAULT_TOAST_DURATION = 5000
 
-export const PromptAppend = Event.define({ type: "tui.prompt.append", schema: { text: Schema.String } })
+export const PromptAppend = initializeEventDefinition(Event.define({ type: "tui.prompt.append", schema: { text: Schema.String } }))
 
-export const CommandExecute = Event.define({
+export const CommandExecute = initializeEventDefinition(Event.define({
   type: "tui.command.execute",
   schema: {
     command: Schema.Union([
@@ -35,9 +41,9 @@ export const CommandExecute = Event.define({
       Schema.String,
     ]),
   },
-})
+}))
 
-export const ToastShow = Event.define({
+export const ToastShow = initializeEventDefinition(Event.define({
   type: "tui.toast.show",
   schema: {
     title: optional(Schema.String),
@@ -47,13 +53,13 @@ export const ToastShow = Event.define({
       description: "Duration in milliseconds",
     }),
   },
-})
+}))
 
-export const SessionSelect = Event.define({
+export const SessionSelect = initializeEventDefinition(Event.define({
   type: "tui.session.select",
   schema: {
     sessionID: SessionID.annotate({ description: "Session ID to navigate to" }),
   },
-})
+}))
 
 export const Definitions = Event.inventory(PromptAppend, CommandExecute, ToastShow, SessionSelect)

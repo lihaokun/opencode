@@ -4,11 +4,17 @@ import { Schema } from "effect"
 import { optional } from "./schema"
 import { define, inventory } from "./event"
 import { NonNegativeInt, PositiveInt, RelativePath } from "./schema"
+import type { ContractResult, EventDefinitionError } from "./llm"
 
-const Edited = define({
+function initializeEventDefinition<A>(result: ContractResult<A, EventDefinitionError>): A {
+  if (!result.ok) throw new globalThis.Error("Event definition initialization failed", { cause: result.error })
+  return result.value
+}
+
+const Edited = initializeEventDefinition(define({
   type: "file.edited",
   schema: { file: Schema.String },
-})
+}))
 export const Event = { Edited, Definitions: inventory(Edited) }
 
 export interface Entry extends Schema.Schema.Type<typeof Entry> {}

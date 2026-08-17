@@ -6,6 +6,12 @@ import { ascending } from "../identifier"
 import { Project } from "../project"
 import { statics } from "../schema"
 import { SessionID } from "../session-id"
+import type { ContractResult, EventDefinitionError } from "../llm"
+
+function initializeEventDefinition<A>(result: ContractResult<A, EventDefinitionError>): A {
+  if (!result.ok) throw new globalThis.Error("Event definition initialization failed", { cause: result.error })
+  return result.value
+}
 
 export const ID = Schema.String.check(Schema.isStartsWith("per")).pipe(
   Schema.brand("PermissionID"),
@@ -58,9 +64,9 @@ export const ReplyInput = Schema.Struct({ requestID: ID, ...ReplyBody.fields }).
 })
 export type ReplyInput = typeof ReplyInput.Type
 
-const Asked = define({ type: "permission.asked", schema: Request.fields })
-const Replied = define({
+const Asked = initializeEventDefinition(define({ type: "permission.asked", schema: Request.fields }))
+const Replied = initializeEventDefinition(define({
   type: "permission.replied",
   schema: { sessionID: SessionID, requestID: ID, reply: Reply },
-})
+}))
 export const Event = { Asked, Replied, Definitions: inventory(Asked, Replied) }

@@ -4,7 +4,7 @@
 >
 > 权威输入：当前approved `docs/design/session-recovery/architecture.md`、`detailed-design.md`与owner子计划集合。原stable snapshot的fresh independent design audit达到`0 P0 / 0 P1`，用户批准与四份Step 0 expectations均已完成。本文不得改变 G1–G12、M1–M8、I1–I13、三个recovery heads plus aggregate event head/cursor、raw-event sole authority、mechanical gate、Legacy-only 或 public/internal 隔离。
 >
-> 状态：D0 package-ownership correction已完成机械检查、fresh independent review `0 P0 / 0 P1`并随`085698426f466b6fc01215c4cb34d89b73ef8290`推送。SESSREC-1 production implementation已进入M1-A scalar/nominal foundation；F1–F31、LLM canonical registry/builders、其余future tests与Step 5 audit尚未开始。
+> 状态：D0 package-ownership correction已随`085698426f466b6fc01215c4cb34d89b73ef8290`推送，M1-A scalar/nominal foundation已随`deb84e90a9051511db3c9ca69f52cacdaf45af2e`推送。当前changeset实现F1 exact `Event.define`、F2 `partitionDefinitionsByPublication`、public manifest source partition与97个production/core caller迁移；F3–F31、LLM canonical registry/builders、recovery event set、future acceptance与Step 5 audit尚未完成。
 
 ## 1. 范围
 
@@ -59,8 +59,8 @@
 | 等级 | 本文允许的表述 |
 |---|---|
 | 当前 A/B/C/D | 此前架构基线记录 source-equivalent `135f20215`、Bun `1.3.14` 上 scoped checks 精确为 A=10、B=1、C=10（7 个 prompt + 3 个 TCP processor）、D=29（2 个 synthetic processor + 1 个 retry + 22 个 TUI + 4 个 routes），总计 50/50；该数字只证明各测试直接断言的当前行为，不证明本文 future contract，也不构成当前修订批准。 |
-| 当前 S | `[S — source seam only]`：本轮静态读取证明`Event.Definition`当前仅含`type/durable/data`；`Event.define()`当前没有`publication`；`EventManifest.Definitions`当前汇总public/server/shared definitions；durable row通过versioned type lookup和Effect Schema decode；Legacy `providerExecuted`、reasoning metadata与public assistant schema均存在可扩展接缝；这些不是运行保证。 |
-| Future F | 本文所有 recovery 类型（含tool partition/phase、reconstructible replay carrier、sealed-use lease key input与新增owner exports）、internal publication、strict field-set、canonical digest、old-row fail-closed、N/M policy、projection allowlist 与测试均为 `[F — planned; not created; not run]`。 |
+| 当前 S / partial implementation | `Event.Definition`现含frozen `type/publication/durable/data` metadata；F1 exact result、F2 owner-identity partition与现有public manifest source partition已实现并有runtime/type/core evidence。Durable row仍通过versioned type lookup和Effect Schema decode；Legacy `providerExecuted`、reasoning metadata与public assistant schema仍只是可扩展接缝。 |
+| Future F | Recovery-specific types/definitions（含tool partition/phase、reconstructible carrier、sealed-use lease input与新增owner exports）、F3/F4/F31、strict field-set、canonical builders/digest、old-row decode、N/M policy、projection allowlist及其future acceptance仍为 `[F — planned; not created; not run]`。 |
 
 ### 1.4 跨子计划依赖方向与 authority 单向性
 
@@ -2886,8 +2886,8 @@ F18/F19/F20的builder名称同时是25-domain inventory中的对应input builder
 | H2 | `foldOperationPostStateThroughSequence` | §4.9 supporting signatures | §5.0.2 H2；`[F — planned; proof present; review unchecked]` |
 | H3 | `validateCurrentRecoveryAggregatePrefixAndHeads` | §4.9 supporting signatures | §5.0.2 H3；`[F — planned; proof present; review unchecked]` |
 | E1 | `buildRecoveryEventRegistry` | §5.0.1 additional exact callable | §5.1.3a；`[F — planned; proof present; D0 review passed]` |
-| F1 | `define` | §5.0.1 | §5.1.1；`[F — planned; proof present; review unchecked]` |
-| F2 | `partitionDefinitionsByPublication` | §5.0.1 | §5.1.2；`[F — planned; proof present; review unchecked]` |
+| F1 | `define` | §5.0.1 | §5.1.1；`[P — implemented; runtime/type evidence; full Step 5 pending]` |
+| F2 | `partitionDefinitionsByPublication` | §5.0.1 | §5.1.2；`[P — implemented; property/type/core evidence; full F31 closure pending]` |
 | F3 | `buildRecoveryEventDefinitions` | §5.0.1 | §5.1.3；`[F — planned; proof present; review unchecked]` |
 | F4 | `validateExactFieldSet` | §5.0.1 | §5.1.4；`[F — planned; proof present; review unchecked]` |
 | F5 | `decodeRecoveryDurableRow` | §5.0.1 | §5.1.5；`[F — planned; pure explicit-M4-proof proof present; review unchecked]` |
@@ -2943,21 +2943,21 @@ F1只能使用该`ContractResult` carrier；module initialization caller负责�
 - **Requires**：type非空；durable version为positive safe integer；aggregate字段名存在于schema；internal recovery caller显式传internal。
 - **Ensures**：返回definition与payload schema均保留type/data/durable；static `publication`总是存在；未传publication时为public；payload wire不额外注入publication字段。
 - **Invariants**：publication是definition metadata，不是event data；同一definition运行期间不可变。
-- **副作用**：创建并freeze schema metadata；不持久化、不publish。
+- **副作用**：创建并freeze schema metadata，并把成功返回的exact object identity登记到module-private `WeakSet` owner registry；registry不持久化、不枚举、不publish且不保活definition。所有失败分支登记次数为0。
 - **实现步骤**：
-  1. 校验`input.publication ?? "public"`仅为两literal；非法返回`ContractResult.ok=false`的typed schema construction error，尚无副作用。
+  1. 只接受own data properties；继承的publication/durable或accessor/hostile reflection fail closed。校验`input.publication ?? "public"`仅为两literal；非法返回`ContractResult.ok=false`，尚无副作用。
   2. 若durable存在，校验version与aggregate schema membership；失败退出。
-  3. 调用`Schema.Struct(input.schema)`；依赖其post：得到字段codec但不赋予exact authority语义。
+  3. 对own enumerable schema fields逐项验证Effect schema并snapshot，再调用`Schema.Struct`；依赖其post：得到字段codec但不赋予public authority。
   4. 构造现有payload schema。
-  5. `statics`返回`type/publication/data`及optional durable；不把publication放入payload。
-  6. 正常返回definition。
-- **分支/退出**：public default、explicit public、explicit internal；invalid publication/durable/aggregate均construction failure；无部分registration。
+  5. `statics`返回`type/publication/data`及optional durable；non-durable definition仍创建own non-enumerable、non-writable `durable:undefined` slot以封死prototype注入；不把publication放入payload，并freeze fields/data/durable/definition metadata。
+  6. 仅在所有构造与freeze成功后，将exact definition object加入module-private `WeakSet` owner registry并正常返回。
+- **分支/退出**：public default（omit或own `undefined`）、explicit public、explicit internal；inherited/accessor publication或durable、invalid publication/version/aggregate/schema member均typed failure；无部分owner registration。
 - **callee pre/post引用**：`Schema.Struct`要求字段codec有效并保证结构codec；`statics`只附加metadata，不改变decode结果。
 - **正确性论证**：
   - 前置：input满足type/schema基本条件。
   - 论证：步骤1把publication归一为闭集；步骤2阻止不可寻址durable event；步骤3–5将metadata与wire分离，因此public filter可在不改变event payload的情况下机械判定，且旧definition省略字段仍明确变为public。
   - 后置：每个definition都有唯一source-level publication，internal不依赖名字前缀。
-  - 副作用论证：只创建schema对象和static metadata，无外部写入。
+  - 副作用论证：除module-private weak owner identity登记外只创建schema/static metadata；WeakSet不枚举、不持久化、不保活且failed exit不写，因此无bus/store/network/public side effect。
 
 #### 5.1.2 F2 `partitionDefinitionsByPublication(definitions) -> {public, internal}`
 
@@ -2972,15 +2972,15 @@ export function partitionDefinitionsByPublication<D extends Definition>(
 
 - **功能描述**：按definition metadata分区并验证同一type/version没有跨publication重复；public branch在literal recheck后产生唯一`PublicEventDefinitionV1` brand。
 - **调用关系**：callers: event manifests、F3；callees: F1 post、`Event.versionedType`。
-- **Requires**：输入有限；每项由F1产生。
+- **Requires**：输入有限；每项由当前module instance的F1产生并仍以同一exact object identity存在。
 - **Ensures**：每个输入恰进入一个输出；输出顺序保持输入顺序；duplicate latest/durable key失败。
 - **Invariants**：`public ∩ internal = ∅`，并集等于输入。
 - **副作用**：无；返回frozen arrays。
 - **实现步骤**：
   1. 初始化public/internal数组与latest/durable key map。
-  2. 有限循环逐definition；依赖F1 post：publication必存在。
+  2. snapshot并验证finite safe length后逐definition；依赖F1 post：publication必存在、metadata frozen，且module-private `WeakSet`包含同一object identity。structural lookalike、clone与Proxy均拒绝。
   3. 检查type latest冲突；durable存在时以`versionedType`检查版本key冲突。
-  4. publication=public时再次检查exact literal后构造`PublicEventDefinitionV1` brand并加入public；internal加入internal；default分支使用`assertNever`并失败。brand constructor不接受generic caller assertion。
+  4. 仅在Effect schema/frozen metadata/owner identity与literal publication全部recheck后构造`PublicEventDefinitionV1` brand并加入public；internal加入internal；unknown/default失败。brand constructor不接受generic caller assertion。
   5. freeze并返回。
 - **分支/退出**：duplicate或未知publication错误退出，无返回部分数组；两合法分支正常合流。
 - **循环**：不变量为前i项已恰分区且无duplicate；每轮i+1，有限length保证终止。
@@ -3497,15 +3497,15 @@ export function decodeRecoveryPublicProjection(
 
 ## 7. 测试映射
 
-除M1-T01的foundation subset外，以下仍为future owner，状态保持`[F — planned; not created; not run]`。`[P — partial foundation evidence]`只表示schema scalar/nominal子集已创建并运行，不表示完整M1-T01、任一F callable或Step 5通过。
+M1-T01 foundation与M1-T03/T04/T04a的F1/F2 subset已有partial evidence；其它行仍为future owner并保持`[F — planned; not created; not run]`。`[P — partial implementation evidence]`只表示明确列出的子集已创建并运行，不表示完整test ID、F3/F31、recovery event set、public/private runtime closure或Step 5通过。
 
 | Test ID | 未来 owner / 建议路径 | 覆盖函数/合同 | fixture / 输入 | 通过判据 | 状态 |
 |---|---|---|---|---|---|
-| M1-T01 | foundation：`packages/schema/test/recovery-contract-foundation.test.ts` + `.types.ts`；其余§4 codec tests仍待创建 | 当前仅§3.1/§4.1 scalar、ID、unbranded digest/domain与type-only commitment brands | safe integer/ID/digest/domain合法与非法边界、FastCheck、compile-time cross-brand fixtures | foundation `8/8`、schema typecheck与non-manifest regression `21/21`；完整schema suite的既有manifest 2 failures在clean D0 HEAD同样复现；剩余§4未覆盖 | [P — partial foundation evidence; remaining planned] |
+| M1-T01 | foundation：`packages/schema/test/recovery-contract-foundation.test.ts` + `.types.ts`；其余§4 codec tests仍待创建 | 当前仅§3.1/§4.1 scalar、ID、unbranded digest/domain与type-only commitment brands | safe integer/ID/digest/domain合法与非法边界、FastCheck、compile-time cross-brand fixtures | foundation `8/8`（207 assertions）；当前schema typecheck与non-manifest regression `29/29`通过；完整schema suite既有manifest 2 failures在clean D0/M1-A同样复现；剩余§4未覆盖 | [P — partial foundation evidence; remaining planned] |
 | M1-T02 | 同上 | F4 | missing/extra/null/wrong discriminator/nested extra | 每个path typed failure；输入不被strip | [F — planned; not created; not run] |
-| M1-T03 | `packages/schema/test/recovery-event-manifest.test.ts` | F1–F3/F31 | schema-owned raw `RecoveryEventDefinitionSetV1`、10个type-indexed recovery definitions、generic public durable definitions | raw set精确10/7+3且无digest字段、recovery全部internal+durable且selector=`aggregateID`；schema package零LLM import；public Latest/Server/OpenAPI source为0项 recovery event；generic public aggregates无需recovery envelope/chain migration | [F — planned; not created; not run] |
-| M1-T04 | `packages/core/test/event.test.ts`（M4协作） | public carriers/service vs trusted private replay | publish/read/replay each internal definition及generic public durable definition | internal raw只可由trusted private durable replay读取；listen/all/typed/public durable/readAggregate/bridge/sync/SSE/SDK均0 notification/0 decode；private manifest不能赋给public surface；public cursor/error无authority字段 | [F — planned; not created; not run] |
-| M1-T04a | `packages/schema/test/recovery-public-event-types.test-d.ts` | §4.5.1a/F2/F31 nominal closure | internal definition/payload、trusted private manifest、arbitrary aggregate cursor的compile fixtures | 均不能构造`PublicEventDefinitionV1`/`PublicCommittedEventV1`/`PublicEventCursorV1`或进入`PublicEventServiceV1`；public definitions可通过owner constructors | [F — planned; not created; not run] |
+| M1-T03 | F1/F2 subset：`packages/schema/test/event.test.ts` + `event.types.ts`；F3/F31 future：`recovery-event-manifest.test.ts` | F1–F3/F31 | 已覆盖exact define result、publication metadata/default、partition order/identity/disjointness/duplicates/hostile inputs；raw 10-definition set仍future | F1/F2 subset schema focused `19/19`（267 assertions）与typecheck通过；10/7+3 recovery set、internal recovery definitions、F31 manifests/OpenAPI zero-leakage仍未创建 | [P — F1/F2 subset evidence; F3/F31 remaining planned] |
+| M1-T04 | F1/F2 compatibility subset：`packages/core/test/event.test.ts` + `session-history.test.ts`；F31/M4 private replay future | public definition metadata vs existing publish/replay payload；trusted private replay仍future | public definition与现有EventV2 publish/replay fixture；private replay fixture仍future | core focused `50/50`（93 assertions）与typecheck通过；publication不进入published payload；internal raw/private manifest/public service zero-notification closure仍未创建 | [P — compatibility subset evidence; private/public runtime closure planned] |
+| M1-T04a | F2 definition-brand subset：`packages/schema/test/event.types.ts`；full F31 carriers future：`recovery-public-event-types.test-d.ts` | §4.5.1a/F2/F31 nominal closure | 已覆盖raw/internal definition不能替代`PublicEventDefinitionV1`、F2 public output可用、publication不进入Data/Payload/Encoded；committed event/cursor/service/private manifest仍future | schema typecheck通过；仅definition-level nominal boundary有证据 | [P — F2 definition-brand subset; F31 carrier closure planned] |
 | M1-T04b | `packages/core/test/recovery-snapshot.test.ts`（M4协作） | `RecoveryAssistantPublicMappingV1` | same-WAL mapping、absent、duplicate、wrong-role、source high-water/digest/control-tail/latest-decision revision变化 | same snapshot mapping可lookup；其余分别closed absent/ambiguous/wrong-role/stale，不cast internal ID、不使用display ID/history猜测 | [F — planned; not created; not run] |
 | M1-T05 | `packages/llm/test/recovery-canonical.test.ts` | F17 | 不同object insertion order、nested maps | canonical bytes/digest相等 | [F — planned; not created; not run] |
 | M1-T06 | 同上 | F17/F21 | array order、absent/null、scalar、domain/kind变化 | 每个声明语义变化改变digest；kind跨域不相等 | [F — planned; not created; not run] |
@@ -3548,7 +3548,7 @@ export function decodeRecoveryPublicProjection(
 
 ### 8.1 Workflow §4.3.1 六条
 
-原stable snapshot与D0 changed snapshot均已由independent reviewer复核并达到`0 P0 / 0 P1`。以下六条已按D0 F3/E1/F31 call graph重新签结；用户批准、Step 0与D0 commit/push已完成。当前M1-A foundation只有partial implementation evidence，其余implementation/future tests仍是独立后续gate。
+原stable snapshot与D0 changed snapshot均已由independent reviewer复核并达到`0 P0 / 0 P1`。以下六条已按D0 F3/E1/F31 call graph重新签结；用户批准、Step 0、D0与M1-A commit/push已完成。当前M1-A及M1-B F1/F2只有partial implementation evidence，其余implementation/future tests仍是独立后续gate。
 
 - [x] 推导连续：F1–F31/F16a与additional E1均有pre→编号/有序intermediate facts→post；F3 raw construction→E1 enrichment→F5–F7/M4 consumption连续且无反向dependency。
 - [x] 分支覆盖：publication、raw/enriched registry identity、public/private durable sets、public event known/unsupported/malformed/read-error、10 operation/version、source/control以及其余既有closed branches均覆盖。
@@ -3589,9 +3589,10 @@ export function decodeRecoveryPublicProjection(
 1. **D0 contract correction**：F3改为schema-owned raw `RecoveryEventDefinitionSetV1`；additional E1 `buildRecoveryEventRegistry`由LLM唯一拥有；F31只消费raw definitions/publication metadata。当前状态：已完成。
 2. **Fresh D0 independent review**：逐项核对25 builders、4 policy codecs、H1–H3、E1、F1–F31/F16a及§8.1/§8.2。当前状态：`0 P0 / 0 P1`；两个P2 metadata/wording项已修正。
 3. **D0 commit/push**：四份D0文档已随`085698426f466b6fc01215c4cb34d89b73ef8290`推送。当前状态：已完成。
-4. **Implementation entry**：1→2→3已完成，SESSREC-1 Step 1现仅进入M1-A scalar/nominal foundation；下一slice仍等待本slice verification/review/commit/push。
+4. **M1-A implementation**：scalar/nominal foundation已验证、review并随`deb84e90a9051511db3c9ca69f52cacdaf45af2e`推送。
+5. **M1-B implementation**：当前changeset实现F1/F2、97个production/core caller boundary与public manifest source partition；F3/F4仍等待本slice verification/review/commit/push。
 
-用户批准、Step 0、D0 review与D0 commit/push boxes已完成；M1-A foundation为partial implementation，完整M1与future acceptance boxes保持unchecked。该状态不把未实现合同写成runtime proof。
+用户批准、Step 0、D0与M1-A review/commit/push boxes已完成；M1-B F1/F2为partial implementation，完整M1、F31与future acceptance boxes保持unchecked。该状态不把未实现合同写成runtime proof。
 
 ### 8.4 架构不变量与正确性结论
 

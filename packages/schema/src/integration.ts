@@ -7,6 +7,12 @@ import { Connection } from "./connection"
 import { ascending } from "./identifier"
 import { statics } from "./schema"
 import { IntegrationID, IntegrationMethodID } from "./integration-id"
+import type { ContractResult, EventDefinitionError } from "./llm"
+
+function initializeEventDefinition<A>(result: ContractResult<A, EventDefinitionError>): A {
+  if (!result.ok) throw new globalThis.Error("Event definition initialization failed", { cause: result.error })
+  return result.value
+}
 
 export const ID = IntegrationID
 export type ID = typeof ID.Type
@@ -76,14 +82,14 @@ export type Method = typeof Method.Type
 export const Inputs = Schema.Record(Schema.String, Schema.String).annotate({ identifier: "Integration.Inputs" })
 export type Inputs = typeof Inputs.Type
 
-const Updated = define({
+const Updated = initializeEventDefinition(define({
   type: "integration.updated",
   schema: {},
-})
-const ConnectionUpdated = define({
+}))
+const ConnectionUpdated = initializeEventDefinition(define({
   type: "integration.connection.updated",
   schema: { integrationID: ID },
-})
+}))
 export const Event = { Updated, ConnectionUpdated, Definitions: inventory(Updated, ConnectionUpdated) }
 
 export interface Ref extends Schema.Schema.Type<typeof Ref> {}

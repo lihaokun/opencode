@@ -14,7 +14,14 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { testEffect } from "./lib/effect"
+import { SafePositiveInt, type ContractResult, type EventDefinitionError } from "@opencode-ai/schema/llm"
 
+function initializeEventDefinition<A>(result: ContractResult<A, EventDefinitionError>): A {
+  if (!result.ok) throw new globalThis.Error("Event definition initialization failed", { cause: result.error })
+  return result.value
+}
+
+const eventVersion = Schema.decodeUnknownSync(SafePositiveInt)
 const projects = Layer.succeed(
   ProjectV2.Service,
   ProjectV2.Service.of({
@@ -34,11 +41,11 @@ const it = testEffect(
 )
 const location = Location.Ref.make({ directory: AbsolutePath.make("/project") })
 
-const GapEvent = EventV2.define({
+const GapEvent = initializeEventDefinition(EventV2.define({
   type: "test.session.history.gap",
-  durable: { aggregate: "sessionID", version: 1 },
+  durable: { aggregate: "sessionID", version: eventVersion(1) },
   schema: { sessionID: SessionV2.ID, value: Schema.String },
-})
+}))
 
 describe("SessionV2.history", () => {
   it.effect("returns an exhausted page for a migrated Session with no event sequence", () =>

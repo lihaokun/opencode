@@ -6,6 +6,12 @@ import { define, inventory } from "./event"
 import { ascending } from "./identifier"
 import { SessionID } from "./session-id"
 import { statics } from "./schema"
+import type { ContractResult, EventDefinitionError } from "./llm"
+
+function initializeEventDefinition<A>(result: ContractResult<A, EventDefinitionError>): A {
+  if (!result.ok) throw new globalThis.Error("Event definition initialization failed", { cause: result.error })
+  return result.value
+}
 
 export const ID = Schema.String.check(Schema.isStartsWith("que")).pipe(
   Schema.brand("QuestionV2.ID"),
@@ -67,20 +73,20 @@ export const Reply = Schema.Struct({
 }).annotate({ identifier: "QuestionV2.Reply" })
 export interface Reply extends Schema.Schema.Type<typeof Reply> {}
 
-const Asked = define({ type: "question.v2.asked", schema: Request.fields })
-const Replied = define({
+const Asked = initializeEventDefinition(define({ type: "question.v2.asked", schema: Request.fields }))
+const Replied = initializeEventDefinition(define({
   type: "question.v2.replied",
   schema: {
     sessionID: SessionID,
     requestID: ID,
     answers: Schema.Array(Answer),
   },
-})
-const Rejected = define({
+}))
+const Rejected = initializeEventDefinition(define({
   type: "question.v2.rejected",
   schema: {
     sessionID: SessionID,
     requestID: ID,
   },
-})
+}))
 export const Event = { Asked, Replied, Rejected, Definitions: inventory(Asked, Replied, Rejected) }

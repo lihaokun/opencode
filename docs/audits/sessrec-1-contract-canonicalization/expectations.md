@@ -6,7 +6,7 @@
 **D0 contract sync / review**: `2026-08-16；0 P0 / 0 P1`
 **Step 5 验证时间**: `待 Step 5 填`
 
-> 证据边界：本文的expectations仍只来自允许读取的设计契约，Step 5实现位置/一致列尚未回填。M1-A scalar/nominal foundation已有partial production evidence：focused runtime/property tests `8/8`、schema typecheck通过、non-manifest schema regression `21/21`；完整schema suite仍有clean D0 HEAD可同样复现的`event-manifest.test.ts`既有2项失败。该partial evidence不证明完整M1-T01、F1–F31、automatic recovery或Step 5通过；其余实现、测试、schema、脚本、migration与codegen仍为`[F — planned; not created; not run]`。
+> 证据边界：本文仍未执行完整Step 5，未整体回填实现位置/一致列。M1-A已随`deb84e90a9051511db3c9ca69f52cacdaf45af2e`推送；当前M1-B F1/F2已有partial evidence：schema focused `19/19`（267 assertions）、schema typecheck、non-manifest `29/29`（289 assertions）、core focused `50/50`（93 assertions）与core typecheck通过；完整schema suite仍仅有clean D0/M1-A同样复现的`event-manifest.test.ts`既有2项失败。该evidence不证明F3–F31、recovery event set、automatic recovery、full public/private closure或Step 5通过。
 
 ---
 
@@ -132,7 +132,7 @@
 | `RecoveryFailureCause` | exact 24 source/kind pairs；tool可有`callID?`，supersession必有`operationID`，all可有`detail?`；无reason/code | SESSREC-1 §4.8.5 | `RecoveryFailureCause` + F23 | 计划：M1 owner barrel（未创建） | 计划 `M1-T19`（未创建） |
 | `RecoveryOperationType` | `initial-chain-genesis-and-dispatch`、`ordinary-assistant-and-dispatch-admitted`、`subsequent-dispatch-recorded`、`tool-evidence-recorded`、`reasoning-evidence-recorded`、`provider-prefix-recorded`、`incomplete-terminal-recorded`、`decision-finalized`、`automatic-child-admitted-and-consumed`、`source-superseded` | SESSREC-1 §4.8.1 | `RecoveryOperationType` / `OperationSchemaByTypeV1` | 计划：M1 owner barrel（未创建） | 计划 `M1-T27`（未创建） |
 | `RecoveryEventType` | 上述10项分别精确加 `session.recovery.` 前缀 | SESSREC-1 §4.8.1 | registry-indexed private type | 计划：M1 event registry（未创建） | 计划 `M1-T03/T27`（未创建） |
-| Publication | `public`、`internal`；省略default public；recovery explicit internal | SESSREC-1 F1–F3 | definition metadata | 计划：`packages/schema/src/event.ts`（未修改） | 计划 `M1-T03/T04/T04a` |
+| Publication | `public`、`internal`；省略或显式`undefined` default public；recovery explicit internal | SESSREC-1 F1–F3 | definition metadata | F1/F2：`packages/schema/src/event.ts`；recovery definitions F3仍未创建 | F1/F2 subset：`event.test.ts`/`event.types.ts`/core event tests通过；F3/F31待后续 |
 | Storage | `true`、`false`、`unknown` strings | SESSREC-1 §4.3.3 | `StorageMode` | 计划：M1 shared schema（未创建） | 计划 `M1-T13` |
 | Origins | `initial`、`ordinary`、`automatic-recovery` | SESSREC-1 §4.2.3/§4.4.1 | `PreparedDispatchKindV1` | 计划：M1 shared schema（未创建） | 计划 `M1-T10/T27` |
 | Actions | `safe-retry`、`continue-after-settled-tools` | SESSREC-1 §4.7.1 | `AutomaticRecoveryAction` | 计划：M1 owner export（未创建） | 计划 `M1-T20/T38` |
@@ -181,8 +181,8 @@
 
 | 设计步骤 | 来源 | 计划 marker / 义务 | 实现位置（待 Step 5 填） | 验证 |
 |---|---|---|---|---|
-| P1 publication | F1 | `// # Step P1: normalize source-level publication metadata` | 待 Step 5 填 | 计划 grep（未创建） |
-| P2 partition | F2 | `// # Step P2: partition public and internal definitions exactly once` | 待 Step 5 填 | 计划 grep（未创建） |
+| P1 publication | F1 | `// # Step P1: normalize source-level publication metadata` | `packages/schema/src/event.ts` | 当前grep恰1处；完整Step 5仍待执行 |
+| P2 partition | F2 | `// # Step P2: partition public and internal definitions exactly once` | `packages/schema/src/event.ts` | 当前grep恰1处；完整Step 5仍待执行 |
 | P3 raw definitions | schema F3 | `// # Step P3: build ten internal durable recovery definitions without digest` | 待 Step 5 填 | 计划 grep（未创建） |
 | P4 field sets | F4 | `// # Step P4: validate recursive exact field membership` | 待 Step 5 填 | 计划 grep（未创建） |
 | P5 row decode | F5 | `// # Step P5: decode owner-qualified durable recovery row` | 待 Step 5 填 | 计划 grep（未创建） |
@@ -210,7 +210,7 @@
 |---|---|---|---|
 | M1是shared recovery schema/canonical semantics唯一owner；dependency保持 `schema ← llm ← opencode` | architecture M1；SESSREC-1 §1 | `M1-T24/T38` + import review | 待 Step 5 验证 |
 | Schema F3只产owner-held frozen singleton `RecoveryEventDefinitionSetV1`且不hash/import LLM；LLM E1按top-level/member identity只接受该same set并附加两个existing allowed-set digests；F5–F7归LLM消费enriched registry；F31对E1零依赖 | SESSREC-1 §4.5.1/F3/E1/F5–F7/F31 | `M1-T03/T26/T28/T38` + dependency/import review | 待 Step 5 验证 |
-| 除F12外M1 pure callable使用exact `ContractResult<A,E>`；无throwing/Effect/undefined overload | SESSREC-1 §3.1/§5.0 | signature/type tests | 待 Step 5 验证 |
+| 除F12外M1 pure callable使用exact `ContractResult<A,E>`；无throwing/Effect/undefined overload | SESSREC-1 §3.1/§5.0 | F1 type fixture与97个caller boundary已通过typecheck；其余callables future | [P — F1一致；完整Step 5待验证] |
 | Unknown version/event/field-set、extra authority field、owner/digest mismatch、partial/non-foldable authority fail closed | SESSREC-1 §3.2/F4–F7 | `M1-T02/T17/T18/T28` | 待 Step 5 验证 |
 | Old rows only compatibility/opaque/unknown；缺providerExecuted不当false，缺provenance不当provider-end | F8/F14/F15 | `M1-T16/T33/T34` | 待 Step 5 验证 |
 | Storage exact三值；undefined→unknown；null/string/number非法；unknown不等于false | F9 | `M1-T13` | 待 Step 5 验证 |
@@ -246,7 +246,7 @@
 | Types8–10 record只从raw payload+envelope deterministic rebuild，不从clock/runtime/projection补字段 | §4.8.1–§4.8.3 | 待 Step 5 填 | `M1-T27` |
 | First apply重验current policy/heads；exact replay验证stored historical policy/post-state；current full-prefix validation独立 | §4.8.3/F26/F27/H3 | 待 Step 5 填 | `M1-T21/T31` |
 | applyMode只在ephemeral result；不进receipt/raw/folded/digest/public | §4.8.3 | 待 Step 5 填 | `M1-T29/T38` |
-| Public/internal必须在schema definition/source和manifest前分区；F31只消费raw F3 definitions/publication metadata；末端字符串filter只defense-in-depth | architecture §4.8；F1–F3/F31 | 待 Step 5 填 | `M1-T03/T04/T04a` |
+| Public/internal必须在schema definition/source和manifest前分区；F31只消费raw F3 definitions/publication metadata；末端字符串filter只defense-in-depth | architecture §4.8；F1–F3/F31 | F1/F2与现有public manifest source partition已实现；F3/F31 private/public durable assembly仍future | [P — F1/F2 subset；M1-T03/T04/T04a其余待验证] |
 | F28在M4 stable display-ID allocation之后；F28–F30不分配ID、不查表、不写DB | §4.7.4/F28–F30 | 待 Step 5 填 | `M1-T32` |
 | Global automatic 21-step runtime顺序由cross-owner持有；M1仅提供exact descriptor/input/receipt validators | architecture §5.1；detailed-design §3.1 | 待 Step 5 填 | Step 5 cross-owner review |
 
@@ -254,7 +254,7 @@
 
 ## 7. 不变量契约（property-based）
 
-> Future TypeScript property framework建议项目选定 `fast-check`；依赖与测试未创建。
+> 当前F1/F2 subset复用`effect/testing`导出的FastCheck；其余future property suites仍未创建。
 
 | 不变量 | 来源 | 未来测试 |
 |---|---|---|
@@ -280,7 +280,7 @@
 | `(aggregateID,operationID)` exact replay；same key different payload/type conflict；operationID-only非法 | §4.7.3/§4.8.2 | `property_lookup_aggregate_scoped`（计划） |
 | F26/F27 success iff receipt/raw/stored post-state/policy/heads/handle exact；later heads不破坏历史有效性 | F26/F27 | `property_receipt_exact_historical_state`（计划） |
 | Public success只含allowlist；任意深度forbidden authority shape失败；unknown enum→unknown | F28–F30 | `property_public_zero_leakage`（计划） |
-| Public/internal partition互斥完备并保持顺序；internal永无public brand | F2/F31 | `property_public_internal_partition`（计划） |
+| Public/internal partition互斥完备并保持顺序；internal永无public brand | F2/F31 | F2 finite-list FastCheck + type fixture已通过；F31 carrier/service closure仍计划 |
 
 ---
 
@@ -331,7 +331,7 @@
 | Evidence/partition/phases/carriers/literals在M3 producer、M4 fold、M5 classifier、M7 lowering exact | §4.4/§6 | `M1-T33–T38` + cross-owner review（计划） |
 | Policy snake_case/camelCase/default/provenance/digest/effectiveM在config/M1/M4/M6 exact | architecture §5.7；§4.6.3 | `M1-T15/T31`（计划） |
 | M4 returns complete result；F26 types1/2/3，F27 type9；detached receipt/current head不能替代stored post-state | architecture §4.10/§7；F26/F27 | `M1-T21/T29` + runtime integration（计划） |
-| Public brands only literal-public definitions；private reader可读internal；all public/shared/Native V2/M8只nominal public carriers | architecture §4.8；F2/F31 | `M1-T03/T04/T04a/T24`（计划） |
+| Public brands only literal-public definitions；private reader可读internal；all public/shared/Native V2/M8只nominal public carriers | architecture §4.8；F2/F31 | F2 definition-level nominal boundary已由`event.types.ts`验证；F31 committed carrier/service/private reader仍计划 |
 | Projection chain M4 stable mapping→M1 F28→wire→M1 F30→M8；pure/no allocation；malformed与unsupported分离 | detailed-design §3.8；F28–F30 | `M1-T22/T32` + M8 integration（计划） |
 | Legacy public保持UnknownError；optional projection old-client compatible；internal zero leakage | architecture G10；§4.7.4 | `M1-T23` + OpenAPI/SDK regression（计划） |
 | Native V2仅shared regression consumer，不创建recovery operation/event/expectations | architecture §1.3/§11；§1.2 | Step 5 scope review |

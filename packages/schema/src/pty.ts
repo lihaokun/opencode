@@ -5,6 +5,12 @@ import { optional } from "./schema"
 import { define, inventory } from "./event"
 import { ascending } from "./identifier"
 import { NonNegativeInt, PositiveInt, statics } from "./schema"
+import type { ContractResult, EventDefinitionError } from "./llm"
+
+function initializeEventDefinition<A>(result: ContractResult<A, EventDefinitionError>): A {
+  if (!result.ok) throw new globalThis.Error("Event definition initialization failed", { cause: result.error })
+  return result.value
+}
 
 const IDSchema = Schema.String.check(Schema.isStartsWith("pty")).pipe(Schema.brand("PtyID"))
 
@@ -31,10 +37,10 @@ export const Info = Schema.Struct({
 }).annotate({ identifier: "Pty" })
 export interface Info extends Schema.Schema.Type<typeof Info> {}
 
-const Created = define({ type: "pty.created", schema: { info: Info } })
-const Updated = define({ type: "pty.updated", schema: { info: Info } })
-const Exited = define({ type: "pty.exited", schema: { id: ID, exitCode: NonNegativeInt } })
-const Deleted = define({ type: "pty.deleted", schema: { id: ID } })
+const Created = initializeEventDefinition(define({ type: "pty.created", schema: { info: Info } }))
+const Updated = initializeEventDefinition(define({ type: "pty.updated", schema: { info: Info } }))
+const Exited = initializeEventDefinition(define({ type: "pty.exited", schema: { id: ID, exitCode: NonNegativeInt } }))
+const Deleted = initializeEventDefinition(define({ type: "pty.deleted", schema: { id: ID } }))
 export const Event = { Created, Updated, Exited, Deleted, Definitions: inventory(Created, Updated, Exited, Deleted) }
 
 export const CreateInput = Schema.Struct({

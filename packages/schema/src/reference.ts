@@ -4,8 +4,14 @@ import { Schema } from "effect"
 import { optional } from "./schema"
 import { define, inventory } from "./event"
 import { AbsolutePath } from "./schema"
+import type { ContractResult, EventDefinitionError } from "./llm"
 
-const Updated = define({ type: "reference.updated", schema: {} })
+function initializeEventDefinition<A>(result: ContractResult<A, EventDefinitionError>): A {
+  if (!result.ok) throw new globalThis.Error("Event definition initialization failed", { cause: result.error })
+  return result.value
+}
+
+const Updated = initializeEventDefinition(define({ type: "reference.updated", schema: {} }))
 export const Event = { Updated, Definitions: inventory(Updated) }
 
 export interface LocalSource extends Schema.Schema.Type<typeof LocalSource> {}

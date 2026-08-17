@@ -15,62 +15,69 @@ import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { eq } from "drizzle-orm"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
+import { SafePositiveInt, type ContractResult, type EventDefinitionError } from "@opencode-ai/schema/llm"
 
+function initializeEventDefinition<A>(result: ContractResult<A, EventDefinitionError>): A {
+  if (!result.ok) throw new globalThis.Error("Event definition initialization failed", { cause: result.error })
+  return result.value
+}
+
+const eventVersion = Schema.decodeUnknownSync(SafePositiveInt)
 const locationLayer = Layer.succeed(
   Location.Service,
   Location.Service.of(
     location({ directory: AbsolutePath.make("project"), workspaceID: WorkspaceV2.ID.make("wrk_test") }),
   ),
 )
-const Message = EventV2.define({
+const Message = initializeEventDefinition(EventV2.define({
   type: "test.message",
   schema: {
     text: Schema.String,
   },
-})
+}))
 
-const SyncMessage = EventV2.define({
+const SyncMessage = initializeEventDefinition(EventV2.define({
   type: "test.sync",
   durable: {
-    version: 1,
+    version: eventVersion(1),
     aggregate: "id",
   },
   schema: {
     id: Schema.String,
     text: Schema.String,
   },
-})
+}))
 
-const SyncSent = EventV2.define({
+const SyncSent = initializeEventDefinition(EventV2.define({
   type: "test.sent",
   durable: {
-    version: 1,
+    version: eventVersion(1),
     aggregate: "messageID",
   },
   schema: {
     messageID: Schema.String,
     text: Schema.String,
   },
-})
+}))
 
-const GlobalMessage = EventV2.define({
+const GlobalMessage = initializeEventDefinition(EventV2.define({
   type: "test.global",
   schema: {
     text: Schema.String,
   },
-})
+}))
 
-const VersionedMessage = EventV2.define({
+const VersionedMessage = initializeEventDefinition(EventV2.define({
   type: "test.versioned",
   durable: {
-    version: 2,
+    version: eventVersion(2),
     aggregate: "id",
   },
   schema: {
     id: Schema.String,
     text: Schema.String,
   },
-})
+}))
 
 const DurableMessage = SessionV1.Event.MessageRemoved
 const durableData = (sessionID: Session.ID, text: string) => ({
@@ -93,7 +100,9 @@ describe("EventV2", () => {
       const received = Array.from(yield* Fiber.join(fiber))
 
       expect(received).toEqual([event])
+      expect(Message.publication).toBe("public")
       expect(event.type).toBe("test.message")
+      expect(event).not.toHaveProperty("publication")
       expect(event).not.toHaveProperty("version")
       expect(event.data).toEqual({ text: "hello" })
       expect(event.location).toEqual({
@@ -125,16 +134,16 @@ describe("EventV2", () => {
 
   it.effect("selects the latest durable definition independent of declaration order", () =>
     Effect.sync(() => {
-      const latest = EventV2.define({
+      const latest = initializeEventDefinition(EventV2.define({
         type: "test.out-of-order",
-        durable: { version: 2, aggregate: "id" },
+        durable: { version: eventVersion(2), aggregate: "id" },
         schema: { id: Schema.String },
-      })
-      const historical = EventV2.define({
+      }))
+      const historical = initializeEventDefinition(EventV2.define({
         type: "test.out-of-order",
-        durable: { version: 1, aggregate: "id" },
+        durable: { version: eventVersion(1), aggregate: "id" },
         schema: { id: Schema.String },
-      })
+      }))
 
       expect(Event.latest([latest, historical]).get("test.out-of-order")).toBe(latest)
       expect(Event.latest([historical, latest]).get("test.out-of-order")).toBe(latest)
@@ -975,7 +984,7 @@ describe("EventV2", () => {
       yield* events.replay(replayed, { publish: true })
       yield* events.replay(replayed, { publish: true })
 
-      expect(received).toMatchObject([{ id: replayed.id, durable: { seq: 0, version: 1 }, data: replayed.data }])
+      expect(received).toMatchObject([{ id: replayed.id, durable: { seq: 0, version: eventVersion(1) }, data: replayed.data }])
     }),
   )
 

@@ -30,6 +30,12 @@ import { TuiEvent } from "./tui-event"
 import { VcsEvent } from "./vcs-event"
 import { WorkspaceEvent } from "./workspace-event"
 import { WorktreeEvent } from "./worktree-event"
+import type { ContractResult, EventDefinitionError } from "./llm"
+
+function initializeEventPartition<A>(result: ContractResult<A, EventDefinitionError>): A {
+  if (!result.ok) throw new globalThis.Error("Event definition partition initialization failed", { cause: result.error })
+  return result.value
+}
 
 const sessionV1DurableDefinitions = SessionV1.Event.Definitions.filter((definition) => definition.durable !== undefined)
 const sessionV1LiveDefinitions = SessionV1.Event.Definitions.filter((definition) => definition.durable === undefined)
@@ -54,13 +60,15 @@ const featureDefinitions = Event.inventory(
   ...Question.Event.Definitions,
 )
 
-export const ServerDefinitions = Event.inventory(
+const rawServerDefinitions = Event.inventory(
   ...foundationDefinitions,
   ...featureDefinitions,
   ...SessionTodo.Event.Definitions,
 )
+const serverPartition = initializeEventPartition(Event.partitionDefinitionsByPublication(rawServerDefinitions))
+export const ServerDefinitions = serverPartition.public
 
-export const Definitions = Event.inventory(
+const rawDefinitions = Event.inventory(
   ...foundationDefinitions,
   ...sessionV1LiveDefinitions,
   ...InstallationEvent.Definitions,
@@ -80,5 +88,7 @@ export const Definitions = Event.inventory(
   ...WorktreeEvent.Definitions,
   ...ServerEvent.Definitions,
 )
+const partition = initializeEventPartition(Event.partitionDefinitionsByPublication(rawDefinitions))
+export const Definitions = partition.public
 export const Latest = Event.latest(Definitions)
 export { Durable }

@@ -5,6 +5,12 @@ import { optional } from "./schema"
 import { Event } from "./event"
 import { NonNegativeInt } from "./schema"
 import { SessionID } from "./session-id"
+import type { ContractResult, EventDefinitionError } from "./llm"
+
+function initializeEventDefinition<A>(result: ContractResult<A, EventDefinitionError>): A {
+  if (!result.ok) throw new globalThis.Error("Event definition initialization failed", { cause: result.error })
+  return result.value
+}
 
 export const Info = Schema.Union([
   Schema.Struct({
@@ -32,20 +38,20 @@ export const Info = Schema.Union([
 ]).annotate({ identifier: "SessionStatus" })
 export type Info = Schema.Schema.Type<typeof Info>
 
-export const Status = Event.define({
+export const Status = initializeEventDefinition(Event.define({
   type: "session.status",
   schema: {
     sessionID: SessionID,
     status: Info,
   },
-})
+}))
 
 // deprecated
-export const Idle = Event.define({
+export const Idle = initializeEventDefinition(Event.define({
   type: "session.idle",
   schema: {
     sessionID: SessionID,
   },
-})
+}))
 
 export const Definitions = Event.inventory(Status, Idle)

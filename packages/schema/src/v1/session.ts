@@ -11,6 +11,13 @@ import { ascending } from "../identifier"
 import { SessionID } from "../session-id"
 import { WorkspaceID } from "../workspace-id"
 import { PermissionV1 } from "./permission"
+import { SafePositiveInt } from "../llm"
+import type { ContractResult, EventDefinitionError } from "../llm"
+
+function initializeEventDefinition<A>(result: ContractResult<A, EventDefinitionError>): A {
+  if (!result.ok) throw new globalThis.Error("Event definition initialization failed", { cause: result.error })
+  return result.value
+}
 
 const Timestamp = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))
 
@@ -499,10 +506,11 @@ export type WithParts = {
   parts: Part[]
 }
 
+const eventVersion1 = Schema.decodeUnknownSync(SafePositiveInt)(1)
 const options = {
   durable: {
     aggregate: "sessionID",
-    version: 1,
+    version: eventVersion1,
   },
 } as const
 
@@ -569,47 +577,47 @@ export const SessionInfo = Schema.Struct({
 export type SessionInfo = typeof SessionInfo.Type
 
 const events = {
-  Created: define({
+  Created: initializeEventDefinition(define({
     type: "session.created",
     ...options,
     schema: {
       sessionID: SessionID,
       info: SessionInfo,
     },
-  }),
-  Updated: define({
+  })),
+  Updated: initializeEventDefinition(define({
     type: "session.updated",
     ...options,
     schema: {
       sessionID: SessionID,
       info: SessionInfo,
     },
-  }),
-  Deleted: define({
+  })),
+  Deleted: initializeEventDefinition(define({
     type: "session.deleted",
     ...options,
     schema: {
       sessionID: SessionID,
       info: SessionInfo,
     },
-  }),
-  MessageUpdated: define({
+  })),
+  MessageUpdated: initializeEventDefinition(define({
     type: "message.updated",
     ...options,
     schema: {
       sessionID: SessionID,
       info: Info,
     },
-  }),
-  MessageRemoved: define({
+  })),
+  MessageRemoved: initializeEventDefinition(define({
     type: "message.removed",
     ...options,
     schema: {
       sessionID: SessionID,
       messageID: MessageID,
     },
-  }),
-  PartUpdated: define({
+  })),
+  PartUpdated: initializeEventDefinition(define({
     type: "message.part.updated",
     ...options,
     schema: {
@@ -617,8 +625,8 @@ const events = {
       part: Part,
       time: Schema.Finite,
     },
-  }),
-  PartRemoved: define({
+  })),
+  PartRemoved: initializeEventDefinition(define({
     type: "message.part.removed",
     ...options,
     schema: {
@@ -626,10 +634,10 @@ const events = {
       messageID: MessageID,
       partID: PartID,
     },
-  }),
+  })),
 }
 
-export const PartDelta = define({
+export const PartDelta = initializeEventDefinition(define({
   type: "message.part.delta",
   schema: {
     sessionID: SessionID,
@@ -638,23 +646,23 @@ export const PartDelta = define({
     field: Schema.String,
     delta: Schema.String,
   },
-})
+}))
 
-export const Diff = define({
+export const Diff = initializeEventDefinition(define({
   type: "session.diff",
   schema: {
     sessionID: SessionID,
     diff: Schema.Array(FileDiff.Info),
   },
-})
+}))
 
-export const Error = define({
+export const Error = initializeEventDefinition(define({
   type: "session.error",
   schema: {
     sessionID: Schema.optional(SessionID),
     error: Assistant.fields.error,
   },
-})
+}))
 
 export const Event = {
   ...events,

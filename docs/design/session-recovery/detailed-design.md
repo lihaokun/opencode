@@ -2,13 +2,13 @@
 
 > Issue：[#7](https://github.com/lihaokun/opencode/issues/7)
 >
-> 状态：详细设计与四份Workflow Step 0 expectations已批准并推送；D0 M1 package-ownership correction已随`085698426f466b6fc01215c4cb34d89b73ef8290`推送且fresh independent review为`0 P0 / 0 P1`。SESSREC-1已进入M1-A scalar/nominal foundation；其余production implementation、future acceptance tests与Step 5 audit仍未开始。
+> 状态：详细设计与四份Workflow Step 0 expectations已批准并推送；D0 M1 package-ownership correction已随`085698426f466b6fc01215c4cb34d89b73ef8290`推送，M1-A foundation已随`deb84e90a9051511db3c9ca69f52cacdaf45af2e`推送。当前changeset实现SESSREC-1 M1-B F1/F2及97个production/core caller迁移；F3–F31、recovery runtime、future acceptance与Step 5 audit仍未完成。
 >
 > 范围：仅 Legacy Session recovery。Native V2 只作为 shared compatibility regression consumer，不具有 recovery flow、API、event、expectations 或测试产品范围。
 >
 > 固定预算：automatic recovery默认`N = 2`；配置规范化时model-assistant默认`configuredM = 64`并导出`effectiveMaxModelAssistants`；runtime admission唯一 authority为transaction-verified committed `NormalizedRecoveryPolicy.digestInput.effectiveMaxModelAssistants`，predicate为`assistantSequence < effectiveM`，禁止runtime reread/re-min。
 >
-> 证据边界：50/50 scoped checks 仅是 source-equivalent `135f20215`、Bun `1.3.14` 上的当前直接 A/B/C/D 行为证据；S统一写作`[S — source seam only]`。M1-A foundation的focused runtime/property/type evidence为partial implementation evidence，不证明F1–F31、automatic recovery、future acceptance或Step 5完成；其余future项仍为`[F — planned; not created; not run]`。
+> 证据边界：50/50 scoped checks 仅是 source-equivalent `135f20215`、Bun `1.3.14` 上的当前直接 A/B/C/D 行为证据；S统一写作`[S — source seam only]`。M1-A与当前M1-B F1/F2的runtime/property/type/package evidence都只是partial implementation evidence，不证明F3–F31、automatic recovery、future acceptance或Step 5完成；其余future项仍为`[F — planned; not created; not run]`。
 
 ## 0. 文档权威、阶段与证据边界
 
@@ -29,11 +29,11 @@
 | Owner 子计划 | 四份函数级设计均存在；SESSREC-1已完成schema-owned raw definition set与LLM-owned enriched registry拆分，其余owner合同冻结。 |
 | Independent design audit | 原stable six-document snapshot与D0 changed snapshot均为`0 P0 / 0 P1`；D0 reviewer另给出2个P2 metadata/wording项，已在本changeset修正。 |
 | Step 0 | **已完成**：四份 per-subplan contract-audit expectations已创建、审查、commit并push（`acc7d0bcf`）。 |
-| Production implementation | **已进入SESSREC-1 M1-A foundation**：schema-owned result/error、safe scalar/ID、unbranded digest/domain codecs与type-only commitment brands；F1–F31 callables及M2–M8未开始。 |
-| Future tests / Step 5 implementation audit / migration / codegen | M1-A focused tests已创建并运行；其余future acceptance tests、Step 5、migration与codegen未创建或未执行。 |
+| Production implementation | M1-A schema-owned result/error、safe scalar/ID、unbranded digest/domain codecs与type-only commitment brands已推送；当前changeset实现F1 exact `Event.define`、F2 publication partition、public manifest source partition及97个production/core caller迁移。F3–F31其余callables及M2–M8未开始。 |
+| Future tests / Step 5 implementation audit / migration / codegen | M1-A与F1/F2 focused/runtime/property/type/core compatibility tests已创建并运行；F3–F31 future acceptance、Step 5 audit-report、migration与codegen未创建或未执行。 |
 | Shell | **N/A**于provider recovery；仍进入M6 per-session serialization，但绕过supersession recovery、policy、M7/M2、N/M与model admission。 |
 | Public authority event | **不存在且禁止新增**；`session.recovery.*` authority variants 必须在 source-level event definition/publication partition 处排除。 |
-| Current gate | M1-A verification/review/commit/push → 下一SESSREC-1 production slice；不得提前进入SESSREC-2。 |
+| Current gate | M1-B F1/F2 verification/review/commit/push → F3/F4 raw recovery definition set；不得提前进入SESSREC-2。 |
 
 ### 0.3 A/B/C/D/S/F
 
@@ -748,9 +748,9 @@ Future acceptance 必须分别报告 provider transport hits、local-tool side e
 
 以下implementation gates仍未整体完成：
 
-- [ ] Production implementation整体未完成；当前仅SESSREC-1 M1-A foundation已实现，F1–F31与M2–M8尚未完成。
-- [ ] Future acceptance tests整体未完成；当前仅M1-A focused tests已创建并运行。
-- [ ] Migration/codegen/Step 5 audit-report尚未执行或创建；M1-A devlog随本slice创建。
+- [ ] Production implementation整体未完成；M1-A与M1-B F1/F2已实现，F3–F31其余callables与M2–M8尚未完成。
+- [ ] Future acceptance tests整体未完成；当前仅M1-A与F1/F2 focused/runtime/property/type/core compatibility tests已创建并运行。
+- [ ] Recovery migration/codegen/Step 5 audit-report尚未执行或创建；M1-B devlog随本slice创建。
 
 ## 11. Step 0 gate and exact implementation dependency order
 
@@ -768,7 +768,7 @@ R21-R24 and R25-R26 owner contracts repaired and global candidate synchronized
   → implementation dependency order
 ```
 
-用户批准与四份Step 0 expectations均已完成。只读真实package dependency核查发现原F3同时由schema manifest调用LLM-owned F17/F21会形成反向依赖，因此D0已将schema F3收窄为raw `RecoveryEventDefinitionSetV1`，并由LLM `buildRecoveryEventRegistry`沿允许方向补两个existing allowed-set digests。D0机械检查、fresh independent review `0 P0 / 0 P1`及commit/push均已完成；当前按下列order进入SESSREC-1 M1-A foundation，后续slice仍不得跨过本slice commit/push gate。
+用户批准与四份Step 0 expectations均已完成。只读真实package dependency核查发现原F3同时由schema manifest调用LLM-owned F17/F21会形成反向依赖，因此D0已将schema F3收窄为raw `RecoveryEventDefinitionSetV1`，并由LLM `buildRecoveryEventRegistry`沿允许方向补两个existing allowed-set digests。D0与M1-A的机械检查、review及commit/push均已完成；当前按下列order实现SESSREC-1 M1-B F1/F2，后续F3/F4 slice仍不得跨过本slice commit/push gate。
 
 ### 11.2 Implementation dependency order after Step 0 passes
 
@@ -792,8 +792,8 @@ R21-R24 and R25-R26 owner contracts repaired and global candidate synchronized
 - proposal只保留requirements/root cause/product scope/original evidence权威，implementation contracts exclusively由当前architecture/detailed design/subplans拥有；
 - detailed design已获用户批准，四份Step 0 expectations已完成、review、commit并push；这仍不是production-ready声明；
 - 原stable-snapshot与D0 changed snapshot的fresh independent review结论均为`0 P0 / 0 P1`；D0只修正M1内部package ownership/call graph；
-- D0 commit/push gate已完成，SESSREC-1 implementation order已进入M1-A scalar/nominal foundation；
-- M1-A focused runtime/property/type evidence已真实创建并运行，但只覆盖foundation；其余future verification仍严格是`[F — planned; not created; not run]`；
+- D0与M1-A commit/push gate已完成，SESSREC-1 implementation order已进入M1-B F1/F2 event-definition boundary；
+- M1-A及F1/F2 focused runtime/property/type/core compatibility evidence已真实创建并运行，但只覆盖这两个partial slices；其余future verification仍严格是`[F — planned; not created; not run]`；
 - 50/50只证明source-equivalent当前A/B/C/D直接行为；`[S — source seam only]`只证明静态接缝；
 - Legacy-only、N=2/M=64、`recoveryOrdinal`/`dispatchOrdinal`分离、shell N/A、无public authority event、three UnknownError strings、source-level event partition、partial-correctness/liveness边界与indeterminate disconnect不透明重发均保持冻结；
-- M1-A验证、审查、commit/push后才可进入下一SESSREC-1 production slice，仍不得提前进入SESSREC-2。
+- M1-B F1/F2验证、审查、commit/push后才可进入F3/F4 raw recovery definition set，仍不得提前进入SESSREC-2。
