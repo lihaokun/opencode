@@ -1,6 +1,6 @@
 # 修正方案 — V1 Session 消息 ID 回卷与持久化顺序
 
-- 状态：生产 DB 根因对照、生产代码、回归测试与本地验证已完成；实现 commit `6784e5ad92`，待文档 commit、stacked PR 与 issue 回填
+- 状态：生产 DB 根因对照、生产代码、回归测试与本地验证已完成；实现 commit `6784e5ad92`、文档 commit `57dab0571a`，stacked [PR #15](https://github.com/lihaokun/opencode/pull/15) 已创建，issue 待合并关闭
 - 日期：2026-08-17
 - 对应问题：[#13](https://github.com/lihaokun/opencode/issues/13)
 - 计划交付：在基于 [PR #14](https://github.com/lihaokun/opencode/pull/14) 的 `message-id-wraparound` stacked branch 中独立实施，不扩大 PR #14 本身的 context-overflow 修复范围
@@ -720,7 +720,7 @@ V1-TERMINAL-1:
 | `packages/opencode/test/session/revert-compact.test.ts` | revert/cleanup suites | 加跨 wrap exact boundary 用例 | 已加: `6784e5ad92` |
 | `packages/opencode/test/cli/run/session-replay.test.ts`、`stream.transport.test.ts` | local replay suites | 加显式 chronology rollover fallback、before anchor 与 fixture | 已加: `6784e5ad92` |
 | `packages/opencode/test/tool/truncation.test.ts` | cleanup suite | 改为 mtime fixture并加 rollover regression | 已加: `6784e5ad92` |
-| `docs/fixes/session-fix-message-id-wraparound.md` | 全文 | 回填最终范围、non-goals、测试、代码状态与实现 commit | 已回填实现 commit `6784e5ad92`；待本次文档 commit |
+| `docs/fixes/session-fix-message-id-wraparound.md` | 全文 | 回填最终范围、non-goals、测试、代码状态与实现 commit | 已提交: `57dab0571a`；PR 状态由后续文档 commit 回填 |
 
 明确不修改：
 
@@ -738,9 +738,9 @@ V1-TERMINAL-1:
 
 | 文档路径 | 要改什么 | 状态（修复后回填） |
 |---|---|---|
-| `docs/fixes/session-fix-message-id-wraparound.md` | 记录八部分方案并回填测试结果、实际文件、non-goals 与实现 commit | 已完成本地回填，待本次文档 commit |
-| GitHub issue #13 | 实施后回填最终方案、测试证据并关闭；明确 IDs 仍可回卷但 consumer 不再把它当 chronology | 待更新 |
-| stacked PR body | 基于 PR #14 创建独立 PR，增加 #13 summary、测试结果与 `Closes #13`；不把它描述为 context-overflow 根因，也不扩大 PR #14 本身范围 | 待更新 |
+| `docs/fixes/session-fix-message-id-wraparound.md` | 记录八部分方案并回填测试结果、实际文件、non-goals 与实现 commit | 已提交: `57dab0571a`；PR 状态由后续文档 commit 回填 |
+| GitHub issue #13 | 实施后回填最终方案、测试证据并关闭；明确 IDs 仍可回卷但 consumer 不再把它当 chronology | PR #15 已声明 `Closes #13`，待合并关闭 |
+| stacked PR body | 基于 PR #14 创建独立 PR，增加 #13 summary、测试结果与 `Closes #13`；不把它描述为 context-overflow 根因，也不扩大 PR #14 本身范围 | 已创建 [PR #15](https://github.com/lihaokun/opencode/pull/15)，base=`dev`，并明确 `Depends on #14` |
 
 不需要同步：
 
@@ -761,4 +761,4 @@ V1-TERMINAL-1:
 - 没有宣称 chronology 修复 concurrent snapshot ownership 或 runner 最终 snapshot 与 idle transition 之间的 lost-wake；
 - 没有把 V2 durable `seq` migration 偷渡进 V1 compatibility patch；
 - 同根的 part ordering、CLI fallback 与 tool retention 已进入测试/代码清单，而不是只修 prompt 一行；
-- 方案已由用户确认；生产 DB 对照后的 chronology terminal 修订已完成验证，commit 与外部 issue/PR 状态保持待办。
+- 方案已由用户确认；生产 DB 对照后的 chronology terminal 修订已完成验证并推送，PR #15 已创建，issue #13 待 PR 合并关闭。
