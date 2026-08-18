@@ -1,6 +1,6 @@
 # 修正方案 — GitHub-hosted Windows 测试兼容性
 
-- 状态：方案已确认，待实现与 CI 验证
+- 状态：实现与本地验证已完成；实现 commit `fbff2233c0`，待 Windows CI 验证
 - 日期：2026-08-18
 - 对应 PR：[#15](https://github.com/lihaokun/opencode/pull/15)
 - workflow 路径：`docs/workflow.md` §7 bug-fix flow + §7.1 八部分修正方案
@@ -55,24 +55,30 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 
 | 类型 | 用例描述 | 状态 |
 |---|---|---|
-| 回归 | Windows path variant 保留盘符并 canonicalize | 待改、待 Windows CI 验证 |
-| 回归 | `db path` 接受 `:memory:` 与 drive-letter absolute SQLite path | 待改、待本地及 Windows CI 验证 |
-| 回归 | File HttpApi 等待异步索引发布真实文件 | 待改、待本地及 Windows CI 验证 |
+| 回归 | Windows path variant 保留盘符并 canonicalize | 已改：`fbff2233c0`；Linux 文件级回归通过，待 Windows CI 覆盖条件分支 |
+| 回归 | `db path` 接受 `:memory:` 与 drive-letter absolute SQLite path | 已改：`fbff2233c0`；CLI smoke 7/7 通过，待 Windows CI |
+| 回归 | File HttpApi 等待异步索引发布真实文件 | 已改：`fbff2233c0`；本地通过，待 Windows CI |
 | 复跑 | Windows E2E 不改断言原样重跑 | 待 CI 验证 |
+
+本地验证从 `packages/opencode` 执行：
+
+- 四个目标测试文件合计 53/53 通过；其中 CLI smoke 因需要临时绑定随机本地端口在沙箱外单独运行。
+- `bun typecheck` 通过。
+- `git diff --check` 通过。
 
 ## 第七部分：代码更新清单
 
 | 文件 | 改动概述 | 状态 |
 |---|---|---|
-| `packages/opencode/test/tool/external-directory.test.ts` | 保留 Windows drive letter | 待改 |
-| `packages/opencode/test/tool/read.test.ts` | 保留 Windows drive letter | 待改 |
-| `packages/opencode/test/cli/smokes/read-only.test.ts` | 按 path 语义验证 DB 输出 | 待改 |
-| `packages/opencode/test/server/httpapi-file.test.ts` | 定向扩大索引 readiness deadline | 待改 |
+| `packages/opencode/test/tool/external-directory.test.ts` | 保留 Windows drive letter | 已改：`fbff2233c0` |
+| `packages/opencode/test/tool/read.test.ts` | 保留 Windows drive letter | 已改：`fbff2233c0` |
+| `packages/opencode/test/cli/smokes/read-only.test.ts` | 按 path 语义验证 DB 输出 | 已改：`fbff2233c0` |
+| `packages/opencode/test/server/httpapi-file.test.ts` | 定向扩大索引 readiness deadline | 已改：`fbff2233c0` |
 
 ## 第八部分：文档更新清单
 
 | 文档 | 要改什么 | 状态 |
 |---|---|---|
-| `docs/fixes/ci-fix-windows-runner-tests.md` | 记录根因、范围、验证结果与 commit | 本文；实现后回填 |
+| `docs/fixes/ci-fix-windows-runner-tests.md` | 记录根因、范围、验证结果与 commit | 已创建并回填实现 commit |
 
 无契约文档更新：本修复只纠正测试环境假设与同步 deadline，不改变生产行为契约。
