@@ -1,6 +1,6 @@
 # 修正方案 — GitHub-hosted Windows 测试兼容性
 
-- 状态：断言修正 `fbff2233c0`、调度层修正 `68c7db55c3`、file-search readiness 修正 `cfa91ddecd`、异步测试边界修正 `832d440911` 已完成；待第三轮 CI
+- 状态：断言修正 `fbff2233c0`、调度层修正 `68c7db55c3`、file-search readiness 修正 `cfa91ddecd`、异步测试边界修正 `832d440911`、search 初始化顺序修正 `ecaf44fc70` 已完成；待第四轮 CI
 - 日期：2026-08-18
 - 对应 PR：[#15](https://github.com/lihaokun/opencode/pull/15)
 - workflow 路径：`docs/workflow.md` §7 bug-fix flow + §7.1 八部分修正方案
@@ -42,6 +42,8 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 
 因此剩余项拆为一个生产 readiness 竞态、三个已测量的测试 deadline，以及一个 Windows 文件读取观察问题。
 
+第三轮 CI 中两组 E2E、Linux Unit、skill refresh、两个 shell-loop 与 ACP EOF 全部通过。Windows Unit 3450 项只剩 File HttpApi 一项失败，但失败已从“30 秒索引仍为空”变为 1.7 秒内 `findText` 返回 503。回归改写曾把 `findText`、`findFile`、`findSymbol` 三个首次 instance 请求放入同一个 `Promise.all`，改变了原用例先建立 instance、再验证 file readiness 的拓扑。最终修正恢复 text/symbol 先完成，随后用单次 `findFile` 请求验证 readiness postcondition。
+
 ## 第二部分：根因分析
 
 - 路径用例把删除盘符误当作大小写和 separator 变体。Windows 的无盘符 rooted path 绑定当前盘；跨 `C:`/`D:` 后已不是同一个文件身份。
@@ -64,7 +66,7 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 3. 首轮曾把 File HttpApi readiness deadline 提高到 30 秒并降低轮询频率；第二轮 CI 证明该 workaround 不足，最终由第 6 项替代并回退额外轮询配置。
 4. Windows Unit 将 Turbo package task 串行执行；opencode suite 的显式 concurrent tests 上限从 20 降到 4。Linux 保持现有 Turbo 调度。
 5. E2E 不改断言；GitHub-hosted Linux/Windows 分别使用 4/2 Playwright workers，避免 5 个 Chromium context 同时争用受限 runner。
-6. 保存 ripgrep 首轮扫描 fiber。`find()` 若当前已有匹配则保持立即返回；若当前为空则 join 同一个扫描 fiber，再对完整首轮索引查询一次。HttpApi 回归改为单次请求必须得到新文件，删除外层轮询 workaround。
+6. 保存 ripgrep 首轮扫描 fiber。`find()` 若当前已有匹配则保持立即返回；若当前为空则 join 同一个扫描 fiber，再对完整首轮索引查询一次。HttpApi 回归保留原来的 instance 建立顺序，随后单次 `findFile` 必须得到新文件，删除外层轮询 workaround。
 7. skill refresh 回归通过 `FSUtil.Service` fresh read/exists 验证原子替换后的磁盘内容，与生产读写边界一致。
 8. 两个 shell-loop 用例外层 deadline 从 10 秒改为 30 秒；ACP EOF 内层 deadline 从 5 秒改为 15 秒，成功条件不变。
 
@@ -86,8 +88,8 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 |---|---|---|
 | 回归 | Windows path variant 保留盘符并 canonicalize | 已改：`fbff2233c0`；本地文件级回归及首轮 Windows CI 通过 |
 | 回归 | `db path` 接受 `:memory:` 与 drive-letter absolute SQLite path | 已改：`fbff2233c0`；本地 CLI smoke 7/7 及首轮 Windows CI 通过 |
-| 回归 | File HttpApi 单次请求等待 initial scan 并返回真实文件 | 已改：`cfa91ddecd`；forced-ripgrep 独立进程 5×2/2 通过，待 Windows CI |
-| 复跑 | E2E 不改断言，以较低 worker 数运行完整 suite | 已改：`68c7db55c3`；第二轮 Windows 93/93 通过，Linux 安装阶段卡住后随失败 run 取消 |
+| 回归 | File HttpApi 单次请求等待 initial scan 并返回真实文件 | readiness：`cfa91ddecd`；初始化顺序：`ecaf44fc70`；forced-ripgrep 独立进程共 8×2/2 通过，待 Windows CI |
+| 复跑 | E2E 不改断言，以较低 worker 数运行完整 suite | 已改：`68c7db55c3`；第三轮 Linux/Windows 均通过，Windows 连续两轮 93/93 |
 | 回归 | skill version refresh 通过 fresh FSUtil read 观察替换结果 | 已改：`832d440911`；本地 10/10 通过，待 Windows CI |
 | 回归 | shell-loop 与 ACP EOF 在 Windows 冷启动下保持原成功条件 | 已改：`832d440911`；隔离回归 3/3 通过，待 Windows CI |
 
@@ -95,7 +97,7 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 
 - 四个目标测试文件合计 53/53 通过；其中 CLI smoke 因需要临时绑定随机本地端口在沙箱外单独运行。
 - package 真实 test script + forced-ripgrep search 2/2 通过；InstanceBootstrap/VCS 16/16、前轮随机失败的 prompt 用例 1/1 通过。
-- readiness 修正后 forced-ripgrep HttpApi 使用五个独立进程均 2/2 通过；Core Ripgrep 2/2 通过。
+- readiness 与初始化顺序修正后 forced-ripgrep HttpApi 使用八个独立进程均 2/2 通过；Core Ripgrep 2/2 通过。
 - skill refresh 重复 10/10 通过；两个 shell-loop 与 ACP EOF 合计 3/3 通过。
 - `packages/core` 与 `packages/opencode` 的 `bun typecheck` 均通过。
 - `git diff --check` 通过。
@@ -112,7 +114,7 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 | `packages/opencode/package.json` | 显式 concurrent tests 上限设为 4 | 已改：`68c7db55c3` |
 | `.github/workflows/test.yml` | Windows Unit package 串行；E2E worker 按 OS 限流 | 已改：`68c7db55c3` |
 | `packages/core/src/filesystem/search.ts` | 空的初始 find 等待首轮 ripgrep scan 后重查 | 已改：`cfa91ddecd` |
-| `packages/opencode/test/server/httpapi-file.test.ts` | 单次 findFile 请求验证 readiness postcondition | 已改：`cfa91ddecd` |
+| `packages/opencode/test/server/httpapi-file.test.ts` | 保留 instance 建立顺序，以单次 findFile 请求验证 readiness postcondition | 已改：`cfa91ddecd`、`ecaf44fc70` |
 | `packages/opencode/test/skill/discovery.test.ts` | 用 FSUtil fresh read 验证 version refresh | 已改：`832d440911` |
 | `packages/opencode/test/session/prompt.test.ts` | 两个 shell-loop deadline 调到 30 秒 | 已改：`832d440911` |
 | `packages/opencode/test/cli/acp/lifecycle.test.ts` | ACP EOF deadline 调到 15 秒 | 已改：`832d440911` |
@@ -121,6 +123,6 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 
 | 文档 | 要改什么 | 状态 |
 |---|---|---|
-| `docs/fixes/ci-fix-windows-runner-tests.md` | 记录根因、范围、验证结果与 commit | 已创建并回填四轮实现 commit |
+| `docs/fixes/ci-fix-windows-runner-tests.md` | 记录根因、范围、验证结果与 commit | 已创建并回填五轮实现 commit |
 
 无其他契约文档更新：唯一生产变化是内部首次空 file-search 的 readiness，不改变接口、schema、错误码或持久化不变量。
