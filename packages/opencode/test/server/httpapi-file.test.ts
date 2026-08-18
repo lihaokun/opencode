@@ -69,6 +69,7 @@ describe("file HttpApi", () => {
         }),
         "file search index was not ready",
         "30 seconds",
+        "250 millis",
       ),
     )
 

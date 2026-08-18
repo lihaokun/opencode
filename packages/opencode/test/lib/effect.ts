@@ -162,12 +162,13 @@ export const pollWithTimeout = <A, E, R>(
   self: Effect.Effect<A | undefined, E, R>,
   message: string,
   duration: Duration.Input = "5 seconds",
+  interval: Duration.Input = "20 millis",
 ) =>
   Effect.gen(function* () {
     while (true) {
       const result = yield* self
       if (result !== undefined) return result
-      yield* Effect.sleep("20 millis")
+      yield* Effect.sleep(interval)
     }
   }).pipe(
     Effect.timeoutOrElse({

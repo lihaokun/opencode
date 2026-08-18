@@ -72,7 +72,12 @@ jobs:
 
       - name: Run unit tests
         timeout-minutes: ${{ matrix.settings.timeout }}
-        run: GITHUB_ACTIONS=false bun turbo test
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            GITHUB_ACTIONS=false bun turbo test --concurrency=1
+          else
+            GITHUB_ACTIONS=false bun turbo test
+          fi
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
 
@@ -94,11 +99,14 @@ jobs:
         settings:
           - name: linux
             host: ubuntu-latest
+            workers: 4
           - name: windows
             host: windows-latest
+            workers: 2
     runs-on: ${{ matrix.settings.host }}
     env:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
+      PLAYWRIGHT_WORKERS: ${{ matrix.settings.workers }}
     defaults:
       run:
         shell: bash
