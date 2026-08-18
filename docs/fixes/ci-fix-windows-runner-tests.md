@@ -1,6 +1,6 @@
 # 修正方案 — GitHub-hosted Windows 测试兼容性
 
-- 状态：断言修正 commit `fbff2233c0` 已通过首轮 Windows CI 对照；调度层修正待实现与复验
+- 状态：断言修正 commit `fbff2233c0` 与调度层修正 commit `68c7db55c3` 已完成；待第二轮 CI 复验
 - 日期：2026-08-18
 - 对应 PR：[#15](https://github.com/lihaokun/opencode/pull/15)
 - workflow 路径：`docs/workflow.md` §7 bug-fix flow + §7.1 八部分修正方案
@@ -69,14 +69,16 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 |---|---|---|
 | 回归 | Windows path variant 保留盘符并 canonicalize | 已改：`fbff2233c0`；本地文件级回归及首轮 Windows CI 通过 |
 | 回归 | `db path` 接受 `:memory:` 与 drive-letter absolute SQLite path | 已改：`fbff2233c0`；本地 CLI smoke 7/7 及首轮 Windows CI 通过 |
-| 回归 | File HttpApi 等待异步索引发布真实文件 | deadline 已改：`fbff2233c0`；轮询限流待改、待 Windows CI |
-| 复跑 | E2E 不改断言，以较低 worker 数运行完整 suite | 待改、待 CI 验证 |
+| 回归 | File HttpApi 等待异步索引发布真实文件 | deadline：`fbff2233c0`；轮询限流：`68c7db55c3`；待 Windows CI |
+| 复跑 | E2E 不改断言，以较低 worker 数运行完整 suite | 已改 worker：`68c7db55c3`；待 CI 验证 |
 
 本地验证从 `packages/opencode` 执行：
 
 - 四个目标测试文件合计 53/53 通过；其中 CLI smoke 因需要临时绑定随机本地端口在沙箱外单独运行。
+- package 真实 test script + forced-ripgrep search 2/2 通过；InstanceBootstrap/VCS 16/16、前轮随机失败的 prompt 用例 1/1 通过。
 - `bun typecheck` 通过。
 - `git diff --check` 通过。
+- 完整 opencode suite 已尝试，但本机 shared `HttpApi Server.listen` 首先超时，后续 SDK 用例统一收到 503 并级联失败；该运行不计为通过，目标隔离回归与 CI 继续作为判定证据。
 
 ## 第七部分：代码更新清单
 
@@ -86,14 +88,14 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 | `packages/opencode/test/tool/read.test.ts` | 保留 Windows drive letter | 已改：`fbff2233c0` |
 | `packages/opencode/test/cli/smokes/read-only.test.ts` | 按 path 语义验证 DB 输出 | 已改：`fbff2233c0` |
 | `packages/opencode/test/server/httpapi-file.test.ts` | 定向扩大索引 readiness deadline | 已改：`fbff2233c0` |
-| `packages/opencode/test/lib/effect.ts` | 允许目标用例配置较低轮询频率 | 待改 |
-| `packages/opencode/package.json` | 显式 concurrent tests 上限设为 4 | 待改 |
-| `.github/workflows/test.yml` | Windows Unit package 串行；E2E worker 按 OS 限流 | 待改 |
+| `packages/opencode/test/lib/effect.ts` | 允许目标用例配置较低轮询频率 | 已改：`68c7db55c3` |
+| `packages/opencode/package.json` | 显式 concurrent tests 上限设为 4 | 已改：`68c7db55c3` |
+| `.github/workflows/test.yml` | Windows Unit package 串行；E2E worker 按 OS 限流 | 已改：`68c7db55c3` |
 
 ## 第八部分：文档更新清单
 
 | 文档 | 要改什么 | 状态 |
 |---|---|---|
-| `docs/fixes/ci-fix-windows-runner-tests.md` | 记录根因、范围、验证结果与 commit | 已创建并回填实现 commit |
+| `docs/fixes/ci-fix-windows-runner-tests.md` | 记录根因、范围、验证结果与 commit | 已创建并回填两轮实现 commit |
 
 无契约文档更新：本修复只纠正测试环境假设与同步 deadline，不改变生产行为契约。
