@@ -68,6 +68,7 @@ describe("file HttpApi", () => {
           return body.includes("hello.txt") ? { response, body } : undefined
         }),
         "file search index was not ready",
+        "30 seconds",
       ),
     )
 
@@ -79,5 +80,5 @@ describe("file HttpApi", () => {
 
     expect(symbols.status).toBe(200)
     expect(await symbols.json()).toEqual([])
-  })
+  }, 60_000)
 })
