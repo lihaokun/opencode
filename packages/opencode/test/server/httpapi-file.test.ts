@@ -55,11 +55,11 @@ describe("file HttpApi", () => {
     await using tmp = await tmpdir({ git: true })
     await Bun.write(path.join(tmp.path, "hello.txt"), "needle")
 
-    const [text, files, symbols] = await Promise.all([
+    const [text, symbols] = await Promise.all([
       request(FilePaths.findText, tmp.path, { pattern: "needle" }),
-      request(FilePaths.findFile, tmp.path, { query: "hello", type: "file" }),
       request(FilePaths.findSymbol, tmp.path, { query: "hello" }),
     ])
+    const files = await request(FilePaths.findFile, tmp.path, { query: "hello", type: "file" })
 
     expect(text.status).toBe(200)
     expect(await text.json()).toContainEqual(expect.objectContaining({ line_number: 1 }))
