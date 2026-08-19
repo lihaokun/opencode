@@ -295,6 +295,24 @@ const lengthThenFailureEnv = LayerNode.compile(root, [
 ])
 const itLengthThenFailure = testEffect(lengthThenFailureEnv)
 
+function toolFenceStream(event: LLMEvent): Stream.Stream<LLMEvent, unknown> {
+  return Stream.make(LLMEvent.stepStart({ index: 0 }), event).pipe(
+    Stream.concat(
+      Stream.fail(
+        new APICallError({
+          message: "tool fence retry",
+          url: "https://example.com/v1/chat/completions",
+          requestBodyValues: {},
+          statusCode: 503,
+          responseHeaders: { "retry-after-ms": "0" },
+          responseBody: '{"error":"retry"}',
+          isRetryable: true,
+        }),
+      ),
+    ),
+  )
+}
+
 function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
   switch (name) {
     case "empty-unknown":
@@ -440,6 +458,31 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
         LLMEvent.textDelta({ id: "exception-text", text: "partial" }),
         LLMEvent.textEnd({ id: "exception-text" }),
       ).pipe(Stream.concat(Stream.fail(new Error("post-output boom"))))
+    case "tool-fence-input-start":
+      return toolFenceStream(LLMEvent.toolInputStart({ id: "fenced-call", name: "lookup" }))
+    case "tool-fence-input-delta":
+      return toolFenceStream(LLMEvent.toolInputDelta({ id: "fenced-call", name: "lookup", text: "{" }))
+    case "tool-fence-input-end":
+      return toolFenceStream(LLMEvent.toolInputEnd({ id: "fenced-call", name: "lookup" }))
+    case "tool-fence-call":
+      return toolFenceStream(LLMEvent.toolCall({ id: "fenced-call", name: "lookup", input: {} }))
+    case "tool-fence-result":
+      return toolFenceStream(
+        LLMEvent.toolResult({
+          id: "orphan-result",
+          name: "lookup",
+          result: { type: "json", value: { output: "done" } },
+        }),
+      )
+    case "tool-fence-error":
+      return toolFenceStream(
+        LLMEvent.toolError({
+          id: "orphan-error",
+          name: "lookup",
+          message: "tool failed",
+          error: new Error("tool failed"),
+        }),
+      )
     case "blocked-permission":
       return Stream.make(
         LLMEvent.stepStart({ index: 0 }),
@@ -1356,6 +1399,45 @@ for (const scenario of [
     ),
   )
 }
+itSettlement.live("session.processor fences ordinary replay for every normalized tool event", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        for (const [scenario, retainsTool] of [
+          ["tool-fence-input-start", true],
+          ["tool-fence-input-delta", true],
+          ["tool-fence-input-end", true],
+          ["tool-fence-call", true],
+          ["tool-fence-result", false],
+          ["tool-fence-error", false],
+        ] as const) {
+          settlementCalls.set(scenario, 0)
+          const result = yield* runSettlement(dir, scenario)
+          const tools = result.parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+
+          expect(result.result).toBe("stop")
+          expect(result.message.error).toMatchObject({ data: { message: "tool fence retry" } })
+          expect(result.errors).toHaveLength(1)
+          expect(settlementCalls.get(scenario)).toBe(1)
+          expect(tools.every((part) => part.state.status !== "pending" && part.state.status !== "running")).toBe(true)
+          if (retainsTool) {
+            expect(tools).toContainEqual(
+              expect.objectContaining({
+                state: expect.objectContaining({
+                  status: "error",
+                  error: "Tool execution aborted",
+                  metadata: expect.objectContaining({ interrupted: true }),
+                }),
+              }),
+            )
+          } else {
+            expect(tools).toEqual([])
+          }
+        }
+      }),
+    { config: cfg },
+  ),
+)
 
 itSettlement.live("session.processor does not replace a blocked tool turn with an incomplete-stream error", () =>
   provideTmpdirInstance(

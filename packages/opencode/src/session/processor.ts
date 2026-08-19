@@ -126,6 +126,20 @@ function providerTurnEvidence(): ProviderTurnEvidence {
 
 type StreamEvent = LLMEvent
 
+function isToolActivityEvent(event: StreamEvent) {
+  switch (event.type) {
+    case "tool-input-start":
+    case "tool-input-delta":
+    case "tool-input-end":
+    case "tool-call":
+    case "tool-result":
+    case "tool-error":
+      return true
+    default:
+      return false
+  }
+}
+
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionProcessor") {}
 
 const layer = Layer.effect(
@@ -167,6 +181,7 @@ const layer = Layer.effect(
       let recoverContextOverflow = true
       let attempt: PhysicalAttemptCheckpoint | undefined
       let hasPluginActivity = false
+      let hasToolActivity = false
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -336,6 +351,7 @@ const layer = Layer.effect(
       }
 
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+        if (isToolActivityEvent(value)) hasToolActivity = true
         switch (value.type) {
           case "reasoning-start":
             evidence.hasAssistantStarted = true
@@ -796,7 +812,7 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
-                decide: ({ ordinary }) => (hasPluginActivity ? undefined : ordinary),
+                decide: ({ ordinary }) => (hasPluginActivity || hasToolActivity ? undefined : ordinary),
                 set: (info) => {
                   return status.set(ctx.sessionID, {
                     type: "retry",
