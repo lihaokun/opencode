@@ -1,7 +1,7 @@
 # 修正方案 — GitHub-hosted Windows 测试兼容性
 
-- 状态：断言修正 `fbff2233c0`、调度层修正 `68c7db55c3`、file-search readiness 修正 `cfa91ddecd`、异步测试边界修正 `832d440911`、search 初始化顺序修正 `ecaf44fc70` 已完成；待第四轮 CI
-- 日期：2026-08-18
+- 状态：断言修正 `fbff2233c0`、调度层修正 `68c7db55c3`、file-search readiness 修正 `cfa91ddecd`、异步测试边界修正 `832d440911`、search 初始化顺序修正 `ecaf44fc70`、lifecycle 修正 `987f4522ee` 已完成；待下一轮 CI
+- 日期：2026-08-19
 - 对应 PR：[#15](https://github.com/lihaokun/opencode/pull/15)
 - workflow 路径：`docs/workflow.md` §7 bug-fix flow + §7.1 八部分修正方案
 - 修复分类：测试用例、测试调度与一个内部 file-search readiness 行为修正；不改变公共接口或数据库 schema
@@ -44,6 +44,11 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 
 第三轮 CI 中两组 E2E、Linux Unit、skill refresh、两个 shell-loop 与 ACP EOF 全部通过。Windows Unit 3450 项只剩 File HttpApi 一项失败，但失败已从“30 秒索引仍为空”变为 1.7 秒内 `findText` 返回 503。回归改写曾把 `findText`、`findFile`、`findSymbol` 三个首次 instance 请求放入同一个 `Promise.all`，改变了原用例先建立 instance、再验证 file readiness 的拓扑。最终修正恢复 text/symbol 先完成，随后用单次 `findFile` 请求验证 readiness postcondition。
 
+第四轮 CI 的两组 E2E、typecheck、nix 与规范检查通过，剩余失败进一步收敛为两个测试生命周期问题：
+
+- Windows Unit 3450 项仍只剩 File HttpApi 一项；`findText` 在 1.3 秒返回空 503。该本地请求不选择 remote workspace，仓库也没有此路径主动构造 503；Effect HTTP 只会为纯 server-side interrupt 生成空 503。目标文件隔离重复通过，因此 full suite 中 process-global handler/memoMap 与全局 instance cleanup 的并发中断是触发条件。
+- Linux Unit 的普通测试、coverage 208/208、auth 208/208 全过；effect mode 打印 header 后被 GitHub 6 小时上限取消。开启逐场景 progress 后，本机完整顺序同样停在约第 80 项的 `worktree.create`；它恰好位于该固定序号，不能据此推断资源累积。该 endpoint 在后台 bootstrap 完成前即返回，而 exerciser 收到响应后立即调用 remove；仓库已有 worktree 与 experimental HttpApi 回归都先等待 `Worktree.Event.Ready` 再删除，证明 exerciser 缺少同一生命周期边界。`runScenario()` 又把 `Effect.scoped` 放在 scenario timeout 外层，使超时后的 scope cleanup 不受 30 秒 deadline 约束。
+
 ## 第二部分：根因分析
 
 - 路径用例把删除盘符误当作大小写和 separator 变体。Windows 的无盘符 rooted path 绑定当前盘；跨 `C:`/`D:` 后已不是同一个文件身份。
@@ -54,6 +59,8 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 - E2E 在 CI 固定使用 5 workers。日志包含 Chromium GPU transient failure 和 `browserContext.close()` teardown timeout，且最终失败跨 run、跨 OS 漂移；同一应用代码已有成功 run，不能归类为产品回归或某一个错误断言。
 - 两个 shell-loop 用例在本机隔离运行已需约 6.6 秒，10 秒外层 deadline 对 Windows 冷路径没有合理余量；ACP 子进程在失败 run 中约 5.4 秒退出，超过其 5 秒内层 deadline。
 - skill refresh 的生产写入使用 `FSUtil` staging + rename，Core 的等价回归通过 fresh filesystem read 验证；legacy 测试却用 `Bun.file` 观察被原子替换的同一路径。先统一为同一 `FSUtil` 观察边界，若 Windows 仍返回旧内容再升级为生产 rename/cache 修正。
+- File HttpApi 测试使用 process-global `HttpApiApp.webHandler()` 和共享 memoMap，同时 suite 中存在显式 concurrent tests 及全局 `disposeAllInstances()` cleanup。Effect HTTP 将被服务端中断的纯 interrupt 映射为空 503；这与 Windows 唯一失败形态一致，而不是 search handler 返回了业务错误。
+- `Worktree.create()` 只等待 git worktree 建立，随后把 bootstrap fork 到 service scope 并立即返回。exerciser 在响应断言中立刻 remove，可能与 bootstrap 的 `InstanceStore.load()` 竞争；现有正式回归都在 POST 前订阅 `Worktree.Event.Ready`，收到对应 name/directory 的 ready 后才删除。该竞态进入 scope finalizer 后，原先放在 `Effect.scoped` 内层的 scenario timeout 无法覆盖清理阶段，最终只能由 6 小时 job 上限取消。
 
 ## 第三部分：参考实现对照
 
@@ -69,6 +76,9 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 6. 保存 ripgrep 首轮扫描 fiber。`find()` 若当前已有匹配则保持立即返回；若当前为空则 join 同一个扫描 fiber，再对完整首轮索引查询一次。HttpApi 回归保留原来的 instance 建立顺序，随后单次 `findFile` 必须得到新文件，删除外层轮询 workaround。
 7. skill refresh 回归通过 `FSUtil.Service` fresh read/exists 验证原子替换后的磁盘内容，与生产读写边界一致。
 8. 两个 shell-loop 用例外层 deadline 从 10 秒改为 30 秒；ACP EOF 内层 deadline 从 5 秒改为 15 秒，成功条件不变。
+9. File HttpApi 用例使用 `test.serial`，并顺序请求 search endpoints；用例不声明并发契约，响应与内容断言保持不变。
+10. HttpApi exerciser 的 `worktree.create` scenario 在 POST 前订阅 `Worktree.Event.Ready`，按 name 等待 bootstrap 完成后再删除；同时把 `Effect.scoped` 移入 scenario timeout，使正常的 scope lifecycle 共享同一 deadline。
+11. Linux HttpApi exerciser workflow step 增加 20 分钟上限，仅作未来未知 cleanup 缺陷的最终保险。
 
 ## 第五部分：正确性论证
 
@@ -80,6 +90,9 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 - Playwright 限流只改变 worker 数；全部 93 个用例、重试策略和断言保持不变。
 - deadline 修正仍要求 shell-loop 完成、两个 caller join 同一结果、ACP 以 code 0 退出；只为已测量的 Windows 进程冷启动保留余量。
 - skill refresh 仍断言新内容、旧 reference 删除和下载计数；仅替换观察 API，不降低任何 postcondition。
+- File HttpApi 串行化不减少任何 endpoint 或断言，只移除测试未声明且依赖 process-global teardown 的并发拓扑。
+- ready watcher 在请求前注册，并按唯一测试 name 过滤事件；收到 Ready 后才调用既有 remove，因此验证的 endpoint、返回体和删除 postcondition 都不变，只消除 bootstrap/remove 竞态。watcher 由 scenario scope 负责注销。
+- scoped 生命周期进入 timeout 后，acquire、request、assertion 与正常 cleanup 共享同一个 30 秒边界；CI step timeout 只负责覆盖无法被 Effect interruption 终止的未知宿主缺陷。
 - 生产代码只改变 legacy ripgrep file-search 的首次空结果 readiness；message-ID chronology 与其他运行路径不改动。
 
 ## 第六部分：测试用例清单
@@ -90,8 +103,10 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 | 回归 | `db path` 接受 `:memory:` 与 drive-letter absolute SQLite path | 已改：`fbff2233c0`；本地 CLI smoke 7/7 及首轮 Windows CI 通过 |
 | 回归 | File HttpApi 单次请求等待 initial scan 并返回真实文件 | readiness：`cfa91ddecd`；初始化顺序：`ecaf44fc70`；forced-ripgrep 独立进程共 8×2/2 通过，待 Windows CI |
 | 复跑 | E2E 不改断言，以较低 worker 数运行完整 suite | 已改：`68c7db55c3`；第三轮 Linux/Windows 均通过，Windows 连续两轮 93/93 |
-| 回归 | skill version refresh 通过 fresh FSUtil read 观察替换结果 | 已改：`832d440911`；本地 10/10 通过，待 Windows CI |
-| 回归 | shell-loop 与 ACP EOF 在 Windows 冷启动下保持原成功条件 | 已改：`832d440911`；隔离回归 3/3 通过，待 Windows CI |
+| 回归 | skill version refresh 通过 fresh FSUtil read 观察替换结果 | 已改：`832d440911`；本地 10/10 与第四轮 Windows CI 通过 |
+| 回归 | shell-loop 与 ACP EOF 在 Windows 冷启动下保持原成功条件 | 已改：`832d440911`；隔离 3/3 与第四轮 Windows CI 通过 |
+| 回归 | File HttpApi 不与 process-global instance cleanup 并发 | 已改：`987f4522ee`；本地目标文件 2/2 通过，待 Windows CI |
+| 回归 | worktree.create 等待 Ready 后删除，完整 lifecycle 受 timeout | 已改：`987f4522ee`；定向 2/2、严格 5 秒完整 effect 208/208 通过，待 Linux CI |
 
 本地验证从 `packages/opencode` 执行：
 
@@ -99,6 +114,8 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 - package 真实 test script + forced-ripgrep search 2/2 通过；InstanceBootstrap/VCS 16/16、前轮随机失败的 prompt 用例 1/1 通过。
 - readiness 与初始化顺序修正后 forced-ripgrep HttpApi 使用八个独立进程均 2/2 通过；Core Ripgrep 2/2 通过。
 - skill refresh 重复 10/10 通过；两个 shell-loop 与 ACP EOF 合计 3/3 通过。
+- File HttpApi 目标文件 2/2 通过；worktree create/invalid 定向 2/2 通过。
+- `bun run test:httpapi` 的 coverage、auth、effect 三阶段均 208/208 通过；effect 另以 5 秒 scenario timeout 完整通过 208/208，且移除未证明必要的额外 instance-dispose 后复验仍通过。
 - `packages/core` 与 `packages/opencode` 的 `bun typecheck` 均通过。
 - `git diff --check` 通过。
 - 完整 opencode suite 已尝试，但本机 shared `HttpApi Server.listen` 首先超时，后续 SDK 用例统一收到 503 并级联失败；该运行不计为通过，目标隔离回归与 CI 继续作为判定证据。
@@ -118,11 +135,14 @@ https://github.com/lihaokun/opencode/actions/runs/32072875850
 | `packages/opencode/test/skill/discovery.test.ts` | 用 FSUtil fresh read 验证 version refresh | 已改：`832d440911` |
 | `packages/opencode/test/session/prompt.test.ts` | 两个 shell-loop deadline 调到 30 秒 | 已改：`832d440911` |
 | `packages/opencode/test/cli/acp/lifecycle.test.ts` | ACP EOF deadline 调到 15 秒 | 已改：`832d440911` |
+| `packages/opencode/test/server/httpapi-file.test.ts` | serial + 顺序请求，移除全局 lifecycle 竞态 | 已改：`987f4522ee`，待 CI |
+| `packages/opencode/test/server/httpapi-exercise/{index,runner,runtime,types}.ts` | worktree Ready watcher；完整 scope 纳入 timeout | 已改：`987f4522ee`，待 CI |
+| `.github/workflows/test.yml` | HttpApi exerciser step 增加 20 分钟上限 | 已改：`987f4522ee`，待 CI |
 
 ## 第八部分：文档更新清单
 
 | 文档 | 要改什么 | 状态 |
 |---|---|---|
-| `docs/fixes/ci-fix-windows-runner-tests.md` | 记录根因、范围、验证结果与 commit | 已创建并回填五轮实现 commit |
+| `docs/fixes/ci-fix-windows-runner-tests.md` | 记录根因、范围、验证结果与 commit | 已创建并回填历轮实现 commit |
 
 无其他契约文档更新：唯一生产变化是内部首次空 file-search 的 readiness，不改变接口、schema、错误码或持久化不变量。
