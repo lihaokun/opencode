@@ -798,7 +798,7 @@ describe("session.llm.ai-sdk adapter", () => {
     ])
   })
 
-  test("turns a missing raw finish reason into a terminal provider error after partial output", async () => {
+  test("classifies a missing raw finish reason as an incomplete terminal provider error", async () => {
     const events = await adapt([
       { type: "reasoning-start", id: "reasoning-1" },
       { type: "reasoning-delta", id: "reasoning-1", text: "thinking" },
@@ -834,6 +834,7 @@ describe("session.llm.ai-sdk adapter", () => {
       {
         type: "provider-error",
         message: "Provider stream ended without a terminal finish event",
+        classification: "incomplete-stream",
         retryable: false,
       },
     ])
@@ -921,6 +922,7 @@ describe("session.llm.ai-sdk adapter", () => {
       {
         type: "provider-error",
         message: "Provider stream ended without a terminal finish event",
+        classification: "incomplete-stream",
         retryable: false,
       },
     ])

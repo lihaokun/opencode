@@ -47,6 +47,23 @@ describe("llm schema", () => {
     expect(() => decodeLLMEvent({ type: "bogus" })).toThrow()
   })
 
+  test("accepts declared provider failure classifications", () => {
+    expect(
+      decodeLLMEvent({
+        type: "provider-error",
+        message: "missing terminal finish",
+        classification: "incomplete-stream",
+      }),
+    ).toMatchObject({ type: "provider-error", classification: "incomplete-stream" })
+    expect(() =>
+      decodeLLMEvent({
+        type: "provider-error",
+        message: "unknown classification",
+        classification: "other",
+      }),
+    ).toThrow()
+  })
+
   test("finish constructors accept usage input", () => {
     expect(LLMEvent.stepFinish({ index: 0, reason: "stop", usage: { inputTokens: 1 } }).usage).toBeInstanceOf(Usage)
     expect(LLMEvent.finish({ reason: "stop", usage: { outputTokens: 2 } }).usage).toBeInstanceOf(Usage)
