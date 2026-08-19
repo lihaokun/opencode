@@ -33,6 +33,18 @@ type PrepareInput = {
   readonly plugin: Plugin.Interface
   readonly flags: RuntimeFlags.Info
   readonly isWorkflow: boolean
+  readonly preparedPayload?: PreparedPayload
+}
+
+type PreparePayloadInput = Pick<
+  PrepareInput,
+  "user" | "sessionID" | "model" | "agent" | "permission" | "system" | "messages" | "tools" | "plugin"
+>
+
+export type PreparedPayload = {
+  readonly system: string[]
+  readonly messages: ModelMessage[]
+  readonly tools: Record<string, Tool>
 }
 
 export type Prepared = {
@@ -55,27 +67,8 @@ const mergeOptions = (target: Record<string, any>, source: Record<string, any> |
 
 export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: PrepareInput) {
   const isOpenaiOauth = input.provider.id === "openai" && input.auth?.type === "oauth"
-  const system = [
-    [
-      ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
-      ...input.system,
-      ...(input.user.system ? [input.user.system] : []),
-    ]
-      .filter((x) => x)
-      .join("\n"),
-  ]
-
-  const header = system[0]
-  yield* input.plugin.trigger(
-    "experimental.chat.system.transform",
-    { sessionID: input.sessionID, model: input.model },
-    { system },
-  )
-  if (system.length > 2 && system[0] === header) {
-    const rest = system.slice(1)
-    system.length = 0
-    system.push(header, rest.join("\n"))
-  }
+  const payload = input.preparedPayload ?? (yield* preparePayload(input))
+  const system = payload.system
 
   const activeVariant = input.small ? undefined : input.user.model.variant
   const variant = activeVariant && input.model.variants ? input.model.variants[activeVariant] : {}
@@ -120,7 +113,7 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
 
   const messages =
     isOpenaiOauth || input.isWorkflow
-      ? input.messages
+      ? payload.messages
       : [
           ...system.map(
             (x): ModelMessage => ({
@@ -128,7 +121,7 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
               content: x,
             }),
           ),
-          ...input.messages,
+          ...payload.messages,
         ]
 
   const params = yield* input.plugin.trigger(
@@ -165,6 +158,60 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     },
   )
 
+  const opencodeProjectID = input.model.providerID.startsWith("opencode")
+    ? (yield* InstanceState.context).project.id
+    : undefined
+
+  return {
+    system,
+    messages,
+    tools: payload.tools,
+    params,
+    messageTransformOptions: options,
+    headers: {
+      ...(input.model.providerID.startsWith("opencode")
+        ? {
+            ...(opencodeProjectID ? { "x-opencode-project": opencodeProjectID } : {}),
+            "x-opencode-session": input.sessionID,
+            "x-opencode-request": input.user.id,
+            "x-opencode-client": input.flags.client,
+            "User-Agent": USER_AGENT,
+          }
+        : {
+            "x-session-affinity": input.sessionID,
+            "X-Session-Id": input.sessionID,
+            ...(input.parentSessionID ? { "x-parent-session-id": input.parentSessionID } : {}),
+            "User-Agent": USER_AGENT,
+          }),
+      ...input.model.headers,
+      ...headers,
+    },
+  }
+})
+
+export const preparePayload = Effect.fn("LLMRequestPrep.preparePayload")(function* (input: PreparePayloadInput) {
+  const system = [
+    [
+      ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
+      ...input.system,
+      ...(input.user.system ? [input.user.system] : []),
+    ]
+      .filter((x) => x)
+      .join("\n"),
+  ]
+
+  const header = system[0]
+  yield* input.plugin.trigger(
+    "experimental.chat.system.transform",
+    { sessionID: input.sessionID, model: input.model },
+    { system },
+  )
+  if (system.length > 2 && system[0] === header) {
+    const rest = system.slice(1)
+    system.length = 0
+    system.push(header, rest.join("\n"))
+  }
+
   const tools = resolveTools(input)
   // Codex parity: OpenAI Responses-family providers hardcode `strict: false`
   // on every function tool so MCP-sourced and dynamic schemas that don't
@@ -194,34 +241,10 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     })
   }
 
-  const opencodeProjectID = input.model.providerID.startsWith("opencode")
-    ? (yield* InstanceState.context).project.id
-    : undefined
-
   return {
     system,
-    messages,
+    messages: input.messages,
     tools: Object.fromEntries(Object.entries(tools).toSorted(([a], [b]) => a.localeCompare(b))),
-    params,
-    messageTransformOptions: options,
-    headers: {
-      ...(input.model.providerID.startsWith("opencode")
-        ? {
-            ...(opencodeProjectID ? { "x-opencode-project": opencodeProjectID } : {}),
-            "x-opencode-session": input.sessionID,
-            "x-opencode-request": input.user.id,
-            "x-opencode-client": input.flags.client,
-            "User-Agent": USER_AGENT,
-          }
-        : {
-            "x-session-affinity": input.sessionID,
-            "X-Session-Id": input.sessionID,
-            ...(input.parentSessionID ? { "x-parent-session-id": input.parentSessionID } : {}),
-            "User-Agent": USER_AGENT,
-          }),
-      ...input.model.headers,
-      ...headers,
-    },
   }
 })
 

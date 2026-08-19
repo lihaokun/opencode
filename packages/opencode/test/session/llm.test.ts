@@ -238,9 +238,7 @@ describe("session.llm openai-compatible parser", () => {
       "reasoning-delta",
       "reasoning-end",
     ])
-    expect(
-      reasoning.flatMap((event) => (event.type === "reasoning-delta" ? [event.text] : [])).join(""),
-    ).toBe("r1r2")
+    expect(reasoning.flatMap((event) => (event.type === "reasoning-delta" ? [event.text] : [])).join("")).toBe("r1r2")
   })
 
   test("ends reasoning before a nonempty tool call array and preserves the tool call", async () => {
@@ -298,13 +296,8 @@ describe("session.llm openai-compatible parser", () => {
 describe("session.llm.ai-sdk adapter", () => {
   type AISDKAdapterEvent = Parameters<typeof LLMAISDK.toLLMEvents>[1]
 
-  const adaptBatches = (
-    events: ReadonlyArray<AISDKAdapterEvent>,
-    state = LLMAISDK.adapterState(),
-  ) =>
-    Effect.runPromise(
-      Effect.forEach(events, (event) => LLMAISDK.toLLMEvents(state, event)),
-    )
+  const adaptBatches = (events: ReadonlyArray<AISDKAdapterEvent>, state = LLMAISDK.adapterState()) =>
+    Effect.runPromise(Effect.forEach(events, (event) => LLMAISDK.toLLMEvents(state, event)))
   const adapt = (events: ReadonlyArray<AISDKAdapterEvent>) => adaptBatches(events).then((items) => items.flat())
   const compatibleState = () => LLMAISDK.adapterState({ coalesceOpenAICompatibleReasoning: true })
   // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- tests defensive adapter branches outside AI SDK's current typed surface
@@ -609,9 +602,7 @@ describe("session.llm.ai-sdk adapter", () => {
       state,
     )
 
-    expect(LLMAISDK.drainPendingReasoningEnd(state)).toMatchObject([
-      { type: "reasoning-end", id: "reasoning-0" },
-    ])
+    expect(LLMAISDK.drainPendingReasoningEnd(state)).toMatchObject([{ type: "reasoning-end", id: "reasoning-0" }])
     expect(LLMAISDK.drainPendingReasoningEnd(state)).toEqual([])
 
     await Effect.runPromise(
@@ -1291,6 +1282,63 @@ describe("session.llm.request reasoning envelope", () => {
       isWorkflow: false,
     }
   }
+
+  test("prepares canonical system and effective tools without transport hooks", async () => {
+    const calls: string[] = []
+    const request = {
+      ...input({
+        trigger: (name, output) => {
+          calls.push(name)
+          if (name === "experimental.chat.system.transform" && Array.isArray(output.system)) {
+            output.system.push("plugin system")
+          }
+          return Effect.succeed(output)
+        },
+      }),
+      user: {
+        ...input().user,
+        system: "prompt system",
+        tools: { disabled: false },
+      },
+      agent: {
+        ...input().agent,
+        prompt: "agent system",
+      },
+      system: ["caller system"],
+      tools: {
+        enabled: tool({ description: "enabled", inputSchema: z.object({}), execute: async () => ({}) }),
+        disabled: tool({ description: "disabled", inputSchema: z.object({}), execute: async () => ({}) }),
+      },
+    }
+
+    const payload = await Effect.runPromise(LLMRequestPrep.preparePayload(request))
+
+    expect(payload.system.join("\n")).toContain("agent system")
+    expect(payload.system.join("\n")).toContain("caller system")
+    expect(payload.system.join("\n")).toContain("prompt system")
+    expect(payload.system.join("\n")).toContain("plugin system")
+    expect(Object.keys(payload.tools)).toEqual(["enabled"])
+    expect(calls).toEqual(["experimental.chat.system.transform"])
+  })
+
+  test("reuses a prepared payload and runs transport hooks only for the real request", async () => {
+    const calls: string[] = []
+    const request = input({
+      trigger: (name, output) => {
+        calls.push(name)
+        return Effect.succeed(output)
+      },
+    })
+
+    const payload = await Effect.runPromise(LLMRequestPrep.preparePayload(request))
+    expect(calls).toEqual(["experimental.chat.system.transform"])
+
+    const result = await Effect.runPromise(LLMRequestPrep.prepare({ ...request, preparedPayload: payload }))
+
+    expect(calls).toEqual(["experimental.chat.system.transform", "chat.params", "chat.headers"])
+    expect(result.system).toBe(payload.system)
+    expect(result.tools).toBe(payload.tools)
+  })
 
   test("keeps Anthropic's SDK input plus numeric max inside one core envelope", async () => {
     const result = await Effect.runPromise(LLMRequestPrep.prepare(input()))

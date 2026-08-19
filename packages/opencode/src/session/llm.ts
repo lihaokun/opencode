@@ -45,6 +45,7 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  preparedPayload?: LLMRequestPrep.PreparedPayload
 }
 
 export type StreamRequest = StreamInput & {
@@ -54,6 +55,7 @@ export type StreamRequest = StreamInput & {
 export type LLMEventBatch = ReadonlyArray<LLMEvent>
 
 export interface Interface {
+  readonly preparePayload: (input: StreamInput) => Effect.Effect<LLMRequestPrep.PreparedPayload>
   readonly streamBatches: (input: StreamInput) => Stream.Stream<LLMEventBatch, unknown>
   readonly stream: (input: StreamInput) => Stream.Stream<LLMEvent, unknown>
 }
@@ -85,6 +87,8 @@ const live: Layer.Layer<
     const llmClient = yield* LLMClient.Service
     const flags = yield* RuntimeFlags.Service
 
+    const preparePayload: Interface["preparePayload"] = (input) => LLMRequestPrep.preparePayload({ ...input, plugin })
+
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
       yield* Effect.logInfo("stream", {
         providerID: input.model.providerID,
@@ -108,6 +112,7 @@ const live: Layer.Layer<
       const isWorkflow = language instanceof GitLabWorkflowLanguageModel
       const prepared = yield* LLMRequestPrep.prepare({
         ...input,
+        preparedPayload: input.preparedPayload ?? (yield* preparePayload(input)),
         provider: item,
         auth: info,
         plugin,
@@ -394,7 +399,7 @@ const live: Layer.Layer<
     const stream: Interface["stream"] = (input) =>
       streamBatches(input).pipe(Stream.flatMap((events) => Stream.fromIterable(events)))
 
-    return Service.of({ stream, streamBatches })
+    return Service.of({ preparePayload, stream, streamBatches })
   }),
 )
 

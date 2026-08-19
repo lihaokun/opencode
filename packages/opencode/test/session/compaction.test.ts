@@ -310,6 +310,8 @@ function llm() {
     llmLayer: Layer.succeed(
       LLM.Service,
       LLM.Service.of({
+        preparePayload: (input) =>
+          Effect.succeed({ system: input.system, messages: input.messages, tools: input.tools }),
         streamBatches,
         stream: (input) => streamBatches(input).pipe(Stream.flatMap((batch) => Stream.fromIterable(batch))),
       }),
@@ -567,6 +569,129 @@ describe("session.compaction.isOverflow", () => {
           const model = createModel({ context: 100_000, output: 32_000 })
           const tokens = { input: 75_000, output: 5_000, reasoning: 0, cache: { read: 0, write: 0 } }
           expect(yield* compact.isOverflow({ tokens, model })).toBe(false)
+        }),
+      {
+        config: {
+          compaction: { auto: false },
+        },
+      },
+    ),
+  )
+})
+
+describe("session.compaction.willOverflow", () => {
+  const bigText = "x".repeat(400_000)
+
+  it.live(
+    "returns true when the assembled payload exceeds usable context (regression #12)",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const model = createModel({ context: 100_000, output: 32_000 })
+        expect(
+          yield* compact.willOverflow({
+            system: ["you are helpful"],
+            messages: [{ role: "user", content: bigText }],
+            tools: {},
+            model,
+          }),
+        ).toBe(true)
+      }),
+    ),
+  )
+
+  it.live(
+    "returns true when system context alone exceeds usable context",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const model = createModel({ context: 100_000, output: 32_000 })
+        expect(
+          yield* compact.willOverflow({
+            system: [bigText],
+            messages: [{ role: "user", content: "hi" }],
+            tools: {},
+            model,
+          }),
+        ).toBe(true)
+      }),
+    ),
+  )
+
+  it.live(
+    "returns true when tool definitions alone exceed usable context",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const model = createModel({ context: 100_000, output: 32_000 })
+        expect(
+          yield* compact.willOverflow({
+            system: [],
+            messages: [{ role: "user", content: "hi" }],
+            tools: {
+              oversized: {
+                description: bigText,
+                inputSchema: { type: "object", properties: {} },
+              },
+            },
+            model,
+          }),
+        ).toBe(true)
+      }),
+    ),
+  )
+
+  it.live(
+    "returns false when the assembled payload is within usable context",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const model = createModel({ context: 100_000, output: 32_000 })
+        expect(
+          yield* compact.willOverflow({
+            system: ["you are helpful"],
+            messages: [{ role: "user", content: "hi" }],
+            tools: {},
+            model,
+          }),
+        ).toBe(false)
+      }),
+    ),
+  )
+
+  it.live(
+    "returns false when model context limit is 0",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const model = createModel({ context: 0, output: 32_000 })
+        expect(
+          yield* compact.willOverflow({
+            system: [],
+            messages: [{ role: "user", content: bigText }],
+            tools: {},
+            model,
+          }),
+        ).toBe(false)
+      }),
+    ),
+  )
+
+  it.live(
+    "returns false when compaction.auto is disabled",
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const compact = yield* SessionCompaction.Service
+          const model = createModel({ context: 100_000, output: 32_000 })
+          expect(
+            yield* compact.willOverflow({
+              system: [],
+              messages: [{ role: "user", content: bigText }],
+              tools: {},
+              model,
+            }),
+          ).toBe(false)
         }),
       {
         config: {

@@ -166,6 +166,28 @@ const blockingProcessor = Layer.succeed(
 
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 
+const oversizedToolID = "oversized_test_tool"
+const oversizedToolPlugin = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    init: () => Effect.void,
+    trigger: ((_name: unknown, _input: unknown, output: unknown) =>
+      Effect.succeed(output)) as Plugin.Interface["trigger"],
+    list: () =>
+      Effect.succeed([
+        {
+          tool: {
+            [oversizedToolID]: {
+              description: "x".repeat(400_000),
+              args: {},
+              execute: async () => "ok",
+            },
+          },
+        },
+      ]),
+  }),
+)
+
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
 
 const promptRoot = LayerNode.group([
@@ -221,7 +243,11 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makeHttp(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  plugin?: "oversized-tool"
+}) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [SessionSummary.node, summary],
@@ -232,6 +258,9 @@ function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processo
   if (input?.processor === "blocking") {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
   }
+  if (input?.plugin === "oversized-tool") {
+    return LayerNode.compile(root, [...replacements, [Plugin.node, oversizedToolPlugin]])
+  }
   return LayerNode.compile(root, replacements)
 }
 
@@ -240,6 +269,7 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 }
 
 const it = testEffect(makeHttp())
+const withOversizedTool = testEffect(makeHttp({ plugin: "oversized-tool" }))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -304,9 +334,17 @@ function providerCfg(url: string) {
 }
 
 function crossoverCfg(url: string) {
+  return providerCfg(url)
+}
+
+function preflightCfg(url: string) {
   const config = providerCfg(url)
   return {
     ...config,
+    compaction: {
+      reserved: 30_000,
+      tail_turns: 0,
+    },
     provider: {
       ...config.provider,
       test: {
@@ -315,7 +353,10 @@ function crossoverCfg(url: string) {
           ...config.provider.test.models,
           "test-model": {
             ...config.provider.test.models["test-model"],
-            limit: { context: 20, output: 10 },
+            limit: {
+              ...config.provider.test.models["test-model"].limit,
+              input: 100_000,
+            },
           },
         },
       },
@@ -323,7 +364,7 @@ function crossoverCfg(url: string) {
   }
 }
 
-const crossoverUsage = { input: 100, output: 1 } satisfies Usage
+const crossoverUsage = { input: 95_000, output: 1 } satisfies Usage
 
 function usageWithoutFinish(usage: Usage) {
   return {
@@ -471,9 +512,12 @@ const user = Effect.fn("test.user")(function* (sessionID: SessionID, text: strin
   return msg
 })
 
-const seed = Effect.fn("test.seed")(function* (sessionID: SessionID, opts?: { finish?: string }) {
+const seed = Effect.fn("test.seed")(function* (
+  sessionID: SessionID,
+  opts?: { finish?: string; userText?: string; assistantText?: string },
+) {
   const session = yield* Session.Service
-  const msg = yield* user(sessionID, "hello")
+  const msg = yield* user(sessionID, opts?.userText ?? "hello")
   const assistant: SessionV1.Assistant = {
     id: MessageID.ascending(),
     role: "assistant",
@@ -495,7 +539,7 @@ const seed = Effect.fn("test.seed")(function* (sessionID: SessionID, opts?: { fi
     messageID: assistant.id,
     sessionID,
     type: "text",
-    text: "hi there",
+    text: opts?.assistantText ?? "hi there",
   })
   return { user: msg, assistant }
 })
@@ -974,7 +1018,7 @@ it.instance("loop persists a high-usage missing finish without compaction or rep
         name: "UnknownError",
         data: { message: "Provider stream ended without a terminal finish event" },
       })
-      expect(result.info.tokens).toMatchObject({ input: 100, output: 1, total: 101 })
+      expect(result.info.tokens).toMatchObject({ input: 95_000, output: 1, total: 95_001 })
       expect(result.info.time.completed).toBeNumber()
       expect(stored.info.finish).toBe(result.info.finish)
       expect(stored.info.error).toEqual(result.info.error)
@@ -1033,7 +1077,7 @@ it.instance("high-usage missing finish prevents StructuredOutput promotion and c
         data: { message: "Provider stream ended without a terminal finish event" },
       })
       expect(result.info.structured).toBeUndefined()
-      expect(result.info.tokens).toMatchObject({ input: 100, output: 1, total: 101 })
+      expect(result.info.tokens).toMatchObject({ input: 95_000, output: 1, total: 95_001 })
     }
     const output = completedTool(result.parts)
     expect(output?.tool).toBe("StructuredOutput")
@@ -1089,7 +1133,7 @@ unix("high-usage missing finish does not replay a completed tool or start compac
         name: "UnknownError",
         data: { message: "Provider stream ended without a terminal finish event" },
       })
-      expect(result.info.tokens).toMatchObject({ input: 100, output: 1, total: 101 })
+      expect(result.info.tokens).toMatchObject({ input: 95_000, output: 1, total: 95_001 })
     }
     expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("charged\n")
     expect(
@@ -1256,6 +1300,732 @@ it.instance("a missing terminal finish wins over a successful StructuredOutput t
   }),
 )
 
+it.instance(
+  "loop compacts oversized history before send and fully replays the current user turn",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(preflightCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const oldMarker = "old-history-preflight-marker"
+      const currentMarker = "current-turn-replay-marker"
+      const detailMarker = "current-turn-second-part"
+      const systemMarker = "current-turn-system-marker"
+      const summaryMarker = "compacted-history-marker"
+      const answerMarker = "recovered-after-preflight-marker"
+
+      yield* seed(chat.id, {
+        finish: "stop",
+        userText: `${oldMarker}\n${"x".repeat(280_000)}`,
+        assistantText: "old assistant response",
+      })
+      const original = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        tools: { bash: false },
+        system: systemMarker,
+        parts: [
+          { type: "text", text: currentMarker },
+          { type: "text", text: detailMarker },
+        ],
+      })
+      yield* llm.textMatch((hit) => {
+        const body = JSON.stringify(hit.body)
+        return body.includes(oldMarker) && !body.includes(currentMarker)
+      }, summaryMarker)
+      yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes(currentMarker), answerMarker)
+
+      const result = yield* awaitWithTimeout(
+        prompt.loop({ sessionID: chat.id }),
+        "preflight compaction recovery did not terminate",
+        "10 seconds",
+      )
+      const hits = yield* llm.hits
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const active = yield* MessageV2.filterCompactedEffect(chat.id)
+      const summaryBody = JSON.stringify(hits[0]?.body)
+      const finalBody = JSON.stringify(hits[1]?.body)
+
+      expect(hits).toHaveLength(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(summaryBody).toContain(oldMarker)
+      expect(summaryBody).not.toContain(currentMarker)
+      expect(summaryBody).not.toContain(detailMarker)
+      expect(finalBody).toContain(summaryMarker)
+      expect(finalBody).toContain(currentMarker)
+      expect(finalBody).toContain(detailMarker)
+      expect(finalBody).toContain(systemMarker)
+      expect(finalBody).not.toContain(oldMarker)
+      expect(finalBody.split(currentMarker)).toHaveLength(2)
+      expect(finalBody.split(detailMarker)).toHaveLength(2)
+
+      const compactions = messages.flatMap((message) =>
+        message.parts.filter((part): part is SessionV1.CompactionPart => part.type === "compaction"),
+      )
+      expect(compactions).toHaveLength(1)
+      expect(compactions[0]).toMatchObject({ auto: true, overflow: true })
+      const summaries = messages.filter((message) => message.info.role === "assistant" && message.info.summary)
+      expect(summaries).toHaveLength(1)
+      expect(summaries[0]?.parts).toContainEqual(expect.objectContaining({ type: "text", text: summaryMarker }))
+
+      const markerUsers = messages.filter(
+        (message) =>
+          message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.text === currentMarker),
+      )
+      expect(markerUsers).toHaveLength(2)
+      expect(
+        active.filter(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.text === currentMarker),
+        ),
+      ).toHaveLength(1)
+      const replay = markerUsers.find((message) => message.info.id !== original.info.id)
+      if (!replay || replay.info.role !== "user" || original.info.role !== "user") {
+        throw new Error("Expected one replayed user message")
+      }
+      expect(replay.info.agent).toBe(original.info.agent)
+      expect(replay.info.model.providerID).toBe(original.info.model.providerID)
+      expect(replay.info.model.modelID).toBe(original.info.model.modelID)
+      expect(replay.info.model.variant).toBe(original.info.model.variant)
+      expect(replay.info.system).toBe(original.info.system)
+      expect(replay.info.tools).toEqual(original.info.tools)
+      expect(replay.info.format).toEqual(original.info.format)
+      expect(
+        replay.parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+      ).toEqual(
+        original.parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+      )
+      expect(
+        messages.filter((message) => message.info.role === "assistant" && message.info.parentID === original.info.id),
+      ).toHaveLength(0)
+
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.parentID).toBe(replay.info.id)
+        expect(result.info.finish).toBe("stop")
+        expect(result.info.error).toBeUndefined()
+      }
+      expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: answerMarker }))
+    }),
+  15_000,
+)
+
+it.instance(
+  "overflow compaction tokens stay isolated across concurrent sessions",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(preflightCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const first = yield* sessions.create({ title: "Pinned" })
+      const second = yield* sessions.create({ title: "Pinned" })
+      const gate = yield* Deferred.make<void>()
+      const firstMarker = "isolated-overflow-first-marker"
+      const secondMarker = "isolated-overflow-second-marker"
+      const firstSummary = "isolated-overflow-first-summary"
+      const secondSummary = "isolated-overflow-second-summary"
+      const firstAnswer = "isolated-overflow-first-answer"
+      const secondAnswer = "isolated-overflow-second-answer"
+
+      yield* seed(first.id, { finish: "stop", userText: `${firstMarker}-old\n${"x".repeat(280_000)}` })
+      yield* seed(second.id, { finish: "stop", userText: `${secondMarker}-old\n${"x".repeat(280_000)}` })
+      yield* prompt.prompt({
+        sessionID: first.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: firstMarker }],
+      })
+      yield* prompt.prompt({
+        sessionID: second.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: secondMarker }],
+      })
+      yield* llm.push(
+        reply().wait(deferredAsPromise(gate)).text(firstSummary).stop(),
+        reply().text(secondSummary).stop(),
+        reply().text(secondAnswer).stop(),
+        reply().text(firstAnswer).stop(),
+      )
+
+      const firstRun = yield* prompt.loop({ sessionID: first.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "first session did not enter compaction", "5 seconds")
+      const secondResult = yield* awaitWithTimeout(
+        prompt.loop({ sessionID: second.id }),
+        "second session inherited the first session's compaction token",
+        "10 seconds",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      const firstResult = yield* awaitWithTimeout(
+        Fiber.join(firstRun),
+        "first session did not finish after its summary was released",
+        "10 seconds",
+      )
+
+      const hits = yield* llm.hits
+      const firstMessages = yield* sessions.messages({ sessionID: first.id })
+      const secondMessages = yield* sessions.messages({ sessionID: second.id })
+      expect(hits).toHaveLength(4)
+      expect(JSON.stringify(hits[0]?.body)).toContain(`${firstMarker}-old`)
+      expect(JSON.stringify(hits[1]?.body)).toContain(`${secondMarker}-old`)
+      expect(JSON.stringify(hits[2]?.body)).toContain(secondMarker)
+      expect(JSON.stringify(hits[3]?.body)).toContain(firstMarker)
+      expect(
+        firstMessages.flatMap((message) => message.parts).filter((part) => part.type === "compaction"),
+      ).toHaveLength(1)
+      expect(
+        secondMessages.flatMap((message) => message.parts).filter((part) => part.type === "compaction"),
+      ).toHaveLength(1)
+      expect(firstResult.parts).toContainEqual(expect.objectContaining({ type: "text", text: firstAnswer }))
+      expect(secondResult.parts).toContainEqual(expect.objectContaining({ type: "text", text: secondAnswer }))
+    }),
+  20_000,
+)
+
+it.instance(
+  "post-overflow usage compaction does not create another overflow recovery",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(preflightCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const currentMarker = "post-overflow-usage-current-marker"
+      const finalMarker = "post-overflow-usage-final-marker"
+
+      yield* seed(chat.id, {
+        finish: "stop",
+        userText: `post-overflow-usage-old-marker\n${"x".repeat(280_000)}`,
+      })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: currentMarker }],
+      })
+      yield* llm.text("post-overflow-usage-first-summary")
+      yield* llm.text("post-overflow-usage-high-usage-answer", { usage: { input: 100_001, output: 1 } })
+      yield* llm.text("post-overflow-usage-second-summary")
+      yield* llm.text(finalMarker)
+
+      const result = yield* awaitWithTimeout(
+        Effect.raceFirst(prompt.loop({ sessionID: chat.id }), llm.wait(5).pipe(Effect.as("repeated" as const))),
+        "usage compaction after overflow recovery did not converge",
+        "10 seconds",
+      )
+
+      expect(result).not.toBe("repeated")
+      if (result === "repeated") return
+      const hits = yield* llm.hits
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const compactions = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      expect(hits).toHaveLength(4)
+      expect(compactions).toHaveLength(2)
+      expect(compactions.filter((part) => part.overflow === true)).toHaveLength(1)
+      expect(messages.filter((message) => message.info.role === "assistant" && message.info.summary)).toHaveLength(2)
+      expect(JSON.stringify(hits[1]?.body)).toContain(currentMarker)
+      expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: finalMarker }))
+    }),
+  20_000,
+)
+
+it.instance("loop compacts and replays once after provider context overflow", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const currentMarker = "provider-overflow-current-marker"
+    const detailMarker = "provider-overflow-detail-marker"
+    const systemMarker = "provider-overflow-system-marker"
+    const summaryMarker = "provider-overflow-summary-marker"
+    const answerMarker = "provider-overflow-recovered-marker"
+
+    yield* seed(chat.id, { finish: "stop" })
+    const original = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      tools: { bash: false },
+      system: systemMarker,
+      parts: [
+        { type: "text", text: currentMarker },
+        { type: "text", text: detailMarker },
+      ],
+    })
+    yield* llm.error(400, { error: { message: "Prompt exceeds max length" } })
+    yield* llm.text(summaryMarker)
+    yield* llm.text(answerMarker)
+
+    const result = yield* awaitWithTimeout(
+      prompt.loop({ sessionID: chat.id }),
+      "provider overflow recovery did not terminate",
+      "10 seconds",
+    )
+    const hits = yield* llm.hits
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const active = yield* MessageV2.filterCompactedEffect(chat.id)
+    const firstBody = JSON.stringify(hits[0]?.body)
+    const summaryBody = JSON.stringify(hits[1]?.body)
+    const finalBody = JSON.stringify(hits[2]?.body)
+
+    expect(hits).toHaveLength(3)
+    expect(yield* llm.pending).toBe(0)
+    expect(firstBody).toContain(currentMarker)
+    expect(summaryBody).not.toContain(currentMarker)
+    expect(summaryBody).not.toContain(detailMarker)
+    expect(finalBody).toContain(summaryMarker)
+    expect(finalBody).toContain(currentMarker)
+    expect(finalBody).toContain(detailMarker)
+    expect(finalBody).toContain(systemMarker)
+    expect(finalBody.split(currentMarker)).toHaveLength(2)
+    expect(finalBody.split(detailMarker)).toHaveLength(2)
+
+    const markerUsers = messages.filter(
+      (message) =>
+        message.info.role === "user" &&
+        message.parts.some((part) => part.type === "text" && part.text === currentMarker),
+    )
+    expect(markerUsers).toHaveLength(2)
+    expect(
+      active.filter(
+        (message) =>
+          message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.text === currentMarker),
+      ),
+    ).toHaveLength(1)
+    const replay = markerUsers.find((message) => message.info.id !== original.info.id)
+    if (!replay || replay.info.role !== "user" || original.info.role !== "user") {
+      throw new Error("Expected one replayed user message")
+    }
+    expect(replay.info.agent).toBe(original.info.agent)
+    expect(replay.info.model.providerID).toBe(original.info.model.providerID)
+    expect(replay.info.model.modelID).toBe(original.info.model.modelID)
+    expect(replay.info.model.variant).toBe(original.info.model.variant)
+    expect(replay.info.system).toBe(original.info.system)
+    expect(replay.info.tools).toEqual(original.info.tools)
+    expect(
+      replay.parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+    ).toEqual(
+      original.parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+    )
+    expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
+    expect(messages.filter((message) => message.info.role === "assistant" && message.info.summary)).toHaveLength(1)
+
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.parentID).toBe(replay.info.id)
+      expect(result.info.finish).toBe("stop")
+      expect(result.info.error).toBeUndefined()
+    }
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: answerMarker }))
+  }),
+)
+
+it.instance("loop persists a second provider context overflow after one recovery", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const currentMarker = "provider-second-overflow-current-marker"
+    const summaryMarker = "provider-second-overflow-summary-marker"
+
+    yield* seed(chat.id, { finish: "stop" })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: currentMarker }],
+    })
+    yield* llm.error(413, { error: { message: "request entity too large" } })
+    yield* llm.text(summaryMarker)
+    yield* llm.error(413, { error: { message: "request entity too large" } })
+
+    const result = yield* awaitWithTimeout(
+      Effect.raceFirst(prompt.loop({ sessionID: chat.id }), llm.wait(4).pipe(Effect.as("repeated" as const))),
+      "second provider overflow neither terminated nor retried compaction",
+      "5 seconds",
+    )
+
+    expect(result).not.toBe("repeated")
+    if (result === "repeated") return
+    const hits = yield* llm.hits
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const active = yield* MessageV2.filterCompactedEffect(chat.id)
+    const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: result.info.id })
+    const ids = messages.map((message) => message.info.id)
+
+    expect(hits).toHaveLength(3)
+    expect(yield* llm.pending).toBe(0)
+    expect(result.info.role).toBe("assistant")
+    expect(stored.info.role).toBe("assistant")
+    if (result.info.role === "assistant" && stored.info.role === "assistant") {
+      expect(result.info.finish).toBe("error")
+      expect(result.info.error?.name).toBe("ContextOverflowError")
+      expect(result.info.error).toMatchObject({
+        name: "ContextOverflowError",
+        data: { message: expect.stringContaining("request entity too large") },
+      })
+      expect(result.info.time.completed).toBeNumber()
+      expect(stored.info.finish).toBe(result.info.finish)
+      expect(stored.info.error).toEqual(result.info.error)
+      expect(stored.info.time.completed).toBe(result.info.time.completed)
+    }
+    expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
+    expect(messages.filter((message) => message.info.role === "assistant" && message.info.summary)).toHaveLength(1)
+    expect(
+      messages.filter(
+        (message) =>
+          message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.text === currentMarker),
+      ),
+    ).toHaveLength(2)
+    expect(
+      active.filter(
+        (message) =>
+          message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.text === currentMarker),
+      ),
+    ).toHaveLength(1)
+    expect(active.at(-1)?.info.id).toBe(result.info.id)
+    expect(
+      messages
+        .flatMap((message) => message.parts)
+        .some((part) => part.type === "text" && part.metadata && part.metadata.compaction_continue === true),
+    ).toBe(false)
+
+    const replay = yield* prompt.loop({ sessionID: chat.id })
+    expect(replay.info.id).toBe(result.info.id)
+    expect((yield* sessions.messages({ sessionID: chat.id })).map((message) => message.info.id)).toEqual(ids)
+    expect(yield* llm.hits).toHaveLength(3)
+
+    const nextMarker = "provider-overflow-next-run-marker"
+    const nextAnswer = "provider-overflow-next-run-answer"
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: nextMarker }],
+    })
+    yield* llm.error(413, { error: { message: "request entity too large" } })
+    yield* llm.text("provider-overflow-next-run-summary")
+    yield* llm.text(nextAnswer)
+
+    const next = yield* awaitWithTimeout(
+      prompt.loop({ sessionID: chat.id }),
+      "a new run did not receive a fresh overflow recovery allowance",
+      "10 seconds",
+    )
+    const nextMessages = yield* sessions.messages({ sessionID: chat.id })
+    expect(yield* llm.hits).toHaveLength(6)
+    expect(nextMessages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(
+      2,
+    )
+    expect(nextMessages.filter((message) => message.info.role === "assistant" && message.info.summary)).toHaveLength(2)
+    expect(next.info.role).toBe("assistant")
+    if (next.info.role === "assistant") {
+      expect(next.info.finish).toBe("stop")
+      expect(next.info.error).toBeUndefined()
+    }
+    expect(next.parts).toContainEqual(expect.objectContaining({ type: "text", text: nextAnswer }))
+  }),
+)
+
+it.instance("loop sends an oversized current-only user turn once without compaction", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const marker = "oversized-current-user-marker"
+    const submitted = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: `${marker}\n${"x".repeat(400_000)}` }],
+    })
+    yield* llm.error(413, { error: { message: "request entity too large" } })
+
+    const result = yield* awaitWithTimeout(
+      Effect.raceFirst(prompt.loop({ sessionID: chat.id }), llm.wait(2).pipe(Effect.as("repeated" as const))),
+      "oversized current user message neither terminated nor repeated recovery",
+      "5 seconds",
+    )
+
+    expect(result).not.toBe("repeated")
+    if (result === "repeated") return
+    const hits = yield* llm.hits
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: result.info.id })
+    const ids = messages.map((message) => message.info.id)
+
+    expect(hits).toHaveLength(1)
+    expect(JSON.stringify(hits[0]?.body)).toContain(marker)
+    expect(yield* llm.pending).toBe(0)
+    expect(messages.filter((message) => message.info.id === submitted.info.id)).toHaveLength(1)
+    expect(messages.filter((message) => message.info.role === "user")).toHaveLength(1)
+    expect(messages.filter((message) => message.info.role === "assistant")).toHaveLength(1)
+    expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(0)
+    expect(messages.some((message) => message.info.role === "assistant" && message.info.summary)).toBe(false)
+    expect(result.info.role).toBe("assistant")
+    expect(stored.info.role).toBe("assistant")
+    if (result.info.role === "assistant" && stored.info.role === "assistant") {
+      expect(result.info.parentID).toBe(submitted.info.id)
+      expect(result.info.finish).toBe("error")
+      expect(result.info.error).toMatchObject({
+        name: "ContextOverflowError",
+        data: {
+          message: expect.stringContaining("request entity too large"),
+          responseBody: JSON.stringify({ error: { message: "request entity too large" } }),
+        },
+      })
+      expect(result.info.time.completed).toBeNumber()
+      expect(stored.info.finish).toBe(result.info.finish)
+      expect(stored.info.error).toEqual(result.info.error)
+      expect(stored.info.time.completed).toBe(result.info.time.completed)
+    }
+
+    const replay = yield* prompt.loop({ sessionID: chat.id })
+    expect(replay.info.id).toBe(result.info.id)
+    expect((yield* sessions.messages({ sessionID: chat.id })).map((message) => message.info.id)).toEqual(ids)
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+it.instance("loop accounts for prompt-specific system text before sending", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const oldMarker = "prompt-system-old-history-marker"
+    const currentMarker = "prompt-system-current-marker"
+    const systemMarker = "oversized-prompt-system-marker"
+    const summaryMarker = "prompt-system-summary-marker"
+
+    yield* seed(chat.id, { finish: "stop", userText: oldMarker })
+    const submitted = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      system: `${systemMarker}\n${"x".repeat(400_000)}`,
+      parts: [{ type: "text", text: currentMarker }],
+    })
+    yield* llm.text(summaryMarker)
+    yield* llm.error(413, { error: { message: "request entity too large" } })
+
+    const result = yield* awaitWithTimeout(
+      Effect.raceFirst(prompt.loop({ sessionID: chat.id }), llm.wait(3).pipe(Effect.as("repeated" as const))),
+      "oversized prompt-specific system text neither terminated nor repeated recovery",
+      "5 seconds",
+    )
+
+    expect(result).not.toBe("repeated")
+    if (result === "repeated") return
+    const hits = yield* llm.hits
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: result.info.id })
+    const ids = messages.map((message) => message.info.id)
+    const summaryBody = JSON.stringify(hits[0]?.body)
+    const retryBody = JSON.stringify(hits[1]?.body)
+
+    expect(hits).toHaveLength(2)
+    expect(yield* llm.pending).toBe(0)
+    expect(summaryBody).toContain(oldMarker)
+    expect(summaryBody).not.toContain(currentMarker)
+    expect(summaryBody).not.toContain(systemMarker)
+    expect(retryBody).toContain(summaryMarker)
+    expect(retryBody).toContain(currentMarker)
+    expect(retryBody).toContain(systemMarker)
+    expect(messages.filter((message) => message.info.id === submitted.info.id)).toHaveLength(1)
+    expect(
+      messages.filter(
+        (message) =>
+          message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.text === currentMarker),
+      ),
+    ).toHaveLength(2)
+    expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
+    expect(messages.filter((message) => message.info.role === "assistant" && message.info.summary)).toHaveLength(1)
+    expect(result.info.role).toBe("assistant")
+    expect(stored.info.role).toBe("assistant")
+    if (result.info.role === "assistant" && stored.info.role === "assistant") {
+      expect(result.info.finish).toBe("error")
+      expect(result.info.error).toMatchObject({
+        name: "ContextOverflowError",
+        data: { message: expect.stringContaining("request entity too large") },
+      })
+      expect(result.info.time.completed).toBeNumber()
+      expect(stored.info.finish).toBe(result.info.finish)
+      expect(stored.info.error).toEqual(result.info.error)
+      expect(stored.info.time.completed).toBe(result.info.time.completed)
+    }
+
+    const replay = yield* prompt.loop({ sessionID: chat.id })
+    expect(replay.info.id).toBe(result.info.id)
+    expect((yield* sessions.messages({ sessionID: chat.id })).map((message) => message.info.id)).toEqual(ids)
+    expect(yield* llm.hits).toHaveLength(2)
+  }),
+)
+
+withOversizedTool.instance("loop excludes disabled tools from preflight payload sizing", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const currentMarker = "disabled-oversized-tool-current-marker"
+    const answerMarker = "disabled-oversized-tool-answer-marker"
+
+    yield* seed(chat.id, { finish: "stop" })
+    const submitted = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      tools: { [oversizedToolID]: false },
+      parts: [{ type: "text", text: currentMarker }],
+    })
+    yield* llm.textMatch((hit) => {
+      const body = JSON.stringify(hit.body)
+      return body.includes(currentMarker) && !body.includes(oversizedToolID)
+    }, answerMarker)
+
+    const result = yield* awaitWithTimeout(
+      Effect.raceFirst(prompt.loop({ sessionID: chat.id }), llm.wait(2).pipe(Effect.as("compacted" as const))),
+      "disabled oversized tool neither reached the main request nor repeated compaction",
+      "5 seconds",
+    )
+
+    expect(result).not.toBe("compacted")
+    if (result === "compacted") return
+    const hits = yield* llm.hits
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const body = JSON.stringify(hits[0]?.body)
+
+    expect(hits).toHaveLength(1)
+    expect(yield* llm.pending).toBe(0)
+    expect(body).toContain(currentMarker)
+    expect(body).not.toContain(oversizedToolID)
+    expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(0)
+    expect(messages.some((message) => message.info.role === "assistant" && message.info.summary)).toBe(false)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.parentID).toBe(submitted.info.id)
+      expect(result.info.finish).toBe("stop")
+      expect(result.info.error).toBeUndefined()
+    }
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: answerMarker }))
+  }),
+)
+
+withOversizedTool.instance("loop excludes permission-denied tools from preflight payload sizing", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: oversizedToolID, pattern: "*", action: "deny" }],
+    })
+    const currentMarker = "denied-oversized-tool-current-marker"
+    const answerMarker = "denied-oversized-tool-answer-marker"
+
+    yield* seed(chat.id, { finish: "stop" })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: currentMarker }],
+    })
+    yield* llm.text(answerMarker)
+
+    const result = yield* awaitWithTimeout(
+      Effect.raceFirst(prompt.loop({ sessionID: chat.id }), llm.wait(2).pipe(Effect.as("compacted" as const))),
+      "permission-denied oversized tool neither reached the main request nor repeated compaction",
+      "5 seconds",
+    )
+
+    expect(result).not.toBe("compacted")
+    if (result === "compacted") return
+    const hits = yield* llm.hits
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const body = JSON.stringify(hits[0]?.body)
+
+    expect(hits).toHaveLength(1)
+    expect(yield* llm.pending).toBe(0)
+    expect(body).toContain(currentMarker)
+    expect(body).not.toContain(oversizedToolID)
+    expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(0)
+    expect(messages.some((message) => message.info.role === "assistant" && message.info.summary)).toBe(false)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("stop")
+      expect(result.info.error).toBeUndefined()
+    }
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: answerMarker }))
+  }),
+)
+
+withOversizedTool.instance("loop includes enabled tools in preflight payload sizing", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const oldMarker = "enabled-oversized-tool-old-marker"
+    const currentMarker = "enabled-oversized-tool-current-marker"
+    const summaryMarker = "enabled-oversized-tool-summary-marker"
+    const answerMarker = "enabled-oversized-tool-answer-marker"
+
+    yield* seed(chat.id, { finish: "stop", userText: oldMarker })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: currentMarker }],
+    })
+    yield* llm.text(summaryMarker)
+    yield* llm.text(answerMarker)
+
+    const result = yield* awaitWithTimeout(
+      Effect.raceFirst(prompt.loop({ sessionID: chat.id }), llm.wait(3).pipe(Effect.as("repeated" as const))),
+      "enabled oversized tool neither completed nor repeated compaction",
+      "5 seconds",
+    )
+
+    expect(result).not.toBe("repeated")
+    if (result === "repeated") return
+    const hits = yield* llm.hits
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const summaryBody = JSON.stringify(hits[0]?.body)
+    const retryBody = JSON.stringify(hits[1]?.body)
+
+    expect(hits).toHaveLength(2)
+    expect(yield* llm.pending).toBe(0)
+    expect(summaryBody).toContain(oldMarker)
+    expect(summaryBody).not.toContain(currentMarker)
+    expect(summaryBody).not.toContain(oversizedToolID)
+    expect(retryBody).toContain(summaryMarker)
+    expect(retryBody).toContain(currentMarker)
+    expect(retryBody).toContain(oversizedToolID)
+    expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
+    expect(messages.filter((message) => message.info.role === "assistant" && message.info.summary)).toHaveLength(1)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("stop")
+      expect(result.info.error).toBeUndefined()
+    }
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: answerMarker }))
+  }),
+)
+
 it.instance("loop stops provider overflow instead of auto-compacting when disabled", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig((url) => ({
@@ -1283,6 +2053,80 @@ it.instance("loop stops provider overflow instead of auto-compacting when disabl
       expect(result.info.finish).toBe("error")
     }
     expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(false)
+  }),
+)
+
+it.instance("loop terminates with overflow when invariant system context cannot fit", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      instructions: ["./oversized.md"],
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const oldMarker = "invariant-system-old-marker"
+    const currentMarker = "invariant-system-current-marker"
+    const instructionMarker = "invariant-system-instruction-marker"
+    const summaryMarker = "invariant-system-summary-marker"
+    yield* writeText(path.join(dir, "oversized.md"), `${instructionMarker}\n${"x".repeat(400_000)}`)
+    yield* seed(chat.id, { finish: "stop", userText: oldMarker })
+
+    const submitted = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: currentMarker }],
+    })
+    yield* llm.text(summaryMarker)
+    yield* llm.error(413, { error: { message: "request entity too large" } })
+
+    const result = yield* awaitWithTimeout(
+      Effect.raceFirst(prompt.loop({ sessionID: chat.id }), llm.wait(3).pipe(Effect.as("repeated" as const))),
+      "prompt loop neither terminated nor retried compaction",
+      "5 seconds",
+    )
+
+    expect(result).not.toBe("repeated")
+    if (result === "repeated") return
+    const hits = yield* llm.hits
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: result.info.id })
+    const ids = messages.map((message) => message.info.id)
+    const summaryBody = JSON.stringify(hits[0]?.body)
+    const retryBody = JSON.stringify(hits[1]?.body)
+
+    expect(hits).toHaveLength(2)
+    expect(yield* llm.pending).toBe(0)
+    expect(summaryBody).toContain(oldMarker)
+    expect(summaryBody).not.toContain(currentMarker)
+    expect(summaryBody).not.toContain(instructionMarker)
+    expect(retryBody).toContain(summaryMarker)
+    expect(retryBody).toContain(currentMarker)
+    expect(retryBody).toContain(instructionMarker)
+    expect(result.info.role).toBe("assistant")
+    expect(stored.info.role).toBe("assistant")
+    if (result.info.role === "assistant" && stored.info.role === "assistant") {
+      expect(result.info.error?.name).toBe("ContextOverflowError")
+      expect(result.info.finish).toBe("error")
+      expect(result.info.time.completed).toBeNumber()
+      expect(stored.info.error).toEqual(result.info.error)
+      expect(stored.info.finish).toBe(result.info.finish)
+      expect(stored.info.time.completed).toBe(result.info.time.completed)
+    }
+    expect(messages.filter((message) => message.info.id === submitted.info.id)).toHaveLength(1)
+    const compactions = messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")
+    const summaries = messages.filter((message) => message.info.role === "assistant" && message.info.summary)
+    expect(compactions).toHaveLength(1)
+    expect(summaries).toHaveLength(1)
+    expect(
+      summaries.every((message) => "completed" in message.info.time && message.info.time.completed !== undefined),
+    ).toBe(true)
+
+    const replay = yield* prompt.loop({ sessionID: chat.id })
+    expect(replay.info.id).toBe(result.info.id)
+    expect((yield* sessions.messages({ sessionID: chat.id })).map((message) => message.info.id)).toEqual(ids)
+    expect(yield* llm.hits).toHaveLength(hits.length)
   }),
 )
 
