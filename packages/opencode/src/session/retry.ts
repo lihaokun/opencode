@@ -173,17 +173,34 @@ function parseJSON(value: unknown) {
   })
 }
 
+export type PolicyDecisionInput = {
+  failure: unknown
+  error: Err
+  ordinary: Retryable | undefined
+  attempt: number
+}
+
 export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
   set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
+  decide?: (input: PolicyDecisionInput) => Retryable | undefined
+  beforeRetry?: (input: PolicyDecisionInput & { retry: Retryable }) => Effect.Effect<void, unknown>
 }) {
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
       const error = opts.parse(meta.input)
-      const retry = retryable(error, opts.provider)
+      const ordinary = retryable(error, opts.provider)
+      const input = {
+        failure: meta.input,
+        error,
+        ordinary,
+        attempt: meta.attempt,
+      } satisfies PolicyDecisionInput
+      const retry = opts.decide ? opts.decide(input) : ordinary
       if (!retry) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
+        if (opts.beforeRetry) yield* opts.beforeRetry({ ...input, retry })
         const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
         yield* opts.set({

@@ -4,7 +4,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
-import { Effect, Schedule, Schema } from "effect"
+import { Effect, Exit, Schedule, Schema } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -113,6 +113,95 @@ describe("session.retry.delay", () => {
         attempt: 2,
         message: "boom",
       })
+    }),
+  )
+
+  it.instance("policy lets decide deny an ordinarily retryable failure", () =>
+    Effect.gen(function* () {
+      const error = apiError({ "retry-after-ms": "0" })
+      const decisions: SessionRetry.PolicyDecisionInput[] = []
+      let updates = 0
+      const step = yield* Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          provider: "test",
+          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          decide: (input) => {
+            decisions.push(input)
+            return undefined
+          },
+          set: () =>
+            Effect.sync(() => {
+              updates++
+            }),
+        }),
+      )
+
+      const exit = yield* Effect.exit(step(error))
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(decisions).toHaveLength(1)
+      expect(decisions[0]?.failure).toBe(error)
+      expect(decisions[0]?.ordinary).toEqual({ message: "boom" })
+      expect(decisions[0]?.attempt).toBe(1)
+      expect(updates).toBe(0)
+    }),
+  )
+
+  it.instance("policy prepares before status and keeps attempts monotonic across retry kinds", () =>
+    Effect.gen(function* () {
+      const incomplete = { type: "incomplete" }
+      const ordinaryFailure = apiError({ "retry-after-ms": "0" })
+      const order: string[] = []
+      const attempts: number[] = []
+      const failures: unknown[] = []
+      const step = yield* Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          provider: "test",
+          parse: () => ordinaryFailure,
+          decide: (input) => (input.failure === incomplete ? { message: "incomplete" } : input.ordinary),
+          beforeRetry: (input) =>
+            Effect.sync(() => {
+              order.push(`prepare:${input.attempt}`)
+              attempts.push(input.attempt)
+              failures.push(input.failure)
+            }),
+          set: (input) =>
+            Effect.sync(() => {
+              order.push(`status:${input.attempt}`)
+            }),
+        }),
+      )
+
+      yield* step(incomplete)
+      yield* step(ordinaryFailure)
+      yield* step(incomplete)
+
+      expect(attempts).toEqual([1, 2, 3])
+      expect(failures).toEqual([incomplete, ordinaryFailure, incomplete])
+      expect(order).toEqual(["prepare:1", "status:1", "prepare:2", "status:2", "prepare:3", "status:3"])
+    }),
+  )
+
+  it.instance("policy fails closed when retry preparation fails", () =>
+    Effect.gen(function* () {
+      const error = apiError({ "retry-after-ms": "0" })
+      let updates = 0
+      const step = yield* Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          provider: "test",
+          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          beforeRetry: () => Effect.fail(new Error("preparation failed")),
+          set: () =>
+            Effect.sync(() => {
+              updates++
+            }),
+        }),
+      )
+
+      const exit = yield* Effect.exit(step(error))
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(updates).toBe(0)
     }),
   )
 })
