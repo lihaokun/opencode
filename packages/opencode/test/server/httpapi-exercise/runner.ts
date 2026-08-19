@@ -1,9 +1,10 @@
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Duration, Effect, Layer, Scope } from "effect"
+import { Cause, Deferred, Duration, Effect, Layer, Scope } from "effect"
 import { TestLLMServer } from "../../lib/llm-server"
 import type { Config } from "../../../src/config/config"
+import type { GlobalEvent } from "../../../src/bus/global"
 
 import type { MessageV2 } from "../../../src/session/message-v2"
 import { MessageID, PartID } from "../../../src/session/schema"
@@ -18,13 +19,13 @@ export function runScenario(options: Options) {
   return (scenario: Scenario) => {
     if (scenario.kind === "todo") return Effect.succeed({ status: "skip", scenario } as Result)
     return runActive(options, scenario).pipe(
+      Effect.scoped,
       Effect.timeoutOrElse({
         duration: options.scenarioTimeout,
         orElse: () => Effect.die(new Error(`scenario timed out after ${Duration.format(options.scenarioTimeout)}`)),
       }),
       Effect.as({ status: "pass", scenario } as Result),
       Effect.catchCause((cause) => Effect.succeed({ status: "fail" as const, scenario, message: Cause.pretty(cause) })),
-      Effect.scoped,
     )
   }
 }
@@ -178,6 +179,24 @@ function withContext<A, E>(
             run(modules.Session.Service.use((svc) => svc.messages({ sessionID }).pipe(Effect.orDie))),
           todos: (sessionID, todos) => run(modules.Todo.Service.use((svc) => svc.update({ sessionID, todos }))),
           worktree: (input) => run(modules.Worktree.Service.use((svc) => svc.create(input).pipe(Effect.orDie))),
+          watchWorktreeReady: (input) =>
+            Effect.gen(function* () {
+              const ready = yield* Deferred.make<void>()
+              const on = (event: GlobalEvent) => {
+                if (event.payload.type !== modules.Worktree.Event.Ready.type) return
+                if (input.directory && event.directory !== input.directory) return
+                if (input.name && event.payload.properties.name !== input.name) return
+                Deferred.doneUnsafe(ready, Effect.void)
+              }
+              modules.GlobalBus.on("event", on)
+              yield* Scope.addFinalizer(scope, Effect.sync(() => modules.GlobalBus.off("event", on)))
+              return Deferred.await(ready).pipe(
+                Effect.timeoutOrElse({
+                  duration: "10 seconds",
+                  orElse: () => Effect.die(new Error("timed out waiting for worktree.ready")),
+                }),
+              )
+            }),
           worktreeRemove: (directory) =>
             run(modules.Worktree.Service.use((svc) => svc.remove({ directory })).pipe(Effect.ignore)),
           llmText: (value) => Effect.suspend(() => llm().text(value)),

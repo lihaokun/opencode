@@ -29,15 +29,13 @@ afterEach(async () => {
 })
 
 describe("file HttpApi", () => {
-  test("serves read endpoints", async () => {
+  test.serial("serves read endpoints", async () => {
     await using tmp = await tmpdir({ git: true })
     await Bun.write(path.join(tmp.path, "hello.txt"), "hello")
 
-    const [list, content, status] = await Promise.all([
-      request(FilePaths.list, tmp.path, { path: "." }),
-      request(FilePaths.content, tmp.path, { path: "hello.txt" }),
-      request(FilePaths.status, tmp.path),
-    ])
+    const list = await request(FilePaths.list, tmp.path, { path: "." })
+    const content = await request(FilePaths.content, tmp.path, { path: "hello.txt" })
+    const status = await request(FilePaths.status, tmp.path)
 
     expect(list.status).toBe(200)
     expect(await list.json()).toContainEqual(
@@ -51,14 +49,12 @@ describe("file HttpApi", () => {
     expect(await status.json()).toEqual([])
   })
 
-  test("serves search endpoints", async () => {
+  test.serial("serves search endpoints", async () => {
     await using tmp = await tmpdir({ git: true })
     await Bun.write(path.join(tmp.path, "hello.txt"), "needle")
 
-    const [text, symbols] = await Promise.all([
-      request(FilePaths.findText, tmp.path, { pattern: "needle" }),
-      request(FilePaths.findSymbol, tmp.path, { query: "hello" }),
-    ])
+    const text = await request(FilePaths.findText, tmp.path, { pattern: "needle" })
+    const symbols = await request(FilePaths.findSymbol, tmp.path, { query: "hello" })
     const files = await request(FilePaths.findFile, tmp.path, { query: "hello", type: "file" })
 
     expect(text.status).toBe(200)
