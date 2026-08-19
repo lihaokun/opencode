@@ -104,6 +104,15 @@ type ProviderTurnEvidence = {
   hasAssistantStarted: boolean
 }
 
+type PhysicalAttemptCheckpoint = {
+  partIDs: Set<SessionV1.Part["id"]>
+  assistant: {
+    finish: SessionV1.Assistant["finish"]
+    cost: number
+    tokens: SessionV1.Assistant["tokens"]
+  }
+}
+
 function providerTurnEvidence(): ProviderTurnEvidence {
   return {
     activeStep: false,
@@ -156,11 +165,18 @@ const layer = Layer.effect(
       let aborted = false
       let evidence = providerTurnEvidence()
       let recoverContextOverflow = true
+      let attempt: PhysicalAttemptCheckpoint | undefined
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
           providerID: input.model.providerID,
           aborted,
+        })
+
+      const createPart = <T extends SessionV1.Part>(part: T) =>
+        Effect.gen(function* () {
+          attempt?.partIDs.add(part.id)
+          return yield* session.updatePart(part)
         })
 
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
@@ -276,7 +292,7 @@ const layer = Layer.effect(
           }
           return { call: ctx.toolcalls[input.id], part }
         }
-        const part = yield* session.updatePart({
+        const part = yield* createPart({
           id: PartID.ascending(),
           messageID: ctx.assistantMessage.id,
           sessionID: ctx.assistantMessage.sessionID,
@@ -332,7 +348,7 @@ const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
-            yield* session.updatePart(ctx.reasoningMap[value.id])
+            yield* createPart(ctx.reasoningMap[value.id])
             return
 
           case "reasoning-delta":
@@ -474,7 +490,7 @@ const layer = Layer.effect(
           case "step-start":
             evidence.activeStep = true
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
-            yield* session.updatePart({
+            yield* createPart({
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
               sessionID: ctx.sessionID,
@@ -504,7 +520,7 @@ const layer = Layer.effect(
             }
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
-            yield* session.updatePart({
+            yield* createPart({
               id: PartID.ascending(),
               reason: value.reason,
               snapshot: completedSnapshot,
@@ -524,7 +540,7 @@ const layer = Layer.effect(
             if (ctx.snapshot) {
               const patch = yield* snapshot.patch(ctx.snapshot)
               if (patch.files.length) {
-                yield* session.updatePart({
+                yield* createPart({
                   id: PartID.ascending(),
                   messageID: ctx.assistantMessage.id,
                   sessionID: ctx.sessionID,
@@ -561,7 +577,7 @@ const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
-            yield* session.updatePart(ctx.currentText)
+            yield* createPart(ctx.currentText)
             return
 
           case "text-delta":
@@ -623,7 +639,7 @@ const layer = Layer.effect(
         if (ctx.snapshot) {
           const patch = yield* snapshot.patch(ctx.snapshot)
           if (patch.files.length) {
-            yield* session.updatePart({
+            yield* createPart({
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
               sessionID: ctx.sessionID,
@@ -737,6 +753,14 @@ const layer = Layer.effect(
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
+            attempt = {
+              partIDs: new Set(),
+              assistant: {
+                finish: ctx.assistantMessage.finish,
+                cost: ctx.assistantMessage.cost,
+                tokens: structuredClone(ctx.assistantMessage.tokens),
+              },
+            }
             ctx.needsCompaction = false
             evidence = providerTurnEvidence()
             ctx.currentText = undefined
