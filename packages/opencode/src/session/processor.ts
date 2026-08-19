@@ -812,7 +812,8 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
-                decide: ({ ordinary }) => (hasPluginActivity || hasToolActivity ? undefined : ordinary),
+                decide: ({ ordinary }) =>
+                  hasPluginActivity || hasToolActivity || ctx.assistantMessage.error ? undefined : ordinary,
                 set: (info) => {
                   return status.set(ctx.sessionID, {
                     type: "retry",

@@ -295,21 +295,21 @@ const lengthThenFailureEnv = LayerNode.compile(root, [
 ])
 const itLengthThenFailure = testEffect(lengthThenFailureEnv)
 
+function retryableFailure(message: string) {
+  return new APICallError({
+    message,
+    url: "https://example.com/v1/chat/completions",
+    requestBodyValues: {},
+    statusCode: 503,
+    responseHeaders: { "retry-after-ms": "0" },
+    responseBody: '{"error":"retry"}',
+    isRetryable: true,
+  })
+}
+
 function toolFenceStream(event: LLMEvent): Stream.Stream<LLMEvent, unknown> {
   return Stream.make(LLMEvent.stepStart({ index: 0 }), event).pipe(
-    Stream.concat(
-      Stream.fail(
-        new APICallError({
-          message: "tool fence retry",
-          url: "https://example.com/v1/chat/completions",
-          requestBodyValues: {},
-          statusCode: 503,
-          responseHeaders: { "retry-after-ms": "0" },
-          responseBody: '{"error":"retry"}',
-          isRetryable: true,
-        }),
-      ),
-    ),
+    Stream.concat(Stream.fail(retryableFailure("tool fence retry"))),
   )
 }
 
@@ -458,6 +458,13 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
         LLMEvent.textDelta({ id: "exception-text", text: "partial" }),
         LLMEvent.textEnd({ id: "exception-text" }),
       ).pipe(Stream.concat(Stream.fail(new Error("post-output boom"))))
+    case "terminal-error-retry":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({ index: 0, reason: "length" }),
+      ).pipe(Stream.concat(Stream.fail(retryableFailure("retry after terminal error"))))
+    case "preexisting-error-retry":
+      return Stream.fail(retryableFailure("retry with preexisting error"))
     case "tool-fence-input-start":
       return toolFenceStream(LLMEvent.toolInputStart({ id: "fenced-call", name: "lookup" }))
     case "tool-fence-input-delta":
@@ -843,6 +850,7 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
     limit?: { context: number; output: number }
     recoverContextOverflow?: boolean
     unfinished?: boolean
+    error?: NonNullable<SessionV1.Assistant["error"]>
   },
 ) {
   const { processors, session, provider } = yield* boot()
@@ -850,8 +858,9 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
   const chat = yield* session.create({})
   const parent = yield* user(chat.id, scenario)
   const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-  if (options?.unfinished) {
-    delete msg.finish
+  if (options?.unfinished) delete msg.finish
+  if (options?.error) msg.error = options.error
+  if (options?.unfinished || options?.error) {
     yield* session.updateMessage(msg)
   }
   const base = yield* provider.getModel(ref.providerID, ref.modelID)
@@ -1238,6 +1247,46 @@ itBoundary.live("session.processor gives length and blocked terminals priority o
         expect(blocked.result).toBe("stop")
         expect(blocked.message.error).toBeUndefined()
         expect(blocked.errors).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor blocks replay after an attempt creates a terminal assistant error", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("terminal-error-retry", 0)
+        const result = yield* runSettlement(dir, "terminal-error-retry")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("length")
+        expect(result.message.error?.name).toBe("MessageOutputLengthError")
+        expect(result.errors.map((error) => error.name)).toEqual(["MessageOutputLengthError"])
+        expect(settlementCalls.get("terminal-error-retry")).toBe(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor preserves a preexisting terminal error while denying replay", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const error = new SessionV1.ContentFilterError({ message: "blocked first" }).toObject()
+        settlementCalls.set("preexisting-error-retry", 0)
+        const result = yield* runSettlement(dir, "preexisting-error-retry", { error })
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("end_turn")
+        expect(result.message.error).toEqual(error)
+        expect(result.stored.info.role).toBe("assistant")
+        if (result.stored.info.role === "assistant") {
+          expect(result.stored.info.finish).toBe("end_turn")
+          expect(result.stored.info.error).toEqual(error)
+        }
+        expect(result.errors).toEqual([])
+        expect(settlementCalls.get("preexisting-error-retry")).toBe(1)
       }),
     { config: cfg },
   ),
