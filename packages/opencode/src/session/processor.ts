@@ -189,11 +189,41 @@ const layer = Layer.effect(
           aborted,
         })
 
+      const replayBlocked = () =>
+        hasPluginActivity ||
+        hasToolActivity ||
+        !!ctx.assistantMessage.error ||
+        ctx.blocked ||
+        ctx.needsCompaction ||
+        aborted
+
       const createPart = <T extends SessionV1.Part>(part: T) =>
         Effect.gen(function* () {
           attempt?.partIDs.add(part.id)
           return yield* session.updatePart(part)
         })
+
+      const rollbackAttempt = Effect.fn("SessionProcessor.rollbackAttempt")(function* (failure: unknown) {
+        if (replayBlocked()) return yield* Effect.fail(failure)
+        const current = attempt
+        if (!current) return yield* Effect.fail(new Error("Missing physical attempt checkpoint"))
+        if (current.partIDs.size === 0) return
+
+        ctx.currentText = undefined
+        ctx.reasoningMap = {}
+        for (const partID of current.partIDs) {
+          yield* session.removePart({
+            sessionID: ctx.sessionID,
+            messageID: ctx.assistantMessage.id,
+            partID,
+          })
+        }
+
+        ctx.assistantMessage.finish = current.assistant.finish
+        ctx.assistantMessage.cost = current.assistant.cost
+        ctx.assistantMessage.tokens = structuredClone(current.assistant.tokens)
+        yield* session.updateMessage(ctx.assistantMessage)
+      })
 
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
         const done = ctx.toolcalls[toolCallID]?.done
@@ -812,8 +842,8 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
-                decide: ({ ordinary }) =>
-                  hasPluginActivity || hasToolActivity || ctx.assistantMessage.error ? undefined : ordinary,
+                decide: ({ ordinary }) => (replayBlocked() ? undefined : ordinary),
+                beforeRetry: ({ failure }) => rollbackAttempt(failure),
                 set: (info) => {
                   return status.set(ctx.sessionID, {
                     type: "retry",

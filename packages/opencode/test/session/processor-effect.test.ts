@@ -3,6 +3,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { EventV2 } from "@opencode-ai/core/event"
 import { expect } from "bun:test"
 import { APICallError, tool } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
@@ -188,6 +189,7 @@ const root = LayerNode.group([
   Provider.node,
   Database.node,
   EventV2Bridge.node,
+  EventV2.node,
   SessionStatus.node,
   CrossSpawnSpawner.node,
 ])
@@ -800,13 +802,61 @@ const attemptEvidenceLLM = Layer.effect(
 const attemptEvidenceEnv = LayerNode.compile(root, [...replacements, [LLM.node, attemptEvidenceLLM]])
 const itAttemptEvidence = testEffect(attemptEvidenceEnv)
 
+const ordinaryRollbackAttempts = new Map<string, number>()
+const ordinaryRollbackLLM = Layer.succeed(
+  LLM.Service,
+  singletonBatchLLM((input) => {
+    const content = input.messages.at(-1)?.content
+    const scenario = typeof content === "string" ? content : ""
+    const attempt = (ordinaryRollbackAttempts.get(scenario) ?? 0) + 1
+    ordinaryRollbackAttempts.set(scenario, attempt)
+    if (attempt > 1) {
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "retained-text" }),
+        LLMEvent.textDelta({ id: "retained-text", text: "retained" }),
+        LLMEvent.textEnd({ id: "retained-text" }),
+        LLMEvent.stepFinish({
+          index: 0,
+          reason: "stop",
+          usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+        }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+    }
+    const events =
+      scenario === "rollback-removal-failure"
+        ? Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "failed-removal-text" }),
+            LLMEvent.textDelta({ id: "failed-removal-text", text: "discarded" }),
+          )
+        : Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.reasoningStart({ id: "discarded-reasoning" }),
+            LLMEvent.reasoningDelta({ id: "discarded-reasoning", text: "discarded reasoning" }),
+            LLMEvent.reasoningEnd({ id: "discarded-reasoning" }),
+            LLMEvent.textStart({ id: "discarded-text" }),
+            LLMEvent.textDelta({ id: "discarded-text", text: "discarded" }),
+            LLMEvent.stepFinish({
+              index: 0,
+              reason: "unknown",
+              usage: { inputTokens: 11, outputTokens: 7, totalTokens: 18 },
+            }),
+          )
+    return events.pipe(Stream.concat(Stream.fail(retryableFailure("ordinary retry"))))
+  }),
+)
+const ordinaryRollbackEnv = LayerNode.compile(root, [...replacements, [LLM.node, ordinaryRollbackLLM]])
+const itOrdinaryRollback = testEffect(ordinaryRollbackEnv)
+
+let compactionAttempts = 0
 const compactionAttemptLLM = Layer.effect(
   LLM.Service,
   Effect.sync(() => {
-    let attempt = 0
     const batches = (): Stream.Stream<LLM.LLMEventBatch, unknown> => {
-      attempt++
-      if (attempt > 1) {
+      compactionAttempts++
+      if (compactionAttempts > 1) {
         return Stream.fromIterable([
           [LLMEvent.stepStart({ index: 0 })],
           [LLMEvent.textStart({ id: "attempt-2-text" })],
@@ -851,6 +901,7 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
     recoverContextOverflow?: boolean
     unfinished?: boolean
     error?: NonNullable<SessionV1.Assistant["error"]>
+    assistant?: Partial<Pick<SessionV1.Assistant, "finish" | "cost" | "tokens">>
   },
 ) {
   const { processors, session, provider } = yield* boot()
@@ -860,16 +911,32 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
   const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
   if (options?.unfinished) delete msg.finish
   if (options?.error) msg.error = options.error
-  if (options?.unfinished || options?.error) {
+  if (options?.assistant) Object.assign(msg, options.assistant)
+  if (options?.unfinished || options?.error || options?.assistant) {
     yield* session.updateMessage(msg)
   }
   const base = yield* provider.getModel(ref.providerID, ref.modelID)
   const mdl = options?.limit ? { ...base, limit: options.limit } : base
   const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+  const removedParts: SessionV1.Part["id"][] = []
+  const assistantUpdates: SessionV1.Assistant[] = []
   const off = yield* eventBridge.listen((event) => {
-    if (event.type !== Session.Event.Error.type) return Effect.void
-    const data = event.data as typeof Session.Event.Error.data.Type
-    if (data.sessionID === chat.id && data.error) errors.push(data.error)
+    if (event.type === Session.Event.Error.type) {
+      const data = event.data as typeof Session.Event.Error.data.Type
+      if (data.sessionID === chat.id && data.error) errors.push(data.error)
+      return Effect.void
+    }
+    if (event.type === SessionV1.Event.PartRemoved.type) {
+      const data = event.data as typeof SessionV1.Event.PartRemoved.data.Type
+      if (data.sessionID === chat.id && data.messageID === msg.id) removedParts.push(data.partID)
+      return Effect.void
+    }
+    if (event.type === SessionV1.Event.MessageUpdated.type) {
+      const data = event.data as typeof SessionV1.Event.MessageUpdated.data.Type
+      if (data.sessionID === chat.id && data.info.role === "assistant" && data.info.id === msg.id) {
+        assistantUpdates.push(structuredClone(data.info))
+      }
+    }
     return Effect.void
   })
   const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
@@ -899,6 +966,8 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
     stored: yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id }),
     parts: yield* MessageV2.parts(msg.id),
     errors,
+    removedParts,
+    assistantUpdates,
   }
 })
 
@@ -1610,7 +1679,100 @@ itNoTextComplete.live("session.processor does not fence text completion when no 
   ),
 )
 
-itAttemptEvidence.live("session.processor resets finish and output evidence before a retry attempt", () =>
+itOrdinaryRollback.live("session.processor rolls back ordinary attempts on the same assistant", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const baselineTokens: SessionV1.Assistant["tokens"] = {
+          total: 101,
+          input: 41,
+          output: 37,
+          reasoning: 13,
+          cache: { read: 7, write: 3 },
+        }
+        ordinaryRollbackAttempts.set("ordinary-rollback", 0)
+        const result = yield* runSettlement(dir, "ordinary-rollback", {
+          assistant: {
+            finish: "end_turn",
+            cost: 7,
+            tokens: baselineTokens,
+          },
+        })
+        const finalIDs = new Set(result.parts.map((part) => part.id))
+
+        expect(result.result).toBe("continue")
+        expect(result.message.id).toBe(result.stored.info.id)
+        expect(result.message.finish).toBe("stop")
+        expect(result.message.cost).toBe(7)
+        expect(result.message.error).toBeUndefined()
+        expect(ordinaryRollbackAttempts.get("ordinary-rollback")).toBe(2)
+        expect(result.removedParts).toHaveLength(4)
+        expect(result.removedParts.every((partID) => !finalIDs.has(partID))).toBe(true)
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded" }))
+        expect(result.parts).not.toContainEqual(
+          expect.objectContaining({ type: "reasoning", text: "discarded reasoning" }),
+        )
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "retained" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+        expect(result.assistantUpdates).toContainEqual(
+          expect.objectContaining({
+            id: result.message.id,
+            finish: "end_turn",
+            cost: 7,
+            tokens: baselineTokens,
+          }),
+        )
+        expect(result.assistantUpdates.every((update) => update.id === result.message.id)).toBe(true)
+      }),
+    { config: cfg },
+  ),
+)
+
+itOrdinaryRollback.live("session.processor does not request again when rollback removal fails", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2.Service
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "rollback-removal-failure")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        yield* events.project(SessionV1.Event.PartRemoved, (event) =>
+          event.data.sessionID === chat.id
+            ? Effect.die(new Error("rollback removal failed"))
+            : Effect.void,
+        )
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        ordinaryRollbackAttempts.set("rollback-removal-failure", 0)
+
+        const exit = yield* Effect.exit(
+          handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "rollback-removal-failure" }],
+            tools: {},
+          }),
+        )
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(ordinaryRollbackAttempts.get("rollback-removal-failure")).toBe(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itAttemptEvidence.live("session.processor removes ordinary retry output before the next attempt", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
@@ -1622,29 +1784,33 @@ itAttemptEvidence.live("session.processor resets finish and output evidence befo
           name: "UnknownError",
           data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
         })
-        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "first attempt" }))
-        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(2)
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "first attempt" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+        expect(result.removedParts).toHaveLength(3)
         expect(result.errors).toHaveLength(1)
       }),
     { config: cfg },
   ),
 )
 
-itCompactionAttempt.live("session.processor resets compaction state before a retry attempt", () =>
+itCompactionAttempt.live("session.processor does not replay after compaction is requested", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
+        compactionAttempts = 0
         const result = yield* runSettlement(dir, "retry-compaction-state", {
           limit: { context: 20, output: 10 },
         })
 
-        expect(result.result).toBe("continue")
+        expect(result.result).toBe("stop")
         expect(result.message.finish).toBe("stop")
-        expect(result.message.error).toBeUndefined()
+        expect(result.message.error).toMatchObject({ data: { message: "rate limit" } })
         expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "first attempt" }))
-        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "second attempt" }))
-        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(2)
-        expect(result.errors).toEqual([])
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "second attempt" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+        expect(result.removedParts).toEqual([])
+        expect(result.errors).toHaveLength(1)
+        expect(compactionAttempts).toBe(1)
       }),
     { config: cfg },
   ),
