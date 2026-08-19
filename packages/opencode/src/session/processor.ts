@@ -166,6 +166,7 @@ const layer = Layer.effect(
       let evidence = providerTurnEvidence()
       let recoverContextOverflow = true
       let attempt: PhysicalAttemptCheckpoint | undefined
+      let hasPluginActivity = false
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -597,6 +598,8 @@ const layer = Layer.effect(
             if (!ctx.currentText) return
             // oxlint-disable-next-line no-self-assign -- reactivity trigger
             ctx.currentText.text = ctx.currentText.text
+            const hooks = yield* plugin.list()
+            if (hooks.some((hook) => hook["experimental.text.complete"])) hasPluginActivity = true
             ctx.currentText.text = (yield* plugin.trigger(
               "experimental.text.complete",
               {
@@ -793,6 +796,7 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
+                decide: ({ ordinary }) => (hasPluginActivity ? undefined : ordinary),
                 set: (info) => {
                   return status.set(ctx.sessionID, {
                     type: "retry",

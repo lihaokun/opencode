@@ -578,7 +578,12 @@ const textEvidencePlugin = Layer.mock(Plugin.Service)({
     }
     return Effect.succeed(output)
   },
-  list: () => Effect.succeed([]),
+  list: () =>
+    Effect.succeed([
+      {
+        "experimental.text.complete": async () => {},
+      },
+    ]),
   init: () => Effect.void,
 })
 const textEvidenceEnv = LayerNode.compile(root, [
@@ -587,6 +592,123 @@ const textEvidenceEnv = LayerNode.compile(root, [
   [Plugin.node, textEvidencePlugin],
 ])
 const itTextEvidence = testEffect(textEvidenceEnv)
+
+const pluginFenceAttempts = new Map<string, number>()
+let pluginFenceCallbackCalls = 0
+const pluginFenceLLM = Layer.succeed(
+  LLM.Service,
+  singletonBatchLLM((input) => {
+    const content = input.messages.at(-1)?.content
+    const scenario = typeof content === "string" ? content : ""
+    const attempt = (pluginFenceAttempts.get(scenario) ?? 0) + 1
+    pluginFenceAttempts.set(scenario, attempt)
+    if (attempt > 1) {
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: `${scenario}-retained` }),
+        LLMEvent.textDelta({ id: `${scenario}-retained`, text: "retained" }),
+        LLMEvent.textEnd({ id: `${scenario}-retained` }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+    }
+    const events =
+      scenario === "registered-uninvoked"
+        ? Stream.make(LLMEvent.stepStart({ index: 0 }))
+        : Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: `${scenario}-partial` }),
+            LLMEvent.textDelta({ id: `${scenario}-partial`, text: "partial" }),
+            LLMEvent.textEnd({ id: `${scenario}-partial` }),
+          )
+    return events.pipe(
+      Stream.concat(
+        Stream.fail(
+          new APICallError({
+            message: "plugin fence retry",
+            url: "https://example.com/v1/chat/completions",
+            requestBodyValues: {},
+            statusCode: 503,
+            responseHeaders: { "retry-after-ms": "0" },
+            responseBody: '{"error":"retry"}',
+            isRetryable: true,
+          }),
+        ),
+      ),
+    )
+  }),
+)
+const pluginFencePlugin = Layer.mock(Plugin.Service)({
+  trigger: <Output>(name: string, _input: unknown, output: Output) => {
+    if (
+      name === "experimental.text.complete" &&
+      typeof output === "object" &&
+      output !== null &&
+      "text" in output &&
+      typeof output.text === "string"
+    ) {
+      pluginFenceCallbackCalls++
+      output.text = `${output.text}:plugin`
+    }
+    return Effect.succeed(output)
+  },
+  list: () =>
+    Effect.succeed([
+      {
+        "experimental.text.complete": async () => {},
+      },
+    ]),
+  init: () => Effect.void,
+})
+const pluginFenceEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, pluginFenceLLM],
+  [Plugin.node, pluginFencePlugin],
+])
+const itPluginFence = testEffect(pluginFenceEnv)
+
+const throwingTextCompletePlugin = Layer.mock(Plugin.Service)({
+  trigger: <Output>(name: string, _input: unknown, output: Output) => {
+    if (name !== "experimental.text.complete") return Effect.succeed(output)
+    pluginFenceCallbackCalls++
+    return Effect.die(
+      new APICallError({
+        message: "plugin callback retry",
+        url: "https://example.com/plugin",
+        requestBodyValues: {},
+        statusCode: 503,
+        responseHeaders: { "retry-after-ms": "0" },
+        responseBody: '{"error":"plugin"}',
+        isRetryable: true,
+      }),
+    )
+  },
+  list: () =>
+    Effect.succeed([
+      {
+        "experimental.text.complete": async () => {},
+      },
+    ]),
+  init: () => Effect.void,
+})
+const throwingTextCompleteEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, pluginFenceLLM],
+  [Plugin.node, throwingTextCompletePlugin],
+])
+const itThrowingTextComplete = testEffect(throwingTextCompleteEnv)
+
+const noTextCompletePlugin = Layer.mock(Plugin.Service)({
+  trigger: <Output>(_name: string, _input: unknown, output: Output) => Effect.succeed(output),
+  list: () => Effect.succeed([]),
+  init: () => Effect.void,
+})
+const noTextCompleteEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, pluginFenceLLM],
+  [Plugin.node, noTextCompletePlugin],
+])
+const itNoTextComplete = testEffect(noTextCompleteEnv)
 
 const attemptEvidenceLLM = Layer.effect(
   LLM.Service,
@@ -1281,6 +1403,77 @@ itTextEvidence.live("session.processor bases usable text evidence on the plugin-
           data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
         })
         expect(cleared.parts).toContainEqual(expect.objectContaining({ type: "text", text: "" }))
+      }),
+    { config: cfg },
+  ),
+)
+
+itPluginFence.live("session.processor blocks ordinary replay after an actual text-complete callback", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        pluginFenceAttempts.set("plugin-invoked", 0)
+        pluginFenceCallbackCalls = 0
+        const result = yield* runSettlement(dir, "plugin-invoked")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.error).toMatchObject({ data: { message: "plugin fence retry" } })
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial:plugin" }))
+        expect(pluginFenceCallbackCalls).toBe(1)
+        expect(pluginFenceAttempts.get("plugin-invoked")).toBe(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itThrowingTextComplete.live("session.processor keeps the text-complete fence when a callback throws", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        pluginFenceAttempts.set("plugin-throws", 0)
+        pluginFenceCallbackCalls = 0
+        const result = yield* runSettlement(dir, "plugin-throws")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.error).toMatchObject({ data: { message: "plugin callback retry" } })
+        expect(pluginFenceCallbackCalls).toBe(1)
+        expect(pluginFenceAttempts.get("plugin-throws")).toBe(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itPluginFence.live("session.processor does not fence a registered text-complete hook before invocation", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        pluginFenceAttempts.set("registered-uninvoked", 0)
+        pluginFenceCallbackCalls = 0
+        const result = yield* runSettlement(dir, "registered-uninvoked")
+
+        expect(result.result).toBe("continue")
+        expect(result.message.error).toBeUndefined()
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "retained:plugin" }))
+        expect(pluginFenceCallbackCalls).toBe(1)
+        expect(pluginFenceAttempts.get("registered-uninvoked")).toBe(2)
+      }),
+    { config: cfg },
+  ),
+)
+
+itNoTextComplete.live("session.processor does not fence text completion when no matching hook exists", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        pluginFenceAttempts.set("no-matching-hook", 0)
+        pluginFenceCallbackCalls = 0
+        const result = yield* runSettlement(dir, "no-matching-hook")
+
+        expect(result.result).toBe("continue")
+        expect(result.message.error).toBeUndefined()
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "retained" }))
+        expect(pluginFenceCallbackCalls).toBe(0)
+        expect(pluginFenceAttempts.get("no-matching-hook")).toBe(2)
       }),
     { config: cfg },
   ),
