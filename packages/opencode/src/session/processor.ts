@@ -36,6 +36,20 @@ type ProcessOptions = {
   readonly recoverContextOverflow?: boolean
 }
 
+type IncompleteSource = "provider" | "clean-eof"
+
+class IncompleteStreamControl extends Error {
+  readonly _tag = "IncompleteStreamControl"
+
+  constructor(
+    readonly source: IncompleteSource,
+    message: string,
+    readonly finish: "unknown" | "error",
+  ) {
+    super(message)
+  }
+}
+
 export interface Handle {
   readonly message: SessionV1.Assistant
   readonly updateToolCall: (
@@ -452,6 +466,9 @@ const layer = Layer.effect(
           }
 
           case "provider-error":
+            if (value.classification === "incomplete-stream") {
+              return yield* Effect.fail(new IncompleteStreamControl("provider", value.message, "unknown"))
+            }
             throw new Error(value.message)
 
           case "step-start":
@@ -589,25 +606,17 @@ const layer = Layer.effect(
       })
 
       const settleIncomplete = Effect.fn("SessionProcessor.settleIncomplete")(function* () {
-        if (ctx.assistantMessage.error || ctx.blocked) return
+        if (ctx.assistantMessage.error || ctx.blocked || ctx.needsCompaction || aborted) return
         const credibleStepSettlement = evidence.completedSteps > 0 && !evidence.activeStep
         const hasVisibleText =
           evidence.hasCompletedVisibleText || (ctx.currentText !== undefined && ctx.currentText.text.trim().length > 0)
         const hasUsableOutput = hasVisibleText || evidence.hasToolEvidence
-        const message = !credibleStepSettlement
-          ? UNSETTLED_STEP_MESSAGE
-          : evidence.lastStepFinish === "unknown" && !hasUsableOutput
-            ? EMPTY_UNKNOWN_MESSAGE
-            : undefined
-        if (!message) return
-
-        const error = new NamedError.Unknown({ message }).toObject()
-        ctx.assistantMessage.error = error
-        if (!credibleStepSettlement) ctx.assistantMessage.finish = "error"
-        yield* events.publish(Session.Event.Error, {
-          sessionID: ctx.assistantMessage.sessionID,
-          error,
-        })
+        if (!credibleStepSettlement) {
+          return yield* Effect.fail(new IncompleteStreamControl("clean-eof", UNSETTLED_STEP_MESSAGE, "error"))
+        }
+        if (evidence.lastStepFinish === "unknown" && !hasUsableOutput) {
+          return yield* Effect.fail(new IncompleteStreamControl("clean-eof", EMPTY_UNKNOWN_MESSAGE, "unknown"))
+        }
       })
 
       const cleanup = Effect.fn("SessionProcessor.cleanup")(function* () {
@@ -678,6 +687,17 @@ const layer = Layer.effect(
           stack: e instanceof Error ? e.stack : undefined,
         })
         if (ctx.assistantMessage.error) {
+          yield* status.set(ctx.sessionID, { type: "idle" })
+          return
+        }
+        if (e instanceof IncompleteStreamControl) {
+          const error = new NamedError.Unknown({ message: e.message }).toObject()
+          ctx.assistantMessage.error = error
+          ctx.assistantMessage.finish = e.finish
+          yield* events.publish(Session.Event.Error, {
+            sessionID: ctx.assistantMessage.sessionID,
+            error,
+          })
           yield* status.set(ctx.sessionID, { type: "idle" })
           return
         }

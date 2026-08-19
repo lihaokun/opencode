@@ -411,6 +411,35 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
         LLMEvent.stepStart({ index: 0 }),
         LLMEvent.toolCall({ id: "late-tool-call", name: "lookup", input: {} }),
       ).pipe(Stream.concat(Stream.fail(contextOverflowError())))
+    case "classified-incomplete":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "classified-text" }),
+        LLMEvent.textDelta({ id: "classified-text", text: "partial" }),
+        LLMEvent.textEnd({ id: "classified-text" }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.providerError({
+          message: "specific incomplete provider failure",
+          classification: "incomplete-stream",
+          retryable: false,
+        }),
+      )
+    case "canonical-looking-provider-error":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.providerError({
+          message: "Provider stream ended without a terminal finish event",
+          retryable: false,
+        }),
+      )
+    case "post-output-exception":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "exception-text" }),
+        LLMEvent.textDelta({ id: "exception-text", text: "partial" }),
+        LLMEvent.textEnd({ id: "exception-text" }),
+      ).pipe(Stream.concat(Stream.fail(new Error("post-output boom"))))
     case "blocked-permission":
       return Stream.make(
         LLMEvent.stepStart({ index: 0 }),
@@ -438,11 +467,14 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
   }
 }
 
+const settlementCalls = new Map<string, number>()
 const settlementLLM = Layer.succeed(
   LLM.Service,
   singletonBatchLLM((input) => {
     const content = input.messages.at(-1)?.content
-    return settlementStream(typeof content === "string" ? content : "")
+    const scenario = typeof content === "string" ? content : ""
+    settlementCalls.set(scenario, (settlementCalls.get(scenario) ?? 0) + 1)
+    return settlementStream(scenario)
   }),
 )
 const settlementEnv = LayerNode.compile(root, [...replacements, [LLM.node, settlementLLM]])
@@ -479,6 +511,7 @@ function boundaryBatches(name: string): Stream.Stream<LLM.LLMEventBatch, unknown
           LLMEvent.stepFinish({ index: 0, reason: "unknown", usage: highUsage }),
           LLMEvent.providerError({
             message: "Provider stream ended without a terminal finish event",
+            classification: "incomplete-stream",
             retryable: false,
           }),
         ],
@@ -1003,7 +1036,7 @@ itBoundary.live("session.processor keeps raw-defined unknown overflow compatible
   ),
 )
 
-itBoundary.live("session.processor gives an empty unknown error priority over compaction", () =>
+itBoundary.live("session.processor excludes compaction cutoff from clean EOF incomplete detection", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
@@ -1012,16 +1045,10 @@ itBoundary.live("session.processor gives an empty unknown error priority over co
           limit: { context: 20, output: 10 },
         })
 
-        expect(result.result).toBe("stop")
-        expect(result.message.error).toMatchObject({
-          name: "UnknownError",
-          data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
-        })
-        expect(result.errors).toHaveLength(1)
-        expect(result.errors[0]).toMatchObject({
-          name: "UnknownError",
-          data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
-        })
+        expect(result.result).toBe("compact")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toBeUndefined()
+        expect(result.errors).toEqual([])
         expect(successorDemand.get("empty-unknown-overflow")).toBe(0)
       }),
     { config: cfg },
@@ -1095,6 +1122,36 @@ itSettlement.live("session.processor recovers a context overflow when the attemp
   ),
 )
 
+itSettlement.live("session.processor maps only classified provider errors to private incomplete control", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("classified-incomplete", 0)
+        const classified = yield* runSettlement(dir, "classified-incomplete")
+        expect(classified.result).toBe("stop")
+        expect(classified.message.finish).toBe("unknown")
+        expect(classified.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "specific incomplete provider failure" },
+        })
+        expect(classified.errors).toHaveLength(1)
+        expect(settlementCalls.get("classified-incomplete")).toBe(1)
+
+        settlementCalls.set("canonical-looking-provider-error", 0)
+        const unclassified = yield* runSettlement(dir, "canonical-looking-provider-error")
+        expect(unclassified.result).toBe("stop")
+        expect(unclassified.message.finish).toBe("unknown")
+        expect(unclassified.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended without a terminal finish event" },
+        })
+        expect(unclassified.errors).toHaveLength(1)
+        expect(settlementCalls.get("canonical-looking-provider-error")).toBe(1)
+      }),
+    { config: cfg },
+  ),
+)
+
 itSettlement.live("session.processor persists context overflow when attempt recovery is disabled", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -1122,6 +1179,26 @@ itSettlement.live("session.processor persists context overflow when attempt reco
           expect(result.stored.info.time.completed).toBe(result.message.time.completed)
         }
         expect(result.errors).toEqual([result.message.error])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor leaves post-output stream exceptions on the ordinary error path", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("post-output-exception", 0)
+        const result = yield* runSettlement(dir, "post-output-exception")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "post-output boom" },
+        })
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial" }))
+        expect(result.errors).toHaveLength(1)
+        expect(settlementCalls.get("post-output-exception")).toBe(1)
       }),
     { config: cfg },
   ),
@@ -1166,6 +1243,7 @@ itSettlement.live("session.processor does not replace a blocked tool turn with a
           ["blocked-permission", new PermissionV1.RejectedError().message],
           ["blocked-question", new Question.RejectedError().message],
         ] as const) {
+          settlementCalls.set(scenario, 0)
           const result = yield* runSettlement(dir, scenario)
 
           expect(result.result).toBe("stop")
@@ -1180,6 +1258,7 @@ itSettlement.live("session.processor does not replace a blocked tool turn with a
               }),
             }),
           )
+          expect(settlementCalls.get(scenario)).toBe(1)
         }
       }),
     { config: cfg },
