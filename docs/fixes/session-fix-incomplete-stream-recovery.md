@@ -1,6 +1,6 @@
 # Issue #7 修正方案：Legacy incomplete stream 同 assistant 回滚重试
 
-> 状态：修正方案与编码前契约已确认；classification、attempt tracking、retry hooks、replay fences 与 ordinary retry rollback 已实施并验证；summary deferral 与 incomplete replay 尚未启用
+> 状态：修正方案与编码前契约已确认；classification、attempt tracking、retry hooks/fences、ordinary rollback 与 attempt-local summary deferral 已实施并验证；incomplete replay 尚未启用
 > 日期：2026-08-19
 > Issue：[#7 — Incomplete provider stream 应按副作用状态恢复](https://github.com/lihaokun/opencode/issues/7)
 > 分析基线：`48cffdff0f83387b5ac82dafc59603b4fa2e9461`
@@ -1447,6 +1447,18 @@ Focused regressions 覆盖 actual callback success、callback throw、registered
 
 Focused regressions 证明：两次 ordinary physical attempts 复用同一 assistant ID；attempt 1 的 text/reasoning/step parts 经 durable removal 从 authoritative read 消失；attempt 2 仅保留一组 parts；中间 assistant update 恢复原 checkpoint；part-removal projector 故障时 request count 保持 1。另更新既有 retry fixture，锁定 rolled-back output 不再泄漏，并确认 compaction outcome 不 replay。
 
+### 6.5.9 Attempt-local processor summary deferral 单元验证记录
+
+2026-08-20 将 processor `step-finish` 原本的 summary launch 改为 current physical attempt 内按顺序登记。rollback preparation 在任何 part removal 前把 disposition 标记为 `rollback` 并清空 launches；最终 retained attempt 由 process `ensuring` finalizer 在 existing cleanup body 前标记为 `retain`、按原数量/顺序 fork summary。未修改 `summary.ts`、未增加全局 summary gate，也不合并同一 attempt 的多个 step launches。
+
+| 命令 | 结果 |
+|---|---|
+| `bun test packages/opencode/test/session/processor-effect.test.ts` | 51 pass / 0 fail / 347 assertions |
+| `bun run --cwd packages/opencode typecheck` | 通过 |
+| `git diff --check` | 通过 |
+
+Focused regressions 证明：ordinary rolled-back attempt 的 summary 不启动、最终 retained attempt 只启动一次；rollback removal failure 也不泄漏已丢弃 launch；retained normal/error/blocked/compaction/interrupt exits 均释放；normal 与 interrupt 的 launch registration 顺序均早于 cleanup completion update。
+
 ## 6.6 最小复现固化要求
 
 - A/B 分别证明explicit incomplete与qualifying clean EOF；
@@ -1485,11 +1497,11 @@ Focused regressions 证明：两次 ordinary physical attempts 复用同一 assi
 | `packages/llm/src/schema/errors.ts` | provider failure classification | 增加 `incomplete-stream` stable literal；不改 public Legacy error | 已改并通过 typecheck（本步骤） |
 | `packages/llm/test/schema.test.ts` | provider-error schema decode | 接受 declared `incomplete-stream`，拒绝未知 classification | 已加并通过：9/9（本步骤） |
 | `packages/opencode/src/session/llm/ai-sdk.ts` | canonical missing raw finish mapping | existing detailed normalized error 附 classification | 已改并通过 typecheck（本步骤） |
-| `packages/opencode/src/session/processor.ts` | stream settle、attempt bookkeeping、event handling、retry preparation、summary launch | 两个entry；private control；part tracking；assistant checkpoint；plugin/tool/error fences；same-assistant rollback；独立预算；exact final semantics；attempt-local summary deferral；existing tool cleanup | 进行中：entry/private landing、attempt checkpoint/tracking、retry hooks/fences 与 ordinary same-assistant rollback 已改并验证；incomplete replay、独立预算、summary 待改 |
+| `packages/opencode/src/session/processor.ts` | stream settle、attempt bookkeeping、event handling、retry preparation、summary launch | 两个entry；private control；part tracking；assistant checkpoint；plugin/tool/error fences；same-assistant rollback；独立预算；exact final semantics；attempt-local summary deferral；existing tool cleanup | 进行中：entry/private landing、attempt checkpoint/tracking、retry hooks/fences、ordinary rollback 与 attempt-local summary deferral 已改并验证；incomplete replay与独立预算待改 |
 | `packages/opencode/src/session/retry.ts` | policy/gate/preparation integration | incomplete与ordinary retry发request前共用gate/preparation，复用delay/status | 已改并验证：optional decide/beforeRetry hooks；processor integration 待后续单元 |
 | `packages/opencode/test/session/llm.test.ts` | adapter tests | stable classification 与 detailed message regression | 已改并通过：54/54（本步骤） |
 | `packages/opencode/test/session/retry.test.ts` | retry policy tests | gate/preparation、独立count与ordinary retry交互 | 进行中：decision/preparation order、deny、fail-closed、monotonic attempt 已加并通过 37/37；processor budget integration 待加 |
-| `packages/opencode/test/session/processor-effect.test.ts` | focused integration tests | same-assistant rollback、entries、exact boundary、fences、three-attempt exhaustion、final semantics、usage、summary、tool cleanup、observability | 进行中：entry boundaries、fences、ordinary rollback/checkpoint/fail-closed、compaction 与 retained tool cleanup regressions 已加并通过 47/47；incomplete/summary/observability 其余项待加/改 |
+| `packages/opencode/test/session/processor-effect.test.ts` | focused integration tests | same-assistant rollback、entries、exact boundary、fences、three-attempt exhaustion、final semantics、usage、summary、tool cleanup、observability | 进行中：entry boundaries、fences、ordinary rollback/checkpoint/fail-closed、summary retained/rollback exits、compaction 与 tool cleanup regressions 已加并通过 51/51；incomplete/observability 其余项待加/改 |
 | `packages/opencode/test/session/prompt.test.ts` | existing Legacy loop regressions | 为无 fence 的 missing-finish fixture 提供 bounded retry 序列并更新 request count；completed-tool fence 用例继续锁定 no replay | 待改 |
 | `packages/opencode/test/tool/task.test.ts` | child/task incomplete regressions | child 自身无 tool fence 时验证 bounded retry/exhaustion；已有 tool activity 时仍不 replay，并保持 Task error 投影 | 待改 |
 | `packages/opencode/test/cli/run/run-process.test.ts` | top-level/child CLI regressions | 更新 missing-finish request 数与最终 error；明确 authoritative state 收敛而 append-only stdout/JSON 可保留 transient failed output | 待改 |
@@ -1526,7 +1538,7 @@ Focused regressions 证明：两次 ordinary physical attempts 复用同一 assi
 7. [已完成] 六类 normalized tool event fence + retained partial tool cleanup assertion（ordinary replay 已接入；incomplete replay 尚未启用）；
 8. [已完成] assistant terminal-error fence（ordinary replay decision 已接入；rollback preparation 二次检查待下一单元）；
 9. [已完成] ordinary retry 适用时复用 fences 与 same-assistant rollback preparation；已验证 authoritative attempt 隔离与 preparation failure no-next-request，未启用 incomplete replay；
-10. processor `step-finish` summary 改 attempt-local deferral；rollback 丢弃，retained success/error/interrupt 由 process finalizer 在 cleanup body 前释放一次；
+10. [已完成] processor `step-finish` summary attempt-local deferral；rollback 丢弃，retained success/error/blocked/compaction/interrupt 由 process finalizer 在 cleanup body 前释放；
 11. explicit incomplete recovery + independent two-retry budget；覆盖 successful same-assistant replay、three-attempt exhaustion 与 incomplete→ordinary→incomplete monotonic schedule sequence；
 12. clean EOF recovery + exact final error/finish；
 13. focused authoritative/removal-aware/append-only observability test；
@@ -1599,7 +1611,7 @@ Focused regressions 证明：两次 ordinary physical attempts 复用同一 assi
 | `docs/devlog/2026-08-<implementation-date>-incomplete-stream-recovery.md` | 全部 recovery 实现完成后汇总代码、测试、关键 decision 和 required metrics | 待加 |
 | `CLAUDE.md`「已知限制与注意事项」 | 仅实现后确认有可复用经验时回写，例如authoritative removal不等于append-only历史擦除 | 待判定 |
 
-初次方案收尾与编码前 contract amendment 已分别完成。stable classification / AI SDK mapping、processor private entries、physical-attempt checkpoint/tracking、retry hooks、replay fences 与 ordinary same-assistant rollback 已修改 shared schema、adapter、processor/retry 与对应 tests；plugin/tool runtime/public API、Prompt/V2 仍无 diff，summary deferral 与 incomplete replay 尚未启用。
+初次方案收尾与编码前 contract amendment 已分别完成。stable classification / AI SDK mapping、processor private entries、physical-attempt checkpoint/tracking、retry hooks/fences、ordinary same-assistant rollback 与 attempt-local summary deferral 已修改 shared schema、adapter、processor/retry 与对应 tests；summary.ts、plugin/tool runtime/public API、Prompt/V2 仍无 diff，incomplete replay 尚未启用。
 
 ## 8.2 行为契约变更
 

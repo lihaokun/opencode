@@ -41,6 +41,21 @@ const summary = Layer.succeed(
   }),
 )
 
+const summaryLaunches: Parameters<SessionSummary.Interface["summarize"]>[0][] = []
+const summaryTimeline: string[] = []
+const summaryProbe = Layer.succeed(
+  SessionSummary.Service,
+  SessionSummary.Service.of({
+    summarize: (input) => {
+      summaryLaunches.push(input)
+      summaryTimeline.push("summary")
+      return Effect.void
+    },
+    diff: () => Effect.succeed([]),
+    computeDiff: () => Effect.succeed([]),
+  }),
+)
+
 const ref = {
   providerID: ProviderV2.ID.make("test"),
   modelID: ModelV2.ID.make("test-model"),
@@ -195,6 +210,10 @@ const root = LayerNode.group([
 ])
 const replacements = [
   [SessionSummary.node, summary],
+  [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
+] as const
+const summaryProbeReplacements = [
+  [SessionSummary.node, summaryProbe],
   [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
 ] as const
 const env = LayerNode.compile(
@@ -531,6 +550,8 @@ const settlementLLM = Layer.succeed(
 )
 const settlementEnv = LayerNode.compile(root, [...replacements, [LLM.node, settlementLLM]])
 const itSettlement = testEffect(settlementEnv)
+const summarySettlementEnv = LayerNode.compile(root, [...summaryProbeReplacements, [LLM.node, settlementLLM]])
+const itSummarySettlement = testEffect(summarySettlementEnv)
 
 const highUsage = { inputTokens: 100, outputTokens: 1, totalTokens: 101 }
 const successorDemand = new Map<string, number>()
@@ -616,6 +637,8 @@ const boundaryLLM = Layer.succeed(
 )
 const boundaryEnv = LayerNode.compile(root, [...replacements, [LLM.node, boundaryLLM]])
 const itBoundary = testEffect(boundaryEnv)
+const summaryBoundaryEnv = LayerNode.compile(root, [...summaryProbeReplacements, [LLM.node, boundaryLLM]])
+const itSummaryBoundary = testEffect(summaryBoundaryEnv)
 
 const textEvidencePlugin = Layer.mock(Plugin.Service)({
   trigger: <Output>(name: string, _input: unknown, output: Output) => {
@@ -830,6 +853,7 @@ const ordinaryRollbackLLM = Layer.succeed(
             LLMEvent.stepStart({ index: 0 }),
             LLMEvent.textStart({ id: "failed-removal-text" }),
             LLMEvent.textDelta({ id: "failed-removal-text", text: "discarded" }),
+            LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
           )
         : Stream.make(
             LLMEvent.stepStart({ index: 0 }),
@@ -849,6 +873,8 @@ const ordinaryRollbackLLM = Layer.succeed(
 )
 const ordinaryRollbackEnv = LayerNode.compile(root, [...replacements, [LLM.node, ordinaryRollbackLLM]])
 const itOrdinaryRollback = testEffect(ordinaryRollbackEnv)
+const summaryRollbackEnv = LayerNode.compile(root, [...summaryProbeReplacements, [LLM.node, ordinaryRollbackLLM]])
+const itSummaryRollback = testEffect(summaryRollbackEnv)
 
 let compactionAttempts = 0
 const compactionAttemptLLM = Layer.effect(
@@ -885,6 +911,21 @@ const compactionAttemptLLM = Layer.effect(
 )
 const compactionAttemptEnv = LayerNode.compile(root, [...replacements, [LLM.node, compactionAttemptLLM]])
 const itCompactionAttempt = testEffect(compactionAttemptEnv)
+
+const summaryInterruptLLM = Layer.succeed(
+  LLM.Service,
+  singletonBatchLLM(() =>
+    Stream.make(
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+    ).pipe(Stream.concat(Stream.never)),
+  ),
+)
+const summaryInterruptEnv = LayerNode.compile(root, [
+  ...summaryProbeReplacements,
+  [LLM.node, summaryInterruptLLM],
+])
+const itSummaryInterrupt = testEffect(summaryInterruptEnv)
 
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
@@ -1728,10 +1769,169 @@ itOrdinaryRollback.live("session.processor rolls back ordinary attempts on the s
   ),
 )
 
-itOrdinaryRollback.live("session.processor does not request again when rollback removal fails", () =>
+itSummarySettlement.live("session.processor releases retained summaries before cleanup", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        const events = yield* EventV2Bridge.Service
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
+          const data = event.data as typeof SessionV1.Event.MessageUpdated.data.Type
+          if (data.info.role === "assistant" && data.info.time.completed) summaryTimeline.push("cleanup")
+          return Effect.void
+        })
+
+        const normal = yield* runSettlement(dir, "unknown-visible")
+        yield* off
+
+        expect(normal.result).toBe("continue")
+        expect(summaryLaunches).toEqual([
+          {
+            sessionID: normal.message.sessionID,
+            messageID: normal.message.parentID,
+          },
+        ])
+        expect(summaryTimeline).toEqual(["summary", "cleanup"])
+
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        const failed = yield* runSettlement(dir, "classified-incomplete")
+        expect(failed.result).toBe("stop")
+        expect(summaryLaunches).toEqual([
+          {
+            sessionID: failed.message.sessionID,
+            messageID: failed.message.parentID,
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSummaryBoundary.live("session.processor releases retained blocked and compaction summaries", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        successorDemand.set("blocked-overflow", 0)
+        const blocked = yield* runSettlement(dir, "blocked-overflow", {
+          limit: { context: 20, output: 10 },
+        })
+        expect(blocked.result).toBe("stop")
+        expect(summaryLaunches).toHaveLength(1)
+        expect(summaryLaunches[0]).toEqual({
+          sessionID: blocked.message.sessionID,
+          messageID: blocked.message.parentID,
+        })
+
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        successorDemand.set("raw-defined-overflow", 0)
+        const compact = yield* runSettlement(dir, "raw-defined-overflow", {
+          limit: { context: 20, output: 10 },
+        })
+        expect(compact.result).toBe("compact")
+        expect(summaryLaunches).toHaveLength(1)
+        expect(summaryLaunches[0]).toEqual({
+          sessionID: compact.message.sessionID,
+          messageID: compact.message.parentID,
+        })
+      }),
+    { config: cfg },
+  ),
+)
+
+itSummaryInterrupt.live("session.processor releases retained summaries on interrupt", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        const database = yield* Database.Service
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "summary-interrupt")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
+          const data = event.data as typeof SessionV1.Event.MessageUpdated.data.Type
+          if (data.sessionID === chat.id && data.info.role === "assistant" && data.info.time.completed) {
+            summaryTimeline.push("cleanup")
+          }
+          return Effect.void
+        })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "summary-interrupt" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* waitFor(
+          MessageV2.parts(msg.id).pipe(
+            Effect.map((parts) => parts.some((part) => part.type === "step-finish") || undefined),
+            Effect.provideService(Database.Service, database),
+          ),
+          "timed out waiting for summary step",
+        )
+        yield* Fiber.interrupt(run)
+        const exit = yield* Fiber.await(run)
+        yield* off
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(summaryLaunches).toEqual([{ sessionID: chat.id, messageID: parent.id }])
+        expect(summaryTimeline).toEqual(["summary", "cleanup"])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSummaryRollback.live("session.processor discards rolled-back summary launches", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        ordinaryRollbackAttempts.set("ordinary-rollback", 0)
+        const result = yield* runSettlement(dir, "ordinary-rollback")
+
+        expect(result.result).toBe("continue")
+        expect(ordinaryRollbackAttempts.get("ordinary-rollback")).toBe(2)
+        expect(summaryLaunches).toEqual([
+          {
+            sessionID: result.message.sessionID,
+            messageID: result.message.parentID,
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSummaryRollback.live("session.processor does not request or summarize again when rollback removal fails", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
         const { processors, session, provider } = yield* boot()
         const events = yield* EventV2.Service
         const chat = yield* session.create({})
@@ -1767,6 +1967,7 @@ itOrdinaryRollback.live("session.processor does not request again when rollback 
 
         expect(Exit.isFailure(exit)).toBe(true)
         expect(ordinaryRollbackAttempts.get("rollback-removal-failure")).toBe(1)
+        expect(summaryLaunches).toEqual([])
       }),
     { config: cfg },
   ),

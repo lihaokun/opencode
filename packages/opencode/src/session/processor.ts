@@ -104,12 +104,18 @@ type ProviderTurnEvidence = {
   hasAssistantStarted: boolean
 }
 
+type DeferredSummaryLaunch = Parameters<SessionSummary.Interface["summarize"]>[0]
+
 type PhysicalAttemptCheckpoint = {
   partIDs: Set<SessionV1.Part["id"]>
   assistant: {
     finish: SessionV1.Assistant["finish"]
     cost: number
     tokens: SessionV1.Assistant["tokens"]
+  }
+  summaries: {
+    disposition: "pending" | "rollback" | "retain"
+    launches: DeferredSummaryLaunch[]
   }
 }
 
@@ -207,6 +213,8 @@ const layer = Layer.effect(
         if (replayBlocked()) return yield* Effect.fail(failure)
         const current = attempt
         if (!current) return yield* Effect.fail(new Error("Missing physical attempt checkpoint"))
+        current.summaries.disposition = "rollback"
+        current.summaries.launches = []
         if (current.partIDs.size === 0) return
 
         ctx.currentText = undefined
@@ -223,6 +231,17 @@ const layer = Layer.effect(
         ctx.assistantMessage.cost = current.assistant.cost
         ctx.assistantMessage.tokens = structuredClone(current.assistant.tokens)
         yield* session.updateMessage(ctx.assistantMessage)
+      })
+
+      const releaseAttemptSummaries = Effect.fn("SessionProcessor.releaseAttemptSummaries")(function* () {
+        const current = attempt
+        if (!current || current.summaries.disposition !== "pending") return
+        current.summaries.disposition = "retain"
+        const launches = current.summaries.launches
+        current.summaries.launches = []
+        for (const launch of launches) {
+          yield* summary.summarize(launch).pipe(Effect.ignore, Effect.forkIn(scope))
+        }
       })
 
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
@@ -598,12 +617,10 @@ const layer = Layer.effect(
               }
               ctx.snapshot = undefined
             }
-            yield* summary
-              .summarize({
-                sessionID: ctx.sessionID,
-                messageID: ctx.assistantMessage.parentID,
-              })
-              .pipe(Effect.ignore, Effect.forkIn(scope))
+            attempt?.summaries.launches.push({
+              sessionID: ctx.sessionID,
+              messageID: ctx.assistantMessage.parentID,
+            })
             if (
               !ctx.assistantMessage.summary &&
               isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })
@@ -809,6 +826,10 @@ const layer = Layer.effect(
                 cost: ctx.assistantMessage.cost,
                 tokens: structuredClone(ctx.assistantMessage.tokens),
               },
+              summaries: {
+                disposition: "pending",
+                launches: [],
+              },
             }
             ctx.needsCompaction = false
             evidence = providerTurnEvidence()
@@ -857,7 +878,10 @@ const layer = Layer.effect(
             ),
             Effect.catch(halt),
             Effect.ensuring(
-              cleanup().pipe(
+              Effect.gen(function* () {
+                yield* releaseAttemptSummaries()
+                yield* cleanup()
+              }).pipe(
                 Effect.catchCauseIf(
                   (cause) => !Cause.hasInterruptsOnly(cause) && !!ctx.assistantMessage.error,
                   (cause) => halt(Cause.squash(cause)),
