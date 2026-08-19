@@ -1,6 +1,6 @@
 # Issue #7 修正方案：Legacy incomplete stream 同 assistant 回滚重试
 
-> 状态：根因分析与修正方案，待用户审阅；尚未进入编码阶段
+> 状态：修正方案已确认；编码前既有契约 amendment 已同步；尚未进入源码实施阶段
 > 日期：2026-08-19
 > Issue：[#7 — Incomplete provider stream 应按副作用状态恢复](https://github.com/lihaokun/opencode/issues/7)
 > 分析基线：`48cffdff0f83387b5ac82dafc59603b4fa2e9461`
@@ -1417,7 +1417,7 @@ bun run typecheck
 
 每步按项目流程单独实现、测试、审阅：
 
-1. 编码前同步并确认既有 incomplete contract amendment；
+1. [已完成] 编码前同步并确认既有 incomplete contract amendment（`docs/fixes/session-fix-incomplete-provider-stream.md` §11）；
 2. `packages/llm` stable classification + `packages/opencode` adapter mapping/test；
 3. processor 两个 incomplete entry + exact-entry-boundary regression；
 4. minimal physical-attempt checkpoint + creation-time part tracking；
@@ -1494,11 +1494,11 @@ bun run typecheck
 | 文档路径 | 要改什么 | 状态 |
 |---|---|---|
 | `docs/fixes/session-fix-incomplete-stream-recovery.md` | 本文：Legacy-only、same-assistant、两个incomplete entries、independent budget、actual plugin/tool/error fences、authoritative rollback、exact final semantics、visibility分层与rolled-back-attempt summary deferral | 已修正，待审阅 |
-| `docs/fixes/session-fix-incomplete-provider-stream.md` | **编码前**追加 Issue #7 superseding amendment：保留 Issue #3 历史 no-retry 结论，同时声明本文 fences/budget/rollback 条件下的 bounded replay；不引入 broad exception conversion 或 generic final message | 本文确认后、源码修改前待改 |
+| `docs/fixes/session-fix-incomplete-provider-stream.md` | **编码前**追加 Issue #7 superseding amendment：保留 Issue #3 历史 no-retry 结论，同时声明本文 fences/budget/rollback 条件下的 bounded replay；不引入 broad exception conversion 或 generic final message | 已同步：§11（本步骤） |
 | `docs/devlog/2026-08-<implementation-date>-incomplete-stream-recovery.md` | 实现完成后记录代码、测试、关键decision和required metrics | 待加 |
 | `CLAUDE.md`「已知限制与注意事项」 | 仅实现后确认有可复用经验时回写，例如authoritative removal不等于append-only历史擦除 | 待判定 |
 
-当前任务只修正本文，不修改表中其它文件。
+初次方案收尾只修正本文；本次编码前文档同步步骤同时更新旧 Issue #3 修正文档 §11 与本文状态，不包含源码或测试 diff。
 
 ## 8.2 行为契约变更
 
