@@ -1691,3 +1691,22 @@ Issue #7 实施后的目标行为为：
 
 本节不授权或实施任何源码/test diff；它只把 Issue #3 历史 no-retry 契约与已确认的 Issue #7
 Legacy bounded recovery 目标契约明确分层。
+
+### 11.5 2026-08-20 实施后状态回填
+
+本节 11.1—11.4 保留为编码前同步门的历史记录；其中“本节提交时源码尚未实施”“目标行为”“后续验证”等时态仅描述提交 `ad59676db` 当时的状态。Issue #7 的 Legacy bounded recovery 现已按
+`docs/fixes/session-fix-incomplete-stream-recovery.md` 完成实施与验证。
+
+完成状态：
+
+- shared classification / AI SDK mapping：`269aa2848`；
+- processor private entries、attempt state、retry hooks/fences、rollback、summary deferral、explicit/clean-EOF bounded recovery：`c10dea5ab`—`d17915191`；
+- observability 与 Prompt/Task/CLI/compaction cross-layer regressions：`31e23f984`、`602df5a50`；
+- 最终审核修复：retry-delay interrupt `bb8f5c879`、compaction timeout `9b9da8e80`、mixed Fail+Interrupt no-replay `df9eb3687`；
+- final Legacy session suite：464 pass / 7 skip / 1 todo / 0 fail / 1668 assertions；
+- Task 37/37、CLI 20/20、shared schema 9/9；`packages/llm` 与 `packages/opencode` typecheck 通过；
+- 独立五维审核无 unresolved finding，forbidden-scope diff 为空。
+
+实施后契约与 11.2 一致：safe incomplete 在同一 assistant 内最多 replay 两次；任一 actual matching text-complete invocation、任一 normalized tool event、existing terminal error 或 interrupt evidence 都 fail closed；retry 前先撤销 current attempt authoritative parts并恢复 assistant checkpoint；最终仍使用 Legacy `UnknownError`，不新增 public error 或 SDK/OpenAPI 变化。
+
+保持不变的范围边界：V2、Prompt/Task/CLI/compaction production、TUI/consumer、plugin/tool runtime、`summary.ts` 与 public Legacy error union 均无 diff。rollback preparation failure 只保证不发下一 provider request，不承诺 crash-atomic repair；append-only output 仍可保留 transient failed-attempt bytes。
