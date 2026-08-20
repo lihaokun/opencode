@@ -18,6 +18,7 @@ import { useSessionLayout } from "@/pages/session/session-layout"
 import { getSessionContext } from "./session-context-metrics"
 import { estimateSessionContextBreakdown, type SessionContextBreakdownKey } from "./session-context-breakdown"
 import { createSessionContextFormatter } from "./session-context-format"
+import { compareMessageToRevert } from "@/utils/session-message"
 
 const BREAKDOWN_COLOR: Record<SessionContextBreakdownKey, string> = {
   system: "var(--syntax-info)",
@@ -118,9 +119,9 @@ export function SessionContextTab() {
 
   const visibleUserMessages = createMemo(
     () => {
-      const revert = info()?.revert?.messageID
+      const revert = info()?.revert
       if (!revert) return userMessages()
-      return userMessages().filter((m) => m.id < revert)
+      return userMessages().filter((message) => compareMessageToRevert(message, revert) < 0)
     },
     emptyUserMessages,
     { equals: same },

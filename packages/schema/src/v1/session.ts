@@ -529,7 +529,9 @@ const SessionShare = Schema.Struct({
 
 const SessionRevert = Schema.Struct({
   messageID: MessageID,
+  messageTimeCreated: optional(NonNegativeInt),
   partID: optional(PartID),
+  partTimeCreated: optional(NonNegativeInt),
   snapshot: optional(Schema.String),
   diff: optional(Schema.String),
 })

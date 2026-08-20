@@ -214,7 +214,9 @@ export type Session = {
   permission?: PermissionRuleset
   revert?: {
     messageID: string
+    messageTimeCreated?: number
     partID?: string
+    partTimeCreated?: number
     snapshot?: string
     diff?: string
   }
@@ -2239,7 +2241,9 @@ export type GlobalSession = {
   permission?: PermissionRuleset
   revert?: {
     messageID: string
+    messageTimeCreated?: number
     partID?: string
+    partTimeCreated?: number
     snapshot?: string
     diff?: string
   }

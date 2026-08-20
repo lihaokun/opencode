@@ -79,6 +79,7 @@ import { collapseToolOutput } from "../../util/collapse-tool-output"
 import { usePluginRuntime } from "../../plugin/runtime"
 import { DialogRetryAction } from "../../component/dialog-retry-action"
 import { getRevertDiffFiles } from "../../util/revert-diff"
+import { compareMessageToRevert, earliestMessage, latestMessage } from "../../util/session"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
 import { LocationProvider } from "../../context/location"
@@ -610,8 +611,11 @@ export function Session() {
       run: async () => {
         const status = sync.data.session_status?.[route.sessionID]
         if (status?.type !== "idle") await sdk.client.session.abort({ sessionID: route.sessionID }).catch(() => {})
-        const revert = session()?.revert?.messageID
-        const message = messages().findLast((x) => (!revert || x.id < revert) && x.role === "user")
+        const revert = session()?.revert
+        const message = latestMessage(
+          messages(),
+          (item) => item.role === "user" && (!revert || compareMessageToRevert(item, revert) < 0),
+        )
         if (!message) return
         void sdk.client.session
           .revert({
@@ -647,9 +651,12 @@ export function Session() {
       },
       run: () => {
         dialog.clear()
-        const messageID = session()?.revert?.messageID
-        if (!messageID) return
-        const message = messages().find((x) => x.role === "user" && x.id > messageID)
+        const revert = session()?.revert
+        if (!revert) return
+        const message = earliestMessage(
+          messages(),
+          (item) => item.role === "user" && compareMessageToRevert(item, revert) > 0,
+        )
         if (!message) {
           void sdk.client.session.unrevert({
             sessionID: route.sessionID,
@@ -872,9 +879,10 @@ export function Session() {
       value: "messages.copy",
       category: "Session",
       run: () => {
-        const revertID = session()?.revert?.messageID
-        const lastAssistantMessage = messages().findLast(
-          (msg) => msg.role === "assistant" && (!revertID || msg.id < revertID),
+        const revert = session()?.revert
+        const lastAssistantMessage = latestMessage(
+          messages(),
+          (message) => message.role === "assistant" && (!revert || compareMessageToRevert(message, revert) < 0),
         )
         if (!lastAssistantMessage) {
           toast.show({ message: "No assistant messages found", variant: "error" })
@@ -1117,14 +1125,18 @@ export function Session() {
   }))
 
   const revertInfo = createMemo(() => session()?.revert)
-  const revertMessageID = createMemo(() => revertInfo()?.messageID)
 
   const revertDiffFiles = createMemo(() => getRevertDiffFiles(revertInfo()?.diff ?? ""))
 
   const revertRevertedMessages = createMemo(() => {
-    const messageID = revertMessageID()
-    if (!messageID) return []
-    return messages().filter((x) => x.id >= messageID && x.role === "user")
+    const info = revertInfo()
+    if (!info) return []
+    return messages().filter((message) => message.role === "user" && compareMessageToRevert(message, info) >= 0)
+  })
+  const revertDisplayMessageID = createMemo(() => {
+    const info = revertInfo()
+    if (!info) return
+    return earliestMessage(messages(), (message) => compareMessageToRevert(message, info) >= 0)?.id
   })
 
   const revert = createMemo(() => {
@@ -1133,6 +1145,8 @@ export function Session() {
     if (!info.messageID) return
     return {
       messageID: info.messageID,
+      messageTimeCreated: info.messageTimeCreated,
+      displayMessageID: revertDisplayMessageID(),
       reverted: revertRevertedMessages(),
       diff: info.diff,
       diffFiles: revertDiffFiles(),
@@ -1187,7 +1201,7 @@ export function Session() {
                 <For each={messages()}>
                   {(message, index) => (
                     <Switch>
-                      <Match when={message.id === revert()?.messageID}>
+                      <Match when={message.id === revert()?.displayMessageID}>
                         {(function () {
                           const redoShortcut = useCommandShortcut("session.redo")
                           const [hover, setHover] = createSignal(false)
@@ -1247,7 +1261,7 @@ export function Session() {
                           )
                         })()}
                       </Match>
-                      <Match when={revert()?.messageID && message.id >= revert()!.messageID}>
+                      <Match when={revert() && compareMessageToRevert(message, revert()!) >= 0}>
                         <></>
                       </Match>
                       <Match when={message.role === "user"}>

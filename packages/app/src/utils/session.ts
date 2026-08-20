@@ -3,6 +3,13 @@ import type { Session } from "@opencode-ai/sdk/v2/client"
 
 export function normalizeSessionInfo(input: SessionInfo | Session): Session {
   if (!("location" in input)) return input
+  const revert = input.revert as
+    | (NonNullable<typeof input.revert> & {
+        messageTimeCreated?: number
+        partTimeCreated?: number
+        diff?: string
+      })
+    | undefined
   return {
     id: input.id,
     slug: input.id,
@@ -18,10 +25,13 @@ export function normalizeSessionInfo(input: SessionInfo | Session): Session {
     model: input.model,
     version: "",
     time: input.time,
-    revert: input.revert && {
-      messageID: input.revert.messageID,
-      partID: input.revert.partID,
-      snapshot: input.revert.snapshot,
+    revert: revert && {
+      messageID: revert.messageID,
+      messageTimeCreated: revert.messageTimeCreated,
+      partID: revert.partID,
+      partTimeCreated: revert.partTimeCreated,
+      snapshot: revert.snapshot,
+      diff: revert.diff,
     },
   }
 }

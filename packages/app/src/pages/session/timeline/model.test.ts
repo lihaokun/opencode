@@ -1,9 +1,16 @@
 import { describe, expect, test } from "bun:test"
 import type { AssistantMessage, Message, UserMessage } from "@opencode-ai/sdk/v2"
-import { isTimelineReady, loadOlderTimeline, selectUserMessages, selectVisibleUserMessages } from "./model"
+import {
+  isTimelineReady,
+  loadOlderTimeline,
+  selectProjectedMessages,
+  selectUserMessages,
+  selectVisibleUserMessages,
+} from "./model"
 
-const user = (id: string) => ({ id, role: "user" }) as UserMessage
-const assistant = (id: string) => ({ id, role: "assistant" }) as AssistantMessage
+const user = (id: string, created = Number(id.slice(4))) => ({ id, role: "user", time: { created } }) as UserMessage
+const assistant = (id: string, created = Number(id.slice(4))) =>
+  ({ id, role: "assistant", time: { created } }) as AssistantMessage
 
 describe("timeline model", () => {
   test("selects users and applies the revert boundary", () => {
@@ -11,8 +18,33 @@ describe("timeline model", () => {
     const users = selectUserMessages(messages)
 
     expect(users.map((message) => message.id)).toEqual(["msg_1", "msg_3", "msg_5"])
-    expect(selectVisibleUserMessages(users, "msg_5").map((message) => message.id)).toEqual(["msg_1", "msg_3"])
+    expect(selectVisibleUserMessages(users, { messageID: "msg_5" }).map((message) => message.id)).toEqual([
+      "msg_1",
+      "msg_3",
+    ])
     expect(selectVisibleUserMessages(users)).toBe(users)
+  })
+
+  test("applies a persisted revert boundary across the ID rollover", () => {
+    const users = [user("msg_ffff", 100), user("msg_0001", 200), user("msg_0002", 300)]
+
+    expect(
+      selectVisibleUserMessages(users, { messageID: "msg_0001", messageTimeCreated: 200 }).map((message) => message.id),
+    ).toEqual(["msg_ffff"])
+  })
+
+  test("selects the earliest hidden projection boundary by chronology", () => {
+    const u1 = user("msg_fffe", 100)
+    const u2 = user("msg_ffff", 200)
+    const u3 = user("msg_0001", 300)
+    const rawIDOrder = [u3, u1, u2]
+
+    expect(
+      selectProjectedMessages(rawIDOrder, rawIDOrder, [u1], {
+        messageID: u2.id,
+        messageTimeCreated: u2.time.created,
+      }).map((message) => message.id),
+    ).toEqual([u1.id])
   })
 
   test("waits for an assistant-only load to hydrate its user root", () => {

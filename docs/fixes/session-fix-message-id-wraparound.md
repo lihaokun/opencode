@@ -1,14 +1,14 @@
 # 修正方案 — V1 Session 消息 ID 回卷与持久化顺序
 
-- 状态：生产 DB 根因对照、生产代码、回归测试与本地验证已完成；实现 commit `6784e5ad92`、文档 commit `57dab0571a`，stacked [PR #15](https://github.com/lihaokun/opencode/pull/15) 已创建，issue 待合并关闭
-- 日期：2026-08-17
+- 状态：原始 rollover 根因修复已完成（实现 commit `6784e5ad92`、文档 commit `57dab0571a`）；2026-08-20 PR review 发现“持久化 revert boundary 被单独删除后，cleanup 静默保留 reverted suffix”的回归，follow-up 代码、回归、generated legacy SDK 与本地验证已完成，当前 worktree 待提交
+- 日期：2026-08-17；PR review follow-up：2026-08-20
 - 对应问题：[#13](https://github.com/lihaokun/opencode/issues/13)
 - 计划交付：在基于 [PR #14](https://github.com/lihaokun/opencode/pull/14) 的 `message-id-wraparound` stacked branch 中独立实施，不扩大 PR #14 本身的 context-overflow 修复范围
-- 影响模块：legacy V1 Identifier consumer、Session message/part chronology、prompt loop、revert/fork、CLI local replay、legacy tool-output retention
+- 影响模块：legacy V1 Identifier consumer、Session message/part chronology、prompt loop、revert marker hydration/cleanup、legacy App/TUI revert consumer、fork、CLI local replay、legacy tool-output retention
 - workflow 路径：`docs/workflow.md` §7 bug-fix flow + §7.1 八部分修正方案
-- 修复分类：算法内部逻辑错误；不新增公共接口或数据库 schema，不进入 §4 新功能设计流程
+- 修复分类：原始修复为算法内部逻辑错误；PR review follow-up 仍是 boundary 算法回归，但为让 legacy App/TUI 使用同一 durable boundary，会给 legacy `Session.Info.revert` 和 V1 event schema 增加向后兼容的可选 chronology 字段。该窄接口修订会扩展 legacy Server `HttpApi` 的 Session response 并触发 generated client/SDK 同步；不修改数据库 schema、current Protocol、current/V2 `Revert.State` 或 V2 Session Core
 
-本修复建立一个明确边界：V1 的 message/part ID 是身份键，不是永久时钟。需要 chronology 的 consumer 使用持久化创建时间和稳定 tie-breaker；identity boundary 使用准确 ID equality。V2 已通过 durable sequence 从结构上消除了同类依赖，但本修复不把 V2 的 event/session-input 架构迁回 V1。
+本修复建立一个明确边界：V1 的 message/part ID 是身份键，不是永久时钟。需要 chronology 的 consumer 使用持久化创建时间和稳定 tie-breaker；ID equality 继续用于 identity/reference，但持久化 revert marker 必须同时携带 chronology key，不能要求被引用实体永远存在。V2 已通过 durable sequence 从结构上消除了同类依赖，本修复不修改或桥接 V2。
 
 ---
 
@@ -215,16 +215,46 @@ packages/opencode/src/tool/truncate.ts:54-65 Truncate.cleanup
 
 ### 1.5 预期行为与实际行为
 
-| Case | 当前实际行为 | 修复后预期行为 |
-|---|---|---|
-| pre-wrap history → post-wrap `finish: stop` assistant | raw latest 仍选择 pre-wrap tool-call assistant，继续 provider turn | 按 canonical chronology 选择真实 terminal assistant，active run 终止 |
-| history 内同时存在回卷前后 user/assistant | `latest()` 可能长期选择回卷前 raw-ID max | 按持久化创建 chronology 选择真实最新消息 |
-| finished assistant 后存在 post-wrap task owner | raw ID range 可能丢 task或保留已完成 task | task selection 与消息持久化顺序一致 |
-| revert/fork boundary 跨 wrap | raw ID relational comparison 选择错误范围 | 先按 canonical chronology 读取，再按准确 boundary identity 切片 |
-| 同一 message 的 parts 跨 wrap | SQL 按 part ID 排序，可能把后生成 part 放前面 | SQL 按 `(time_created, id)` 稳定排序 |
-| CLI missing-anchor local row 跨 wrap | raw ID fallback 可能插入错误位置 | 使用显式 local chronology metadata，不比较 raw ID 时间 |
-| 回卷后七天内新 tool-output 文件 | cleanup 可能立即删除新文件 | 使用文件 `mtime`，只删除真实超过 retention 的文件 |
-| 普通同周期 Session | raw ID 与创建时间通常同序 | 可观察顺序保持不变 |
+| Case                                                  | 当前实际行为                                                                                  | 修复后预期行为                                                                                 |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| pre-wrap history → post-wrap `finish: stop` assistant | raw latest 仍选择 pre-wrap tool-call assistant，继续 provider turn                            | 按 canonical chronology 选择真实 terminal assistant，active run 终止                           |
+| history 内同时存在回卷前后 user/assistant             | `latest()` 可能长期选择回卷前 raw-ID max                                                      | 按持久化创建 chronology 选择真实最新消息                                                       |
+| finished assistant 后存在 post-wrap task owner        | raw ID range 可能丢 task或保留已完成 task                                                     | task selection 与消息持久化顺序一致                                                            |
+| revert/fork boundary 跨 wrap                          | raw ID relational comparison 选择错误范围                                                     | fork 的瞬时 input 继续按 identity 定位；持久化 revert marker 使用 `(time_created,id)` 定位范围 |
+| revert marker 指向的 message/part 被单独删除          | PR #15 的 exact-identity cleanup 找不到 boundary，直接 clear marker，错误保留 reverted suffix | 即使 boundary 实体已不存在，仍按 marker 内持久化 chronology key 删除 boundary 后缀             |
+| 同一 message 的 parts 跨 wrap                         | SQL 按 part ID 排序，可能把后生成 part 放前面                                                 | SQL 按 `(time_created, id)` 稳定排序                                                           |
+| CLI missing-anchor local row 跨 wrap                  | raw ID fallback 可能插入错误位置                                                              | 使用显式 local chronology metadata，不比较 raw ID 时间                                         |
+| 回卷后七天内新 tool-output 文件                       | cleanup 可能立即删除新文件                                                                    | 使用文件 `mtime`，只删除真实超过 retention 的文件                                              |
+| 普通同周期 Session                                    | raw ID 与创建时间通常同序                                                                     | 可观察顺序保持不变                                                                             |
+
+### 1.6 PR review follow-up：缺失 revert boundary 静默保留后缀
+
+[PR #15 review](https://github.com/lihaokun/opencode/pull/15#discussion_r3811545420) 给出的最小序列是：
+
+```text
+U1: (time=100, id=msg_001)
+U2: (time=200, id=msg_002)  ← stage revert marker
+U3: (time=300, id=msg_003)  ← reverted suffix
+
+DELETE /session/:sessionID/message/:U2
+下一次 prompt → SessionRevert.cleanup()
+```
+
+PR #15 当前 follow-up 前的执行是：
+
+```ts
+const boundary = msgs.findIndex((msg) => msg.info.id === messageID)
+if (boundary === -1) {
+  yield * sessions.clearRevert(sessionID)
+  return
+}
+```
+
+删除 `U2` 后，`boundary === -1`，cleanup 清空 marker 并返回；`U3` 留在 transcript，且 `unrevert` 已无法恢复原 marker。该行为不是旧版本的既有缺陷：旧 cleanup 即使 target 不存在，仍会用 raw `id >= messageID` 处理 suffix。PR #15 为消除 rollover 风险把 range 改成 exact identity，但遗漏了“持久化 boundary 的被引用实体可独立删除”这一生命周期。
+
+part boundary 同构：若 `P1 → P2 → P3` 在 `P2` stage revert 后单独删除 `P2`，当前 `findIndex(part.id === partID)` 无法定位，`P3` 被保留。修复必须同时覆盖 message 与 part，且不得通过禁止 delete API 来维持 marker 有效性。
+
+可直接执行的回归测试将使用真实 Session/SQLite 路径：创建 `U1/U2/U3`，stage `U2`，通过既有 `removeMessage` 删除 `U2`，调用 `cleanup`，断言只保留 `U1` 且 marker 被清除。对应 part 用例创建同一 message 内 `P1/P2/P3` 后执行相同步骤。
 
 ---
 
@@ -271,9 +301,11 @@ latest terminal assistant 是否在 latest user 之后产生，从而可以结�
 
 `parentID` 不能替代本次修复：生产 event replay 证明 rollover 期间创建的 assistant 已经继承了旧 raw-ID `latest()` 选错的 pre-wrap user。使用 parent equality 会把真正最新的 stopped assistant误判为未覆盖最新 user，并额外发起 provider turn。
 
-### 2.4 根因 D：identity boundary 被实现成 raw-ID range
+### 2.4 根因 D：瞬时 identity input 与持久化 range marker 被混成同一契约
 
-revert 和 fork API 接收的是一个具体 message ID。其语义是“找到这个 message，在 canonical ordered collection 中从此处分割”，而不是“构造一个字符串大于等于范围”。使用数组位置或先解析 boundary 后切片能直接表达契约；raw-ID range 同时引入了 rollover、supplied ID 和未来 ID 格式耦合。
+fork input 是一次调用内消费的具体 message ID：其语义是“找到这个 message，在 canonical ordered collection 中从此处分割”，准确 equality 足够。revert marker 则会跨请求持久化，并允许既有 delete API 在 cleanup 前删除其 message/part；它表达的是一个 durable range cutoff，而不只是活实体引用。
+
+原实现用 raw `id >= markerID`，实体缺失时仍能处理 suffix，但把 ID 错当 chronology。PR #15 改成准确 equality + array slice 后解决 rollover，却无意增加了“marker 指向实体必须一直存在”的前置条件。该前置条件不由 API、数据库外键或既有行为保证，因而产生 review regression。正确修复不是回退 raw range，也不是禁止删除，而是让持久化 marker 自身携带 `(time_created,id)` cutoff。
 
 ### 2.5 根因 E：part 与文件 retention 重复依赖同一错误假设
 
@@ -296,6 +328,22 @@ PartTable 已经有稳定的 `time_created`，但 hydration 只按 part ID 排�
 - runLoop 读取 U1 snapshot 后、创建 A1 前新 U2 才完成持久化时，`A1.parentID=U1` 但 chronology 为 `U1,U2,A1` 的既有并发归属窗口。它在 ID rollover 前已经存在；若要由 `parentID` 改变 terminal contract，必须作为独立 bug fix 设计和验证，不能混入 #13 的 chronology 修复；
 - terminal assistant 已被 runLoop snapshot 读取、但 runner 尚未原子进入 idle 时新 user 才完成持久化的 lost-wake 窗口。该输入不会丢失，但当前 `Runner.ensureRunning()` 可能只 join 即将结束的 run 而不再启动 drain；彻底修复需要 prompt admission/wake generation 与 runner idle transition 的原子协议，不能由 `parentID` 或额外一次非原子数据库读取保证；
 - V2 Session runner。V2 chronology 已使用 durable `seq`，本修复不得回退或桥接到 legacy loop。
+
+### 2.7 根因 F：legacy revert marker 丢失了 durable chronology
+
+`Session.Info.revert` 当前只持久化 `messageID` / `partID`。只要 target 存在，代码尚可从 target row 恢复 `time_created`；target 删除后，marker 本身没有足够信息回答“哪些现存 message/part 位于 cutoff 之后”。因此两个看似互斥的实现都只能覆盖一半契约：
+
+```text
+raw ID range:
+  target 缺失仍可运行
+  但 rollover 后 chronology 错
+
+exact ID + slice:
+  rollover 时正确
+  但 target 缺失时失去 range
+```
+
+根因是 marker 数据不完整，不是 `findIndex` 的局部错误。新 marker 必须在 stage 时保存 message chronology，part revert 还要保存 part chronology；旧 marker 在读取时按旧 ID 逻辑一次性补成当前内存形态。兼容 hydration 只恢复旧版本当时可表达的 boundary，不声称纠正旧 marker 已经具有的 rollover 歧义。
 
 ---
 
@@ -323,30 +371,36 @@ Session History 只按 `seq` 读取：
 
 ```ts
 // packages/core/src/session/history.ts
-const rows = yield* db
-  .select()
-  .from(SessionMessageTable)
-  .where(/* session/compaction boundary */)
-  .orderBy(asc(SessionMessageTable.seq))
-  .all()
+const rows =
+  yield *
+  db
+    .select()
+    .from(SessionMessageTable)
+    .where(/* session/compaction boundary */)
+    .orderBy(asc(SessionMessageTable.seq))
+    .all()
 ```
 
 V2 revert 先用 ID 查准确 boundary，再比较 boundary sequence：
 
 ```ts
 // packages/core/src/session/revert.ts
-const boundary = yield* db
-  .select({ seq: SessionMessageTable.seq })
-  .from(SessionMessageTable)
-  .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.id, messageID)))
-  .get()
+const boundary =
+  yield *
+  db
+    .select({ seq: SessionMessageTable.seq })
+    .from(SessionMessageTable)
+    .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.id, messageID)))
+    .get()
 
-const rows = yield* db
-  .select()
-  .from(SessionMessageTable)
-  .where(gt(SessionMessageTable.seq, boundary.seq))
-  .orderBy(asc(SessionMessageTable.seq))
-  .all()
+const rows =
+  yield *
+  db
+    .select()
+    .from(SessionMessageTable)
+    .where(gt(SessionMessageTable.seq, boundary.seq))
+    .orderBy(asc(SessionMessageTable.seq))
+    .all()
 ```
 
 V2 prompt admission 另有 `SessionInputTable.admitted_seq` / `promoted_seq`，因此 logical input order 也不依赖 prompt ID。该能力超出 issue #13 的 V1 compatibility patch，并解释了为什么本修复不能顺带关闭 PR #14 的 compaction 并发 admission follow-up。
@@ -362,13 +416,13 @@ A.parentID = U.id
 A.finish = stop
 ```
 
-| Step | 当前 V1 | V2 参考实现 |
-|---|---|---|
-| 1. durable write U | `MessageTable(id=ffff, time_created=t1)` | `SessionMessageTable(id=ffff, seq=N)` |
-| 2. durable write A | `MessageTable(id=0000, time_created=t2)` | `SessionMessageTable(id=0000, seq=N+1)` |
-| 3. history load | page 最初按 `(t,id)` 正确加载 | 按 `seq` 得到 `[U,A]` |
-| 4. latest binding | raw-ID max/range 丢弃 page chronology | runner/history 保持 `seq` chronology |
-| 5. completion | `ffff < 0000` 为 false，继续 run | A 属于 U 的完成 attempt，runner退出/进入安全边界 |
+| Step               | 当前 V1                                  | V2 参考实现                                      |
+| ------------------ | ---------------------------------------- | ------------------------------------------------ |
+| 1. durable write U | `MessageTable(id=ffff, time_created=t1)` | `SessionMessageTable(id=ffff, seq=N)`            |
+| 2. durable write A | `MessageTable(id=0000, time_created=t2)` | `SessionMessageTable(id=0000, seq=N+1)`          |
+| 3. history load    | page 最初按 `(t,id)` 正确加载            | 按 `seq` 得到 `[U,A]`                            |
+| 4. latest binding  | raw-ID max/range 丢弃 page chronology    | runner/history 保持 `seq` chronology             |
+| 5. completion      | `ffff < 0000` 为 false，继续 run         | A 属于 U 的完成 attempt，runner退出/进入安全边界 |
 
 首个执行差异位于 V1 `MessageV2.latest()`：持久化读取仍正确，但内存绑定从 `(time_created,id)` 降级为 raw ID。该差异正是根因。
 
@@ -378,9 +432,9 @@ V2 `ToolOutputStore.cleanup()` 不从 ID 解码时间：
 
 ```ts
 const cutoff = Date.now() - Duration.toMillis(RETENTION)
-const info = yield* fs.stat(file)
+const info = yield * fs.stat(file)
 const modified = info.mtime.map((date) => date.getTime()).getOrElse(() => 0)
-if (modified < cutoff) yield* fs.remove(file)
+if (modified < cutoff) yield * fs.remove(file)
 ```
 
 同一回卷后新文件输入：V1 decoded ID 小于回卷前 cutoff 并删除；V2 `mtime≈now` 大于 cutoff 并保留。差异与根因一致。
@@ -396,6 +450,25 @@ if (modified < cutoff) yield* fs.remove(file)
 - message/part/public storage 边界审计。
 
 Issue #13 的 rollover 不需要承担这些风险。V1 已持久化首次创建 `time_created`，且 page/cursor 已把 `(time_created,id)` 作为稳定顺序。复用这一既有契约是最小兼容修复；V2 durable sequence 仍是下一代严格 chronology 的参考，而不是本次迁移目标。
+
+### 3.5 缺失 boundary 的行为对照
+
+PR #15 之前的 legacy cleanup 是本 follow-up 的兼容参考：
+
+```ts
+for (const msg of msgs) {
+  if (msg.info.id < messageID) continue
+  if (msg.info.id > messageID) {
+    remove.push(msg)
+    continue
+  }
+  // exact target handling
+}
+```
+
+对 `U1 → U2 → U3`、marker=`U2`、随后删除 `U2`，该实现仍把 raw-ID 意义下的 `U3` 放进 remove set。它的正确属性是“boundary 生命周期不依赖 target 存活”，错误属性是“range chronology 来自 raw ID”。follow-up 保留前者并替换后者：new marker 直接保存 tuple；old marker hydration 仅在缺字段时按旧 ID predecessor 逻辑找到 boundary row，并取该 row 的 `time_created`。因此普通旧数据库保持升级前语义，new marker 则不再有 rollover 歧义。
+
+V2 revert 依赖 target row 的 durable `seq`，但 V2 的 delete/stage/commit 生命周期、schema 与 legacy 不同，不能直接作为“缺失 legacy target”的实现复用。这里只参考它把 durable ordering metadata 与 ID identity 分开的原则，不修改 V2 代码。
 
 ---
 
@@ -490,15 +563,116 @@ lastUser.id < lastAssistant.id
 
 保留现有 finish、tool-calls、orphaned interrupted tool 等判定。该修改只替换 chronology source，不改变 V1 terminal contract。生产 DB 中受 rollover 影响的 assistant 已持有 stale pre-wrap `parentID`，因此本修复不得改用 parent equality；`parentID` 并发归属语义作为 §2.6 的独立非目标。
 
-### 4.5 revert 与 fork 使用 identity boundary
+### 4.5 持久化 revert marker 保存 durable chronology boundary
 
-`Session.messages()` 已按 page 的 `(time_created,id)` 返回 canonical chronological array。revert/fork 不再构造 raw-ID range：
+fork input 仍是瞬时 identity boundary，继续用准确 `msg.info.id === input.messageID` 停止复制；它不持久化，也不受 review regression 影响。revert marker 改为以下 legacy 数据契约：
 
-- `SessionRevert.revert()`：用准确 `messageID` 找到 boundary index，`all.slice(index)` 交给 diff；
-- `SessionRevert.cleanup()`：用准确 boundary index 分成 before/target/after；part revert 在 target 已按 canonical part order 的 parts 中按准确 `partID` 切片；
-- `Session.fork()`：只在 `msg.info.id === input.messageID` 时停止复制，或先解析准确 index 后 slice。
+```text
+LegacyRevertMarker（wire / DB JSON）
+  messageID: MessageID
+  messageTimeCreated?: NonNegativeInt
+  partID?: PartID
+  partTimeCreated?: NonNegativeInt
+  snapshot?: string
+  diff?: string
 
-若 boundary 不存在，保留或明确现有 API 的 not-found/clone-all契约，不用字符串大小猜测一个不存在 boundary 的位置。实现前通过现有测试锁定并在新增用例中明确。
+HydratedLegacyRevert（legacy Session service 内存不变量）
+  messageID: MessageID
+  messageTimeCreated: NonNegativeInt
+  partID absent  => partTimeCreated absent
+  partID present 且 target message 仍存在 => partTimeCreated present
+```
+
+字段命名明确表示值来自首次持久化的 `MessageTable.time_created` / `PartTable.time_created`，而不是从 ID 解码。wire schema 把两个新字段声明为 optional，以便新 App/TUI 仍能连接旧 server，也让共享兼容层接收不带字段的 V2 marker；但当前 legacy server 对新建 marker 总是写全，对旧 marker 每次读取都返回 hydrated 形态。
+
+`SessionRevert.revert()` 在最终确定 `rev.messageID` 后，从对应 canonical message 取 `info.time.created`；若保留 `partID`，从 `PartTable` 取该 part 首次持久化的 `time_created`。注意 `rev.messageID` 可能是循环中计算出的 last user，而不一定等于原始 input，因此必须按最终 marker identity 取时间。新 marker 的 DB JSON 与返回给 caller 的 `Session.Info` 同时包含 chronology 字段。
+
+`SessionRevert.revert()` 的 diff range 也改为 tuple boundary，不再依赖 target index：
+
+```text
+messageKey(msg) = (msg.info.time.created, msg.info.id)
+markerMessageKey = (revert.messageTimeCreated, revert.messageID)
+range = all where messageKey(msg) >= markerMessageKey
+```
+
+stage 时 target 必然存在；使用同一 tuple 仍可确保 diff、cleanup 与 UI 解释完全一致。
+
+### 4.5.1 旧 marker 只在 hydration 中升级，不回写
+
+数据库中已存在的 marker 没有 chronology 字段。兼容逻辑集中在 legacy Session marker hydration：
+
+1. marker 已有 `messageTimeCreated`，且需要的 part time 也存在：原样返回，不查额外 row；
+2. marker 缺 message time：先按准确 message ID 查 row；若 target 已删除，则复用旧版本 ID 定界规则，选择 raw ID 最大且 `id <= marker.messageID` 的现存 message；
+3. 第 2 步没有 predecessor，但 Session 仍有 message：使用 canonical 最早 message 的 `time_created`，对应旧 raw range 会从首项开始删除的空左侧边界；Session 已空则使用确定性的零值，cleanup 只需 clear marker；
+4. marker 有 `partID` 但缺 part time：在 marker message 内同样先准确查 ID，再选择 raw ID 最大且 `id <= marker.partID` 的现存 part；没有 predecessor 但仍有 parts 时使用 canonical 最早 part 的 `time_created`，没有任何 part 时不伪造可消费的 part boundary；
+5. 返回补全后的内存副本。
+
+该 compatibility fallback 有意保留旧版本的 raw-ID 定界风险：若 old marker 本身跨 rollover，hydration 可能得到旧实现会得到的歧义结果。这不是 new marker 的行为，也不是本 follow-up 新引入的问题。禁止为“矫正”旧 marker 增加 migration、全表 backfill 或 modulo epoch guessing。
+
+hydration 不调用 `patch`、不更新 `SessionTable.revert`、不发布 Session updated event，也不顺便重新持久化。因而：
+
+```text
+old DB JSON（无 time）
+  → 每次 legacy read 按旧逻辑补全 runtime marker
+  → DB JSON 保持原样
+
+new DB JSON（有 time）
+  → 直接 hydrate
+```
+
+实现可保留纯 `fromRow()` 解析，再在 `get/list/listGlobal/children` 共用的 legacy hydration boundary 上，仅对“存在 old marker 且缺字段”的 row 执行有索引查询。不得修改共享 `packages/core/src/session/sql.ts` 的 V2 `Revert.State`；JSON 列会保留额外 key，legacy adapter 使用局部窄类型解释它们。
+
+### 4.5.2 cleanup 直接比较 tuple，不要求 boundary identity 存活
+
+message-level marker：
+
+```text
+remove msg iff messageKey(msg) >= markerMessageKey
+```
+
+part-level marker：
+
+```text
+remove msg iff messageKey(msg) > markerMessageKey
+
+若 msg.id == marker.messageID 且该 message 仍存在：
+  partKey(part) = (PartTable.time_created, part.id)
+  markerPartKey = (revert.partTimeCreated, revert.partID)
+  remove part iff partKey(part) >= markerPartKey
+```
+
+part marker 的准确 message equality 只用于找到仍存活的 container 以删除其 parts，不再决定后续 message suffix 是否清理。message target 已删除时，仍按 message tuple 删除所有较新 message；part target 已删除时，仍按 part tuple 删除所有较新 parts。最后才 clear marker。
+
+Part 公共 schema 不暴露 DB `time_created`，因此 part cleanup 在 legacy server 内部读取 `PartTable` chronology row；不修改公共 Part、Protocol 或 V2 schema。`deleteMessage` / `deletePart` 保持现有独立删除语义，不增加“先升级 marker”、拒绝删除、事务联动或事件伪造。
+
+### 4.5.3 legacy App/TUI 消费同一个 marker tuple
+
+所有把 revert marker ID 当时间边界的 legacy consumer 改用：
+
+```text
+compareMessageToRevert(message, marker):
+  if marker.messageTimeCreated is present:
+    compare (message.time.created, message.id)
+            (marker.messageTimeCreated, marker.messageID)
+  otherwise:
+    preserve existing raw-ID comparison
+```
+
+fallback 只服务两种连接兼容：新 client 连接尚未升级的 legacy server，以及共享 App 路径收到没有 legacy chronology extension 的 V2 marker。当前 legacy server hydration 后不会走 fallback。不得为此修改 current/V2 `Revert.State`、V2 Session Core 或 Protocol；legacy Server `HttpApi` 的 additive response 变化按仓库规则同步 generated client types。
+
+需要替换的 marker chronology consumer 至少包括：
+
+- `packages/tui/src/routes/session/index.tsx`：undo、redo、copy-last-assistant、reverted user 计数、reverted suffix 隐藏；
+- `packages/app/src/components/session/session-context-tab.tsx`：revert 后 context user 过滤；
+- `packages/app/src/pages/session/use-session-commands.tsx`：visible user、undo/redo next boundary、viewport 定位；
+- `packages/app/src/pages/session/timeline/model.ts` 与 `message-timeline.tsx`：timeline visible/projected boundary；
+- `packages/app/src/utils/session.ts` 与 `server-compat.ts`：转换时保留 runtime chronology extension，不手写一个会丢字段的 marker 子集。
+
+选择“上一个/下一个/第一个隐藏 boundary”时不能只把 predicate 换掉后继续依赖 raw-ID-sorted array 的 `find/findLast`；应在候选集合中按 message tuple 选择最大/最小值。revert dock 的 suffix items 在 marker 带 time 时也按 tuple 排序；无 extension 的 fallback 保持 raw-ID 行为。ID equality、`parentID`、Map key 与纯 identity lookup 不变。
+
+本 follow-up 的前端范围限于 revert marker 派生的 chronology 决策。TUI `pending/queued`、child Session 排序以及 App/TUI 通用 cache 的其它 raw-ID ordering 是 rollout 前已存在的低严重度 UI chronology 风险，不是 review regression 的执行路径；本 PR 不借 marker 修复重写整个 client store。本文不再宣称“仓库所有 ID sort 都已迁移”，只保证 server Session chronology 与所有 legacy revert boundary consumer 不使用 raw marker ID 表达时间。
+
+legacy public `Session.Info.revert` 的 additive 字段需要按仓库规则运行 `./packages/sdk/js/script/build.ts`，并从 `packages/client` 运行 `bun run generate`。生成结果中可能出现 `packages/sdk/js/src/v2/gen/*`；这里的 `v2` 是 legacy JS SDK 的 API 目录名，不代表修改 V2 Session Core。所有 generated 文件只由生成器更新，禁止手改。
 
 ### 4.6 PartTable 使用持久化创建顺序
 
@@ -533,12 +707,12 @@ Part projector 和 Message projector 一样在首次 insert 固定 `time_created
 
 ```ts
 const cutoff = Date.now() - Duration.toMillis(RETENTION)
-const info = yield* fs.stat(file).pipe(Effect.catch(() => Effect.void))
+const info = yield * fs.stat(file).pipe(Effect.catch(() => Effect.void))
 const modified = info?.mtime.pipe(
   Option.map((date) => date.getTime()),
   Option.getOrElse(() => 0),
 )
-if (modified < cutoff) yield* fs.remove(file)
+if (modified < cutoff) yield * fs.remove(file)
 ```
 
 仅处理 `tool_` managed files；保留 unreadable/missing file 的现有 best-effort cleanup 语义。测试使用 `fs.utimes()` 设置真实旧 mtime，不再通过伪造 ID 时间表达文件年龄。
@@ -576,7 +750,24 @@ SessionPrompt.runLoop
   → 0 additional provider requests
 ```
 
-revert/fork/parts 使用同一 persisted chronology 或准确 identity boundary；tool cleanup 使用 `mtime`。因此同一个 encoded-ID wrap 不再进入任何持久化 Session chronology 决策。
+fork 使用准确 identity boundary；revert/parts 使用 marker 内 persisted chronology；tool cleanup 使用 `mtime`。因此同一个 encoded-ID wrap 不再进入这些持久化 Session chronology 决策。
+
+PR review 的缺失 boundary 序列修复后执行为：
+
+```text
+stage U2
+  → marker = { messageID: U2.id, messageTimeCreated: U2.time.created }
+
+delete U2
+  → marker 不变，U1/U3 仍存在
+
+cleanup
+  → compare(U1, marker) < 0  => keep U1
+  → compare(U3, marker) > 0  => remove U3
+  → clear marker
+```
+
+旧 DB marker 缺 `messageTimeCreated` 时，hydration 先按 old ID predecessor 规则取得 boundary time，返回同一 runtime 形态；该读取不改变 DB。part boundary 使用完全相同的两级 tuple：message suffix 先清理，target message 若仍存在再清理 part suffix。
 
 ---
 
@@ -606,27 +797,35 @@ comparator 仅在 `created(left) === created(right)` 时读取 ID。encoded-ID r
 
 `latest()` 与 prompt stop/error gate 都使用 persisted `(time_created,id)` comparator。若 terminal assistant 在 latest user 后创建，则 gate 成立；若 latest user 更新，则 gate 不成立。生产 rollover assistant 的 stale `parentID` 不参与 recovery，因此不会掩盖 chronology 上真正最新的 stopped assistant。并发 snapshot 的 causal ownership 语义保持既有行为，并明确留在 §2.6 非目标。
 
-#### Lemma 5：range consumer 不再解释 ID 内容
+#### Lemma 5：持久化 range 不依赖 boundary 实体存活
 
-revert/fork 先在 canonical ordered array 中通过 equality 解析 boundary，再按 index 切片。任何保持 ID identity 的编码格式、supplied ID 或 rollover 都不会改变 boundary position。
+new revert marker 在 target 存活时复制其 persisted chronology key。后续删除 target 只删除 MessageTable/PartTable row，不会改变 marker JSON；cleanup 对现存 rows 直接比较 tuple，因而不需要重新找到 equality boundary。fork 等瞬时 identity input 仍只在调用期间解析准确 target，不改变其既有契约。
 
 #### Lemma 6：part 与 file chronology 使用各自直接来源
 
 PartTable 的首次 `time_created` 与 file `mtime` 都不经过 Identifier 六字节编码。因此 part sequence 与 retention decision 不受 ID wrap 影响。
 
-由 Lemma 1-6，issue #13 的根因——raw ID 被提升为永久 chronology/range/retention source——在所有已发现 consumer 处被移除，而不是只掩盖 prompt busy-loop 症状。
+#### Lemma 7：legacy hydration 不给新数据重新引入 rollover
+
+raw-ID predecessor 只在 persisted marker 缺 chronology 字段时运行。new marker 从创建起已有 tuple，永不进入 fallback；所以 old marker 可能保留的 rollover 歧义不会传播给新 marker。hydration 无写副作用，反复读取不会逐步漂移或把推测值固化进数据库。
+
+#### Lemma 8：server、App 与 TUI 解释同一 cutoff
+
+legacy server 返回的 hydrated marker、cleanup comparator 和 legacy frontend comparator 都使用 `(messageTimeCreated,messageID)`。同一 message 对同一 marker 的比较符号一致，因此 server 计划删除的 suffix 与 UI 隐藏/undo/redo 选择的 suffix 一致。没有 extension 的 old server/V2 marker 单独走兼容 fallback，不改变这些实现的既有行为。
+
+由 Lemma 1-8，issue #13 的主执行路径和 legacy revert boundary consumer 不再把 raw ID 提升为永久 chronology/range/retention source；PR review 暴露的 missing-target 生命周期也被 marker 自身的 durable cutoff 覆盖，而不是只掩盖 `findIndex === -1` 症状。
 
 ### 5.2 不变量保持
 
 修复后保持以下既有不变量：
 
-- Message/Part ID 字符串、prefix、长度和 public schema 不变；
+- Message/Part ID 字符串、prefix 与长度不变；legacy revert public schema 只增加 optional chronology 字段，旧 client 可忽略、新 client 可连接旧 server；
 - ID equality、parentID、tail_start_id、messageID/partID lookup 语义不变；
 - `MessageV2.page()` cursor shape `{time,id}` 与分页方向不变；
 - `filterCompacted()` 的模型消费布局和 compaction boundary 不变；
 - parts 更新同一 ID 时保持原位置，不因 streaming update 重新排序；
 - prompt 的 finish/tool-call/orphan/error 优先级不变，仅把 terminal chronology 判定替换为 canonical comparator；
-- revert snapshot/diff 和 fork ID remap 逻辑不变，仅替换 range boundary 解析；
+- revert snapshot/diff 和 fork ID remap 逻辑不变；持久化 revert range 改由 marker tuple 解析；
 - CLI explicit anchor 行为优先于 fallback，local rows 仍是 process-local；
 - tool cleanup 仍只删除超过七天的 managed `tool_` 文件；
 - V2 `SessionMessageTable.seq`、`SessionInput.admitted_seq`、runner 与 history 不改动。
@@ -645,6 +844,14 @@ V1-IDENTITY-1:
 V1-TERMINAL-1:
   prompt stop/error gate 必须与 latest() 使用同一个 persisted chronology comparator，
   不得重新用 raw ID relational comparison。
+
+V1-REVERT-1:
+  新建 legacy revert marker 必须携带 message chronology；part marker 还必须携带
+  可用的 part chronology。cleanup 不得把 target identity 存活作为 suffix cleanup 前置条件。
+
+V1-REVERT-COMPAT-1:
+  old marker chronology 只在 read hydration 中按旧 ID 语义补全；不得写回、迁移、
+  发布伪 update event或修改 V2 Revert.State。
 ```
 
 ### 5.3 无回归引入
@@ -656,7 +863,10 @@ V1-TERMINAL-1:
 - **compaction layout 风险**：`filterCompacted()` 会重排 array；用 persisted comparator 而非 array max/last，并补 compaction/replay regression；
 - **same-millisecond 风险**：仍用 ID 作为 tie-breaker，锁定与 page SQL 相同结果；
 - **prompt tool-loop 风险**：保留 `hasToolCalls` 和 finish 条件，补普通 tool continuation regression；
-- **revert/fork boundary 风险**：补 boundary 前/本身/后的准确集合断言；
+- **revert/fork boundary 风险**：保留 fork identity 用例；revert 补 boundary 存活/删除、message/part、tuple 前/本身/后的准确集合断言；
+- **old marker 兼容风险**：补 exact/predecessor/空左侧 hydration，并直接读取 DB 证明 hydration 不回写；
+- **wire 兼容风险**：新字段保持 optional；legacy SDK regenerated type、old-server fallback 和 App compatibility converter 分别验证；
+- **frontend 选择风险**：undo/redo 不能依赖 raw-ID-sorted array 的 find/findLast，补 rollover + missing target 的 tuple min/max selector 用例；
 - **part streaming 风险**：首次 insert time 固定，补更新同一 part 不移动顺序；
 - **CLI replay 风险**：保留 explicit anchor 全套既有用例，并新增 rollover fallback；
 - **cleanup 风险**：采用已有 V2 实现形态，补 old/recent/unrelated/missing-stat 用例；
@@ -664,7 +874,7 @@ V1-TERMINAL-1:
 
 ### 5.4 明确保证上界
 
-本方案保证每个 encoded-ID rollover 都不会破坏 V1 Session message/part chronology。它不宣称 `time_created` 等价于 V2 durable sequence：wall-clock rollback、不可观察的同毫秒外部 admission 顺序仍在非目标内。若未来要求覆盖这些边界，应单独设计 V1 schema migration 或完成 V2 切换，不能继续扩展 ID comparator 猜测 epoch。
+本方案保证每个 encoded-ID rollover 都不会破坏已列出的 V1 server Session chronology 与 legacy revert boundary；new marker 在 target message/part 删除后仍能处理 suffix。它不宣称 `time_created` 等价于 V2 durable sequence，也不在本 PR 全面重写 legacy frontend cache：wall-clock rollback、不可观察的同毫秒 external admission 和 §4.5.3 明列的非-marker UI ordering 仍在非目标内。若未来要求覆盖这些边界，应单独设计 V1 schema/client-store migration 或完成 V2 切换，不能继续扩展 ID comparator 猜测 epoch。
 
 ---
 
@@ -672,62 +882,82 @@ V1-TERMINAL-1:
 
 所有 provider 相关用例使用现有进程内 `TestLLMServer`，不访问真实 API。测试从 `packages/opencode` 运行；不得从仓库根目录运行。
 
-| 类型 | 文件 / 计划用例 | 用例描述 | 状态（修复后回填） |
-|---|---|---|---|
-| 回归 | `test/session/message-v2.test.ts` — `selects the latest messages across the 36-bit timestamp rollover` | 使用真实 `Identifier.create(timestamp)` + `MessageV2.latest` 固化第一部分最小复现 | 已加并通过: `6784e5ad92` |
-| 回归 | `test/session/prompt.test.ts` — `loop exits without a provider request across the message ID rollover` | 固化生产形状 `U0,A0(tool-calls),U1,A1(parent=U0,stop)`；证明 canonical chronology 选择 A1 并零 provider request | 已更新并通过: `6784e5ad92` |
-| 新增 | `test/session/message-v2.test.ts` — `keeps tasks created after a pre-rollover finished assistant` | finished assistant 与 compaction owner 跨 wrap，tasks 只保留真实较新项 | 已加并通过: `6784e5ad92` |
-| 新增 | `test/session/messages-pagination.test.ts` — `paginates messages by persisted time across the ID rollover` | 多页 cursor 跨 wrap；无重复、无遗漏、每页顺序稳定 | 已加并通过: `6784e5ad92` |
-| 新增 | `test/session/messages-pagination.test.ts` — `orders parts by persisted creation time across the ID rollover` | `page/parts` 按持久化顺序一致，并验证后续更新不移动原 part | 已加并通过: `6784e5ad92` |
-| 新增 | `test/session/messages-pagination.test.ts` — `preserves the persisted creation time when a message is updated` | 同一 message 后续 update 不改变首次持久化 chronology | 已加并通过: `6784e5ad92` |
-| 新增 | `test/session/revert-compact.test.ts` — `cleanup honors the exact revert boundary across the ID rollover` | 保留 boundary 前缀并删除 boundary/后缀；既有 sequential revert/diff suites 同时全量通过 | 已加并通过: `6784e5ad92` |
-| 新增 | `test/session/messages-pagination.test.ts` — `fork stops at the exact message boundary across the ID rollover` | fork 只复制 boundary 前消息并正确 remap assistant parent | 已加并通过: `6784e5ad92` |
-| 新增 | `test/session/message-v2.test.ts` — `filterCompacted preserves latest chronology across the ID rollover` | compaction summary + retained tail + continue user 的模型重排不影响 latest | 已加并通过: `6784e5ad92` |
-| 兼容 | `test/session/prompt.test.ts` — `loop continues when finish is stop but assistant has tool parts` | finish=stop 但含 live tool call 时仍继续；无 tool 时退出 | 既有用例通过 |
-| 新增 | `test/cli/run/session-replay.test.ts` — `places missing-anchor local rows by creation time across the ID rollover` | 删除 raw message-ID fallback；保留 before/after anchors 与 failed-prompt ordering | 已加并通过: `6784e5ad92` |
-| 回归 | `test/tool/truncation.test.ts` — `deletes files older than 7 days and preserves recent files` | 使用 `fs.utimes` 固定真实 retention 边界 | 已更新并通过: `6784e5ad92` |
-| 新增 | `test/tool/truncation.test.ts` — `uses file mtime regardless of the encoded tool ID timestamp` | old mtime/new ID 删除；recent mtime/old-looking ID 保留 | 已加并通过: `6784e5ad92` |
-| 兼容 | `test/session/message-v2.test.ts`、`messages-pagination.test.ts` | conversion/latest/page/get/stream/parts/filterCompacted 全量 | 39 + 55 pass |
-| 兼容 | `test/session/revert-compact.test.ts`、`test/session/session.test.ts` | revert/fork 全量 | 8 + 7 pass |
-| 兼容 | `test/cli/run/session-replay.test.ts`、`stream.transport.test.ts` | local replay/anchor/resize replay 全量 | 14 + 30 pass |
-| 兼容 | `test/session/prompt.test.ts`、`test/server/session-prompt-overflow.test.ts` | prompt、#11/#12 overflow 与 API stub 回归 | 81 + 2 pass；1 个既有条件 skip |
-| 兼容 | `test/cli/run/run-process.test.ts` | finish/tool/continuation 与 subprocess 交叉行为 | 20 pass |
-| 兼容 | `test/tool/truncation.test.ts` | output、配置与 cleanup 全量 | 20 pass |
-| 类型 | `bun typecheck` from `packages/opencode` | 类型检查 | 通过 |
+| 类型 | 文件 / 计划用例                                                                                                                   | 用例描述                                                                                                                          | 状态（修复后回填）                 |
+| ---- | --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| 回归 | `test/session/message-v2.test.ts` — `selects the latest messages across the 36-bit timestamp rollover`                            | 使用真实 `Identifier.create(timestamp)` + `MessageV2.latest` 固化第一部分最小复现                                                 | 已加并通过: `6784e5ad92`           |
+| 回归 | `test/session/prompt.test.ts` — `loop exits without a provider request across the message ID rollover`                            | 固化生产形状 `U0,A0(tool-calls),U1,A1(parent=U0,stop)`；证明 canonical chronology 选择 A1 并零 provider request                   | 已更新并通过: `6784e5ad92`         |
+| 新增 | `test/session/message-v2.test.ts` — `keeps tasks created after a pre-rollover finished assistant`                                 | finished assistant 与 compaction owner 跨 wrap，tasks 只保留真实较新项                                                            | 已加并通过: `6784e5ad92`           |
+| 新增 | `test/session/messages-pagination.test.ts` — `paginates messages by persisted time across the ID rollover`                        | 多页 cursor 跨 wrap；无重复、无遗漏、每页顺序稳定                                                                                 | 已加并通过: `6784e5ad92`           |
+| 新增 | `test/session/messages-pagination.test.ts` — `orders parts by persisted creation time across the ID rollover`                     | `page/parts` 按持久化顺序一致，并验证后续更新不移动原 part                                                                        | 已加并通过: `6784e5ad92`           |
+| 新增 | `test/session/messages-pagination.test.ts` — `preserves the persisted creation time when a message is updated`                    | 同一 message 后续 update 不改变首次持久化 chronology                                                                              | 已加并通过: `6784e5ad92`           |
+| 新增 | `test/session/revert-compact.test.ts` — `cleanup honors the exact revert boundary across the ID rollover`                         | 保留 boundary 前缀并删除 boundary/后缀；既有 sequential revert/diff suites 同时全量通过                                           | 已加并通过: `6784e5ad92`           |
+| 回归 | `test/session/revert-compact.test.ts` — `cleanup removes the reverted suffix after its message boundary is deleted`               | 固化 review 的 `U1/U2/U3 → revert U2 → delete U2 → cleanup`；断言只保留 U1                                                        | 已加并通过 — 本轮 worktree         |
+| 新增 | `test/session/revert-compact.test.ts` — `cleanup removes later parts after its part boundary is deleted`                          | `P1/P2/P3 → revert P2 → delete P2` 后删除 P3、保留 P1，并继续删除较新 messages                                                    | 已加并通过 — 本轮 worktree         |
+| 新增 | 上述 message/part regressions                                                                                                     | new marker 写入 message/part persisted time；target 删除后 tuple cleanup 不受 raw ID wrap 影响                                    | 已断言 raw DB JSON 并通过          |
+| 兼容 | `test/session/revert-compact.test.ts` — legacy hydration cases                                                                    | 手工写入无 time 的 old marker，覆盖 exact target、deleted target predecessor、空左侧；读取后 runtime 有 boundary，原 DB JSON 不变 | 已加 2 例并通过 — 本轮 worktree    |
+| 新增 | `test/session/messages-pagination.test.ts` — `fork stops at the exact message boundary across the ID rollover`                    | fork 只复制 boundary 前消息并正确 remap assistant parent                                                                          | 已加并通过: `6784e5ad92`           |
+| 新增 | `test/session/message-v2.test.ts` — `filterCompacted preserves latest chronology across the ID rollover`                          | compaction summary + retained tail + continue user 的模型重排不影响 latest                                                        | 已加并通过: `6784e5ad92`           |
+| 兼容 | `test/session/prompt.test.ts` — `loop continues when finish is stop but assistant has tool parts`                                 | finish=stop 但含 live tool call 时仍继续；无 tool 时退出                                                                          | 既有用例通过                       |
+| 新增 | `test/cli/run/session-replay.test.ts` — `places missing-anchor local rows by creation time across the ID rollover`                | 删除 raw message-ID fallback；保留 before/after anchors 与 failed-prompt ordering                                                 | 已加并通过: `6784e5ad92`           |
+| 回归 | `test/tool/truncation.test.ts` — `deletes files older than 7 days and preserves recent files`                                     | 使用 `fs.utimes` 固定真实 retention 边界                                                                                          | 已更新并通过: `6784e5ad92`         |
+| 新增 | `test/tool/truncation.test.ts` — `uses file mtime regardless of the encoded tool ID timestamp`                                    | old mtime/new ID 删除；recent mtime/old-looking ID 保留                                                                           | 已加并通过: `6784e5ad92`           |
+| 兼容 | `test/session/message-v2.test.ts`、`messages-pagination.test.ts`                                                                  | conversion/latest/page/get/stream/parts/filterCompacted 全量                                                                      | 39 + 55 pass                       |
+| 兼容 | `test/session/revert-compact.test.ts`、`test/session/session.test.ts`                                                             | revert/fork 全量                                                                                                                  | 8 + 7 pass                         |
+| 兼容 | `test/cli/run/session-replay.test.ts`、`stream.transport.test.ts`                                                                 | local replay/anchor/resize replay 全量                                                                                            | 14 + 30 pass                       |
+| 兼容 | `test/session/prompt.test.ts`、`test/server/session-prompt-overflow.test.ts`                                                      | prompt、#11/#12 overflow 与 API stub 回归                                                                                         | 81 + 2 pass；1 个既有条件 skip     |
+| 兼容 | `test/cli/run/run-process.test.ts`                                                                                                | finish/tool/continuation 与 subprocess 交叉行为                                                                                   | 20 pass                            |
+| 兼容 | `test/tool/truncation.test.ts`                                                                                                    | output、配置与 cleanup 全量                                                                                                       | 20 pass                            |
+| 兼容 | `packages/app/src/utils/session.test.ts`、`server-compat.test.ts`                                                                 | legacy chronology extension 双向转换不丢失；无字段的 V2/old-server marker 保持 fallback                                           | 相关 App 定向测试 28 pass          |
+| 回归 | `packages/app/src/pages/session/timeline/model.test.ts` + chronology selector tests                                               | rollover 与 missing-target 时 visible/undo/redo/projection/dock 使用 tuple min/max/排序，不依赖 raw-ID array position             | 已加并通过                         |
+| 回归 | `packages/tui/test/util/session.test.ts`                                                                                          | TUI undo/redo/copy/render boundary 在 rollover 与 missing-target 时使用 marker tuple                                              | 5 pass；TUI 全量 195 pass / 1 skip |
+| 生成 | legacy SDK generated type check                                                                                                   | 运行 `./packages/sdk/js/script/build.ts` 后 new optional fields 出现在 legacy Session type；generated diff 仅来自脚本             | 已生成并通过 SDK typecheck         |
+| 类型 | `bun typecheck` from `packages/opencode`、`packages/app`、`packages/tui`、`packages/schema`、`packages/sdk/js`、`packages/client` | 受影响 package 类型检查                                                                                                           | 6 个 package 全部通过              |
 
-生产 DB 对照后的本地验证合计 276 pass、1 个既有条件 skip、0 fail；实现 commit 为 `6784e5ad92`。第一行与 prompt integration 两条均保留，unit comparator 不替代 loop-level proof。另已只读重放事故 Session durable events 至 seq `14744`，确认旧 raw latest 不退出、canonical chronology 选择 stopped assistant 并退出、parent-only predicate 不退出。
+原始修复的生产 DB 对照与本地验证合计 276 pass、1 个既有条件 skip、0 fail；实现 commit 为 `6784e5ad92`。第一行与 prompt integration 两条均保留，unit comparator 不替代 loop-level proof。另已只读重放事故 Session durable events 至 seq `14744`，确认旧 raw latest 不退出、canonical chronology 选择 stopped assistant 并退出、parent-only predicate 不退出。
+
+本轮 follow-up 验证：`packages/opencode` 完整 `test/session` 在允许 ephemeral localhost listener 后 473 pass / 7 skip / 1 todo / 0 fail；TUI 全量 195 pass / 1 skip / 0 fail；App 受影响四文件 28 pass / 0 fail。App 全量 unit 为 677 pass，唯一失败是未改动 i18n 目录的既有 locale parity（5 个缺失翻译 key）；Schema 定向 legacy test 2 pass，Schema 全量的 2 个既有 EventManifest 计数/顺序失败与本 diff 无关。App production Playwright benchmark 完成 build 后因环境缺 Chromium 未执行；同一 production selector 微基准（10,000 messages × 1,000）fallback 从 89.835ms 到 87.871ms，tuple path 59.541ms，无性能回归。
 
 ---
 
 ## 第七部分：代码更新清单
 
-| 文件 | 函数 / 当前行号 | 改动概述 | 状态（修复后回填） |
-|---|---|---|---|
-| `packages/opencode/src/id/id.ts` | `create`, `timestamp` / 51-77 | 保持编码不变；修正 monotonic/timestamp 注释，明确低 36 位周期 | 已改: `6784e5ad92` |
-| `packages/opencode/src/session/message-v2.ts` | `info` / 80-90 | 用 `row.time_created` 作为 hydrated message 创建时间 | 已改: `6784e5ad92` |
-| `packages/opencode/src/session/message-v2.ts` | `hydrate`, `parts` / 100-115, 490-506 | parts 按 `(time_created,id)` 排序 | 已改: `6784e5ad92` |
-| `packages/opencode/src/session/message-v2.ts` | 新 `compareChronology`; `latest` / 581-611 | 定义 canonical message chronology；替换 user/assistant/finished/task raw-ID comparisons | 已改: `6784e5ad92` |
-| `packages/opencode/src/session/prompt.ts` | `runLoop` / 1092-1127 | stop/error 复用 `compareChronology(lastUser,lastAssistant)` | 已修订并验证: `6784e5ad92` |
-| `packages/opencode/src/session/revert.ts` | `revert`, `cleanup` / 31-127 | 准确 boundary lookup + canonical array slice，移除 raw-ID range | 已改: `6784e5ad92` |
-| `packages/opencode/src/session/session.ts` | `fork` / 693-732 | 用准确 boundary identity 截止复制 | 已改: `6784e5ad92` |
-| `packages/opencode/src/cli/cmd/run/types.ts` | `LocalReplayRow` / 332-337 | 增加 process-local `createdAt` 与 before/after anchors | 已改: `6784e5ad92` |
-| `packages/opencode/src/cli/cmd/run/runtime.ts` | `rememberLocal`, prompt failure / 365-369, 644-694 | 记录 local chronology、首个输出 before anchor 与最后输出 after anchor | 已改: `6784e5ad92` |
-| `packages/opencode/src/cli/cmd/run/session-replay.ts` | `replayLocalRows` / 263-335 | anchors 优先；missing-anchor fallback 使用 explicit chronology，不比较 raw message ID | 已改: `6784e5ad92` |
-| `packages/opencode/src/tool/truncate.ts` | `cleanup` / 51-68 | 按文件 `mtime` retention，移除 `Identifier.timestamp` 依赖 | 已改: `6784e5ad92` |
-| `packages/opencode/test/session/message-v2.test.ts` | latest/filter suites | 加 latest、task、filterCompacted rollover 用例 | 已加: `6784e5ad92` |
-| `packages/opencode/test/session/messages-pagination.test.ts` | page/get/part/fork suites | 加 pagination、持久化时间、part、fork rollover 用例 | 已加: `6784e5ad92` |
-| `packages/opencode/test/session/prompt.test.ts` | prompt loop suites | 加生产 DB 形状的 stopped assistant 零请求用例 | 已修订并通过: `6784e5ad92` |
-| `packages/opencode/test/session/revert-compact.test.ts` | revert/cleanup suites | 加跨 wrap exact boundary 用例 | 已加: `6784e5ad92` |
-| `packages/opencode/test/cli/run/session-replay.test.ts`、`stream.transport.test.ts` | local replay suites | 加显式 chronology rollover fallback、before anchor 与 fixture | 已加: `6784e5ad92` |
-| `packages/opencode/test/tool/truncation.test.ts` | cleanup suite | 改为 mtime fixture并加 rollover regression | 已加: `6784e5ad92` |
-| `docs/fixes/session-fix-message-id-wraparound.md` | 全文 | 回填最终范围、non-goals、测试、代码状态与实现 commit | 已提交: `57dab0571a`；PR 状态由后续文档 commit 回填 |
+| 文件                                                                                                                                         | 函数 / 当前行号                                    | 改动概述                                                                                                                  | 状态（修复后回填）          |
+| -------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| `packages/opencode/src/id/id.ts`                                                                                                             | `create`, `timestamp` / 51-77                      | 保持编码不变；修正 monotonic/timestamp 注释，明确低 36 位周期                                                             | 已改: `6784e5ad92`          |
+| `packages/opencode/src/session/message-v2.ts`                                                                                                | `info` / 80-90                                     | 用 `row.time_created` 作为 hydrated message 创建时间                                                                      | 已改: `6784e5ad92`          |
+| `packages/opencode/src/session/message-v2.ts`                                                                                                | `hydrate`, `parts` / 100-115, 490-506              | parts 按 `(time_created,id)` 排序                                                                                         | 已改: `6784e5ad92`          |
+| `packages/opencode/src/session/message-v2.ts`                                                                                                | 新 `compareChronology`; `latest` / 581-611         | 定义 canonical message chronology；替换 user/assistant/finished/task raw-ID comparisons                                   | 已改: `6784e5ad92`          |
+| `packages/opencode/src/session/prompt.ts`                                                                                                    | `runLoop` / 1092-1127                              | stop/error 复用 `compareChronology(lastUser,lastAssistant)`                                                               | 已修订并验证: `6784e5ad92`  |
+| `packages/opencode/src/session/revert.ts`                                                                                                    | `revert`, `cleanup` / 31-127                       | 原始修复已移除 raw-ID range；follow-up 在 stage 捕获 marker chronology，diff/cleanup 按 tuple，target 缺失时仍清理 suffix | 已改并验证 — 本轮 worktree  |
+| `packages/opencode/src/session/session.ts`                                                                                                   | legacy `Revert`, `fromRow`/read hydration, `toRow` | 增加 optional wire chronology；old marker 只读补全；new marker JSON 保留字段；不回写、不发布事件                          | 已改并验证 — 本轮 worktree  |
+| `packages/schema/src/v1/session.ts`                                                                                                          | V1 `SessionRevert` event/session contract          | 同步 optional chronology，使 legacy Updated event 投影不丢字段；不修改 current `Revert.State`                             | 已改并验证 — 本轮 worktree  |
+| `packages/opencode/src/session/session.ts`                                                                                                   | `fork` / 693-732                                   | 用准确 boundary identity 截止复制                                                                                         | 已改: `6784e5ad92`          |
+| `packages/opencode/src/cli/cmd/run/types.ts`                                                                                                 | `LocalReplayRow` / 332-337                         | 增加 process-local `createdAt` 与 before/after anchors                                                                    | 已改: `6784e5ad92`          |
+| `packages/opencode/src/cli/cmd/run/runtime.ts`                                                                                               | `rememberLocal`, prompt failure / 365-369, 644-694 | 记录 local chronology、首个输出 before anchor 与最后输出 after anchor                                                     | 已改: `6784e5ad92`          |
+| `packages/opencode/src/cli/cmd/run/session-replay.ts`                                                                                        | `replayLocalRows` / 263-335                        | anchors 优先；missing-anchor fallback 使用 explicit chronology，不比较 raw message ID                                     | 已改: `6784e5ad92`          |
+| `packages/opencode/src/tool/truncate.ts`                                                                                                     | `cleanup` / 51-68                                  | 按文件 `mtime` retention，移除 `Identifier.timestamp` 依赖                                                                | 已改: `6784e5ad92`          |
+| `packages/opencode/test/session/message-v2.test.ts`                                                                                          | latest/filter suites                               | 加 latest、task、filterCompacted rollover 用例                                                                            | 已加: `6784e5ad92`          |
+| `packages/opencode/test/session/messages-pagination.test.ts`                                                                                 | page/get/part/fork suites                          | 加 pagination、持久化时间、part、fork rollover 用例                                                                       | 已加: `6784e5ad92`          |
+| `packages/opencode/test/session/prompt.test.ts`                                                                                              | prompt loop suites                                 | 加生产 DB 形状的 stopped assistant 零请求用例                                                                             | 已修订并通过: `6784e5ad92`  |
+| `packages/opencode/test/session/revert-compact.test.ts`                                                                                      | revert/cleanup suites                              | 加跨 wrap exact boundary 用例                                                                                             | 已加: `6784e5ad92`          |
+| `packages/opencode/test/session/revert-compact.test.ts`、`session-schema.test.ts`                                                            | missing boundary / marker hydration/schema suites  | 加 message/part target 删除、new marker rollover、old marker predecessor、DB 不回写与 optional encoding 用例              | 已改并验证 — 本轮 worktree  |
+| `packages/opencode/test/cli/run/session-replay.test.ts`、`stream.transport.test.ts`                                                          | local replay suites                                | 加显式 chronology rollover fallback、before anchor 与 fixture                                                             | 已加: `6784e5ad92`          |
+| `packages/opencode/test/tool/truncation.test.ts`                                                                                             | cleanup suite                                      | 改为 mtime fixture并加 rollover regression                                                                                | 已加: `6784e5ad92`          |
+| `packages/tui/src/routes/session/index.tsx` + `src/util/session.ts`                                                                          | undo/redo/copy/revert render selectors             | marker relational comparisons改为 tuple；next/previous 用 tuple selection；missing target 时 dock 移到首个 suffix message | 已改并验证 — 本轮 worktree  |
+| `packages/tui/test/util/session.test.ts`                                                                                                     | revert chronology selectors                        | 加 rollover、missing target、old-server fallback                                                                          | 已改并验证 — 本轮 worktree  |
+| `packages/app/src/components/session/session-context-tab.tsx`、`pages/session.tsx`、`pages/session/use-session-commands.tsx`、timeline files | legacy revert selectors                            | context/timeline/undo/redo/projection/dock 使用 marker tuple；V2/no-extension 保留现状                                    | 已改并验证 — 本轮 worktree  |
+| `packages/app/src/utils/session.ts`、`server-compat.ts`                                                                                      | Session compatibility conversion                   | 保留 legacy marker chronology runtime extension；不修改 V2 schema                                                         | 已改并验证 — 本轮 worktree  |
+| `packages/app/src/utils/session.test.ts`、`server-compat.test.ts`、timeline selector tests                                                   | converter/selector suites                          | 加字段保留、tuple boundary 与 fallback 回归                                                                               | 已改并验证 — 本轮 worktree  |
+| `packages/sdk/js/src/v2/gen/types.gen.ts`                                                                                                    | generated legacy Session type                      | 由 `./packages/sdk/js/script/build.ts` 生成 optional marker chronology；未手改                                            | 已生成并通过 typecheck      |
+| `packages/client/src/generated/*`、`generated-effect/*`                                                                                      | current Protocol client                            | 已运行 `bun run generate` / `check:generated`；该 current contract不派生 legacy instance Session response                 | 已运行，无 diff，check 通过 |
+| `docs/fixes/session-fix-message-id-wraparound.md`                                                                                            | 全文                                               | 原始方案已提交；补 PR review 根因、marker 契约、只读 hydration、前端范围及 follow-up 清单                                 | 已回填实现与验证，待提交    |
 
 明确不修改：
 
 - `packages/schema/src/identifier.ts` 的公共 ID 格式；
 - `packages/core/src/session/sql.ts` / database migrations；
-- V2 `SessionMessageTable.seq`、`SessionInputTable`、runner/history/revert；
-- Protocol、Server `HttpApi`、legacy SDK generated files；
+- `packages/schema/src/revert.ts`、V2 `SessionMessageTable.seq`、`SessionInputTable`、runner/history/revert；
+- current Protocol、current/V2 `Revert.State` 与 V2 Session Core；legacy Server `HttpApi` 只做 additive response 扩展，generated client/SDK 只允许由既有生成器更新；
 - PR #14 的 compaction concurrent admission/replay follow-up。
 
 ---
@@ -736,18 +966,18 @@ V1-TERMINAL-1:
 
 本修复新增/明确了 V1 内部可观察行为不变量，因此不能写“无文档更新”。仓库搜索未发现已有 session chronology design/spec 或该模块的 `expectations.md`；本文作为 legacy V1 修复契约载体。
 
-| 文档路径 | 要改什么 | 状态（修复后回填） |
-|---|---|---|
-| `docs/fixes/session-fix-message-id-wraparound.md` | 记录八部分方案并回填测试结果、实际文件、non-goals 与实现 commit | 已提交: `57dab0571a`；PR 状态由后续文档 commit 回填 |
-| GitHub issue #13 | 实施后回填最终方案、测试证据并关闭；明确 IDs 仍可回卷但 consumer 不再把它当 chronology | PR #15 已声明 `Closes #13`，待合并关闭 |
-| stacked PR body | 基于 PR #14 创建独立 PR，增加 #13 summary、测试结果与 `Closes #13`；不把它描述为 context-overflow 根因，也不扩大 PR #14 本身范围 | 已创建 [PR #15](https://github.com/lihaokun/opencode/pull/15)，base=`dev`，并明确 `Depends on #14` |
+| 文档路径                                          | 要改什么                                                                                                                  | 状态（修复后回填）                              |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| `docs/fixes/session-fix-message-id-wraparound.md` | 保留原始八部分结果，并补 review regression、legacy marker schema/hydration/cleanup、App/TUI 范围；实现后回填测试与 commit | 原始文档 `57dab0571a`；follow-up 已回填，待提交 |
+| GitHub issue #13                                  | 实施后回填最终方案、测试证据并关闭；明确 IDs 仍可回卷但 consumer 不再把它当 chronology                                    | PR #15 已声明 `Closes #13`，待合并关闭          |
+| stacked PR body / review thread                   | 实施后说明 missing-target 根因、old marker 无写回兼容、legacy-only/V2 non-goal，并附新增测试证据                          | PR 已创建；follow-up 待代码与验证完成后更新     |
 
 不需要同步：
 
 - `docs/fixes/session-fix-context-overflow.md`：该文档已明确 compaction concurrent admission 是独立 follow-up；ID rollover 与 overflow 只是可能的下游相关，不修改 #11/#12 的正确性论证；
 - research/design/spec/expectations：仓库目前没有 legacy Session chronology 的对应契约文档或 audit 子计划；
 - `FORK_INSTALL.md`：安装/版本契约不变；
-- SDK/OpenAPI：无 public Protocol 或 Server `HttpApi` 变化，不运行 `bun run generate` 或 legacy SDK regeneration。
+- current Protocol：不变；legacy Server `HttpApi` Session response 有 additive 字段，因此从 `packages/client` 运行 `bun run generate`，并单独运行 legacy JS SDK build。
 
 ---
 
@@ -760,5 +990,8 @@ V1-TERMINAL-1:
 - 没有宣称本修复解决 PR #14 的 compaction concurrent admission；
 - 没有宣称 chronology 修复 concurrent snapshot ownership 或 runner 最终 snapshot 与 idle transition 之间的 lost-wake；
 - 没有把 V2 durable `seq` migration 偷渡进 V1 compatibility patch；
+- 没有把 target delete 禁掉，也没有在 `deleteMessage` / `deletePart` 中加入 marker migration 或事务联动；
+- old marker hydration 不写回 DB、不发布 update event；new marker 从创建起写入完整 tuple；
+- legacy App/TUI 只在 marker extension 存在时使用 tuple，V2/no-extension fallback 不改语义；
 - 同根的 part ordering、CLI fallback 与 tool retention 已进入测试/代码清单，而不是只修 prompt 一行；
-- 方案已由用户确认；生产 DB 对照后的 chronology terminal 修订已完成验证并推送，PR #15 已创建，issue #13 待 PR 合并关闭。
+- 原始 chronology terminal 修订已完成验证并推送；PR review follow-up 已按确认方案实施并通过定向、完整 session、TUI、生成器与 typecheck 验证，当前只剩 commit/PR review thread 更新。

@@ -1,6 +1,50 @@
 import { describe, expect, test } from "bun:test"
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
-import { normalizeSessionMessages } from "./session-message"
+import {
+  compareMessageToRevert,
+  earliestMessage,
+  latestMessage,
+  normalizeSessionMessages,
+  selectRevertedMessages,
+} from "./session-message"
+
+describe("message chronology", () => {
+  test("orders revert boundaries by creation time before ID", () => {
+    const before = { id: "msg_ffff", time: { created: 100 } }
+    const boundary = { messageID: "msg_0001", messageTimeCreated: 200 }
+    const after = { id: "msg_0002", time: { created: 300 } }
+
+    expect(compareMessageToRevert(before, boundary)).toBeLessThan(0)
+    expect(compareMessageToRevert(after, boundary)).toBeGreaterThan(0)
+  })
+
+  test("preserves raw ID fallback for markers without chronology", () => {
+    expect(compareMessageToRevert({ id: "msg_ffff", time: { created: 100 } }, { messageID: "msg_0001" })).toBe(1)
+  })
+
+  test("selects chronological neighbors from raw-ID ordered arrays", () => {
+    const messages = [
+      { id: "msg_0002", time: { created: 300 } },
+      { id: "msg_ffff", time: { created: 100 } },
+      { id: "msg_0001", time: { created: 200 } },
+    ]
+
+    expect(latestMessage(messages, (message) => message.time.created < 300)?.id).toBe("msg_0001")
+    expect(earliestMessage(messages, (message) => message.time.created > 100)?.id).toBe("msg_0001")
+  })
+
+  test("orders reverted messages by chronology when the marker carries time", () => {
+    const messages = [
+      { id: "msg_0002", time: { created: 300 } },
+      { id: "msg_fffe", time: { created: 100 } },
+      { id: "msg_ffff", time: { created: 200 } },
+    ]
+
+    expect(
+      selectRevertedMessages(messages, { messageID: "msg_ffff", messageTimeCreated: 200 }).map((message) => message.id),
+    ).toEqual(["msg_ffff", "msg_0002"])
+  })
+})
 
 describe("normalizeSessionMessages", () => {
   test("projects current turns into stable legacy rendering records", () => {

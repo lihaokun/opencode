@@ -75,11 +75,7 @@ function sessionInfo(session: Session): SessionInfo {
     title: session.title,
     location: { directory: session.directory, workspaceID: session.workspaceID },
     subpath: session.path,
-    revert: session.revert && {
-      messageID: session.revert.messageID,
-      partID: session.revert.partID,
-      snapshot: session.revert.snapshot,
-    },
+    revert: session.revert && { ...session.revert },
   }
 }
 
