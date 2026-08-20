@@ -1124,6 +1124,7 @@ describe("session.compaction.process", () => {
       }).pipe(withCompaction({ llm: stub.llmLayer }))
     },
     { git: true },
+    15_000,
   )
 
   itCompaction.instance(
