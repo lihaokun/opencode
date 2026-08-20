@@ -249,15 +249,38 @@ describe("Truncate", () => {
 
         yield* fs.makeDirectory(Truncate.DIR, { recursive: true })
 
-        const old = path.join(Truncate.DIR, Identifier.create("tool", "ascending", Date.now() - 10 * DAY_MS))
-        const recent = path.join(Truncate.DIR, Identifier.create("tool", "ascending", Date.now() - 3 * DAY_MS))
+        const old = path.join(Truncate.DIR, Identifier.create("tool", "ascending"))
+        const recent = path.join(Truncate.DIR, Identifier.create("tool", "ascending"))
 
         yield* writeFileStringScoped(old, "old content")
         yield* writeFileStringScoped(recent, "recent content")
+        const expired = new Date(Date.now() - 10 * DAY_MS)
+        yield* fs.utimes(old, expired, expired)
         yield* svc.cleanup()
 
         expect(yield* fs.exists(old)).toBe(false)
         expect(yield* fs.exists(recent)).toBe(true)
+      }),
+    )
+
+    it.live("uses file mtime regardless of the encoded tool ID timestamp", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const fs = yield* FileSystem.FileSystem
+
+        yield* fs.makeDirectory(Truncate.DIR, { recursive: true })
+
+        const oldMtime = path.join(Truncate.DIR, Identifier.create("tool", "ascending", Date.now()))
+        const recentMtime = path.join(Truncate.DIR, Identifier.create("tool", "ascending", 2 ** 36 - 1))
+        yield* writeFileStringScoped(oldMtime, "old by mtime")
+        yield* writeFileStringScoped(recentMtime, "recent by mtime")
+        const expired = new Date(Date.now() - 10 * DAY_MS)
+        yield* fs.utimes(oldMtime, expired, expired)
+
+        yield* svc.cleanup()
+
+        expect(yield* fs.exists(oldMtime)).toBe(false)
+        expect(yield* fs.exists(recentMtime)).toBe(true)
       }),
     )
   })

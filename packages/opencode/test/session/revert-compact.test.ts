@@ -16,10 +16,21 @@ import { provideTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Identifier } from "../../src/id/id"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionTable } from "@opencode-ai/core/session/sql"
+import { eq } from "drizzle-orm"
 
 const it = testEffect(
   LayerNode.compile(
-    LayerNode.group([Session.node, SessionRevert.node, Snapshot.node, SessionProjector.node, CrossSpawnSpawner.node]),
+    LayerNode.group([
+      Session.node,
+      SessionRevert.node,
+      Snapshot.node,
+      SessionProjector.node,
+      CrossSpawnSpawner.node,
+      Database.node,
+    ]),
   ),
 )
 
@@ -421,6 +432,291 @@ describe("revert + compact workflow", () => {
           expect(ids).toContain(a1.id)
           expect(ids).not.toContain(u2.id)
           expect(ids).not.toContain(a2.id)
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live(
+    "cleanup honors the exact revert boundary across the ID rollover",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const revert = yield* SessionRevert.Service
+          const info = yield* session.create({})
+          const before = 2 ** 36 - 2
+          const after = 2 ** 36 + 1
+          const u1 = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", before)),
+            role: "user",
+            sessionID: info.id,
+            agent: "default",
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
+            time: { created: before },
+          })
+          const a1 = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", before + 1)),
+            role: "assistant",
+            sessionID: info.id,
+            mode: "default",
+            agent: "default",
+            path: { cwd: dir, root: dir },
+            cost: 0,
+            tokens,
+            modelID: ModelV2.ID.make("gpt-4"),
+            providerID: ProviderV2.ID.make("openai"),
+            parentID: u1.id,
+            time: { created: before + 1 },
+            finish: "end_turn",
+          })
+          const u2 = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", after)),
+            role: "user",
+            sessionID: info.id,
+            agent: "default",
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
+            time: { created: after },
+          })
+          yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", after + 1)),
+            role: "assistant",
+            sessionID: info.id,
+            mode: "default",
+            agent: "default",
+            path: { cwd: dir, root: dir },
+            cost: 0,
+            tokens,
+            modelID: ModelV2.ID.make("gpt-4"),
+            providerID: ProviderV2.ID.make("openai"),
+            parentID: u2.id,
+            time: { created: after + 1 },
+            finish: "end_turn",
+          })
+          yield* session.setRevert({
+            sessionID: info.id,
+            revert: { messageID: u2.id },
+            summary: { additions: 0, deletions: 0, files: 0 },
+          })
+
+          yield* revert.cleanup(yield* session.get(info.id))
+
+          expect(u1.id > u2.id).toBe(true)
+          expect((yield* session.messages({ sessionID: info.id })).map((message) => message.info.id)).toEqual([
+            u1.id,
+            a1.id,
+          ])
+          yield* session.remove(info.id)
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live(
+    "cleanup removes the reverted suffix after its message boundary is deleted",
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const revert = yield* SessionRevert.Service
+          const database = yield* Database.Service
+          const info = yield* session.create({})
+          const before = 2 ** 36 - 1
+          const after = 2 ** 36 + 1
+          const u1 = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", before)),
+            role: "user",
+            sessionID: info.id,
+            agent: "default",
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
+            time: { created: before },
+          })
+          yield* text(info.id, u1.id, "before")
+          const u2 = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", after)),
+            role: "user",
+            sessionID: info.id,
+            agent: "default",
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
+            time: { created: after },
+          })
+          yield* text(info.id, u2.id, "boundary")
+          const u3 = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", after + 1)),
+            role: "user",
+            sessionID: info.id,
+            agent: "default",
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
+            time: { created: after + 1 },
+          })
+          yield* text(info.id, u3.id, "after")
+
+          yield* revert.revert({ sessionID: info.id, messageID: u2.id })
+          const staged = yield* session.get(info.id)
+          expect(staged.revert).toMatchObject({ messageID: u2.id, messageTimeCreated: after })
+          const stored = yield* database.db
+            .select({ revert: SessionTable.revert })
+            .from(SessionTable)
+            .where(eq(SessionTable.id, info.id))
+            .get()
+            .pipe(Effect.orDie)
+          expect(stored?.revert).toMatchObject({ messageID: u2.id, messageTimeCreated: after })
+
+          yield* session.removeMessage({ sessionID: info.id, messageID: u2.id })
+          yield* revert.cleanup(yield* session.get(info.id))
+
+          expect(u1.id > u2.id).toBe(true)
+          expect((yield* session.messages({ sessionID: info.id })).map((message) => message.info.id)).toEqual([u1.id])
+          expect((yield* session.get(info.id)).revert).toBeUndefined()
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live(
+    "cleanup removes later parts after its part boundary is deleted",
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const revert = yield* SessionRevert.Service
+          const database = yield* Database.Service
+          const info = yield* session.create({})
+          const u1 = yield* user(info.id)
+          const p1 = yield* text(info.id, u1.id, "before")
+          const p2 = yield* tool(info.id, u1.id)
+          const p3 = yield* text(info.id, u1.id, "after")
+          const u2 = yield* user(info.id)
+          yield* text(info.id, u2.id, "later message")
+
+          yield* revert.revert({ sessionID: info.id, messageID: u1.id, partID: p2.id })
+          const staged = yield* session.get(info.id)
+          expect(staged.revert?.messageID).toBe(u1.id)
+          expect(staged.revert?.partID).toBe(p2.id)
+          expect(staged.revert?.messageTimeCreated).toBe(u1.time.created)
+          expect(staged.revert?.partTimeCreated).toBeNumber()
+          const stored = yield* database.db
+            .select({ revert: SessionTable.revert })
+            .from(SessionTable)
+            .where(eq(SessionTable.id, info.id))
+            .get()
+            .pipe(Effect.orDie)
+          expect(stored?.revert).toMatchObject({
+            messageID: u1.id,
+            messageTimeCreated: u1.time.created,
+            partID: p2.id,
+            partTimeCreated: staged.revert?.partTimeCreated,
+          })
+
+          yield* session.removePart({ sessionID: info.id, messageID: u1.id, partID: p2.id })
+          yield* revert.cleanup(yield* session.get(info.id))
+
+          const messages = yield* session.messages({ sessionID: info.id })
+          expect(messages.map((message) => message.info.id)).toEqual([u1.id])
+          expect(messages[0]?.parts.map((part) => part.id)).toEqual([p1.id])
+          expect(messages[0]?.parts.map((part) => part.id)).not.toContain(p3.id)
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live(
+    "hydrates legacy revert chronology without persisting it",
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const database = yield* Database.Service
+          const info = yield* session.create({})
+          const u1 = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", 100)),
+            role: "user",
+            sessionID: info.id,
+            agent: "default",
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
+            time: { created: 100 },
+          })
+          const u2 = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", 200)),
+            role: "user",
+            sessionID: info.id,
+            agent: "default",
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
+            time: { created: 200 },
+          })
+          const u3 = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", 300)),
+            role: "user",
+            sessionID: info.id,
+            agent: "default",
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
+            time: { created: 300 },
+          })
+          yield* session.setRevert({
+            sessionID: info.id,
+            revert: { messageID: u2.id },
+            summary: { additions: 0, deletions: 0, files: 0 },
+          })
+          yield* session.removeMessage({ sessionID: info.id, messageID: u2.id })
+
+          const before = yield* database.db
+            .select({ revert: SessionTable.revert })
+            .from(SessionTable)
+            .where(eq(SessionTable.id, info.id))
+            .get()
+            .pipe(Effect.orDie)
+          expect(String(before?.revert?.messageID)).toBe(String(u2.id))
+          expect(before?.revert).not.toHaveProperty("messageTimeCreated")
+
+          const hydrated = yield* session.get(info.id)
+          expect(hydrated.revert).toMatchObject({ messageID: u2.id, messageTimeCreated: u1.time.created })
+
+          const after = yield* database.db
+            .select({ revert: SessionTable.revert })
+            .from(SessionTable)
+            .where(eq(SessionTable.id, info.id))
+            .get()
+            .pipe(Effect.orDie)
+          expect(after?.revert).toEqual(before?.revert)
+
+          const revert = yield* SessionRevert.Service
+          yield* revert.cleanup(hydrated)
+          expect((yield* session.messages({ sessionID: info.id })).map((message) => message.info.id)).toEqual([u1.id])
+          expect((yield* session.messages({ sessionID: info.id })).map((message) => message.info.id)).not.toContain(
+            u3.id,
+          )
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live(
+    "hydrates a legacy revert boundary before the first remaining message",
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const revert = yield* SessionRevert.Service
+          const info = yield* session.create({})
+          const boundary = MessageID.make(Identifier.create("msg", "ascending", 100))
+          const message = yield* session.updateMessage({
+            id: MessageID.make(Identifier.create("msg", "ascending", 200)),
+            role: "user",
+            sessionID: info.id,
+            agent: "default",
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
+            time: { created: 200 },
+          })
+          yield* session.setRevert({
+            sessionID: info.id,
+            revert: { messageID: boundary },
+            summary: { additions: 0, deletions: 0, files: 0 },
+          })
+
+          const hydrated = yield* session.get(info.id)
+          expect(hydrated.revert?.messageTimeCreated).toBe(message.time.created)
+          yield* revert.cleanup(hydrated)
+          expect(yield* session.messages({ sessionID: info.id })).toEqual([])
         }),
       { git: true },
     ),

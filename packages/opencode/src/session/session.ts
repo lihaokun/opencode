@@ -24,9 +24,11 @@ import { like } from "drizzle-orm"
 import { sql } from "drizzle-orm"
 import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
+import { lte } from "drizzle-orm"
 import { or } from "drizzle-orm"
+import { asc } from "drizzle-orm"
 import type { SQL } from "drizzle-orm"
-import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { MessageV2 } from "./message-v2"
 import type { InstanceContext } from "../project/instance-context"
@@ -67,12 +69,20 @@ export function fromRow(row: SessionRow): Info {
         }
       : undefined
   const share = row.share_url ? { url: row.share_url } : undefined
-  const revert = row.revert
+  const storedRevert = row.revert as
+    | (NonNullable<typeof row.revert> & {
+        messageTimeCreated?: number
+        partTimeCreated?: number
+      })
+    | null
+  const revert = storedRevert
     ? {
-        messageID: MessageID.make(row.revert.messageID),
-        partID: row.revert.partID ? PartID.make(row.revert.partID) : undefined,
-        snapshot: row.revert.snapshot,
-        diff: row.revert.diff,
+        messageID: MessageID.make(storedRevert.messageID),
+        messageTimeCreated: storedRevert.messageTimeCreated,
+        partID: storedRevert.partID ? PartID.make(storedRevert.partID) : undefined,
+        partTimeCreated: storedRevert.partTimeCreated,
+        snapshot: storedRevert.snapshot,
+        diff: storedRevert.diff,
       }
     : undefined
   return {
@@ -145,7 +155,9 @@ export function toRow(info: Info) {
     revert: info.revert
       ? {
           messageID: SessionMessage.ID.make(info.revert.messageID),
+          messageTimeCreated: info.revert.messageTimeCreated,
           partID: info.revert.partID,
+          partTimeCreated: info.revert.partTimeCreated,
           snapshot: info.revert.snapshot,
           diff: info.revert.diff,
         }
@@ -157,6 +169,80 @@ export function toRow(info: Info) {
     time_archived: info.time.archived,
   }
 }
+
+function hydrateRow(db: Database.Interface["db"], row: SessionRow) {
+  return Effect.gen(function* () {
+    const info = fromRow(row)
+    if (!info.revert) return info
+
+    const messageTimeCreated =
+      info.revert.messageTimeCreated ?? (yield* legacyMessageBoundary(db, info.id, info.revert.messageID))
+    const partTimeCreated =
+      !info.revert.partID || info.revert.partTimeCreated !== undefined
+        ? info.revert.partTimeCreated
+        : yield* legacyPartBoundary(db, info.id, info.revert.messageID, info.revert.partID)
+
+    return {
+      ...info,
+      revert: {
+        ...info.revert,
+        messageTimeCreated,
+        ...(partTimeCreated !== undefined && { partTimeCreated }),
+      },
+    }
+  })
+}
+
+const legacyMessageBoundary = Effect.fnUntraced(function* (
+  db: Database.Interface["db"],
+  sessionID: SessionID,
+  messageID: MessageID,
+) {
+  // Old markers only stored IDs. Preserve their original raw-ID cutoff when deriving
+  // an in-memory time; hydrateRow deliberately never writes this value back.
+  const predecessor = yield* db
+    .select({ time_created: MessageTable.time_created })
+    .from(MessageTable)
+    .where(and(eq(MessageTable.session_id, sessionID), lte(MessageTable.id, messageID)))
+    .orderBy(desc(MessageTable.id))
+    .get()
+    .pipe(Effect.orDie)
+  if (predecessor) return predecessor.time_created
+
+  const earliest = yield* db
+    .select({ time_created: MessageTable.time_created })
+    .from(MessageTable)
+    .where(eq(MessageTable.session_id, sessionID))
+    .orderBy(asc(MessageTable.time_created), asc(MessageTable.id))
+    .get()
+    .pipe(Effect.orDie)
+  return earliest?.time_created ?? 0
+})
+
+const legacyPartBoundary = Effect.fnUntraced(function* (
+  db: Database.Interface["db"],
+  sessionID: SessionID,
+  messageID: MessageID,
+  partID: PartID,
+) {
+  const predecessor = yield* db
+    .select({ time_created: PartTable.time_created })
+    .from(PartTable)
+    .where(and(eq(PartTable.session_id, sessionID), eq(PartTable.message_id, messageID), lte(PartTable.id, partID)))
+    .orderBy(desc(PartTable.id))
+    .get()
+    .pipe(Effect.orDie)
+  if (predecessor) return predecessor.time_created
+
+  const earliest = yield* db
+    .select({ time_created: PartTable.time_created })
+    .from(PartTable)
+    .where(and(eq(PartTable.session_id, sessionID), eq(PartTable.message_id, messageID)))
+    .orderBy(asc(PartTable.time_created), asc(PartTable.id))
+    .get()
+    .pipe(Effect.orDie)
+  return earliest?.time_created
+})
 
 function getForkedTitle(title: string): string {
   const match = title.match(/^(.+) \(fork #(\d+)\)$/)
@@ -208,7 +294,9 @@ const Time = Schema.Struct({
 
 const Revert = Schema.Struct({
   messageID: MessageID,
+  messageTimeCreated: optional(NonNegativeInt),
   partID: optional(PartID),
+  partTimeCreated: optional(NonNegativeInt),
   snapshot: optional(Schema.String),
   diff: optional(Schema.String),
 })
@@ -448,6 +536,10 @@ export interface Interface {
   readonly setWorkspace: (input: { sessionID: SessionID; workspaceID: Info["workspaceID"] }) => Effect.Effect<void>
   readonly diff: (sessionID: SessionID) => Effect.Effect<Snapshot.FileDiff[]>
   readonly messages: (input: { sessionID: SessionID; limit?: number }) => Effect.Effect<SessionV1.WithParts[], NotFound>
+  readonly partChronology: (input: {
+    sessionID: SessionID
+    messageID: MessageID
+  }) => Effect.Effect<{ id: PartID; timeCreated: number }[]>
   readonly children: (parentID: SessionID) => Effect.Effect<Info[]>
   readonly remove: (sessionID: SessionID) => Effect.Effect<void, NotFound>
   readonly updateMessage: <T extends SessionV1.Info>(msg: T) => Effect.Effect<T>
@@ -542,7 +634,7 @@ const layer: Layer.Layer<
     const get = Effect.fn("Session.get")(function* (id: SessionID) {
       const row = yield* db.select().from(SessionTable).where(eq(SessionTable.id, id)).get().pipe(Effect.orDie)
       if (!row) return yield* Effect.fail(new NotFoundError({ message: `Session not found: ${id}` }))
-      return fromRow(row)
+      return yield* hydrateRow(db, row)
     })
 
     const list = Effect.fn("Session.list")(function* (input?: ListInput) {
@@ -592,7 +684,9 @@ const layer: Layer.Layer<
           })
         }
       }
-      return rows.map((row) => ({ ...fromRow(row), project: projects.get(row.project_id) ?? null }))
+      return yield* Effect.forEach(rows, (row) =>
+        hydrateRow(db, row).pipe(Effect.map((info) => ({ ...info, project: projects.get(row.project_id) ?? null }))),
+      )
     })
 
     const children = Effect.fn("Session.children")(function* (parentID: SessionID) {
@@ -602,7 +696,7 @@ const layer: Layer.Layer<
         .where(and(eq(SessionTable.parent_id, parentID)))
         .all()
         .pipe(Effect.orDie)
-      return rows.map(fromRow)
+      return yield* Effect.forEach(rows, (row) => hydrateRow(db, row))
     })
 
     const remove: Interface["remove"] = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -705,7 +799,7 @@ const layer: Layer.Layer<
       const idMap = new Map<string, MessageID>()
 
       for (const msg of msgs) {
-        if (input.messageID && msg.info.id >= input.messageID) break
+        if (input.messageID && msg.info.id === input.messageID) break
         const newID = MessageID.ascending()
         idMap.set(msg.info.id, newID)
 
@@ -852,6 +946,17 @@ const layer: Layer.Layer<
       return result.reverse()
     })
 
+    const partChronology: Interface["partChronology"] = Effect.fn("Session.partChronology")(function* (input) {
+      const rows = yield* db
+        .select({ id: PartTable.id, timeCreated: PartTable.time_created })
+        .from(PartTable)
+        .where(and(eq(PartTable.session_id, input.sessionID), eq(PartTable.message_id, input.messageID)))
+        .orderBy(asc(PartTable.time_created), asc(PartTable.id))
+        .all()
+        .pipe(Effect.orDie)
+      return rows.map((row) => ({ id: PartID.make(row.id), timeCreated: row.timeCreated }))
+    })
+
     const removeMessage = Effect.fn("Session.removeMessage")(function* (input: {
       sessionID: SessionID
       messageID: MessageID
@@ -924,6 +1029,7 @@ const layer: Layer.Layer<
       setWorkspace,
       diff,
       messages,
+      partChronology,
       children,
       remove,
       updateMessage,
@@ -1005,7 +1111,7 @@ function listByProject(
     .all()
     .pipe(
       Effect.orDie,
-      Effect.map((rows) => rows.map(fromRow)),
+      Effect.flatMap((rows) => Effect.forEach(rows, (row) => hydrateRow(db, row))),
     )
 }
 

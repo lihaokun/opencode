@@ -16,6 +16,7 @@
 // cuts per-spawn cost when this suite gets bigger.
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
+import path from "path"
 import { cliIt } from "../../lib/cli-process"
 
 describe("opencode read-only commands (smoke)", () => {
@@ -98,17 +99,18 @@ describe("opencode read-only commands (smoke)", () => {
     60_000,
   )
 
-  // `db path` prints the DB file location. Under harness isolation the DB
-  // resolves to SQLite's `:memory:` (no on-disk pollution between tests);
-  // in production it'd be a path under OPENCODE_TEST_HOME / XDG_DATA_HOME.
-  // Accept either form — both prove the resolver ran without crashing.
+  // `db path` prints either SQLite's `:memory:` or the isolated fixture's
+  // OPENCODE_DB file. Accept both without assuming a POSIX path shape.
   cliIt.live(
     "db path: exits 0 and prints a path or :memory:",
     ({ opencode }) =>
       Effect.gen(function* () {
         const r = yield* opencode.spawn(["db", "path"])
         opencode.expectExit(r, 0, "db path")
-        expect(r.stdout.trim()).toMatch(/^(:memory:|[/\\].+\.(db|sqlite|sqlite3))$/i)
+        const output = r.stdout.trim()
+        if (output === ":memory:") return
+        expect(path.isAbsolute(output)).toBe(true)
+        expect([".db", ".sqlite", ".sqlite3"]).toContain(path.extname(output).toLowerCase())
       }),
     60_000,
   )

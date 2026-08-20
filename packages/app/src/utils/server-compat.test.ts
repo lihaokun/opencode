@@ -4,7 +4,7 @@ import { createCompatibleApi } from "./server-compat"
 
 function setup(
   protocol: "v1" | "v2" | Promise<"v1" | "v2">,
-  responses?: { vcs?: { branch: string; default_branch: string } },
+  responses?: { vcs?: { branch: string; default_branch: string }; session?: Record<string, unknown> },
 ) {
   const requests: Request[] = []
   const fetcher = Object.assign(
@@ -37,6 +37,8 @@ function setup(
       }
       if (request.method === "GET" && new URL(request.url).pathname === "/vcs")
         return Response.json(responses?.vcs ?? {})
+      if (request.method === "GET" && new URL(request.url).pathname === "/session/ses_1" && responses?.session)
+        return Response.json(responses.session)
       if (request.method === "GET") return Response.json([])
       return new Response(undefined, { status: 204 })
     },
@@ -162,6 +164,38 @@ describe("createCompatibleApi", () => {
     await api.session.list({ parentID: null, search: "session", limit: 50 })
 
     expect(new URL(requests[0]!.url).pathname).toBe("/experimental/session")
+  })
+
+  test("preserves legacy revert chronology through the current API shape", async () => {
+    const { api } = setup("v1", {
+      session: {
+        id: "ses_1",
+        slug: "ses_1",
+        projectID: "project",
+        directory: "/repo",
+        title: "Session",
+        version: "1",
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        time: { created: 1, updated: 1 },
+        revert: {
+          messageID: "msg_1",
+          messageTimeCreated: 10,
+          partID: "prt_1",
+          partTimeCreated: 11,
+        },
+      },
+    })
+
+    const result = (await api.session.get({ sessionID: "ses_1" })) as Awaited<ReturnType<typeof api.session.get>> & {
+      revert: { messageTimeCreated: number; partTimeCreated: number }
+    }
+    expect(result.revert).toMatchObject({
+      messageID: "msg_1",
+      messageTimeCreated: 10,
+      partID: "prt_1",
+      partTimeCreated: 11,
+    })
   })
 
   /*

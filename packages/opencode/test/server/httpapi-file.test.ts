@@ -1,83 +1,68 @@
-import { afterEach, describe, expect, test } from "bun:test"
-import { Context, Effect } from "effect"
+import { describe, expect } from "bun:test"
+import { Effect } from "effect"
 import path from "path"
-import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { FilePaths } from "../../src/server/routes/instance/httpapi/groups/file"
-import { resetDatabase } from "../fixture/db"
-import { disposeAllInstances, tmpdir } from "../fixture/fixture"
-import { pollWithTimeout } from "../lib/effect"
+import { TestInstance } from "../fixture/fixture"
+import { testEffect } from "../lib/effect"
+import { httpApiLayer, requestInDirectory } from "./httpapi-layer"
 
-const context = Context.empty() as Context.Context<unknown>
+const it = testEffect(httpApiLayer)
 
 function request(route: string, directory: string, query?: Record<string, string>) {
   const url = new URL(`http://localhost${route}`)
   for (const [key, value] of Object.entries(query ?? {})) {
     url.searchParams.set(key, value)
   }
-  return HttpApiApp.webHandler().handler(
-    new Request(url, {
-      headers: {
-        "x-opencode-directory": directory,
-      },
-    }),
-    context,
-  )
+  return requestInDirectory(`${url.pathname}${url.search}`, directory)
 }
 
-afterEach(async () => {
-  await disposeAllInstances()
-  await resetDatabase()
-})
-
 describe("file HttpApi", () => {
-  test("serves read endpoints", async () => {
-    await using tmp = await tmpdir({ git: true })
-    await Bun.write(path.join(tmp.path, "hello.txt"), "hello")
+  it.instance(
+    "serves read endpoints",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        yield* Effect.promise(() => Bun.write(path.join(tmp.directory, "hello.txt"), "hello"))
 
-    const [list, content, status] = await Promise.all([
-      request(FilePaths.list, tmp.path, { path: "." }),
-      request(FilePaths.content, tmp.path, { path: "hello.txt" }),
-      request(FilePaths.status, tmp.path),
-    ])
+        const list = yield* request(FilePaths.list, tmp.directory, { path: "." })
+        const content = yield* request(FilePaths.content, tmp.directory, { path: "hello.txt" })
+        const status = yield* request(FilePaths.status, tmp.directory)
 
-    expect(list.status).toBe(200)
-    expect(await list.json()).toContainEqual(
-      expect.objectContaining({ name: "hello.txt", path: "hello.txt", type: "file" }),
-    )
+        expect(list.status).toBe(200)
+        expect(yield* list.json).toContainEqual(
+          expect.objectContaining({ name: "hello.txt", path: "hello.txt", type: "file" }),
+        )
 
-    expect(content.status).toBe(200)
-    expect(await content.json()).toMatchObject({ type: "text", content: "hello" })
+        expect(content.status).toBe(200)
+        expect(yield* content.json).toMatchObject({ type: "text", content: "hello" })
 
-    expect(status.status).toBe(200)
-    expect(await status.json()).toEqual([])
-  })
+        expect(status.status).toBe(200)
+        expect(yield* status.json).toEqual([])
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
 
-  test("serves search endpoints", async () => {
-    await using tmp = await tmpdir({ git: true })
-    await Bun.write(path.join(tmp.path, "hello.txt"), "needle")
+  it.instance(
+    "serves search endpoints",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        yield* Effect.promise(() => Bun.write(path.join(tmp.directory, "hello.txt"), "needle"))
 
-    const [text, symbols] = await Promise.all([
-      request(FilePaths.findText, tmp.path, { pattern: "needle" }),
-      request(FilePaths.findSymbol, tmp.path, { query: "hello" }),
-    ])
-    const files = await Effect.runPromise(
-      pollWithTimeout(
-        Effect.promise(async () => {
-          const response = await request(FilePaths.findFile, tmp.path, { query: "hello", type: "file" })
-          const body = await response.json()
-          return body.includes("hello.txt") ? { response, body } : undefined
-        }),
-        "file search index was not ready",
-      ),
-    )
+        const text = yield* request(FilePaths.findText, tmp.directory, { pattern: "needle" })
+        const symbols = yield* request(FilePaths.findSymbol, tmp.directory, { query: "hello" })
+        const files = yield* request(FilePaths.findFile, tmp.directory, { query: "hello", type: "file" })
 
-    expect(text.status).toBe(200)
-    expect(await text.json()).toContainEqual(expect.objectContaining({ line_number: 1 }))
+        expect(text.status).toBe(200)
+        expect(yield* text.json).toContainEqual(expect.objectContaining({ line_number: 1 }))
 
-    expect(files.response.status).toBe(200)
-    expect(files.body).toContain("hello.txt")
+        expect(files.status).toBe(200)
+        expect(yield* files.json).toContain("hello.txt")
 
-    expect(symbols.status).toBe(200)
-    expect(await symbols.json()).toEqual([])
-  })
+        expect(symbols.status).toBe(200)
+        expect(yield* symbols.json).toEqual([])
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    60_000,
+  )
 })

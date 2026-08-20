@@ -29,8 +29,10 @@ jobs:
         settings:
           - name: linux
             host: ubuntu-latest
+            timeout: 20
           - name: windows
             host: windows-latest
+            timeout: 60
     runs-on: ${{ matrix.settings.host }}
     defaults:
       run:
@@ -63,9 +65,19 @@ jobs:
             turbo-${{ runner.os }}-${{ hashFiles('turbo.json', '**/package.json') }}-
             turbo-${{ runner.os }}-
 
+      - name: Prepare ripgrep
+        if: runner.os == 'Windows'
+        working-directory: packages/core
+        run: bun test/lib/prepare-ripgrep.ts
+
       - name: Run unit tests
-        timeout-minutes: 20
-        run: GITHUB_ACTIONS=false bun turbo test
+        timeout-minutes: ${{ matrix.settings.timeout }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            GITHUB_ACTIONS=false bun turbo test --concurrency=1
+          else
+            GITHUB_ACTIONS=false bun turbo test
+          fi
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
 
@@ -76,6 +88,7 @@ jobs:
 
       - name: Run HttpApi exerciser gates
         if: runner.os == 'Linux'
+        timeout-minutes: 20
         working-directory: packages/opencode
         run: bun run test:httpapi
 
@@ -87,11 +100,14 @@ jobs:
         settings:
           - name: linux
             host: ubuntu-latest
+            workers: 4
           - name: windows
             host: windows-latest
+            workers: 2
     runs-on: ${{ matrix.settings.host }}
     env:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
+      PLAYWRIGHT_WORKERS: ${{ matrix.settings.workers }}
     defaults:
       run:
         shell: bash

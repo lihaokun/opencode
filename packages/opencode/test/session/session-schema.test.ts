@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Schema } from "effect"
 import { ProjectV2 } from "@opencode-ai/core/project"
-import { MessageID, SessionID } from "../../src/session/schema"
+import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { Session } from "../../src/session/session"
 
 const info = {
@@ -64,15 +64,31 @@ describe("Session schema", () => {
       },
       revert: {
         messageID: MessageID.ascending(),
+        messageTimeCreated: undefined,
         partID: undefined,
+        partTimeCreated: undefined,
         snapshot: undefined,
         diff: undefined,
       },
     }) as Record<string, unknown>
 
     expect(Object.hasOwn(encoded.summary as Record<string, unknown>, "diffs")).toBe(false)
-    for (const key of ["partID", "snapshot", "diff"]) {
+    for (const key of ["messageTimeCreated", "partID", "partTimeCreated", "snapshot", "diff"]) {
       expect(Object.hasOwn(encoded.revert as Record<string, unknown>, key)).toBe(false)
     }
+  })
+
+  test("encodes persisted revert chronology", () => {
+    const encoded = Schema.encodeUnknownSync(Session.Info)({
+      ...info,
+      revert: {
+        messageID: MessageID.ascending(),
+        messageTimeCreated: 10,
+        partID: PartID.ascending(),
+        partTimeCreated: 11,
+      },
+    }) as Record<string, unknown>
+
+    expect(encoded.revert).toMatchObject({ messageTimeCreated: 10, partTimeCreated: 11 })
   })
 })

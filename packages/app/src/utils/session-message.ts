@@ -12,6 +12,60 @@ const emptyTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write
 const emptyModel: { id: string; providerID: string; variant?: string } = { id: "", providerID: "" }
 const decodeToolInput = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
 
+type ChronologicalMessage = {
+  id: string
+  time: { created: number }
+}
+
+export type MessageRevertBoundary = {
+  messageID: string
+  messageTimeCreated?: number
+}
+
+export function compareMessageChronology(left: ChronologicalMessage, right: ChronologicalMessage) {
+  return left.time.created - right.time.created || compareID(left.id, right.id)
+}
+
+export function compareMessageToRevert(message: ChronologicalMessage, revert: MessageRevertBoundary) {
+  if (revert.messageTimeCreated === undefined) return compareID(message.id, revert.messageID)
+  return message.time.created - revert.messageTimeCreated || compareID(message.id, revert.messageID)
+}
+
+export function selectRevertedMessages<T extends ChronologicalMessage>(
+  messages: readonly T[],
+  revert: MessageRevertBoundary,
+) {
+  const reverted = messages.filter((message) => compareMessageToRevert(message, revert) >= 0)
+  if (revert.messageTimeCreated === undefined) return reverted
+  return reverted.toSorted(compareMessageChronology)
+}
+
+export function latestMessage<T extends ChronologicalMessage>(
+  messages: readonly T[],
+  predicate: (message: T) => boolean,
+) {
+  return messages
+    .filter(predicate)
+    .reduce<
+      T | undefined
+    >((latest, message) => (!latest || compareMessageChronology(message, latest) > 0 ? message : latest), undefined)
+}
+
+export function earliestMessage<T extends ChronologicalMessage>(
+  messages: readonly T[],
+  predicate: (message: T) => boolean,
+) {
+  return messages
+    .filter(predicate)
+    .reduce<
+      T | undefined
+    >((earliest, message) => (!earliest || compareMessageChronology(message, earliest) < 0 ? message : earliest), undefined)
+}
+
+function compareID(left: string, right: string) {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value)
 }

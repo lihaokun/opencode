@@ -99,6 +99,7 @@ import { Persist, persisted } from "@/utils/persist"
 import { extractPromptFromParts } from "@/utils/prompt"
 import { formatServerError, isLocalSessionNotFoundError, isSessionNotFoundError } from "@/utils/server-errors"
 import { legacySessionHref, requireServerKey, sessionHref } from "@/utils/session-route"
+import { compareMessageChronology, earliestMessage, selectRevertedMessages } from "@/utils/session-message"
 import { useUsageExceededDialogs } from "./session/usage-exceeded-dialogs"
 import { createSessionOwnership } from "./session/session-ownership"
 import { createSessionLineage } from "./session/session-lineage"
@@ -543,8 +544,7 @@ export default function Page() {
   })
   const activeTab = tabState.activeTab
   const activeFileTab = tabState.activeFileTab
-  const revertMessageID = createMemo(() => info()?.revert?.messageID)
-  const timeline = createTimelineModel({ sessionID: () => params.id, revertMessageID })
+  const timeline = createTimelineModel({ sessionID: () => params.id, revert: () => info()?.revert })
   const historyLoading = timeline.history.loading
   const historyMore = timeline.history.more
   const lastUserMessage = timeline.lastUserMessage
@@ -1832,7 +1832,8 @@ export default function Page() {
       await runPromptRollbackMutation({
         capturePrompt: prompt.capture,
         optimistic: (prompt) => {
-          roll(input.sessionID, { messageID: input.messageID }, target)
+          const message = userMessages().find((item) => item.id === input.messageID)
+          roll(input.sessionID, { messageID: input.messageID, messageTimeCreated: message?.time.created }, target)
           prompt.set(value)
         },
         request: () => halt(input.sessionID).then(() => session.revert.stage(input)),
@@ -1850,13 +1851,16 @@ export default function Page() {
 
       const session = sdk().api.session
       const target = sync()
-      const next = userMessages().find((item) => item.id > id)
+      const boundary = userMessages().find((item) => item.id === id)
+      const next = boundary
+        ? earliestMessage(userMessages(), (message) => compareMessageChronology(message, boundary) > 0)
+        : undefined
       const last = target.session.get(sessionID)?.revert
 
       await runPromptRollbackMutation({
         capturePrompt: prompt.capture,
         optimistic: (promptSession) => {
-          roll(sessionID, next ? { messageID: next.id } : undefined, target)
+          roll(sessionID, next ? { messageID: next.id, messageTimeCreated: next.time.created } : undefined, target)
           if (next) {
             promptSession.set(draft(next.id))
             return
@@ -1888,11 +1892,9 @@ export default function Page() {
   }
 
   const rolled = createMemo(() => {
-    const id = revertMessageID()
-    if (!id) return []
-    return userMessages()
-      .filter((item) => item.id >= id)
-      .map((item) => ({ id: item.id, text: line(item.id) }))
+    const marker = info()?.revert
+    if (!marker) return []
+    return selectRevertedMessages(userMessages(), marker).map((item) => ({ id: item.id, text: line(item.id) }))
   })
 
   // attachment bytes are embedded as a data URL, so downloading always works;

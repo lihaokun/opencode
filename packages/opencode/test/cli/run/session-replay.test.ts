@@ -2,15 +2,16 @@ import { describe, expect, test } from "bun:test"
 import { replayLocalRows, replaySession } from "@/cli/cmd/run/session-replay"
 import type { SessionMessages } from "@/cli/cmd/run/session.shared"
 import type { RunProvider } from "@/cli/cmd/run/types"
+import { Identifier } from "@/id/id"
 
-function userMessage(id: string, text: string): SessionMessages[number] {
+function userMessage(id: string, text: string, created = 1): SessionMessages[number] {
   return {
     info: {
       id,
       sessionID: "session-1",
       role: "user",
       time: {
-        created: 1,
+        created,
       },
       agent: "build",
       model: {
@@ -416,8 +417,54 @@ describe("run session replay", () => {
     } as const
 
     expect(
-      replayLocalRows([userMessage("msg-user-2", "successful")], [persisted], [{ commit: failed }, { commit: error }]),
+      replayLocalRows(
+        [userMessage("msg-user-2", "successful")],
+        [persisted],
+        [
+          { commit: failed, createdAt: 0 },
+          { commit: error, createdAt: 0 },
+        ],
+      ),
     ).toEqual([failed, error, persisted])
+  })
+
+  test("places missing-anchor local rows by creation time across the ID rollover", () => {
+    const beforeTime = 2 ** 36 - 1
+    const localTime = 2 ** 36 + 1
+    const afterTime = 2 ** 36 + 2
+    const beforeID = Identifier.create("msg", "ascending", beforeTime)
+    const localID = Identifier.create("msg", "ascending", localTime)
+    const afterID = Identifier.create("msg", "ascending", afterTime)
+    const before = {
+      kind: "user",
+      text: "before",
+      phase: "start",
+      source: "system",
+      messageID: beforeID,
+    } as const
+    const local = {
+      kind: "error",
+      text: "local",
+      phase: "start",
+      source: "system",
+      messageID: localID,
+    } as const
+    const after = {
+      kind: "user",
+      text: "after",
+      phase: "start",
+      source: "system",
+      messageID: afterID,
+    } as const
+
+    expect(beforeID > localID).toBe(true)
+    expect(
+      replayLocalRows(
+        [userMessage(beforeID, "before", beforeTime), userMessage(afterID, "after", afterTime)],
+        [before, after],
+        [{ commit: local, createdAt: localTime }],
+      ),
+    ).toEqual([before, local, after])
   })
 
   test("retains local errors but not duplicate local prompts once a prompt persists", () => {
@@ -440,7 +487,10 @@ describe("run session replay", () => {
       replayLocalRows(
         [userMessage("msg-user-1", "failed after persistence")],
         [persisted],
-        [{ commit: persisted }, { commit: error }],
+        [
+          { commit: persisted, createdAt: 1 },
+          { commit: error, createdAt: 1 },
+        ],
       ),
     ).toEqual([persisted, error])
   })
@@ -482,6 +532,7 @@ describe("run session replay", () => {
         [
           {
             commit: error,
+            createdAt: 2,
             after: { kind: "assistant", text: "partial answer", phase: "progress", messageID: "msg-assistant-1" },
           },
         ],
@@ -512,11 +563,9 @@ describe("run session replay", () => {
       messageID: "msg-assistant-1",
     } as const
 
-    expect(replayLocalRows([userMessage("msg-user-1", "start")], [first, late], [{ commit: error }])).toEqual([
-      first,
-      error,
-      late,
-    ])
+    expect(
+      replayLocalRows([userMessage("msg-user-1", "start")], [first, late], [{ commit: error, createdAt: 2 }]),
+    ).toEqual([first, error, late])
   })
 
   test("inserts a local failure between persisted output chunks spanning that failure", () => {
@@ -550,6 +599,7 @@ describe("run session replay", () => {
         [
           {
             commit: error,
+            createdAt: 2,
             after: {
               kind: "assistant",
               text: "before ",
@@ -592,9 +642,14 @@ describe("run session replay", () => {
         [],
         [answer],
         [
-          { commit: prompt },
+          {
+            commit: prompt,
+            createdAt: 1,
+            before: { kind: "assistant", text: "partial answer", phase: "progress", messageID: "msg-2" },
+          },
           {
             commit: error,
+            createdAt: 2,
             after: { kind: "assistant", text: "partial answer", phase: "progress", messageID: "msg-2" },
           },
         ],
@@ -643,6 +698,7 @@ describe("run session replay", () => {
         [
           {
             commit: error,
+            createdAt: 2,
             after: {
               kind: "tool",
               text: "running bash",
@@ -684,7 +740,7 @@ describe("run session replay", () => {
       replayLocalRows(
         [userMessage("msg-user-1", "before"), userMessage("msg-user-3", "after")],
         [first, second],
-        [{ commit: error }],
+        [{ commit: error, createdAt: 1 }],
       ),
     ).toEqual([first, error, second])
   })

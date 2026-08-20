@@ -11,6 +11,10 @@ import { NotFoundError } from "@/storage/storage"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Identifier } from "../../src/id/id"
+import { Database } from "@opencode-ai/core/database/database"
+import { PartTable } from "@opencode-ai/core/session/sql"
+import { eq } from "drizzle-orm"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionNs.node, MessageV2.node, SessionProjector.node])))
 
@@ -59,14 +63,18 @@ const fill = Effect.fn("Test.fill")(function* (
   return ids
 })
 
-const addUser = Effect.fn("Test.addUser")(function* (sessionID: SessionID, text?: string) {
+const addUser = Effect.fn("Test.addUser")(function* (
+  sessionID: SessionID,
+  text?: string,
+  opts?: { id?: MessageID; created?: number },
+) {
   const session = yield* SessionNs.Service
-  const id = MessageID.ascending()
+  const id = opts?.id ?? MessageID.ascending()
   yield* session.updateMessage({
     id,
     sessionID,
     role: "user",
-    time: { created: Date.now() },
+    time: { created: opts?.created ?? Date.now() },
     agent: "test",
     model: { providerID: "test", modelID: "test" },
     tools: {},
@@ -87,15 +95,21 @@ const addUser = Effect.fn("Test.addUser")(function* (sessionID: SessionID, text?
 const addAssistant = Effect.fn("Test.addAssistant")(function* (
   sessionID: SessionID,
   parentID: MessageID,
-  opts?: { summary?: boolean; finish?: string; error?: SessionV1.Assistant["error"] },
+  opts?: {
+    id?: MessageID
+    created?: number
+    summary?: boolean
+    finish?: string
+    error?: SessionV1.Assistant["error"]
+  },
 ) {
   const session = yield* SessionNs.Service
-  const id = MessageID.ascending()
+  const id = opts?.id ?? MessageID.ascending()
   yield* session.updateMessage({
     id,
     sessionID,
     role: "assistant",
-    time: { created: Date.now() },
+    time: { created: opts?.created ?? Date.now() },
     parentID,
     modelID: ModelV2.ID.make("test"),
     providerID: ProviderV2.ID.make("test"),
@@ -271,6 +285,33 @@ describe("MessageV2.page", () => {
     ),
   )
 
+  it.instance("paginates messages by persisted time across the ID rollover", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const before = 2 ** 36 - 2
+        const after = 2 ** 36 + 1
+        const u1 = MessageID.make(Identifier.create("msg", "ascending", before))
+        const a1 = MessageID.make(Identifier.create("msg", "ascending", before + 1))
+        const u2 = MessageID.make(Identifier.create("msg", "ascending", after))
+        const a2 = MessageID.make(Identifier.create("msg", "ascending", after + 1))
+        yield* addUser(sessionID, undefined, { id: u1, created: before })
+        yield* addAssistant(sessionID, u1, { id: a1, created: before + 1, finish: "stop" })
+        yield* addUser(sessionID, undefined, { id: u2, created: after })
+        yield* addAssistant(sessionID, u2, { id: a2, created: after + 1, finish: "stop" })
+
+        expect(u1 > u2).toBe(true)
+        expect(a1 > a2).toBe(true)
+
+        const latest = yield* MessageV2.page({ sessionID, limit: 2 })
+        const earlier = yield* MessageV2.page({ sessionID, limit: 2, before: latest.cursor! })
+
+        expect(latest.items.map((item) => item.info.id)).toEqual([u2, a2])
+        expect(earlier.items.map((item) => item.info.id)).toEqual([u1, a1])
+        expect(earlier.more).toBe(false)
+      }),
+    ),
+  )
+
   it.instance("does not return messages from other sessions", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service
@@ -432,6 +473,61 @@ describe("MessageV2.parts", () => {
     ),
   )
 
+  it.instance("orders parts by persisted creation time across the ID rollover", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        const messageID = yield* addUser(sessionID)
+        const before = 2 ** 36 - 1
+        const after = 2 ** 36 + 1
+        const firstID = PartID.make(Identifier.create("prt", "ascending", before))
+        const secondID = PartID.make(Identifier.create("prt", "ascending", after))
+        yield* session.updatePart({
+          id: firstID,
+          sessionID,
+          messageID,
+          type: "text",
+          text: "before",
+        })
+        yield* session.updatePart({
+          id: secondID,
+          sessionID,
+          messageID,
+          type: "text",
+          text: "after",
+        })
+        const { db } = yield* Database.Service
+        yield* db
+          .update(PartTable)
+          .set({ time_created: before })
+          .where(eq(PartTable.id, firstID))
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .update(PartTable)
+          .set({ time_created: after })
+          .where(eq(PartTable.id, secondID))
+          .run()
+          .pipe(Effect.orDie)
+        yield* session.updatePart({
+          id: firstID,
+          sessionID,
+          messageID,
+          type: "text",
+          text: "updated before",
+        })
+
+        expect(firstID > secondID).toBe(true)
+        const parts = yield* MessageV2.parts(messageID)
+        expect(parts.map((part) => part.id)).toEqual([firstID, secondID])
+        expect(parts[0]).toMatchObject({ type: "text", text: "updated before" })
+        expect((yield* MessageV2.page({ sessionID, limit: 1 })).items[0].parts.map((part) => part.id)).toEqual([
+          firstID,
+          secondID,
+        ])
+      }),
+    ),
+  )
+
   it.instance("returns empty for non-existent message id", () =>
     Effect.gen(function* () {
       yield* SessionNs.Service
@@ -465,6 +561,26 @@ describe("MessageV2.get", () => {
         expect(result.info.role).toBe("user")
         expect(result.parts).toHaveLength(1)
         expect((result.parts[0] as SessionV1.TextPart).text).toBe("m0")
+      }),
+    ),
+  )
+
+  it.instance("preserves the persisted creation time when a message is updated", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        const original = yield* session.updateMessage({
+          id: MessageID.ascending(),
+          sessionID,
+          role: "user",
+          time: { created: 100 },
+          agent: "test",
+          model: { providerID: "test", modelID: "test" },
+        } as unknown as SessionV1.User)
+        yield* session.updateMessage({ ...original, time: { created: 999 } })
+
+        const result = yield* MessageV2.get({ sessionID, messageID: original.id })
+
+        expect(result.info.time.created).toBe(100)
       }),
     ),
   )
@@ -749,6 +865,35 @@ describe("MessageV2.filterCompacted", () => {
         expect(result.map((item) => item.info.id)).toEqual([c1, s1, u2, a2, u3, a3])
       }),
     ),
+  )
+
+  it.instance("fork stops at the exact message boundary across the ID rollover", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const created = yield* session.create({})
+      const before = 2 ** 36 - 2
+      const after = 2 ** 36 + 1
+      const u1 = MessageID.make(Identifier.create("msg", "ascending", before))
+      const a1 = MessageID.make(Identifier.create("msg", "ascending", before + 1))
+      const u2 = MessageID.make(Identifier.create("msg", "ascending", after))
+      const a2 = MessageID.make(Identifier.create("msg", "ascending", after + 1))
+      yield* addUser(created.id, "first", { id: u1, created: before })
+      yield* addAssistant(created.id, u1, { id: a1, created: before + 1, finish: "stop" })
+      yield* addUser(created.id, "second", { id: u2, created: after })
+      yield* addAssistant(created.id, u2, { id: a2, created: after + 1, finish: "stop" })
+
+      const forked = yield* session.fork({ sessionID: created.id, messageID: u2 })
+      const child = yield* session.messages({ sessionID: forked.id })
+
+      expect(u1 > u2).toBe(true)
+      expect(child).toHaveLength(2)
+      expect(child.map((message) => message.info.role)).toEqual(["user", "assistant"])
+      expect(child[1].info.role).toBe("assistant")
+      if (child[1].info.role === "assistant") expect(child[1].info.parentID).toBe(child[0].info.id)
+
+      yield* session.remove(forked.id)
+      yield* session.remove(created.id)
+    }),
   )
 
   it.instance("fork remaps compaction tail_start_id for filterCompacted", () =>

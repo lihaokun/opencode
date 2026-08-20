@@ -2,7 +2,7 @@ export * as FileSystemSearch from "./search"
 
 import { makeLocationNode } from "../effect/app-node"
 import path from "path"
-import { Context, Effect, Layer, Scope } from "effect"
+import { Context, Effect, Fiber, Layer, Scope } from "effect"
 import { Fff } from "#fff"
 import fuzzysort from "fuzzysort"
 import { FileSystem } from "../filesystem"
@@ -32,7 +32,23 @@ export const ripgrepLayer = Layer.effect(
       directories: [] as string[],
     }
     const directories = new Set<string>()
-    yield* ripgrep
+    const search = (input: FileSystem.FindInput) => {
+      const items =
+        input.type === "file"
+          ? state.files
+          : input.type === "directory"
+            ? state.directories
+            : [...state.files, ...state.directories]
+      return fuzzysort.go(input.query, items, { limit: input.limit ?? 50 }).map((item) => {
+        const relative = item.target
+        const type = relative.endsWith(path.sep) ? ("directory" as const) : ("file" as const)
+        return FileSystem.Entry.make({
+          path: RelativePath.make(relative),
+          type,
+        })
+      })
+    }
+    const scan = yield* ripgrep
       .find({
         cwd: location.directory,
         pattern: "*",
@@ -100,20 +116,11 @@ export const ripgrepLayer = Layer.effect(
         }),
       find: (input) =>
         Effect.gen(function* () {
-          const items =
-            input.type === "file"
-              ? state.files
-              : input.type === "directory"
-                ? state.directories
-                : [...state.files, ...state.directories]
-          return fuzzysort.go(input.query, items, { limit: input.limit ?? 50 }).map((item) => {
-            const relative = item.target
-            const type = relative.endsWith(path.sep) ? ("directory" as const) : ("file" as const)
-            return FileSystem.Entry.make({
-              path: RelativePath.make(relative),
-              type,
-            })
-          })
+          const found = search(input)
+          if (found.length > 0) return found
+          // Preserve partial-index hits, but never report an empty result before the initial scan settles.
+          yield* Fiber.join(scan)
+          return search(input)
         }),
     })
   }),

@@ -3,13 +3,19 @@ import { createMemo, createResource, onCleanup, untrack, type Accessor } from "s
 import { useServerSync } from "@/context/server-sync"
 import { useSync } from "@/context/sync"
 import { same } from "@/utils/same"
+import {
+  compareMessageChronology,
+  compareMessageToRevert,
+  earliestMessage,
+  type MessageRevertBoundary,
+} from "@/utils/session-message"
 
 const emptyUserMessages: UserMessage[] = []
 const sessionFreshness = 15_000
 
 export function createTimelineModel(input: {
   sessionID: Accessor<string | undefined>
-  revertMessageID: Accessor<string | undefined>
+  revert: Accessor<MessageRevertBoundary | undefined>
 }) {
   const serverSync = useServerSync()
   const sync = useSync()
@@ -50,7 +56,7 @@ export function createTimelineModel(input: {
   const userMessages = createMemo(() => selectUserMessages(messages()), emptyUserMessages, { equals: same })
   const visibleUserMessages = createMemo(
     () => {
-      return selectVisibleUserMessages(userMessages(), input.revertMessageID())
+      return selectVisibleUserMessages(userMessages(), input.revert())
     },
     emptyUserMessages,
     { equals: same },
@@ -102,9 +108,25 @@ export function isTimelineReady(messages: Message[] | undefined, loading: boolea
   return messages !== undefined && (messages.some((message) => message.role === "user") || !loading)
 }
 
-export function selectVisibleUserMessages(messages: UserMessage[], revertMessageID?: string) {
-  if (!revertMessageID) return messages
-  return messages.filter((message) => message.id < revertMessageID)
+export function selectVisibleUserMessages(messages: UserMessage[], revert?: MessageRevertBoundary) {
+  if (!revert) return messages
+  if (revert.messageTimeCreated === undefined) return messages.filter((message) => message.id < revert.messageID)
+  return messages.filter((message) => compareMessageToRevert(message, revert) < 0)
+}
+
+export function selectProjectedMessages<T extends { id: string; time: { created: number } }>(
+  messages: T[],
+  sessionMessages: Message[],
+  visibleUserMessages: UserMessage[],
+  revert?: MessageRevertBoundary,
+) {
+  const visible = new Set(visibleUserMessages.map((message) => message.id))
+  const hidden = (message: Message) => message.role === "user" && !visible.has(message.id)
+  const boundary =
+    revert?.messageTimeCreated === undefined ? sessionMessages.find(hidden) : earliestMessage(sessionMessages, hidden)
+  if (!boundary) return messages
+  if (revert?.messageTimeCreated === undefined) return messages.filter((message) => message.id < boundary.id)
+  return messages.filter((message) => compareMessageChronology(message, boundary) < 0)
 }
 
 export async function loadOlderTimeline(input: {

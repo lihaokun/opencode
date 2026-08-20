@@ -774,7 +774,10 @@ describe("run stream transport", () => {
       footer: ui.api,
     })
     const localRows: LocalReplayRow[] = [
-      { commit: { kind: "user", text: "pending prompt", phase: "start", source: "system", messageID: "msg-pending" } },
+      {
+        commit: { kind: "user", text: "pending prompt", phase: "start", source: "system", messageID: "msg-pending" },
+        createdAt: 1,
+      },
     ]
     const reset = mock(() => {
       localRows.push({
@@ -785,6 +788,7 @@ describe("run stream transport", () => {
           source: "system",
           messageID: "msg-during-reset",
         },
+        createdAt: 2,
       })
       return Promise.resolve()
     })

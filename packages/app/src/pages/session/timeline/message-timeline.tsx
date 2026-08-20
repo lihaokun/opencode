@@ -62,6 +62,7 @@ import { SessionContextUsage } from "@/components/session-context-usage"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { useLanguage } from "@/context/language"
 import { useSessionKey } from "@/pages/session/session-layout"
+import { selectProjectedMessages } from "./model"
 import { useServerSDK } from "@/context/server-sdk"
 import { usePlatform } from "@/context/platform"
 import { useSettings } from "@/context/settings"
@@ -283,18 +284,16 @@ export function MessageTimeline(props: {
     return sync().data.session_status[id] ?? idle
   })
   const sessionMessages = createMemo(() => (sessionID() ? (sync().data.message[sessionID()!] ?? []) : []))
-  const projectedMessages = createMemo(() => {
-    const id = sessionID()
-    if (!id) return []
-    const visible = new Set(props.userMessages.map((message) => message.id))
-    const boundary = sessionMessages().find((message) => message.role === "user" && !visible.has(message.id))?.id
-    const messages = sync().data.session_message[id] ?? []
-    return boundary ? messages.filter((message) => message.id < boundary) : messages
-  })
   const info = createMemo(() => {
     const id = sessionID()
     if (!id) return
     return sync().session.get(id)
+  })
+  const projectedMessages = createMemo(() => {
+    const id = sessionID()
+    if (!id) return []
+    const messages = sync().data.session_message[id] ?? []
+    return selectProjectedMessages(messages, sessionMessages(), props.userMessages, info()?.revert)
   })
   const titleValue = createMemo(() => info()?.title)
   const titleLabel = createMemo(() => sessionTitle(titleValue()))

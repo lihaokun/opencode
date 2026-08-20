@@ -9,6 +9,7 @@ import { SessionID, MessageID, PartID } from "../../src/session/schema"
 import { Question } from "../../src/question"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Identifier } from "../../src/id/id"
 
 const sessionID = SessionID.make("session")
 const providerID = ProviderV2.ID.make("test")
@@ -1561,6 +1562,126 @@ describe("session.message-v2.latest", () => {
   const SUMMARY_ASSISTANT = MessageID.make("msg_004")
   const CONTINUE_USER = MessageID.make("msg_005")
   const NEW_COMPACTION_USER = MessageID.make("msg_006")
+
+  test("selects the latest messages across the 36-bit timestamp rollover", () => {
+    const before = 2 ** 36 - 1
+    const after = 2 ** 36 + 1
+    const firstUserID = MessageID.make(Identifier.create("msg", "ascending", before))
+    const firstAssistantID = MessageID.make(Identifier.create("msg", "ascending", before))
+    const secondUserID = MessageID.make(Identifier.create("msg", "ascending", after))
+    const secondAssistantID = MessageID.make(Identifier.create("msg", "ascending", after))
+    const firstUser = { ...userInfo(firstUserID), time: { created: before } }
+    const secondUser = { ...userInfo(secondUserID), time: { created: after } }
+    const firstAssistant = {
+      ...assistantInfo(firstAssistantID, firstUserID),
+      time: { created: before },
+      finish: "stop",
+    }
+    const secondAssistant = {
+      ...assistantInfo(secondAssistantID, secondUserID),
+      time: { created: after },
+      finish: "stop",
+    }
+
+    expect(firstUserID > secondUserID).toBe(true)
+    expect(firstAssistantID > secondAssistantID).toBe(true)
+
+    const state = MessageV2.latest([
+      { info: firstUser, parts: [] },
+      { info: firstAssistant, parts: [] },
+      { info: secondUser, parts: [] },
+      { info: secondAssistant, parts: [] },
+    ])
+
+    expect(state.user?.id).toBe(secondUserID)
+    expect(state.assistant?.id).toBe(secondAssistantID)
+    expect(state.finished?.id).toBe(secondAssistantID)
+  })
+
+  test("keeps tasks created after a pre-rollover finished assistant", () => {
+    const before = 2 ** 36 - 1
+    const after = 2 ** 36 + 1
+    const userID = MessageID.make(Identifier.create("msg", "ascending", before))
+    const assistantID = MessageID.make(Identifier.create("msg", "ascending", before))
+    const taskID = MessageID.make(Identifier.create("msg", "ascending", after))
+    const task = {
+      ...basePart(taskID, "task"),
+      type: "compaction" as const,
+      auto: true,
+    }
+
+    expect(assistantID > taskID).toBe(true)
+
+    const state = MessageV2.latest([
+      { info: { ...userInfo(userID), time: { created: before } }, parts: [] },
+      {
+        info: { ...assistantInfo(assistantID, userID), time: { created: before }, finish: "stop" },
+        parts: [],
+      },
+      { info: { ...userInfo(taskID), time: { created: after } }, parts: [task] },
+    ])
+
+    expect(state.finished?.id).toBe(assistantID)
+    expect(state.user?.id).toBe(taskID)
+    expect(state.tasks).toEqual([task])
+  })
+
+  test("filterCompacted preserves latest chronology across the ID rollover", () => {
+    const before = 2 ** 36 - 2
+    const after = 2 ** 36 + 1
+    const tailUserID = MessageID.make(Identifier.create("msg", "ascending", before))
+    const overflowAssistantID = MessageID.make(Identifier.create("msg", "ascending", before + 1))
+    const compactionUserID = MessageID.make(Identifier.create("msg", "ascending", after))
+    const summaryAssistantID = MessageID.make(Identifier.create("msg", "ascending", after + 1))
+    const continueUserID = MessageID.make(Identifier.create("msg", "ascending", after + 2))
+    const filtered = MessageV2.filterCompacted([
+      {
+        info: { ...userInfo(continueUserID), time: { created: after + 2 } },
+        parts: [{ ...basePart(continueUserID, "continue"), type: "text", text: "continue" }],
+      },
+      {
+        info: {
+          ...assistantInfo(summaryAssistantID, compactionUserID),
+          time: { created: after + 1 },
+          summary: true,
+          finish: "stop",
+        },
+        parts: [],
+      },
+      {
+        info: { ...userInfo(compactionUserID), time: { created: after } },
+        parts: [
+          {
+            ...basePart(compactionUserID, "compaction"),
+            type: "compaction",
+            auto: true,
+            tail_start_id: tailUserID,
+          },
+        ],
+      },
+      {
+        info: {
+          ...assistantInfo(overflowAssistantID, tailUserID),
+          time: { created: before + 1 },
+          finish: "tool-calls",
+        },
+        parts: [],
+      },
+      {
+        info: { ...userInfo(tailUserID), time: { created: before } },
+        parts: [{ ...basePart(tailUserID, "tail"), type: "text", text: "tail" }],
+      },
+    ])
+
+    expect(overflowAssistantID > summaryAssistantID).toBe(true)
+
+    const state = MessageV2.latest(filtered)
+
+    expect(state.user?.id).toBe(continueUserID)
+    expect(state.assistant?.id).toBe(summaryAssistantID)
+    expect(state.finished?.id).toBe(summaryAssistantID)
+    expect(state.tasks).toEqual([])
+  })
 
   const tailUser: SessionV1.WithParts = {
     info: userInfo(TAIL_USER),

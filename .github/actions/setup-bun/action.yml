@@ -59,7 +59,13 @@ runs:
         # e.g. ./patches/ for standard-openapi
         # https://github.com/oven-sh/bun/issues/28147
         if [ "$RUNNER_OS" = "Windows" ]; then
-          bun install --linker hoisted ${{ inputs.install-flags }}
+          # Bun 1.3.14 can race while materializing patched peer variants into
+          # a cold cache. The failed attempt leaves that cache warm, so retry
+          # once against the same cache; a persistent failure still fails CI.
+          if ! bun install --linker hoisted ${{ inputs.install-flags }}; then
+            echo "::warning::Bun install failed on Windows; retrying once against the warmed package cache"
+            bun install --linker hoisted ${{ inputs.install-flags }}
+          fi
         else
           bun install ${{ inputs.install-flags }}
         fi

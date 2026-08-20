@@ -12,9 +12,14 @@ import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
 import { useTerminal } from "@/context/terminal"
 import { showToast } from "@/utils/toast"
-import { findLast } from "@opencode-ai/core/util/array"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { extractPromptFromParts } from "@/utils/prompt"
+import {
+  compareMessageChronology,
+  compareMessageToRevert,
+  earliestMessage,
+  latestMessage,
+} from "@/utils/session-message"
 import { UserMessage } from "@opencode-ai/sdk/v2"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { createSessionOwnership } from "./session-ownership"
@@ -97,9 +102,9 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
   }
   const userMessages = () => messages().filter((m) => m.role === "user") as UserMessage[]
   const visibleUserMessages = () => {
-    const revert = info()?.revert?.messageID
+    const revert = info()?.revert
     if (!revert) return userMessages()
-    return userMessages().filter((m) => m.id < revert)
+    return userMessages().filter((message) => compareMessageToRevert(message, revert) < 0)
   }
 
   const showAllFiles = () => {
@@ -309,9 +314,9 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     const session = sdk().api.session
     const directory = sdk().directory
     const promptSession = prompt.capture()
-    const revert = info()?.revert?.messageID
+    const revert = info()?.revert
     const messages = userMessages()
-    const message = findLast(messages, (x) => !revert || x.id < revert)
+    const message = latestMessage(messages, (item) => !revert || compareMessageToRevert(item, revert) < 0)
     if (!message) return
     const parts = sync().data.part[message.id]
 
@@ -326,7 +331,8 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       updatePrompt: (promptSession) => {
         if (parts) promptSession.set(extractPromptFromParts(parts, { directory }))
       },
-      updateViewport: () => setActiveMessage(findLast(messages, (x) => x.id < message.id)),
+      updateViewport: () =>
+        setActiveMessage(latestMessage(messages, (item) => compareMessageChronology(item, message) < 0)),
     })
   }
 
@@ -338,17 +344,18 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     const messages = userMessages()
     const promptSession = prompt.capture()
 
-    const revertMessageID = info()?.revert?.messageID
-    if (!revertMessageID) return
+    const revert = info()?.revert
+    if (!revert) return
 
-    const next = messages.find((x) => x.id > revertMessageID)
+    const next = earliestMessage(messages, (message) => compareMessageToRevert(message, revert) > 0)
     if (!next) {
       await runCommand({
         owner,
         prompt: promptSession,
         request: () => session.revert.clear({ sessionID }),
         updatePrompt: (promptSession) => promptSession.reset(),
-        updateViewport: () => setActiveMessage(findLast(messages, (x) => x.id >= revertMessageID)),
+        updateViewport: () =>
+          setActiveMessage(latestMessage(messages, (message) => compareMessageToRevert(message, revert) >= 0)),
       })
       return
     }
@@ -358,7 +365,8 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       prompt: promptSession,
       request: () => session.revert.stage({ sessionID, messageID: next.id }),
       updatePrompt: () => undefined,
-      updateViewport: () => setActiveMessage(findLast(messages, (x) => x.id < next.id)),
+      updateViewport: () =>
+        setActiveMessage(latestMessage(messages, (message) => compareMessageChronology(message, next) < 0)),
     })
   }
 

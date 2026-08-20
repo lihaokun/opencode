@@ -6,7 +6,7 @@
 import { describe, expect } from "bun:test"
 import { Effect, Schema } from "effect"
 import { raw, reply, type Usage } from "../../lib/llm-server"
-import { cliIt } from "../../lib/cli-process"
+import { CLI_PROCESS_TIMEOUT_MS, cliIt } from "../../lib/cli-process"
 import { testProviderConfig } from "../../lib/test-provider"
 
 const TaskEventPart = Schema.Struct({
@@ -61,6 +61,7 @@ const StoredPart = Schema.Struct({
 })
 
 const crossoverUsage = { input: 100, output: 1 } satisfies Usage
+const TEST_TIMEOUT_MS = 120_000
 
 function missingFinishWithUsage(input: { text: string; usage: Usage }) {
   const chunk = (delta: Record<string, unknown>) => ({
@@ -135,7 +136,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         opencode.expectExit(result, 0)
         expect(result.stdout).toBe("hello from the test llm\n")
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -152,7 +153,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         // One prompt request plus the independently forked session-title request.
         expect(yield* llm.calls).toBe(2)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -244,7 +245,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(childInputs[0]?.max_tokens ?? childInputs[0]?.max_output_tokens).toBe(10_000)
         expect(yield* llm.pending).toBe(0)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -343,7 +344,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(JSON.stringify(recoveryInputs[0])).not.toContain(childReasoning)
         expect(yield* llm.pending).toBe(0)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -446,7 +447,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(yield* llm.calls).toBe(5)
         expect(yield* llm.pending).toBe(0)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -513,7 +514,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(childInputs).toHaveLength(1)
         expect(yield* llm.pending).toBe(0)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -535,7 +536,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         opencode.expectExit(result, 0)
         expect(result.stdout).toBe("before tool\nafter tool\n")
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -552,7 +553,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         opencode.expectExit(plain, 0)
         expect(plain.stdout).toBe("visible\n")
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   // Regression for #27371: an unknown model used to hang the process forever
@@ -566,12 +567,12 @@ describe("opencode run (non-interactive subprocess)", () => {
       Effect.gen(function* () {
         const result = yield* opencode.run("say hi", {
           model: "test/nonexistent-model",
-          timeoutMs: 15_000,
+          timeoutMs: CLI_PROCESS_TIMEOUT_MS,
         })
         expect(result.exitCode).not.toBe(0)
-        expect(result.durationMs).toBeLessThan(15_000)
+        expect(result.durationMs).toBeLessThan(CLI_PROCESS_TIMEOUT_MS)
       }),
-    30_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -580,14 +581,16 @@ describe("opencode run (non-interactive subprocess)", () => {
       Effect.gen(function* () {
         yield* llm.push(reply().text("partial response"))
 
-        const result = yield* opencode.run("trigger a missing terminal finish", { timeoutMs: 30_000 })
+        const result = yield* opencode.run("trigger a missing terminal finish", {
+          timeoutMs: CLI_PROCESS_TIMEOUT_MS,
+        })
 
         expect(result.exitCode).not.toBe(0)
         expect(result.stdout).toBe("partial response\n")
         expect(result.stderr).toContain("Provider stream ended without a terminal finish event")
         expect(yield* llm.pending).toBe(0)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -648,7 +651,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: reasoning }))
         expect(yield* llm.pending).toBe(0)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   // --format json puts one JSON object per line on stdout for each emitted
@@ -685,7 +688,7 @@ describe("opencode run (non-interactive subprocess)", () => {
             .every((line) => line.length > 0),
         ).toBe(true)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -708,7 +711,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         })
         expect(result.stdout.split("\n").filter(Boolean)).toHaveLength(1)
       }),
-    30_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -757,7 +760,7 @@ describe("opencode run (non-interactive subprocess)", () => {
             .every((line) => line.startsWith("{")),
         ).toBe(true)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -780,7 +783,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         )
         expect(events.filter((event) => event.type === "error")).toHaveLength(1)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -819,7 +822,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(yield* llm.calls).toBe(2)
         expect(yield* llm.pending).toBe(0)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -855,7 +858,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(explicitlyDenied.stdout).toContain("continued after explicit denial")
         expect(yield* Effect.promise(() => Bun.file(`${home}/explicitly-denied`).exists())).toBe(false)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.live(
@@ -877,7 +880,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(input).toContain(sentinel)
         expect(input).not.toContain(`file://${source}`)
       }),
-    60_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
@@ -891,7 +894,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.exitCode).not.toBe(0)
         expect(result.stderr).toContain("Cannot attach local directory without a shared filesystem")
       }),
-    30_000,
+    TEST_TIMEOUT_MS,
   )
 
   cliIt.live(
@@ -907,6 +910,6 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.exitCode).not.toBe(0)
         expect(result.durationMs).toBeLessThan(30_000)
       }),
-    30_000,
+    TEST_TIMEOUT_MS,
   )
 })

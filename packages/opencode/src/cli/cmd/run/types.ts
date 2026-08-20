@@ -331,6 +331,8 @@ export type LocalReplayAnchor = {
 
 export type LocalReplayRow = {
   commit: StreamCommit
+  createdAt: number
+  before?: LocalReplayAnchor
   after?: LocalReplayAnchor
 }
 
