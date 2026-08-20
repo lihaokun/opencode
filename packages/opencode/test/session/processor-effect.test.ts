@@ -1780,6 +1780,70 @@ itSummarySettlement.effect("session.processor retries an explicit incomplete str
   ),
 )
 
+itSettlement.live("session.processor records an aborted error when interrupted during retry delay", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("explicit-incomplete-success", 0)
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const sts = yield* SessionStatus.Service
+        const retrying = defer<void>()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "explicit-incomplete-success")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+          const data = event.data as typeof SessionStatus.Event.Status.data.Type
+          if (data.sessionID === chat.id && data.status.type === "retry") retrying.resolve()
+          return Effect.void
+        })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "explicit-incomplete-success" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* Effect.promise(() => retrying.promise)
+        yield* Fiber.interrupt(run)
+        const exit = yield* Fiber.await(run)
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        const parts = yield* MessageV2.parts(msg.id)
+        const state = yield* sts.get(chat.id)
+        yield* off
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+        expect(settlementCalls.get("explicit-incomplete-success")).toBe(1)
+        expect(parts).toEqual([])
+        expect(handle.message.error?.name).toBe("MessageAbortedError")
+        expect(handle.message.time.completed).toBeDefined()
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") {
+          expect(stored.info.error?.name).toBe("MessageAbortedError")
+          expect(stored.info.time.completed).toBeDefined()
+        }
+        expect(state).toMatchObject({ type: "idle" })
+      }),
+    { config: cfg },
+  ),
+)
+
 itSettlement.effect("session.processor stops after two explicit incomplete retries", () =>
   provideTmpdirInstance(
     (dir) =>
