@@ -1065,6 +1065,8 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
   const mdl = options?.limit ? { ...base, limit: options.limit } : base
   const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
   const removedParts: SessionV1.Part["id"][] = []
+  const removalAwareParts = new Map<SessionV1.Part["id"], SessionV1.Part>()
+  const appendOnlyTextDeltas: string[] = []
   const assistantUpdates: SessionV1.Assistant[] = []
   const retryStatuses: Extract<SessionStatus.Info, { type: "retry" }>[] = []
   const off = yield* eventBridge.listen((event) => {
@@ -1075,7 +1077,24 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
     }
     if (event.type === SessionV1.Event.PartRemoved.type) {
       const data = event.data as typeof SessionV1.Event.PartRemoved.data.Type
-      if (data.sessionID === chat.id && data.messageID === msg.id) removedParts.push(data.partID)
+      if (data.sessionID === chat.id && data.messageID === msg.id) {
+        removedParts.push(data.partID)
+        removalAwareParts.delete(data.partID)
+      }
+      return Effect.void
+    }
+    if (event.type === SessionV1.Event.PartUpdated.type) {
+      const data = event.data as typeof SessionV1.Event.PartUpdated.data.Type
+      if (data.sessionID === chat.id && data.part.messageID === msg.id) {
+        removalAwareParts.set(data.part.id, structuredClone(data.part) as SessionV1.Part)
+      }
+      return Effect.void
+    }
+    if (event.type === SessionV1.Event.PartDelta.type) {
+      const data = event.data as typeof SessionV1.Event.PartDelta.data.Type
+      if (data.sessionID === chat.id && data.messageID === msg.id && data.field === "text") {
+        appendOnlyTextDeltas.push(data.delta)
+      }
       return Effect.void
     }
     if (event.type === SessionStatus.Event.Status.type) {
@@ -1121,6 +1140,8 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
     parts: yield* MessageV2.parts(msg.id),
     errors,
     removedParts,
+    removalAwareParts: [...removalAwareParts.values()],
+    appendOnlyTextDeltas,
     assistantUpdates,
     retryStatuses,
   }
@@ -1891,6 +1912,36 @@ itSettlement.effect("session.processor shares one incomplete budget across expli
         expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-1" }))
         expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-2" }))
         expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "discarded-3" }))
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.effect("session.processor converges removal-aware views while append-only output keeps transient text", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const scenario = "explicit-incomplete-success"
+        settlementCalls.set(scenario, 0)
+        const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt(scenario, 1)
+        yield* TestClock.adjust(2_000)
+        const result = yield* Fiber.join(resultFiber)
+        const authoritativeIDs = result.parts.map((part) => part.id).toSorted()
+        const removalAwareIDs = result.removalAwareParts.map((part) => part.id).toSorted()
+        const authoritativeText = result.parts
+          .filter((part): part is SessionV1.TextPart => part.type === "text")
+          .map((part) => part.text)
+        const removalAwareText = result.removalAwareParts
+          .filter((part): part is SessionV1.TextPart => part.type === "text")
+          .map((part) => part.text)
+
+        expect(result.result).toBe("continue")
+        expect(authoritativeIDs).toEqual(removalAwareIDs)
+        expect(authoritativeText).toEqual(["retained-2"])
+        expect(removalAwareText).toEqual(["retained-2"])
+        expect(result.appendOnlyTextDeltas).toEqual(["discarded-1", "retained-2"])
+        expect(result.removedParts).toHaveLength(3)
       }),
     { config: cfg },
   ),

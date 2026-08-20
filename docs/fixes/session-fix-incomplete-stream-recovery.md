@@ -1,6 +1,6 @@
 # Issue #7 修正方案：Legacy incomplete stream 同 assistant 回滚重试
 
-> 状态：修正方案与编码前契约已确认；两个 incomplete entry、独立预算、retry fences、same-assistant rollback 与 attempt-local summary deferral 已实施并验证；observability 与跨层回归待完成
+> 状态：修正方案与编码前契约已确认；两个 incomplete entry、独立预算、retry fences、same-assistant rollback、attempt-local summary deferral 与分层 observability 已实施并验证；跨层回归待完成
 > 日期：2026-08-19
 > Issue：[#7 — Incomplete provider stream 应按副作用状态恢复](https://github.com/lihaokun/opencode/issues/7)
 > 分析基线：`48cffdff0f83387b5ac82dafc59603b4fa2e9461`
@@ -1256,7 +1256,7 @@ fence 命中后 attempt retained，不能依靠 rollback 删除 unfinished tool 
 | Usage checkpoint | `legacy_retry_restores_assistant_finish_cost_tokens_checkpoint` | rolled-back attempt不污染retained aggregate | 待加 |
 | Summary rollback | `legacy_rolled_back_attempt_never_launches_processor_summary` | `step-finish`后rollback，failed attempt call count=0 | 待加 |
 | Summary retained compatibility | `legacy_retained_attempt_releases_deferred_processor_summary_from_finalizer` | success/error/blocked/compaction/interrupt retained exits均在cleanup body前按existing数量/顺序释放一次 | 待加 |
-| Observability | `legacy_retry_converges_authoritative_and_removal_aware_views_while_append_only_may_retain_transient_output` | 一个focused case断言三层visibility | 待加 |
+| Observability | `legacy_retry_converges_authoritative_and_removal_aware_views_while_append_only_may_retain_transient_output` | 一个focused case断言三层visibility | 已加并通过：authoritative/removal-aware 收敛，append-only 保留两次 delta |
 | Intentional outcomes | `legacy_clean_eof_detection_excludes_blocked_compaction_and_interrupt` | 三类existing outcome不进入incomplete | 已加并通过：blocked/compaction/interrupt retained paths |
 
 ## 6.2 参数化边界矩阵
@@ -1485,6 +1485,18 @@ Focused regressions 覆盖：(1) explicit attempt 1 incomplete、attempt 2 succe
 
 Focused regressions 覆盖：(1) unsettled clean EOF attempt 1 回滚后 attempt 2 在同一 assistant 成功，attempt 1 open text/step parts 不留在 authoritative transcript；(2) credible empty unknown 连续三次后以 `EMPTY_UNKNOWN_MESSAGE` + `finish="unknown"` 落地；(3) empty/final-only/active-step EOF 连续三次后以 `UNSETTLED_STEP_MESSAGE` + `finish="error"` 落地；(4) explicit → clean EOF → clean EOF 共用两次 incomplete replay budget，无第四次 request；(5) ordinary retry 后的 clean EOF 继续沿同一 schedule 观察 `attempt=2,3`，不重置 ordinal；(6) actual text-complete callback、pending tool input 与 preexisting terminal error 均阻止 clean EOF replay；blocked、compaction 与 interrupt exclusions 保持既有路径。retained pending tool 继续由 existing cleanup 落为 aborted/error。
 
+### 6.5.12 Transcript observability 分层验证记录
+
+2026-08-20 在 focused processor regression 内同时观察三层结果，不修改任何 production consumer：authoritative read 使用 `MessageV2.parts()`；removal-aware projection 由既有 `PartUpdated` / `PartRemoved` 事件重放；append-only output 记录既有 `PartDelta` 文本流。测试使用 explicit incomplete attempt 1 输出 `discarded-1`、回滚后 attempt 2 输出 `retained-2`。
+
+| 命令 | 结果 |
+|---|---|
+| `bun test packages/opencode/test/session/processor-effect.test.ts` | 60 pass / 0 fail / 453 assertions |
+| `bun run --cwd packages/opencode typecheck` | 通过 |
+| `git diff --check` | 通过 |
+
+最终 authoritative 与 removal-aware views 的 part ID 集合一致，且两者文本都只有 `retained-2`；append-only delta 仍按发生顺序观察到 `discarded-1`、`retained-2`。这正是批准的 visibility contract：durable removal 保证 authoritative convergence，但不承诺所有历史输出 surface retroactive erase。未修改 TUI、CLI、Mini、ACP、GitHub/share 或任何 publisher/projector 实现。
+
 ## 6.6 最小复现固化要求
 
 - A/B 分别证明explicit incomplete与qualifying clean EOF；
@@ -1527,7 +1539,7 @@ Focused regressions 覆盖：(1) unsettled clean EOF attempt 1 回滚后 attempt
 | `packages/opencode/src/session/retry.ts` | policy/gate/preparation integration | incomplete与ordinary retry发request前共用gate/preparation，复用delay/status | 已改并验证：optional decide/beforeRetry hooks；processor integration 待后续单元 |
 | `packages/opencode/test/session/llm.test.ts` | adapter tests | stable classification 与 detailed message regression | 已改并通过：54/54（本步骤） |
 | `packages/opencode/test/session/retry.test.ts` | retry policy tests | gate/preparation、独立count与ordinary retry交互 | 已改并验证：policy hooks 37/37；processor integration 覆盖独立 budget 与跨类别 monotonic attempt |
-| `packages/opencode/test/session/processor-effect.test.ts` | focused integration tests | same-assistant rollback、entries、exact boundary、fences、three-attempt exhaustion、final semantics、usage、summary、tool cleanup、observability | 进行中：explicit/clean EOF success、exhaustion、shared budget、exact final semantics 与 fences 已加并通过 59/59；observability 待完成 |
+| `packages/opencode/test/session/processor-effect.test.ts` | focused integration tests | same-assistant rollback、entries、exact boundary、fences、three-attempt exhaustion、final semantics、usage、summary、tool cleanup、observability | 已改并验证：recovery/fences/exact semantics + 三层 observability，60/60；跨层 fixtures 待其它测试文件完成 |
 | `packages/opencode/test/session/prompt.test.ts` | existing Legacy loop regressions | 为无 fence 的 missing-finish fixture 提供 bounded retry 序列并更新 request count；completed-tool fence 用例继续锁定 no replay | 待改 |
 | `packages/opencode/test/tool/task.test.ts` | child/task incomplete regressions | child 自身无 tool fence 时验证 bounded retry/exhaustion；已有 tool activity 时仍不 replay，并保持 Task error 投影 | 待改 |
 | `packages/opencode/test/cli/run/run-process.test.ts` | top-level/child CLI regressions | 更新 missing-finish request 数与最终 error；明确 authoritative state 收敛而 append-only stdout/JSON 可保留 transient failed output | 待改 |
@@ -1567,7 +1579,7 @@ Focused regressions 覆盖：(1) unsettled clean EOF attempt 1 回滚后 attempt
 10. [已完成] processor `step-finish` summary attempt-local deferral；rollback 丢弃，retained success/error/blocked/compaction/interrupt 由 process finalizer 在 cleanup body 前释放；
 11. [已完成] explicit incomplete recovery + independent two-retry budget；successful same-assistant replay、three-attempt exhaustion 与 incomplete→ordinary→incomplete monotonic schedule sequence 均已验证；
 12. [已完成] clean EOF recovery + shared incomplete budget + exact final error/finish；
-13. focused authoritative/removal-aware/append-only observability test；
+13. [已完成] focused authoritative/removal-aware/append-only observability test；
 14. package-local 定向、Prompt/Task/CLI/session regression 与 typecheck；
 15. 实现后回填本文和既有 contract amendment 状态，新增 devlog。
 
@@ -1637,7 +1649,7 @@ Focused regressions 覆盖：(1) unsettled clean EOF attempt 1 回滚后 attempt
 | `docs/devlog/2026-08-<implementation-date>-incomplete-stream-recovery.md` | 全部 recovery 实现完成后汇总代码、测试、关键 decision 和 required metrics | 待加 |
 | `CLAUDE.md`「已知限制与注意事项」 | 仅实现后确认有可复用经验时回写，例如authoritative removal不等于append-only历史擦除 | 待判定 |
 
-初次方案收尾与编码前 contract amendment 已分别完成。stable classification / AI SDK mapping、processor 两个 private entries、physical-attempt checkpoint/tracking、retry hooks/fences、ordinary same-assistant rollback、attempt-local summary deferral 与 shared-budget incomplete bounded replay 已修改 shared schema、adapter、processor/retry 与对应 tests；summary.ts、plugin/tool runtime/public API、Prompt/V2 仍无 diff，observability 与跨层回归待完成。
+初次方案收尾与编码前 contract amendment 已分别完成。stable classification / AI SDK mapping、processor 两个 private entries、physical-attempt checkpoint/tracking、retry hooks/fences、ordinary same-assistant rollback、attempt-local summary deferral、shared-budget incomplete bounded replay 与分层 observability 已修改 shared schema、adapter、processor/retry 与对应 tests；summary.ts、plugin/tool runtime/public API、Prompt/V2 仍无 diff，跨层回归待完成。
 
 ## 8.2 行为契约变更
 
