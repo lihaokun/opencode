@@ -981,7 +981,7 @@ it.instance("loop preserves partial text and reasoning on length without replay"
   }),
 )
 
-it.instance("loop preserves reasoning-only output and stops on a missing terminal finish", () =>
+it.instance("loop rolls back reasoning-only output and recovers on bounded retry", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -994,25 +994,27 @@ it.instance("loop preserves reasoning-only output and stops on a missing termina
       noReply: true,
       parts: [{ type: "text", text: "reason without a finish" }],
     })
-    yield* llm.push(reply().reason("unfinished reasoning"))
+    yield* llm.push(
+      reply().reason("discarded reasoning"),
+      reply().reason("retained reasoning").text("recovered answer").stop(),
+    )
 
     const result = yield* prompt.loop({ sessionID: chat.id })
 
-    expect(yield* llm.hits).toHaveLength(1)
+    expect(yield* llm.hits).toHaveLength(2)
     expect(yield* llm.pending).toBe(0)
     expect(result.info.role).toBe("assistant")
     if (result.info.role === "assistant") {
-      expect(result.info.finish).toBe("unknown")
-      expect(result.info.error).toMatchObject({
-        name: "UnknownError",
-        data: { message: "Provider stream ended without a terminal finish event" },
-      })
+      expect(result.info.finish).toBe("stop")
+      expect(result.info.error).toBeUndefined()
     }
-    expect(result.parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: "unfinished reasoning" }))
+    expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "reasoning", text: "discarded reasoning" }))
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: "retained reasoning" }))
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "recovered answer" }))
   }),
 )
 
-it.instance("loop preserves partial text and stops on a missing terminal finish", () =>
+it.instance("loop keeps only the final partial text after bounded retry exhaustion", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -1025,11 +1027,15 @@ it.instance("loop preserves partial text and stops on a missing terminal finish"
       noReply: true,
       parts: [{ type: "text", text: "text without a finish" }],
     })
-    yield* llm.push(reply().text("partial answer"))
+    yield* llm.push(
+      reply().text("discarded partial 1"),
+      reply().text("discarded partial 2"),
+      reply().text("final partial answer"),
+    )
 
     const result = yield* prompt.loop({ sessionID: chat.id })
 
-    expect(yield* llm.hits).toHaveLength(1)
+    expect(yield* llm.hits).toHaveLength(3)
     expect(yield* llm.pending).toBe(0)
     expect(result.info.role).toBe("assistant")
     if (result.info.role === "assistant") {
@@ -1039,8 +1045,11 @@ it.instance("loop preserves partial text and stops on a missing terminal finish"
         data: { message: "Provider stream ended without a terminal finish event" },
       })
     }
-    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial answer" }))
+    expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded partial 1" }))
+    expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded partial 2" }))
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "final partial answer" }))
   }),
+  15_000,
 )
 
 it.instance("loop persists a high-usage missing finish without compaction or replay", () =>
@@ -1255,7 +1264,7 @@ unix("loop does not replay a completed tool after a later length finish", () =>
   }),
 )
 
-unix("loop does not replay a completed tool after a later missing terminal finish", () =>
+unix("loop retries a later missing finish without replaying an earlier completed tool", () =>
   Effect.gen(function* () {
     if (!(yield* hasBash)) return
     const { dir, llm } = yield* useServerConfig(providerCfg)
@@ -1279,19 +1288,19 @@ unix("loop does not replay a completed tool after a later missing terminal finis
         description: "Append one marker",
       }),
       reply().reason("cut off after tool"),
+      reply().text("recovered after tool").stop(),
     )
 
     const result = yield* withSh(() => prompt.loop({ sessionID: chat.id }))
 
-    expect(yield* llm.hits).toHaveLength(2)
+    expect(yield* llm.hits).toHaveLength(3)
     expect(yield* llm.pending).toBe(0)
     expect(result.info.role).toBe("assistant")
     if (result.info.role === "assistant") {
-      expect(result.info.error).toMatchObject({
-        name: "UnknownError",
-        data: { message: "Provider stream ended without a terminal finish event" },
-      })
+      expect(result.info.finish).toBe("stop")
+      expect(result.info.error).toBeUndefined()
     }
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "recovered after tool" }))
     expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("charged\n")
   }),
 )

@@ -1,6 +1,6 @@
 # Issue #7 修正方案：Legacy incomplete stream 同 assistant 回滚重试
 
-> 状态：修正方案与编码前契约已确认；两个 incomplete entry、独立预算、retry fences、same-assistant rollback、attempt-local summary deferral 与分层 observability 已实施并验证；跨层回归待完成
+> 状态：修正方案与编码前契约已确认；Legacy bounded recovery、分层 observability 与 Prompt/Task/CLI/compaction 跨层回归已实施并验证；最终审核、文档与 devlog 待完成
 > 日期：2026-08-19
 > Issue：[#7 — Incomplete provider stream 应按副作用状态恢复](https://github.com/lihaokun/opencode/issues/7)
 > 分析基线：`48cffdff0f83387b5ac82dafc59603b4fa2e9461`
@@ -1497,6 +1497,21 @@ Focused regressions 覆盖：(1) unsettled clean EOF attempt 1 回滚后 attempt
 
 最终 authoritative 与 removal-aware views 的 part ID 集合一致，且两者文本都只有 `retained-2`；append-only delta 仍按发生顺序观察到 `discarded-1`、`retained-2`。这正是批准的 visibility contract：durable removal 保证 authoritative convergence，但不承诺所有历史输出 surface retroactive erase。未修改 TUI、CLI、Mini、ACP、GitHub/share 或任何 publisher/projector 实现。
 
+### 6.5.13 Prompt / Task / CLI / compaction 跨层回归记录
+
+2026-08-20 更新直接依赖 missing-finish request-count/output 契约的 existing Legacy fixtures。Prompt 覆盖 safe retry success、三次 exhaustion，以及较早 completed tool 只执行一次而后续无 fence assistant 可安全 transport replay；CLI 覆盖 plain/JSON append-only transient output、authoritative final-attempt convergence 与 child Task 三次 exhaustion 后 parent recovery。`task.test.ts` 使用 stubbed `SessionPrompt.PromptInput → WithParts` 边界，不经过 provider physical attempts，final Task error contract 未变化，因此不为触碰文件而伪造 retry；全套 Task boundary tests 原样通过。完整 session suite 首轮发现 compaction unsettled-summary fixture 仍假定 attempt 1 partial retained，随后改为三次输入并锁定只保留 final summary attempt。
+
+| 命令 | 结果 |
+|---|---|
+| `bun test packages/opencode/test/session/prompt.test.ts` | 69 pass / 1 skip / 0 fail / 330 assertions |
+| `bun test packages/opencode/test/tool/task.test.ts` | 37 pass / 0 fail / 201 assertions |
+| `bun test packages/opencode/test/cli/run/run-process.test.ts` | 20 pass / 0 fail / 131 assertions |
+| `bun test packages/opencode/test/session` | 462 pass / 7 skip / 1 todo / 0 fail / 1651 assertions |
+| `bun run --cwd packages/opencode typecheck` | 通过 |
+| `git diff --check` | 通过 |
+
+Prompt authoritative transcripts 删除前两次 reasoning/text/summary attempt，仅保留 successful 或 exhausted final attempt；completed bash marker 仍恰好一行。plain 与 JSON CLI append-only streams 明确允许观察三次 transient text/reasoning，而数据库 query 只返回 final attempt parts。child Task fixture 对同一 child prompt 观察到恰好三次 provider inputs，Task error 与 parent recovery input 均不泄露任何 private reasoning。未修改 Prompt、Task、CLI、compaction production code或V2。
+
 ## 6.6 最小复现固化要求
 
 - A/B 分别证明explicit incomplete与qualifying clean EOF；
@@ -1540,9 +1555,10 @@ Focused regressions 覆盖：(1) unsettled clean EOF attempt 1 回滚后 attempt
 | `packages/opencode/test/session/llm.test.ts` | adapter tests | stable classification 与 detailed message regression | 已改并通过：54/54（本步骤） |
 | `packages/opencode/test/session/retry.test.ts` | retry policy tests | gate/preparation、独立count与ordinary retry交互 | 已改并验证：policy hooks 37/37；processor integration 覆盖独立 budget 与跨类别 monotonic attempt |
 | `packages/opencode/test/session/processor-effect.test.ts` | focused integration tests | same-assistant rollback、entries、exact boundary、fences、three-attempt exhaustion、final semantics、usage、summary、tool cleanup、observability | 已改并验证：recovery/fences/exact semantics + 三层 observability，60/60；跨层 fixtures 待其它测试文件完成 |
-| `packages/opencode/test/session/prompt.test.ts` | existing Legacy loop regressions | 为无 fence 的 missing-finish fixture 提供 bounded retry 序列并更新 request count；completed-tool fence 用例继续锁定 no replay | 待改 |
-| `packages/opencode/test/tool/task.test.ts` | child/task incomplete regressions | child 自身无 tool fence 时验证 bounded retry/exhaustion；已有 tool activity 时仍不 replay，并保持 Task error 投影 | 待改 |
-| `packages/opencode/test/cli/run/run-process.test.ts` | top-level/child CLI regressions | 更新 missing-finish request 数与最终 error；明确 authoritative state 收敛而 append-only stdout/JSON 可保留 transient failed output | 待改 |
+| `packages/opencode/test/session/compaction.test.ts` | summary processor regression | unsettled summary 三次 exhaustion，只保留 final attempt，仍不标 completed compaction | 已改并通过；包含于 session 462/462 pass |
+| `packages/opencode/test/session/prompt.test.ts` | existing Legacy loop regressions | 为无 fence 的 missing-finish fixture 提供 bounded retry 序列并更新 request count；较早 completed tool 不重复执行 | 已改并通过：69 pass / 1 skip |
+| `packages/opencode/test/tool/task.test.ts` | child/task incomplete regressions | child 最终 error 投影与 private reasoning 隔离 | 无需源码修改：stub boundary 不经过 provider attempts；37/37 通过，actual child recovery 由 CLI integration 覆盖 |
+| `packages/opencode/test/cli/run/run-process.test.ts` | top-level/child CLI regressions | 更新 missing-finish request 数与最终 error；明确 authoritative state 收敛而 append-only stdout/JSON 可保留 transient failed output | 已改并通过：20/20 |
 
 不修改 production consumer 实现。上述 Prompt/Task/CLI 测试文件已存在 no-replay/request-count 契约，本行为改变会直接影响它们，因此必须列入 implementation test modifications；focused removal-aware observability 仍优先复用 processor integration test 内 existing projector helper。
 
@@ -1580,7 +1596,7 @@ Focused regressions 覆盖：(1) unsettled clean EOF attempt 1 回滚后 attempt
 11. [已完成] explicit incomplete recovery + independent two-retry budget；successful same-assistant replay、three-attempt exhaustion 与 incomplete→ordinary→incomplete monotonic schedule sequence 均已验证；
 12. [已完成] clean EOF recovery + shared incomplete budget + exact final error/finish；
 13. [已完成] focused authoritative/removal-aware/append-only observability test；
-14. package-local 定向、Prompt/Task/CLI/session regression 与 typecheck；
+14. [已完成] package-local 定向、Prompt/Task/CLI/compaction/session regression 与 typecheck；
 15. 实现后回填本文和既有 contract amendment 状态，新增 devlog。
 
 ## 7.4 实现后核对项
@@ -1649,7 +1665,7 @@ Focused regressions 覆盖：(1) unsettled clean EOF attempt 1 回滚后 attempt
 | `docs/devlog/2026-08-<implementation-date>-incomplete-stream-recovery.md` | 全部 recovery 实现完成后汇总代码、测试、关键 decision 和 required metrics | 待加 |
 | `CLAUDE.md`「已知限制与注意事项」 | 仅实现后确认有可复用经验时回写，例如authoritative removal不等于append-only历史擦除 | 待判定 |
 
-初次方案收尾与编码前 contract amendment 已分别完成。stable classification / AI SDK mapping、processor 两个 private entries、physical-attempt checkpoint/tracking、retry hooks/fences、ordinary same-assistant rollback、attempt-local summary deferral、shared-budget incomplete bounded replay 与分层 observability 已修改 shared schema、adapter、processor/retry 与对应 tests；summary.ts、plugin/tool runtime/public API、Prompt/V2 仍无 diff，跨层回归待完成。
+初次方案收尾与编码前 contract amendment 已分别完成。stable classification / AI SDK mapping、processor 两个 private entries、physical-attempt checkpoint/tracking、retry hooks/fences、ordinary same-assistant rollback、attempt-local summary deferral、shared-budget incomplete bounded replay、分层 observability 与 Prompt/Task/CLI/compaction 跨层回归已完成；summary.ts、plugin/tool runtime/public API、Prompt/Task/CLI/compaction production 与 V2 仍无 diff，最终审核与 devlog 待完成。
 
 ## 8.2 行为契约变更
 

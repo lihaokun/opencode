@@ -249,12 +249,16 @@ describe("opencode run (non-interactive subprocess)", () => {
   )
 
   cliIt.concurrent(
-    "persists a child missing-finish error and lets the parent recover without replay",
+    "exhausts child missing-finish retries before the parent recovers without replay",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         const parentPrompt = "delegate a task whose stream will end early"
         const childPrompt = "reason about the task before the stream ends"
-        const childReasoning = "unfinished private child reasoning"
+        const childReasoning = [
+          "discarded private child reasoning 1",
+          "discarded private child reasoning 2",
+          "final private child reasoning",
+        ]
         const recovery = "parent recovered from the incomplete child"
         const bodyIncludes = (body: Record<string, unknown>, value: string) => JSON.stringify(body).includes(value)
         const hasUserText = (body: Record<string, unknown>, value: string) => {
@@ -273,7 +277,9 @@ describe("opencode run (non-interactive subprocess)", () => {
             subagent_type: "general",
           }),
         )
-        yield* llm.pushMatch(({ body }) => hasUserText(body, childPrompt), reply().reason(childReasoning))
+        for (const reasoning of childReasoning) {
+          yield* llm.pushMatch(({ body }) => hasUserText(body, childPrompt), reply().reason(reasoning))
+        }
         yield* llm.pushMatch(
           ({ body }) => bodyIncludes(body, "Provider stream ended without a terminal finish event"),
           reply().text(recovery).stop(),
@@ -297,7 +303,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(taskPart?.state?.status).toBe("error")
         expect(taskPart?.state?.error).toContain("Subagent task failed: UnknownError")
         expect(taskPart?.state?.error).toContain("Provider stream ended without a terminal finish event")
-        expect(taskPart?.state?.error).not.toContain(childReasoning)
+        for (const reasoning of childReasoning) expect(taskPart?.state?.error).not.toContain(reasoning)
         expect(events.some((event) => event.type === "text" && JSON.stringify(event.part).includes(recovery))).toBe(
           true,
         )
@@ -337,11 +343,13 @@ describe("opencode run (non-interactive subprocess)", () => {
 
         expect(childAssistant?.info.finish).toBe("unknown")
         expect(childAssistant?.info.error?.name).toBe("UnknownError")
-        expect(childParts).toContainEqual(expect.objectContaining({ type: "reasoning", text: childReasoning }))
+        expect(childParts).not.toContainEqual(expect.objectContaining({ type: "reasoning", text: childReasoning[0] }))
+        expect(childParts).not.toContainEqual(expect.objectContaining({ type: "reasoning", text: childReasoning[1] }))
+        expect(childParts).toContainEqual(expect.objectContaining({ type: "reasoning", text: childReasoning[2] }))
         expect(childParts.some((part) => part.type === "text")).toBe(false)
-        expect(childInputs).toHaveLength(1)
+        expect(childInputs).toHaveLength(3)
         expect(recoveryInputs).toHaveLength(1)
-        expect(JSON.stringify(recoveryInputs[0])).not.toContain(childReasoning)
+        for (const reasoning of childReasoning) expect(JSON.stringify(recoveryInputs[0])).not.toContain(reasoning)
         expect(yield* llm.pending).toBe(0)
       }),
     TEST_TIMEOUT_MS,
@@ -576,41 +584,64 @@ describe("opencode run (non-interactive subprocess)", () => {
   )
 
   cliIt.concurrent(
-    "missing terminal finish preserves partial text and exits nonzero",
+    "missing terminal finish exhausts bounded retries and preserves append-only partial text",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
-        yield* llm.push(reply().text("partial response"))
+        const prompt = "trigger a missing terminal finish"
+        yield* llm.push(
+          reply().text("partial attempt 1"),
+          reply().text("partial attempt 2"),
+          reply().text("final partial response"),
+        )
 
-        const result = yield* opencode.run("trigger a missing terminal finish", {
-          timeoutMs: CLI_PROCESS_TIMEOUT_MS,
-        })
+        const result = yield* opencode.run(prompt, { timeoutMs: CLI_PROCESS_TIMEOUT_MS })
+        const inputs = (yield* llm.inputs).filter((body) => hasUserText(body, prompt) && !isTitleInput(body))
 
         expect(result.exitCode).not.toBe(0)
-        expect(result.stdout).toBe("partial response\n")
+        expect(result.stdout).toBe("partial attempt 1\npartial attempt 2\nfinal partial response\n")
         expect(result.stderr).toContain("Provider stream ended without a terminal finish event")
+        expect(inputs).toHaveLength(3)
         expect(yield* llm.pending).toBe(0)
       }),
     TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
-    "missing terminal finish persists reasoning and an assistant error",
+    "missing terminal finish streams transient reasoning but stores only the final attempt",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
-        const reasoning = "unfinished top-level reasoning"
-        yield* llm.push(reply().reason(reasoning))
+        const prompt = "reason until the stream ends"
+        const reasoning = ["discarded reasoning 1", "discarded reasoning 2", "final retained reasoning"]
+        yield* llm.push(...reasoning.map((text) => reply().reason(text)))
 
-        const result = yield* opencode.run("reason until the stream ends", {
+        const result = yield* opencode.run(prompt, {
           format: "json",
           extraArgs: ["--thinking"],
         })
 
         expect(result.exitCode).not.toBe(0)
         const events = opencode.parseJsonEvents(result.stdout)
-        expect(events.map((event) => event.type)).toEqual(["step_start", "reasoning", "step_finish", "error"])
-        expect(events[1]?.part).toEqual(expect.objectContaining({ type: "reasoning", text: reasoning }))
-        expect(events[2]?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
-        expect(events[3]?.error).toEqual(
+        expect(events.map((event) => event.type)).toEqual([
+          "step_start",
+          "reasoning",
+          "step_finish",
+          "step_start",
+          "reasoning",
+          "step_finish",
+          "step_start",
+          "reasoning",
+          "step_finish",
+          "error",
+        ])
+        expect(events.filter((event) => event.type === "reasoning").map((event) => event.part)).toEqual(
+          reasoning.map((text) => expect.objectContaining({ type: "reasoning", text })),
+        )
+        expect(events.filter((event) => event.type === "step_finish").map((event) => event.part)).toEqual([
+          expect.objectContaining({ type: "step-finish", reason: "unknown" }),
+          expect.objectContaining({ type: "step-finish", reason: "unknown" }),
+          expect.objectContaining({ type: "step-finish", reason: "unknown" }),
+        ])
+        expect(events.at(-1)?.error).toEqual(
           expect.objectContaining({
             name: "UnknownError",
             data: expect.objectContaining({ message: "Provider stream ended without a terminal finish event" }),
@@ -646,9 +677,14 @@ describe("opencode run (non-interactive subprocess)", () => {
           .filter((row) => row.message_id === assistant?.id)
           .map((row) => Schema.decodeUnknownSync(StoredPart)(JSON.parse(row.data ?? "{}")))
 
+        const inputs = (yield* llm.inputs).filter((body) => hasUserText(body, prompt) && !isTitleInput(body))
+
         expect(assistant?.info.finish).toBe("unknown")
         expect(assistant?.info.error?.name).toBe("UnknownError")
-        expect(parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: reasoning }))
+        expect(parts).not.toContainEqual(expect.objectContaining({ type: "reasoning", text: reasoning[0] }))
+        expect(parts).not.toContainEqual(expect.objectContaining({ type: "reasoning", text: reasoning[1] }))
+        expect(parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: reasoning[2] }))
+        expect(inputs).toHaveLength(3)
         expect(yield* llm.pending).toBe(0)
       }),
     TEST_TIMEOUT_MS,
@@ -764,18 +800,36 @@ describe("opencode run (non-interactive subprocess)", () => {
   )
 
   cliIt.concurrent(
-    "--format json records partial output before a missing terminal error",
+    "--format json retains transient retry output before the final missing terminal error",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
-        yield* llm.push(reply().text("partial json"))
+        const partials = ["partial json 1", "partial json 2", "final partial json"]
+        yield* llm.push(...partials.map((text) => reply().text(text)))
         const result = yield* opencode.run("end after partial output", { format: "json" })
 
         const events = opencode.parseJsonEvents(result.stdout)
         expect(result.exitCode).not.toBe(0)
-        expect(events.map((event) => event.type)).toEqual(["step_start", "text", "step_finish", "error"])
-        expect(events[1]?.part).toEqual(expect.objectContaining({ type: "text", text: "partial json" }))
-        expect(events[2]?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
-        expect(events[3]?.error).toEqual(
+        expect(events.map((event) => event.type)).toEqual([
+          "step_start",
+          "text",
+          "step_finish",
+          "step_start",
+          "text",
+          "step_finish",
+          "step_start",
+          "text",
+          "step_finish",
+          "error",
+        ])
+        expect(events.filter((event) => event.type === "text").map((event) => event.part)).toEqual(
+          partials.map((text) => expect.objectContaining({ type: "text", text })),
+        )
+        expect(events.filter((event) => event.type === "step_finish").map((event) => event.part)).toEqual([
+          expect.objectContaining({ type: "step-finish", reason: "unknown" }),
+          expect.objectContaining({ type: "step-finish", reason: "unknown" }),
+          expect.objectContaining({ type: "step-finish", reason: "unknown" }),
+        ])
+        expect(events.at(-1)?.error).toEqual(
           expect.objectContaining({
             name: "UnknownError",
             data: expect.objectContaining({ message: "Provider stream ended without a terminal finish event" }),
