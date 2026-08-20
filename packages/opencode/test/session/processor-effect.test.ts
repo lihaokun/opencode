@@ -7,6 +7,7 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { expect } from "bun:test"
 import { APICallError, tool } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -334,6 +335,34 @@ function toolFenceStream(event: LLMEvent): Stream.Stream<LLMEvent, unknown> {
   )
 }
 
+function incompleteAttempt(name: string, attempt: number, message: string) {
+  const id = `${name}-text-${attempt}`
+  return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.textStart({ id }),
+    LLMEvent.textDelta({ id, text: `discarded-${attempt}` }),
+    LLMEvent.textEnd({ id }),
+    LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+    LLMEvent.providerError({
+      message,
+      classification: "incomplete-stream",
+      retryable: false,
+    }),
+  )
+}
+
+function successfulAttempt(name: string, attempt: number) {
+  const id = `${name}-text-${attempt}`
+  return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.textStart({ id }),
+    LLMEvent.textDelta({ id, text: `retained-${attempt}` }),
+    LLMEvent.textEnd({ id }),
+    LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+    LLMEvent.finish({ reason: "stop" }),
+  )
+}
+
 function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
   switch (name) {
     case "empty-unknown":
@@ -463,6 +492,31 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
           retryable: false,
         }),
       )
+    case "explicit-incomplete-success": {
+      const call = settlementCalls.get(name) ?? 0
+      if (call === 1) return incompleteAttempt(name, call, "first incomplete detail")
+      return successfulAttempt(name, call)
+    }
+    case "explicit-incomplete-exhaustion": {
+      const call = settlementCalls.get(name) ?? 0
+      return incompleteAttempt(name, call, `incomplete detail ${call}`)
+    }
+    case "explicit-incomplete-mixed": {
+      const call = settlementCalls.get(name) ?? 0
+      if (call === 1) return incompleteAttempt(name, call, "first incomplete detail")
+      if (call === 2) {
+        const id = `${name}-text-${call}`
+        return Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id }),
+          LLMEvent.textDelta({ id, text: `discarded-${call}` }),
+          LLMEvent.textEnd({ id }),
+          LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        ).pipe(Stream.concat(Stream.fail(retryableFailure("ordinary failure"))))
+      }
+      if (call === 3) return incompleteAttempt(name, call, "second incomplete detail")
+      return successfulAttempt(name, call)
+    }
     case "canonical-looking-provider-error":
       return Stream.make(
         LLMEvent.stepStart({ index: 0 }),
@@ -511,6 +565,16 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
           error: new Error("tool failed"),
         }),
       )
+    case "tool-fence-explicit-incomplete":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "fenced-incomplete-call", name: "lookup" }),
+        LLMEvent.providerError({
+          message: "tool incomplete detail",
+          classification: "incomplete-stream",
+          retryable: false,
+        }),
+      )
     case "blocked-permission":
       return Stream.make(
         LLMEvent.stepStart({ index: 0 }),
@@ -539,6 +603,12 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
 }
 
 const settlementCalls = new Map<string, number>()
+const waitForSettlementAttempt = Effect.fn("test.waitForSettlementAttempt")(function* (
+  scenario: string,
+  count: number,
+) {
+  while ((settlementCalls.get(scenario) ?? 0) < count) yield* Effect.yieldNow
+})
 const settlementLLM = Layer.succeed(
   LLM.Service,
   singletonBatchLLM((input) => {
@@ -696,6 +766,19 @@ const pluginFenceLLM = Layer.succeed(
             LLMEvent.textDelta({ id: `${scenario}-partial`, text: "partial" }),
             LLMEvent.textEnd({ id: `${scenario}-partial` }),
           )
+    if (scenario === "plugin-incomplete") {
+      return events.pipe(
+        Stream.concat(
+          Stream.make(
+            LLMEvent.providerError({
+              message: "plugin incomplete detail",
+              classification: "incomplete-stream",
+              retryable: false,
+            }),
+          ),
+        ),
+      )
+    }
     return events.pipe(
       Stream.concat(
         Stream.fail(
@@ -961,6 +1044,7 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
   const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
   const removedParts: SessionV1.Part["id"][] = []
   const assistantUpdates: SessionV1.Assistant[] = []
+  const retryStatuses: Extract<SessionStatus.Info, { type: "retry" }>[] = []
   const off = yield* eventBridge.listen((event) => {
     if (event.type === Session.Event.Error.type) {
       const data = event.data as typeof Session.Event.Error.data.Type
@@ -970,6 +1054,13 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
     if (event.type === SessionV1.Event.PartRemoved.type) {
       const data = event.data as typeof SessionV1.Event.PartRemoved.data.Type
       if (data.sessionID === chat.id && data.messageID === msg.id) removedParts.push(data.partID)
+      return Effect.void
+    }
+    if (event.type === SessionStatus.Event.Status.type) {
+      const data = event.data as typeof SessionStatus.Event.Status.data.Type
+      if (data.sessionID === chat.id && data.status.type === "retry") {
+        retryStatuses.push(data.status)
+      }
       return Effect.void
     }
     if (event.type === SessionV1.Event.MessageUpdated.type) {
@@ -1009,6 +1100,7 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
     errors,
     removedParts,
     assistantUpdates,
+    retryStatuses,
   }
 })
 
@@ -1446,12 +1538,17 @@ itSettlement.live("session.processor recovers a context overflow when the attemp
   ),
 )
 
-itSettlement.live("session.processor maps only classified provider errors to private incomplete control", () =>
+itSettlement.effect("session.processor replays only classified provider errors as incomplete controls", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
         settlementCalls.set("classified-incomplete", 0)
-        const classified = yield* runSettlement(dir, "classified-incomplete")
+        const classifiedFiber = yield* runSettlement(dir, "classified-incomplete").pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("classified-incomplete", 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt("classified-incomplete", 2)
+        yield* TestClock.adjust(4_000)
+        const classified = yield* Fiber.join(classifiedFiber)
         expect(classified.result).toBe("stop")
         expect(classified.message.finish).toBe("unknown")
         expect(classified.message.error).toMatchObject({
@@ -1459,7 +1556,8 @@ itSettlement.live("session.processor maps only classified provider errors to pri
           data: { message: "specific incomplete provider failure" },
         })
         expect(classified.errors).toHaveLength(1)
-        expect(settlementCalls.get("classified-incomplete")).toBe(1)
+        expect(classified.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
+        expect(settlementCalls.get("classified-incomplete")).toBe(3)
 
         settlementCalls.set("canonical-looking-provider-error", 0)
         const unclassified = yield* runSettlement(dir, "canonical-looking-provider-error")
@@ -1470,6 +1568,7 @@ itSettlement.live("session.processor maps only classified provider errors to pri
           data: { message: "Provider stream ended without a terminal finish event" },
         })
         expect(unclassified.errors).toHaveLength(1)
+        expect(unclassified.retryStatuses).toEqual([])
         expect(settlementCalls.get("canonical-looking-provider-error")).toBe(1)
       }),
     { config: cfg },
@@ -1503,6 +1602,129 @@ itSettlement.live("session.processor persists context overflow when attempt reco
           expect(result.stored.info.time.completed).toBe(result.message.time.completed)
         }
         expect(result.errors).toEqual([result.message.error])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSummarySettlement.effect("session.processor retries an explicit incomplete stream on the same assistant", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const baselineTokens: SessionV1.Assistant["tokens"] = {
+          total: 101,
+          input: 41,
+          output: 37,
+          reasoning: 13,
+          cache: { read: 7, write: 3 },
+        }
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        settlementCalls.set("explicit-incomplete-success", 0)
+        const resultFiber = yield* runSettlement(dir, "explicit-incomplete-success", {
+          assistant: {
+            finish: "end_turn",
+            cost: 7,
+            tokens: baselineTokens,
+          },
+        }).pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("explicit-incomplete-success", 1)
+        yield* TestClock.adjust(2_000)
+        const result = yield* Fiber.join(resultFiber)
+        const finalIDs = new Set(result.parts.map((part) => part.id))
+
+        expect(result.result).toBe("continue")
+        expect(result.message.id).toBe(result.stored.info.id)
+        expect(result.message.finish).toBe("stop")
+        expect(result.message.cost).toBe(7)
+        expect(result.message.error).toBeUndefined()
+        expect(settlementCalls.get("explicit-incomplete-success")).toBe(2)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1])
+        expect(result.retryStatuses.map((state) => state.message)).toEqual(["first incomplete detail"])
+        expect(result.removedParts).toHaveLength(3)
+        expect(result.removedParts.every((partID) => !finalIDs.has(partID))).toBe(true)
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-1" }))
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "retained-2" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+        expect(result.assistantUpdates).toContainEqual(
+          expect.objectContaining({
+            id: result.message.id,
+            finish: "end_turn",
+            cost: 7,
+            tokens: baselineTokens,
+          }),
+        )
+        expect(summaryLaunches).toEqual([
+          {
+            sessionID: result.message.sessionID,
+            messageID: result.message.parentID,
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.effect("session.processor stops after two explicit incomplete retries", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("explicit-incomplete-exhaustion", 0)
+        const resultFiber = yield* runSettlement(dir, "explicit-incomplete-exhaustion").pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("explicit-incomplete-exhaustion", 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt("explicit-incomplete-exhaustion", 2)
+        yield* TestClock.adjust(4_000)
+        const result = yield* Fiber.join(resultFiber)
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "incomplete detail 3" },
+        })
+        expect(result.errors).toHaveLength(1)
+        expect(settlementCalls.get("explicit-incomplete-exhaustion")).toBe(3)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
+        expect(result.retryStatuses.map((state) => state.message)).toEqual([
+          "incomplete detail 1",
+          "incomplete detail 2",
+        ])
+        expect(result.removedParts).toHaveLength(6)
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-1" }))
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-2" }))
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "discarded-3" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.effect("session.processor keeps one retry ordinal and an independent incomplete budget", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("explicit-incomplete-mixed", 0)
+        const resultFiber = yield* runSettlement(dir, "explicit-incomplete-mixed").pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("explicit-incomplete-mixed", 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt("explicit-incomplete-mixed", 3)
+        yield* TestClock.adjust(8_000)
+        const result = yield* Fiber.join(resultFiber)
+
+        expect(result.result).toBe("continue")
+        expect(result.message.finish).toBe("stop")
+        expect(result.message.error).toBeUndefined()
+        expect(settlementCalls.get("explicit-incomplete-mixed")).toBe(4)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2, 3])
+        expect(result.retryStatuses.map((state) => state.message)).toEqual([
+          "first incomplete detail",
+          "ordinary failure",
+          "second incomplete detail",
+        ])
+        expect(result.removedParts).toHaveLength(9)
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "retained-4" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
       }),
     { config: cfg },
   ),
@@ -1598,6 +1820,34 @@ itSettlement.live("session.processor fences ordinary replay for every normalized
   ),
 )
 
+itSettlement.live("session.processor blocks explicit incomplete replay after normalized tool activity", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const scenario = "tool-fence-explicit-incomplete"
+        settlementCalls.set(scenario, 0)
+        const result = yield* runSettlement(dir, scenario)
+        const tools = result.parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toMatchObject({ data: { message: "tool incomplete detail" } })
+        expect(result.retryStatuses).toEqual([])
+        expect(settlementCalls.get(scenario)).toBe(1)
+        expect(tools).toContainEqual(
+          expect.objectContaining({
+            state: expect.objectContaining({
+              status: "error",
+              error: "Tool execution aborted",
+              metadata: expect.objectContaining({ interrupted: true }),
+            }),
+          }),
+        )
+      }),
+    { config: cfg },
+  ),
+)
+
 itSettlement.live("session.processor does not replace a blocked tool turn with an incomplete-stream error", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -1662,6 +1912,25 @@ itPluginFence.live("session.processor blocks ordinary replay after an actual tex
         expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial:plugin" }))
         expect(pluginFenceCallbackCalls).toBe(1)
         expect(pluginFenceAttempts.get("plugin-invoked")).toBe(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itPluginFence.live("session.processor blocks explicit incomplete replay after a text-complete callback", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        pluginFenceAttempts.set("plugin-incomplete", 0)
+        pluginFenceCallbackCalls = 0
+        const result = yield* runSettlement(dir, "plugin-incomplete")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toMatchObject({ data: { message: "plugin incomplete detail" } })
+        expect(result.retryStatuses).toEqual([])
+        expect(pluginFenceCallbackCalls).toBe(1)
+        expect(pluginFenceAttempts.get("plugin-incomplete")).toBe(1)
       }),
     { config: cfg },
   ),
@@ -1769,7 +2038,7 @@ itOrdinaryRollback.live("session.processor rolls back ordinary attempts on the s
   ),
 )
 
-itSummarySettlement.live("session.processor releases retained summaries before cleanup", () =>
+itSummarySettlement.effect("session.processor releases retained summaries before cleanup", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
@@ -1797,7 +2066,13 @@ itSummarySettlement.live("session.processor releases retained summaries before c
 
         summaryLaunches.length = 0
         summaryTimeline.length = 0
-        const failed = yield* runSettlement(dir, "classified-incomplete")
+        settlementCalls.set("classified-incomplete", 0)
+        const failedFiber = yield* runSettlement(dir, "classified-incomplete").pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("classified-incomplete", 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt("classified-incomplete", 2)
+        yield* TestClock.adjust(4_000)
+        const failed = yield* Fiber.join(failedFiber)
         expect(failed.result).toBe("stop")
         expect(summaryLaunches).toEqual([
           {
@@ -2469,13 +2744,16 @@ it.live("session.processor keeps reasoning with empty tool call arrays in one pa
   ),
 )
 
-it.live("session.processor finalizes pending reasoning when a compatible stream ends incomplete", () =>
+it.live("session.processor removes pending reasoning before retrying a compatible incomplete stream", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
         const { processors, session, provider } = yield* boot()
 
-        yield* llm.push(reply().reason("one").text("bridge").streamError())
+        yield* llm.push(
+          reply().reason("one").text("bridge").streamError(),
+          reply().reason("two").text("done").stop(),
+        )
 
         const chat = yield* session.create({})
         const parent = yield* user(chat.id, "reason")
@@ -2507,11 +2785,13 @@ it.live("session.processor finalizes pending reasoning when a compatible stream 
         const parts = yield* MessageV2.parts(msg.id)
         const reasoning = parts.filter((part): part is SessionV1.ReasoningPart => part.type === "reasoning")
 
-        expect(value).toBe("stop")
-        expect(yield* llm.calls).toBe(1)
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(2)
         expect(reasoning).toHaveLength(1)
-        expect(reasoning[0]).toMatchObject({ text: "one", time: { end: expect.any(Number) } })
-        expect(JSON.stringify(handle.message.error)).toContain("terminal finish event")
+        expect(reasoning[0]).toMatchObject({ text: "two", time: { end: expect.any(Number) } })
+        expect(parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "bridge" }))
+        expect(parts).toContainEqual(expect.objectContaining({ type: "text", text: "done" }))
+        expect(handle.message.error).toBeUndefined()
       }),
     { config: (url) => providerCfg(url) },
   ),

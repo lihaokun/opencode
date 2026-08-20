@@ -1,6 +1,6 @@
 # Issue #7 修正方案：Legacy incomplete stream 同 assistant 回滚重试
 
-> 状态：修正方案与编码前契约已确认；classification、attempt tracking、retry hooks/fences、ordinary rollback 与 attempt-local summary deferral 已实施并验证；incomplete replay 尚未启用
+> 状态：修正方案与编码前契约已确认；classification、attempt tracking、retry hooks/fences、ordinary rollback、attempt-local summary deferral 与 explicit incomplete bounded replay 已实施并验证；clean EOF replay 尚未启用
 > 日期：2026-08-19
 > Issue：[#7 — Incomplete provider stream 应按副作用状态恢复](https://github.com/lihaokun/opencode/issues/7)
 > 分析基线：`48cffdff0f83387b5ac82dafc59603b4fa2e9461`
@@ -1237,11 +1237,11 @@ fence 命中后 attempt retained，不能依靠 rollback 删除 unfinished tool 
 | 类型 | 建议测试名 | 核心断言 | 状态 |
 |---|---|---|---|
 | Adapter classification | `classifies a missing raw finish reason as an incomplete terminal provider error` + shared schema decode | canonical missing raw finish 产生 stable classification 并保留 detail；非法 classification 被拒绝 | 已加并通过（本步骤） |
-| Explicit incomplete | `legacy_explicit_incomplete_rolls_back_and_retries_same_assistant` | 同assistant、old parts删除、checkpoint恢复、next request成功 | 待加 |
+| Explicit incomplete | `legacy_explicit_incomplete_rolls_back_and_retries_same_assistant` | 同assistant、old parts删除、checkpoint恢复、next request成功 | 已加并通过：focused processor regression |
 | Clean EOF | `legacy_clean_eof_without_terminal_retries_same_assistant` | normal EOF无terminal evidence进入private recovery | 待加 |
 | Exact entry boundary | `legacy_post_output_exception_keeps_existing_error_and_retry_classification` | partial后ordinary exception不自动变incomplete、不占专用计数 | 待加 |
 | Ordinary retry rollback | `legacy_ordinary_retry_rolls_back_current_physical_attempt_when_applicable` | existing retryable error 无 fence 时先删除 attempt state 再 replay | 待加 |
-| Mixed retry accounting | `legacy_incomplete_budget_is_separate_while_schedule_attempt_remains_monotonic` | incomplete→503→incomplete：503 不消耗 incomplete budget；`meta.attempt` 不按类别重置 | 待加 |
+| Mixed retry accounting | `legacy_incomplete_budget_is_separate_while_schedule_attempt_remains_monotonic` | incomplete→503→incomplete：503 不消耗 incomplete budget；`meta.attempt` 不按类别重置 | 已加并通过：status attempts `1,2,3` |
 | Public error | `legacy_unknown_error_remains_non_retryable` | public `UnknownError` retryability不变 | 待加/保持 |
 | Plugin fence | `legacy_actual_text_complete_invocation_blocks_all_provider_replay` | callback前置fence；success/throw后incomplete/ordinary均request count=1 | 待加 |
 | No plugin invocation | `legacy_registered_but_uninvoked_text_complete_does_not_set_fence` | registration或无matching handler不阻止safe retry | 待加 |
@@ -1249,9 +1249,9 @@ fence 命中后 attempt retained，不能依靠 rollback 删除 unfinished tool 
 | Tool fences | `legacy_normalized_tool_activity_blocks_all_provider_replay` | 六类events参数化；complete/partial/orphan均request count=1 | 待加 |
 | Retained partial tool | `legacy_retained_partial_tool_is_finalized_by_existing_cleanup` | 不rollback；pending/running最终aborted/error | 待加 |
 | Terminal error fence | `legacy_existing_terminal_error_preserves_error_finish_and_parts` | incomplete/ordinary均不replay、不覆盖error/finish | 待加 |
-| Budget exhaustion | `legacy_incomplete_exhaustion_uses_exactly_three_physical_attempts` | initial + retry1 + retry2；无第4次；只保留第3次authoritative parts | 待加 |
+| Budget exhaustion | `legacy_incomplete_exhaustion_uses_exactly_three_physical_attempts` | initial + retry1 + retry2；无第4次；只保留第3次authoritative parts | 已加并通过：3 requests / 2 retry statuses |
 | Clean EOF final detail | `legacy_clean_eof_exhaustion_preserves_existing_detailed_error_finish` | 未 settled step 保留 `UNSETTLED_STEP_MESSAGE/error`；credible empty unknown 保留 `EMPTY_UNKNOWN_MESSAGE/unknown` | 待加 |
-| Missing-finish final detail | `legacy_missing_finish_exhaustion_preserves_provider_detail_and_unknown_finish` | provider detail不被generic替换，finish为`unknown` | 待加 |
+| Missing-finish final detail | `legacy_missing_finish_exhaustion_preserves_provider_detail_and_unknown_finish` | provider detail不被generic替换，finish为`unknown` | 已加并通过：第三次 detail + `unknown` |
 | Rollback preparation failure | `legacy_rollback_preparation_failure_stops_before_next_request` |实际preparation failure后request count不增加 | 待加 |
 | Usage checkpoint | `legacy_retry_restores_assistant_finish_cost_tokens_checkpoint` | rolled-back attempt不污染retained aggregate | 待加 |
 | Summary rollback | `legacy_rolled_back_attempt_never_launches_processor_summary` | `step-finish`后rollback，failed attempt call count=0 | 待加 |
@@ -1459,6 +1459,19 @@ Focused regressions 证明：两次 ordinary physical attempts 复用同一 assi
 
 Focused regressions 证明：ordinary rolled-back attempt 的 summary 不启动、最终 retained attempt 只启动一次；rollback removal failure 也不泄漏已丢弃 launch；retained normal/error/blocked/compaction/interrupt exits 均释放；normal 与 interrupt 的 launch registration 顺序均早于 cleanup completion update。
 
+### 6.5.10 Explicit incomplete bounded replay 单元验证记录
+
+2026-08-20 仅对 processor-private `IncompleteStreamControl(source="provider")` 启用 bounded replay；`source="clean-eof"` 仍按前一阶段直接落地，留待下一单元。每个 `process()` 使用独立 closure counter，initial request 之外最多允许两次 explicit incomplete replay。counter 只在 shared rollback preparation 全部成功后递增；ordinary retry 不递增。所有类别继续复用同一 Effect schedule，因此 status `attempt` 与 backoff physical ordinal 跨 incomplete/ordinary 单调推进。
+
+| 命令 | 结果 |
+|---|---|
+| `bun test packages/opencode/test/session/processor-effect.test.ts` | 56 pass / 0 fail / 399 assertions |
+| `bun test packages/opencode/test/session/retry.test.ts packages/opencode/test/session/processor-effect.test.ts` | 93 pass / 0 fail / 456 assertions |
+| `bun run --cwd packages/opencode typecheck` | 通过 |
+| `git diff --check` | 通过 |
+
+Focused regressions 覆盖：(1) explicit attempt 1 incomplete、attempt 2 success，复用同一 assistant，删除 attempt 1 authoritative parts、恢复 checkpoint 且只释放 retained summary；(2) 连续三次 explicit incomplete 后精确停止，无第四次 request，只保留 attempt 3 parts，并以第三次 provider detail + `finish="unknown"` 落地；(3) `incomplete → ordinary 503 → incomplete → success` 中 retry status attempts 为 `1,2,3`，ordinary failure 不消耗 incomplete budget；(4) actual text-complete callback 与 normalized tool activity 同样阻止 explicit incomplete replay。compatible AI SDK fixture 另证明未闭合 reasoning/text 在 replay 前被 authoritative removal，成功 attempt 独占最终 transcript。未修改 public `UnknownError` retryability、Prompt loop、plugin/tool runtime 或 V2。
+
 ## 6.6 最小复现固化要求
 
 - A/B 分别证明explicit incomplete与qualifying clean EOF；
@@ -1497,11 +1510,11 @@ Focused regressions 证明：ordinary rolled-back attempt 的 summary 不启动�
 | `packages/llm/src/schema/errors.ts` | provider failure classification | 增加 `incomplete-stream` stable literal；不改 public Legacy error | 已改并通过 typecheck（本步骤） |
 | `packages/llm/test/schema.test.ts` | provider-error schema decode | 接受 declared `incomplete-stream`，拒绝未知 classification | 已加并通过：9/9（本步骤） |
 | `packages/opencode/src/session/llm/ai-sdk.ts` | canonical missing raw finish mapping | existing detailed normalized error 附 classification | 已改并通过 typecheck（本步骤） |
-| `packages/opencode/src/session/processor.ts` | stream settle、attempt bookkeeping、event handling、retry preparation、summary launch | 两个entry；private control；part tracking；assistant checkpoint；plugin/tool/error fences；same-assistant rollback；独立预算；exact final semantics；attempt-local summary deferral；existing tool cleanup | 进行中：entry/private landing、attempt checkpoint/tracking、retry hooks/fences、ordinary rollback 与 attempt-local summary deferral 已改并验证；incomplete replay与独立预算待改 |
+| `packages/opencode/src/session/processor.ts` | stream settle、attempt bookkeeping、event handling、retry preparation、summary launch | 两个entry；private control；part tracking；assistant checkpoint；plugin/tool/error fences；same-assistant rollback；独立预算；exact final semantics；attempt-local summary deferral；existing tool cleanup | 进行中：explicit incomplete bounded replay 与独立预算已改并验证；clean EOF replay、observability 与跨层回归待完成 |
 | `packages/opencode/src/session/retry.ts` | policy/gate/preparation integration | incomplete与ordinary retry发request前共用gate/preparation，复用delay/status | 已改并验证：optional decide/beforeRetry hooks；processor integration 待后续单元 |
 | `packages/opencode/test/session/llm.test.ts` | adapter tests | stable classification 与 detailed message regression | 已改并通过：54/54（本步骤） |
-| `packages/opencode/test/session/retry.test.ts` | retry policy tests | gate/preparation、独立count与ordinary retry交互 | 进行中：decision/preparation order、deny、fail-closed、monotonic attempt 已加并通过 37/37；processor budget integration 待加 |
-| `packages/opencode/test/session/processor-effect.test.ts` | focused integration tests | same-assistant rollback、entries、exact boundary、fences、three-attempt exhaustion、final semantics、usage、summary、tool cleanup、observability | 进行中：entry boundaries、fences、ordinary rollback/checkpoint/fail-closed、summary retained/rollback exits、compaction 与 tool cleanup regressions 已加并通过 51/51；incomplete/observability 其余项待加/改 |
+| `packages/opencode/test/session/retry.test.ts` | retry policy tests | gate/preparation、独立count与ordinary retry交互 | 已改并验证：policy hooks 37/37；processor integration 覆盖独立 budget 与跨类别 monotonic attempt |
+| `packages/opencode/test/session/processor-effect.test.ts` | focused integration tests | same-assistant rollback、entries、exact boundary、fences、three-attempt exhaustion、final semantics、usage、summary、tool cleanup、observability | 进行中：explicit success/exhaustion/mixed budget、same-assistant rollback/checkpoint、plugin/tool fences 与 compatible reasoning fixture 已加并通过 56/56；clean EOF 与 observability 待完成 |
 | `packages/opencode/test/session/prompt.test.ts` | existing Legacy loop regressions | 为无 fence 的 missing-finish fixture 提供 bounded retry 序列并更新 request count；completed-tool fence 用例继续锁定 no replay | 待改 |
 | `packages/opencode/test/tool/task.test.ts` | child/task incomplete regressions | child 自身无 tool fence 时验证 bounded retry/exhaustion；已有 tool activity 时仍不 replay，并保持 Task error 投影 | 待改 |
 | `packages/opencode/test/cli/run/run-process.test.ts` | top-level/child CLI regressions | 更新 missing-finish request 数与最终 error；明确 authoritative state 收敛而 append-only stdout/JSON 可保留 transient failed output | 待改 |
@@ -1534,12 +1547,12 @@ Focused regressions 证明：ordinary rolled-back attempt 的 summary 不启动�
 3. [已完成] processor 两个 incomplete entry + exact-entry-boundary regression（private control 落地，尚未启用 replay）；
 4. [已完成] minimal physical-attempt checkpoint + creation-time part tracking（仅建立 ownership/checkpoint，不启用 rollback）；
 5. [已完成] `SessionRetry.policy()` optional decision/preparation hooks；默认 ordinary 行为兼容，preparation 先于 delay/status 且失败 fail closed；
-6. [已完成] actual text-complete invocation fence + callback compatibility（ordinary replay 已接入；incomplete replay 尚未启用）；
-7. [已完成] 六类 normalized tool event fence + retained partial tool cleanup assertion（ordinary replay 已接入；incomplete replay 尚未启用）；
-8. [已完成] assistant terminal-error fence（ordinary replay decision 已接入；rollback preparation 二次检查待下一单元）；
-9. [已完成] ordinary retry 适用时复用 fences 与 same-assistant rollback preparation；已验证 authoritative attempt 隔离与 preparation failure no-next-request，未启用 incomplete replay；
+6. [已完成] actual text-complete invocation fence + callback compatibility；ordinary 与 explicit incomplete replay 均接入并验证；
+7. [已完成] 六类 normalized tool event fence + retained partial tool cleanup assertion；ordinary 六类参数化与 explicit incomplete integration 均已验证；
+8. [已完成] assistant terminal-error fence；shared decision/preparation gate 同时适用于 ordinary 与 explicit incomplete replay；
+9. [已完成] ordinary retry 适用时复用 fences 与 same-assistant rollback preparation；已验证 authoritative attempt 隔离与 preparation failure no-next-request；
 10. [已完成] processor `step-finish` summary attempt-local deferral；rollback 丢弃，retained success/error/blocked/compaction/interrupt 由 process finalizer 在 cleanup body 前释放；
-11. explicit incomplete recovery + independent two-retry budget；覆盖 successful same-assistant replay、three-attempt exhaustion 与 incomplete→ordinary→incomplete monotonic schedule sequence；
+11. [已完成] explicit incomplete recovery + independent two-retry budget；successful same-assistant replay、three-attempt exhaustion 与 incomplete→ordinary→incomplete monotonic schedule sequence 均已验证；
 12. clean EOF recovery + exact final error/finish；
 13. focused authoritative/removal-aware/append-only observability test；
 14. package-local 定向、Prompt/Task/CLI/session regression 与 typecheck；
@@ -1611,7 +1624,7 @@ Focused regressions 证明：ordinary rolled-back attempt 的 summary 不启动�
 | `docs/devlog/2026-08-<implementation-date>-incomplete-stream-recovery.md` | 全部 recovery 实现完成后汇总代码、测试、关键 decision 和 required metrics | 待加 |
 | `CLAUDE.md`「已知限制与注意事项」 | 仅实现后确认有可复用经验时回写，例如authoritative removal不等于append-only历史擦除 | 待判定 |
 
-初次方案收尾与编码前 contract amendment 已分别完成。stable classification / AI SDK mapping、processor private entries、physical-attempt checkpoint/tracking、retry hooks/fences、ordinary same-assistant rollback 与 attempt-local summary deferral 已修改 shared schema、adapter、processor/retry 与对应 tests；summary.ts、plugin/tool runtime/public API、Prompt/V2 仍无 diff，incomplete replay 尚未启用。
+初次方案收尾与编码前 contract amendment 已分别完成。stable classification / AI SDK mapping、processor private entries、physical-attempt checkpoint/tracking、retry hooks/fences、ordinary same-assistant rollback、attempt-local summary deferral 与 explicit incomplete bounded replay 已修改 shared schema、adapter、processor/retry 与对应 tests；summary.ts、plugin/tool runtime/public API、Prompt/V2 仍无 diff，clean EOF replay 尚未启用。
 
 ## 8.2 行为契约变更
 

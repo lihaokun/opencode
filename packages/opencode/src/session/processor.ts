@@ -28,6 +28,7 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { Usage, type FinishReason, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
+const INCOMPLETE_RETRY_LIMIT = 2
 const EMPTY_UNKNOWN_MESSAGE = "Provider stream ended with an unknown finish reason and no usable output"
 const UNSETTLED_STEP_MESSAGE = "Provider stream ended without a settled model step"
 export type Result = "compact" | "stop" | "continue"
@@ -810,6 +811,7 @@ const layer = Layer.effect(
         streamInput: LLM.StreamInput,
         options?: ProcessOptions,
       ) {
+        let incompleteRetryCount = 0
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
@@ -863,8 +865,30 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
-                decide: ({ ordinary }) => (replayBlocked() ? undefined : ordinary),
-                beforeRetry: ({ failure }) => rollbackAttempt(failure),
+                decide: ({ failure, ordinary }) => {
+                  if (replayBlocked()) return undefined
+                  if (
+                    failure instanceof IncompleteStreamControl &&
+                    failure.source === "provider"
+                  ) {
+                    if (incompleteRetryCount >= INCOMPLETE_RETRY_LIMIT) return undefined
+                    return { message: failure.message }
+                  }
+                  return ordinary
+                },
+                beforeRetry: ({ failure }) =>
+                  rollbackAttempt(failure).pipe(
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        if (
+                          failure instanceof IncompleteStreamControl &&
+                          failure.source === "provider"
+                        ) {
+                          incompleteRetryCount++
+                        }
+                      }),
+                    ),
+                  ),
                 set: (info) => {
                   return status.set(ctx.sessionID, {
                     type: "retry",
