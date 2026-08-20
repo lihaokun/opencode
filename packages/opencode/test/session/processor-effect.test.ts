@@ -506,6 +506,15 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
       if (call === 1) return incompleteAttempt(name, call, "first incomplete detail")
       return successfulAttempt(name, call)
     }
+    case "mixed-failure-interrupt": {
+      const call = settlementCalls.get(name) ?? 0
+      if (call > 1) return successfulAttempt(name, call)
+      return Stream.fromEffect(
+        Effect.failCause(
+          Cause.combine(Cause.fail(retryableFailure("mixed failure interrupt")), Cause.interrupt(123)),
+        ),
+      )
+    }
     case "explicit-incomplete-exhaustion": {
       const call = settlementCalls.get(name) ?? 0
       return incompleteAttempt(name, call, `incomplete detail ${call}`)
@@ -1838,6 +1847,53 @@ itSettlement.live("session.processor records an aborted error when interrupted d
           expect(stored.info.error?.name).toBe("MessageAbortedError")
           expect(stored.info.time.completed).toBeDefined()
         }
+        expect(state).toMatchObject({ type: "idle" })
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor does not replay a mixed failure and interrupt", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("mixed-failure-interrupt", 0)
+        const { processors, session, provider } = yield* boot()
+        const sts = yield* SessionStatus.Service
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "mixed-failure-interrupt")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "mixed-failure-interrupt" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        const exit = yield* Fiber.await(run)
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        const state = yield* sts.get(chat.id)
+
+        expect(Exit.isSuccess(exit)).toBe(true)
+        if (Exit.isSuccess(exit)) expect(exit.value).toBe("stop")
+        expect(settlementCalls.get("mixed-failure-interrupt")).toBe(1)
+        expect(handle.message.error?.name).toBe("MessageAbortedError")
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") expect(stored.info.error?.name).toBe("MessageAbortedError")
         expect(state).toMatchObject({ type: "idle" })
       }),
     { config: cfg },
