@@ -867,10 +867,7 @@ const layer = Layer.effect(
                 parse,
                 decide: ({ failure, ordinary }) => {
                   if (replayBlocked()) return undefined
-                  if (
-                    failure instanceof IncompleteStreamControl &&
-                    failure.source === "provider"
-                  ) {
+                  if (failure instanceof IncompleteStreamControl) {
                     if (incompleteRetryCount >= INCOMPLETE_RETRY_LIMIT) return undefined
                     return { message: failure.message }
                   }
@@ -880,12 +877,7 @@ const layer = Layer.effect(
                   rollbackAttempt(failure).pipe(
                     Effect.tap(() =>
                       Effect.sync(() => {
-                        if (
-                          failure instanceof IncompleteStreamControl &&
-                          failure.source === "provider"
-                        ) {
-                          incompleteRetryCount++
-                        }
+                        if (failure instanceof IncompleteStreamControl) incompleteRetryCount++
                       }),
                     ),
                   ),

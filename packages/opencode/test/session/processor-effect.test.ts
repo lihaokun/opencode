@@ -351,6 +351,15 @@ function incompleteAttempt(name: string, attempt: number, message: string) {
   )
 }
 
+function cleanEofAttempt(name: string, attempt: number) {
+  const id = `${name}-text-${attempt}`
+  return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.textStart({ id }),
+    LLMEvent.textDelta({ id, text: `discarded-${attempt}` }),
+  )
+}
+
 function successfulAttempt(name: string, attempt: number) {
   const id = `${name}-text-${attempt}`
   return Stream.make(
@@ -516,6 +525,16 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
       }
       if (call === 3) return incompleteAttempt(name, call, "second incomplete detail")
       return successfulAttempt(name, call)
+    }
+    case "clean-eof-success": {
+      const call = settlementCalls.get(name) ?? 0
+      if (call === 1) return cleanEofAttempt(name, call)
+      return successfulAttempt(name, call)
+    }
+    case "mixed-incomplete-source-budget": {
+      const call = settlementCalls.get(name) ?? 0
+      if (call === 1) return incompleteAttempt(name, call, "explicit incomplete detail")
+      return cleanEofAttempt(name, call)
     }
     case "canonical-looking-provider-error":
       return Stream.make(
@@ -868,13 +887,16 @@ const noTextCompleteEnv = LayerNode.compile(root, [
 ])
 const itNoTextComplete = testEffect(noTextCompleteEnv)
 
+let attemptEvidenceAttempts = 0
+const waitForAttemptEvidence = Effect.fn("test.waitForAttemptEvidence")(function* (count: number) {
+  while (attemptEvidenceAttempts < count) yield* Effect.yieldNow
+})
 const attemptEvidenceLLM = Layer.effect(
   LLM.Service,
   Effect.sync(() => {
-    let attempt = 0
     return singletonBatchLLM(() => {
-      attempt++
-      if (attempt > 1) {
+      attemptEvidenceAttempts++
+      if (attemptEvidenceAttempts > 1) {
         return Stream.make(
           LLMEvent.stepStart({ index: 0 }),
           LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
@@ -1266,11 +1288,17 @@ itLengthThenFailure.live("session.processor preserves length across a later snap
   ),
 )
 
-itSettlement.live("session.processor rejects an empty unknown finish with one durable error", () =>
+itSettlement.effect("session.processor exhausts clean EOF retries for an empty unknown finish", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
-        const result = yield* runSettlement(dir, "empty-unknown")
+        settlementCalls.set("empty-unknown", 0)
+        const resultFiber = yield* runSettlement(dir, "empty-unknown").pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("empty-unknown", 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt("empty-unknown", 2)
+        yield* TestClock.adjust(4_000)
+        const result = yield* Fiber.join(resultFiber)
         const expected = {
           name: "UnknownError",
           data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
@@ -1286,17 +1314,26 @@ itSettlement.live("session.processor rejects an empty unknown finish with one du
         }
         expect(result.errors).toHaveLength(1)
         expect(result.errors[0]).toMatchObject(expected)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
+        expect(result.removedParts).toHaveLength(4)
+        expect(settlementCalls.get("empty-unknown")).toBe(3)
       }),
     { config: cfg },
   ),
 )
 
-itSettlement.live("session.processor excludes reasoning, whitespace, and pending tool input from usable output", () =>
+itSettlement.effect("session.processor excludes reasoning and whitespace from usable output", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
-        for (const scenario of ["unknown-reasoning", "unknown-whitespace", "unknown-pending-tool"]) {
-          const result = yield* runSettlement(dir, scenario)
+        for (const scenario of ["unknown-reasoning", "unknown-whitespace"]) {
+          settlementCalls.set(scenario, 0)
+          const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
+          yield* waitForSettlementAttempt(scenario, 1)
+          yield* TestClock.adjust(2_000)
+          yield* waitForSettlementAttempt(scenario, 2)
+          yield* TestClock.adjust(4_000)
+          const result = yield* Fiber.join(resultFiber)
           expect(result.result).toBe("stop")
           expect(result.message.finish).toBe("unknown")
           expect(result.message.error).toMatchObject({
@@ -1304,18 +1341,57 @@ itSettlement.live("session.processor excludes reasoning, whitespace, and pending
             data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
           })
           expect(result.errors).toHaveLength(1)
+          expect(settlementCalls.get(scenario)).toBe(3)
+          expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
         }
       }),
     { config: cfg },
   ),
 )
 
-itSettlement.live("session.processor rejects every stream without a credible final step settlement", () =>
+itSettlement.live("session.processor fences clean EOF replay after pending tool input", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const scenario = "unknown-pending-tool"
+        settlementCalls.set(scenario, 0)
+        const result = yield* runSettlement(dir, scenario)
+        const tools = result.parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
+        })
+        expect(result.retryStatuses).toEqual([])
+        expect(settlementCalls.get(scenario)).toBe(1)
+        expect(tools).toContainEqual(
+          expect.objectContaining({
+            state: expect.objectContaining({
+              status: "error",
+              error: "Tool execution aborted",
+              metadata: expect.objectContaining({ interrupted: true }),
+            }),
+          }),
+        )
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.effect("session.processor exhausts every clean EOF without a credible final step settlement", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
         for (const scenario of ["empty", "final-only", "multi-step-incomplete"]) {
-          const result = yield* runSettlement(dir, scenario)
+          settlementCalls.set(scenario, 0)
+          const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
+          yield* waitForSettlementAttempt(scenario, 1)
+          yield* TestClock.adjust(2_000)
+          yield* waitForSettlementAttempt(scenario, 2)
+          yield* TestClock.adjust(4_000)
+          const result = yield* Fiber.join(resultFiber)
           const expected = {
             name: "UnknownError",
             data: { message: "Provider stream ended without a settled model step" },
@@ -1326,17 +1402,26 @@ itSettlement.live("session.processor rejects every stream without a credible fin
           expect(result.message.error).toMatchObject(expected)
           expect(result.errors).toHaveLength(1)
           expect(result.errors[0]).toMatchObject(expected)
+          expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
+          expect(settlementCalls.get(scenario)).toBe(3)
         }
       }),
     { config: cfg },
   ),
 )
 
-itSettlement.live("session.processor gives no-step settlement priority over an earlier empty unknown", () =>
+itSettlement.effect("session.processor preserves no-step priority after clean EOF retry exhaustion", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
-        const result = yield* runSettlement(dir, "unknown-then-incomplete")
+        const scenario = "unknown-then-incomplete"
+        settlementCalls.set(scenario, 0)
+        const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt(scenario, 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt(scenario, 2)
+        yield* TestClock.adjust(4_000)
+        const result = yield* Fiber.join(resultFiber)
 
         expect(result.result).toBe("stop")
         expect(result.message.finish).toBe("error")
@@ -1345,6 +1430,8 @@ itSettlement.live("session.processor gives no-step settlement priority over an e
           data: { message: "Provider stream ended without a settled model step" },
         })
         expect(result.errors).toHaveLength(1)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
+        expect(settlementCalls.get(scenario)).toBe(3)
       }),
     { config: cfg },
   ),
@@ -1489,6 +1576,13 @@ itSettlement.live("session.processor preserves a preexisting terminal error whil
         }
         expect(result.errors).toEqual([])
         expect(settlementCalls.get("preexisting-error-retry")).toBe(1)
+
+        settlementCalls.set("empty", 0)
+        const cleanEof = yield* runSettlement(dir, "empty", { error })
+        expect(cleanEof.result).toBe("stop")
+        expect(cleanEof.message.error).toEqual(error)
+        expect(cleanEof.retryStatuses).toEqual([])
+        expect(settlementCalls.get("empty")).toBe(1)
       }),
     { config: cfg },
   ),
@@ -1730,6 +1824,78 @@ itSettlement.effect("session.processor keeps one retry ordinal and an independen
   ),
 )
 
+itSummarySettlement.effect("session.processor retries an unsettled clean EOF on the same assistant", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        settlementCalls.set("clean-eof-success", 0)
+        const resultFiber = yield* runSettlement(dir, "clean-eof-success").pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("clean-eof-success", 1)
+        yield* TestClock.adjust(2_000)
+        const result = yield* Fiber.join(resultFiber)
+        const finalIDs = new Set(result.parts.map((part) => part.id))
+
+        expect(result.result).toBe("continue")
+        expect(result.message.id).toBe(result.stored.info.id)
+        expect(result.message.finish).toBe("stop")
+        expect(result.message.error).toBeUndefined()
+        expect(settlementCalls.get("clean-eof-success")).toBe(2)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1])
+        expect(result.retryStatuses.map((state) => state.message)).toEqual([
+          "Provider stream ended without a settled model step",
+        ])
+        expect(result.removedParts).toHaveLength(2)
+        expect(result.removedParts.every((partID) => !finalIDs.has(partID))).toBe(true)
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-1" }))
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "retained-2" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+        expect(summaryLaunches).toEqual([
+          {
+            sessionID: result.message.sessionID,
+            messageID: result.message.parentID,
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.effect("session.processor shares one incomplete budget across explicit and clean EOF sources", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const scenario = "mixed-incomplete-source-budget"
+        settlementCalls.set(scenario, 0)
+        const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt(scenario, 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt(scenario, 2)
+        yield* TestClock.adjust(4_000)
+        const result = yield* Fiber.join(resultFiber)
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("error")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended without a settled model step" },
+        })
+        expect(settlementCalls.get(scenario)).toBe(3)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
+        expect(result.retryStatuses.map((state) => state.message)).toEqual([
+          "explicit incomplete detail",
+          "Provider stream ended without a settled model step",
+        ])
+        expect(result.removedParts).toHaveLength(5)
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-1" }))
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-2" }))
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "discarded-3" }))
+      }),
+    { config: cfg },
+  ),
+)
+
 itSettlement.live("session.processor leaves post-output stream exceptions on the ordinary error path", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -1882,6 +2048,8 @@ itTextEvidence.live("session.processor bases usable text evidence on the plugin-
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
+        settlementCalls.set("plugin-fill", 0)
+        settlementCalls.set("plugin-clear", 0)
         const filled = yield* runSettlement(dir, "plugin-fill")
         expect(filled.result).toBe("continue")
         expect(filled.message.error).toBeUndefined()
@@ -1894,6 +2062,8 @@ itTextEvidence.live("session.processor bases usable text evidence on the plugin-
           data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
         })
         expect(cleared.parts).toContainEqual(expect.objectContaining({ type: "text", text: "" }))
+        expect(cleared.retryStatuses).toEqual([])
+        expect(settlementCalls.get("plugin-clear")).toBe(1)
       }),
     { config: cfg },
   ),
@@ -2248,11 +2418,17 @@ itSummaryRollback.live("session.processor does not request or summarize again wh
   ),
 )
 
-itAttemptEvidence.live("session.processor removes ordinary retry output before the next attempt", () =>
+itAttemptEvidence.effect("session.processor rolls back ordinary output before bounded clean EOF retries", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
-        const result = yield* runSettlement(dir, "retry-attempt")
+        attemptEvidenceAttempts = 0
+        const resultFiber = yield* runSettlement(dir, "retry-attempt").pipe(Effect.forkChild)
+        yield* waitForAttemptEvidence(2)
+        yield* TestClock.adjust(4_000)
+        yield* waitForAttemptEvidence(3)
+        yield* TestClock.adjust(8_000)
+        const result = yield* Fiber.join(resultFiber)
 
         expect(result.result).toBe("stop")
         expect(result.message.finish).toBe("unknown")
@@ -2262,7 +2438,9 @@ itAttemptEvidence.live("session.processor removes ordinary retry output before t
         })
         expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "first attempt" }))
         expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
-        expect(result.removedParts).toHaveLength(3)
+        expect(result.removedParts).toHaveLength(7)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2, 3])
+        expect(attemptEvidenceAttempts).toBe(4)
         expect(result.errors).toHaveLength(1)
       }),
     { config: cfg },
