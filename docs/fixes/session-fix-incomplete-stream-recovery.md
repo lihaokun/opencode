@@ -655,6 +655,8 @@ process finalizer / existing cleanup
   release occurs at finalizer entry, before existing cleanup body
   interrupt/blocked/compaction/error/success retained exits use the same release path
   rolled-back attempts have no pending launch to release
+  incomplete terminal retained parts and assistant state complete durable publication before idle
+  CLI/stream consumers may treat the subsequent idle as a terminal fence
 ```
 
 ## 4.2 stable incomplete classification
@@ -915,6 +917,19 @@ incompleteRetryCount = 0
 |其它 ordinary error | `MessageV2.fromError` existing result | existing settle semantics |
 
 incomplete 因 fence 不能 retry 时，同样按原始 settle 分支保留 detailed message/finish。
+
+### 4.10.1 terminal publication ordering
+
+最终 retained incomplete attempt 若仍有 open text/reasoning/tool state，必须先完成 existing cleanup，再发布 terminal idle：
+
+```text
+Session.Event.Error
+→ retained PartUpdated（含 text/reasoning end、tool terminal state）
+→ assistant MessageUpdated(error + finish + time.completed)
+→ SessionStatus idle
+```
+
+`idle` 是 Legacy CLI 与 stream transport 的 terminal fence；因此对 incomplete terminal，`PartUpdated / MessageUpdated happens-before idle` 是硬性契约。不能只在内存设置 error/finish 后立即发布 idle。
 
 ## 4.11 retained tool attempt cleanup
 
@@ -1251,6 +1266,7 @@ fence 命中后 attempt retained，不能依靠 rollback 删除 unfinished tool 
 | Terminal error fence | `legacy_existing_terminal_error_preserves_error_finish_and_parts` | incomplete/ordinary均不replay、不覆盖error/finish | 已加并通过（`ae34d166c`、`d17915191`） |
 | Budget exhaustion | `legacy_incomplete_exhaustion_uses_exactly_three_physical_attempts` | initial + retry1 + retry2；无第4次；只保留第3次authoritative parts | 已加并通过：3 requests / 2 retry statuses（`0d133d5b2`、`d17915191`） |
 | Clean EOF final detail | `legacy_clean_eof_exhaustion_preserves_existing_detailed_error_finish` | 未 settled step 保留 `UNSETTLED_STEP_MESSAGE/error`；credible empty unknown 保留 `EMPTY_UNKNOWN_MESSAGE/unknown` | 已加并通过（`d17915191`） |
+| Incomplete terminal ordering | `session.processor finalizes retained incomplete output before publishing idle` | retained open text 先闭合、assistant terminal state 先持久化，随后才发布 idle | 已加并通过（`49a969975`） |
 | Missing-finish final detail | `legacy_missing_finish_exhaustion_preserves_provider_detail_and_unknown_finish` | provider detail不被generic替换，finish为`unknown` | 已加并通过（`0d133d5b2`） |
 | Rollback preparation failure | `legacy_rollback_preparation_failure_stops_before_next_request` |实际preparation failure后request count不增加 | 已加并通过（`e3e4dbc59`） |
 | Usage checkpoint | `legacy_retry_restores_assistant_finish_cost_tokens_checkpoint` | rolled-back attempt不污染retained aggregate | 已加并通过（`e3e4dbc59`、`0d133d5b2`） |
