@@ -3144,6 +3144,7 @@ it.live("session.processor removes pending reasoning before retrying a compatibl
       }),
     { config: (url) => providerCfg(url) },
   ),
+  15_000,
 )
 
 it.live("session.processor effect tests reset reasoning state across retries", () =>

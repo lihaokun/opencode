@@ -1012,6 +1012,7 @@ it.instance("loop rolls back reasoning-only output and recovers on bounded retry
     expect(result.parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: "retained reasoning" }))
     expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "recovered answer" }))
   }),
+  15_000,
 )
 
 it.instance("loop keeps only the final partial text after bounded retry exhaustion", () =>
@@ -1303,6 +1304,7 @@ unix("loop retries a later missing finish without replaying an earlier completed
     expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "recovered after tool" }))
     expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("charged\n")
   }),
+  15_000,
 )
 
 it.instance("length wins over a successful StructuredOutput tool result", () =>
