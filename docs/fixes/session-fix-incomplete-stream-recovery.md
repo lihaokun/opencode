@@ -1,6 +1,6 @@
 # Issue #7 修正方案：Legacy incomplete stream 同 assistant 回滚重试
 
-> 状态：Legacy bounded recovery 已完成；PR #19 rebase 后 P1-A / P1-B 已修复并通过 focused regression，更新后的最终全量验证待执行
+> 状态：Legacy bounded recovery 与 PR #19 rebase 后 P1-A / P1-B 均已完成；current-HEAD 全量回归通过
 > 日期：2026-08-19
 > Issue：[#7 — Incomplete provider stream 应按副作用状态恢复](https://github.com/lihaokun/opencode/issues/7)
 > 分析基线：`48cffdff0f83387b5ac82dafc59603b4fa2e9461`
@@ -1570,7 +1570,24 @@ P1-B focused 验证：
 | `bun run --cwd packages/opencode typecheck` | 通过 |
 | `git diff --check` | 通过 |
 
-回归证明：rollback removal projector defect 后 request count 保持 1，已丢弃 attempt 不启动 summary，process 返回 `stop`；内存与 durable assistant 均持久化 `UnknownError("rollback removal failed")`、`finish="error"`、`time.completed`，session 最终为 idle。更新后的跨层最终全量验证仍待下一步骤执行，不能用本 focused 记录替代。
+回归证明：rollback removal projector defect 后 request count 保持 1，已丢弃 attempt 不启动 summary，process 返回 `stop`；内存与 durable assistant 均持久化 `UnknownError("rollback removal failed")`、`finish="error"`、`time.completed`，session 最终为 idle。
+
+current-HEAD 最终全量验证：
+
+| 验证项 | 结果 |
+|---|---|
+| processor + retry | 106 pass / 0 fail / 592 assertions |
+| Prompt + compaction + context-overflow | 146 pass / 2 skip / 0 fail / 746 assertions |
+| 真实 CLI subprocess E2E | 20 pass / 0 fail / 131 assertions |
+| message-ID wraparound regressions | 98 pass / 0 fail / 225 assertions |
+| 完整 Legacy session suite | 504 pass / 7 skip / 1 todo / 0 fail / 2018 assertions |
+| child Task integration | 37 pass / 0 fail / 201 assertions |
+| LLM schema | 9 pass / 0 fail / 23 assertions |
+| `packages/opencode` / `packages/llm` typecheck | 均通过 |
+| changed-file `oxlint` | 89 warnings / 0 errors（11 files） |
+| `git diff --check` | 通过 |
+
+changed-file lint warnings 均为既有 warning；无 error。该 current-HEAD 矩阵替代 §6.5.14 的 pre-rebase 历史数值，作为本次本地退出证据；远端仍需 GitHub Actions 验证 Linux/Windows matrix。
 
 ## 6.6 最小复现固化要求
 
@@ -1593,7 +1610,7 @@ P1-B focused 验证：
 - plugin/tool/error fences覆盖incomplete与ordinary retry；
 - same-assistant rollback、part removal、assistant checkpoint均有assertion；
 - final detailed error/finish分别有assertion；
-- rollback preparation failure后无next request；
+- rollback preparation failure后无next request，non-interrupt defect 形成 durable terminal error/finish/completed 且最终 idle；
 - rolled-back attempt summary call count 为 0；retained normal/error/interrupt exits 均由 finalizer 释放一次；
 - retained partial tool最终不是pending/running；
 - focused observability证明三层contract；
@@ -1782,13 +1799,15 @@ P1-B focused 验证：
 
 ## 8.5 实现完成后的回填
 
-原 Issue #7 实现的代码、测试、文档三轨已完成；PR #19 rebase 后新增确认的 P1-A / P1-B 也已实现并完成 focused regression。更新后的最终跨层全量验证尚待执行，因此本节原有 pass/total 仅是 rebase/P1 修复前的历史基线，不作为当前 HEAD 的最终退出证据。
+Issue #7 实现、PR #19 rebase 集成、P1-A / P1-B 修复、测试与文档三轨均已完成；current-HEAD 本地退出矩阵全部通过。
 
 - 第六部分已回填 actual regressions、pass/total 与对应 commits；
 - 第七部分已回填 original implementation commits；P1-A / P1-B 见 §6.5.15 与 `docs/fixes/session-fix-incomplete-terminal-settlement.md`；
 - authoritative rollback、exact final semantics、tool cleanup、summary deferral、observability、retry-delay interrupt、mixed interrupt 与 terminal settlement 均有 focused assertion；
-- 历史 broad session baseline 为 464 pass / 7 skip / 1 todo / 0 fail / 1668 assertions；更新后的 current-HEAD 数值将在下一次全量验证后回填；
-- 历史 Task 与 CLI regressions 分别为 37/37、20/20；shared schema 为 9/9；两个 package typecheck 通过；current-HEAD 全量结果待回填；
-- root-wide lint 仍报告与本分支无关的既有 unused-variable warnings；本修复不为清理无关 warning 扩大 scope。
+- current-HEAD 完整 Legacy session suite：504 pass / 7 skip / 1 todo / 0 fail / 2018 assertions；
+- current-HEAD Task、CLI 与 shared schema 分别为 37/37、20/20、9/9；两个 package typecheck 通过；
+- processor/retry、Prompt/compaction/context-overflow 与 message-ID wraparound 定向矩阵全部通过；
+- changed-file lint：89 warnings / 0 errors；warnings 为既有规则结果，本修复不为清理无关 warning 扩大 scope；
+- `git diff --check` 通过；远端 GitHub Actions Linux/Windows matrix 待更新 PR 后验证。
 
 已知而接受的边界保持不变：rollback preparation failure 保证不发下一 provider request，并在 cleanup 后收敛为 terminal assistant + idle；但不扩展为 crash-atomic rollback、survivor reconciliation 或 durable batch。append-only surface 不承诺历史擦除。

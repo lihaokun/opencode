@@ -17,6 +17,8 @@
 - 延迟 processor `step-finish` summary launch：rolled-back attempt 不启动 summary，最终 retained attempt 由 process finalizer 在 cleanup body 前释放。
 - 明确三层 observability：authoritative transcript 与 removal-aware projection 收敛到 retained attempt；append-only output 可以保留 transient failed-attempt bytes。
 - 更新 Prompt、CLI、child Task 与 compaction regressions，验证同 assistant retry、三次 exhaustion、earlier tool side effect 恰好一次、authoritative final-attempt convergence 与 append-only caveat。
+- 将 PR #19 rebase 到包含 context-overflow bounded recovery 与 message-ID wraparound 修复的最新 `dev`，保留两组行为并完成冲突集成。
+- 修复 post-rebase 独立审核确认的两个 terminal settlement 缺口：retained incomplete cleanup / durable assistant update 必须先于 idle；rollback preparation defect 必须 fail closed 后持久化 terminal `UnknownError`、`finish="error"`、`time.completed` 并最终 idle。
 
 ## 为什么
 
@@ -38,7 +40,8 @@ Issue #3 已保证缺少可信 terminal evidence 不能误报成功，但 Legacy
 - matching text-complete handler 在实际 invocation 前建立 fence；仅 registration 不建立 fence。
 - model text/reasoning/step 已持久化、发布或被 append-only consumer 观察，本身不建立 replay fence。
 - rollback 只承诺 authoritative/materialized transcript 与 removal-aware projection 收敛，不承诺所有历史输出 surface 擦除。
-- rollback preparation 失败只保证 no-next-request；不引入 crash-atomic rollback、survivor reconciliation、durable batch 或 Snapshot global restore。
+- rollback preparation 失败保证 no-next-request；non-interrupt defect 还必须经 outer cause normalization 收敛为 durable terminal assistant + idle，但仍不引入 crash-atomic rollback、survivor reconciliation、durable batch 或 Snapshot global restore。
+- `idle` 是 Legacy CLI / stream transport 的 terminal fence；retained part finalization 与 assistant `error/finish/time.completed` durable publication 必须 happens-before idle。
 - final error/finish 按来源保留：unsettled clean EOF 为 `UNSETTLED_STEP_MESSAGE/error`，credible empty unknown 为 `EMPTY_UNKNOWN_MESSAGE/unknown`，canonical missing finish 保留 provider detail/unknown。
 
 ## 实施提交
@@ -52,7 +55,9 @@ Issue #3 已保证缺少可信 terminal evidence 不能误报成功，但 Legacy
 | ordinary rollback / summary deferral | `e3e4dbc59`、`28b35d189` |
 | explicit / clean EOF bounded recovery | `0d133d5b2`、`d17915191` |
 | observability / cross-layer regressions | `31e23f984`、`602df5a50` |
-| final audit fixes | `bb8f5c879`、`9b9da8e80`、`df9eb3687` |
+| final audit fixes（rebase 前原始提交） | `bb8f5c879`、`9b9da8e80`、`df9eb3687` |
+| rebase 后 timeout 合规 | `c958dc7e9` |
+| terminal settlement 修正方案 / P1-A / P1-B / 契约同步 | `10dac571b`、`49a969975`、`b8eda038f`、`57e749efe`、`246fdff1b` |
 
 ## 最终审核发现与修复
 
@@ -72,28 +77,41 @@ Issue #3 已保证缺少可信 terminal evidence 不能误报成功，但 Legacy
 
 compaction fixture 使用真实 2s + 4s backoff，但单文件 bare `bun test` 默认 timeout 为 5s。修复为该用例设置 15s 显式 timeout；focused direct command 与 full compaction file 均通过。
 
+### 4. incomplete terminal 在 durable cleanup 前发布 idle
+
+rebase 后复审确认，最终 retained incomplete attempt 可能仍持有 open text/reasoning/tool state，而 `halt()` 在 cleanup 前发布 idle。CLI 与 stream transport 会把 idle 当作 terminal fence，因此可能遗漏之后的 retained part finalization 与 assistant terminal update。
+
+修复：incomplete branch 只建立 `UnknownError` / exact finish 并标记 deferred idle；process finalizer 先 release summaries、完成 retained cleanup、持久化 assistant `time.completed`，最后发布 idle。event-timeline regression 锁定 `text:partial-3 → assistant-terminal → idle`。
+
+### 5. rollback preparation defect 绕过 terminal settlement
+
+`Session.removePart()` projector/storage defect 发生在 retry policy 的 `beforeRetry` 内，位于单次 physical attempt cause normalization 外，原路径会直接 defect exit，留下 assistant 无 terminal error、status 仍 busy。
+
+修复：在 rollback preparation failure 时单调记录 terminal-idle deferral，在完整 retry schedule 外、outer interruption handler 后做 non-pure-interrupt cause normalization，再由 `halt()` 映射 existing `UnknownError` 与 `finish="error"`。regression 证明 request count 保持 1、无 summary launch、process 返回 stop、durable assistant 有 error/finish/completed 且最终 idle。已批准的 non-atomic rollback boundary 不变。
+
 ## 验证
 
 | 验证项 | 结果 |
 |---|---|
-| `packages/llm/test/schema.test.ts` | 9 pass / 0 fail / 23 assertions |
-| `packages/opencode/test/session/processor-effect.test.ts` | 62 pass / 0 fail |
-| `packages/opencode/test/session/compaction.test.ts` | 57 pass / 1 skip / 0 fail / 168 assertions |
-| `packages/opencode/test/session` | 464 pass / 7 skip / 1 todo / 0 fail / 1668 assertions |
-| `packages/opencode/test/tool/task.test.ts` | 37 pass / 0 fail / 201 assertions |
-| `packages/opencode/test/cli/run/run-process.test.ts` | 20 pass / 0 fail / 131 assertions |
+| processor + retry | 106 pass / 0 fail / 592 assertions |
+| Prompt + compaction + context-overflow | 146 pass / 2 skip / 0 fail / 746 assertions |
+| 真实 CLI subprocess E2E | 20 pass / 0 fail / 131 assertions |
+| message-ID wraparound regressions | 98 pass / 0 fail / 225 assertions |
+| 完整 Legacy session suite | 504 pass / 7 skip / 1 todo / 0 fail / 2018 assertions |
+| child Task integration | 37 pass / 0 fail / 201 assertions |
+| LLM schema | 9 pass / 0 fail / 23 assertions |
 | `packages/llm` typecheck | 通过 |
 | `packages/opencode` typecheck | 通过 |
+| changed-file `oxlint` | 89 warnings / 0 errors（11 files） |
 | `git diff --check` | 通过 |
-| 独立五维审核 | 0 个 unresolved finding |
 
-root-wide `bun run lint` 仍报告与本分支无关的既有 unused-variable warnings；未为清理无关文件扩大 Issue #7 scope。最终仍需由远端 GitHub Actions 执行完整 Linux/Windows matrix。
+current HEAD 的全部本地回归均通过。changed-file lint 的 89 项均为既有 unused import、test polling/unsafe assertion 等 warning，没有 error；未为清理无关 warning 扩大 Issue #7 scope。远端更新后仍需由 GitHub Actions 执行 Linux/Windows matrix。
 
 ## 五维审核
 
 1. **一致性**：实现与批准方案一致；两个 incomplete entries、same-assistant rollback、独立预算、fences、exact final semantics、summary 与 observability contract 均有 regression。
 2. **风格**：复用既有 Effect schedule、Session removal/update、cleanup、summary API 与 typed LLM events；未新增依赖或 public error hierarchy。
-3. **正确性**：最终审核发现的 retry-delay interrupt、mixed interrupt replay 与 compaction timeout 已修复；独立复审无 unresolved correctness/security finding。
+3. **正确性**：retry-delay interrupt、mixed interrupt replay、compaction timeout、incomplete cleanup-before-idle 与 rollback preparation terminal settlement 均已修复；current-HEAD 完整 Legacy session、跨层 CLI/Task、schema 与 typecheck 全部通过。
 4. **性能**：incomplete replay 最多两次；新增 bookkeeping 为 attempt-local set/counter/checkpoint。未引入 hot-path network call、全局 gate 或 consumer retrofit。
 5. **可维护性**：classification 在 shared schema 单点定义；recovery 保持 processor-private；V2、Prompt continuation、plugin/tool runtime 与 public SDK 边界不受影响。
 
@@ -110,6 +128,8 @@ root-wide `bun run lint` 仍报告与本分支无关的既有 unused-variable wa
 - Provider 协议事实必须在 adapter 边界形成稳定 classification；下游不能靠错误文案猜测类别。
 - Durable removal 与 removal-aware convergence 不等于 append-only 历史擦除；设计与测试必须明确 observer 能力边界。
 - Effect retry 的 interruption handling 不能只包裹 attempt body，也要覆盖 rollback preparation 与 backoff；mixed cause 必须在 squashing 前锁存 interrupt evidence。
+- Retry preparation 内的 defect 位于 attempt cause boundary 外；fail-closed 不仅要 no-next-request，还要通过完整 schedule 外层 normalization 形成 durable terminal error/status。
+- `idle` 若被 consumer 当作 terminal fence，就必须晚于 retained part finalization 与 assistant terminal durable publication。
 - 使用真实 backoff 的 exhaustion 测试必须显式设置足够 timeout，不能依赖 package wrapper 隐式放宽。
 
 以上经验均已同步回写上层项目 `CLAUDE.md` 的「已知限制与注意事项」，并由本次 focused regressions 固化。
@@ -118,12 +138,12 @@ root-wide `bun run lint` 仍报告与本分支无关的既有 unused-variable wa
 
 | 指标 | 数值 |
 |------|------|
-| 新增代码行数 | 约 1,930 行（production + tests 的 `git diff --numstat` `+` 侧，不含文档） |
-| 修改代码行数 | 约 183 行（既有行替换，按 `-` 侧估算） |
-| 删除代码行数 | 0 行独立功能删除（diff 的 183 个 `-` 行计入“修改”） |
-| 涉及文件数 | 15 个（production 4、tests 7、docs/devlog 4） |
-| 新增测试用例数 | 净新增约 30 个；另重命名/强化约 15 个既有 regressions |
-| 测试通过率 | 530/530 required local tests 通过；另 7 skip / 1 todo；0 fail |
-| 发现 bug 数 | 3 个实施后审核问题（retry-delay interrupt、mixed interrupt replay、compaction timeout） |
-| 修复 bug 数 | 4 个（Issue #7 根因组 + 3 个审核问题） |
-| 迭代轮次 | 设计约 8 轮 / 核心实现 14 单元 / 最终审核修复 3 轮 |
+| 新增代码行数 | 约 1,831 行（production + tests，按 current `origin/dev...HEAD` 的 1,988 个 `+` 减去约 157 行替换估算，不含文档） |
+| 修改代码行数 | 约 157 行（既有行替换，按 `-` 侧估算） |
+| 删除代码行数 | 0 行独立功能删除（diff 的 157 个 `-` 行计入“修改”） |
+| 涉及文件数 | 16 个（production 4、tests 7、docs/devlog 5） |
+| 新增测试用例数 | 净新增约 31 个；另重命名/强化约 16 个既有 regressions |
+| 测试通过率 | 570/570 canonical required local tests 通过（Legacy session 504 + Task 37 + CLI 20 + LLM schema 9）；另 7 skip / 1 todo；0 fail |
+| 发现 bug 数 | 5 个实施/复审问题（retry-delay interrupt、mixed interrupt replay、compaction timeout、cleanup-before-idle、rollback defect settlement） |
+| 修复 bug 数 | 6 个（Issue #7 根因组 + 5 个实施/复审问题） |
+| 迭代轮次 | 设计约 8 轮 / 核心实现 14 单元 / rebase 集成 1 轮 / 审核修复 5 轮 |
