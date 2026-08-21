@@ -3,7 +3,7 @@
 > 日期：2026-08-20  
 > Issue：#7 / PR #19 rebase 后独立审核  
 > 分支：`incomplete-stream-retry`  
-> 状态：修复前方案，待确认  
+> 状态：P1-A / P1-B 已实施并通过 focused regression；最终全量验证待执行
 > 范围：Legacy `SessionProcessor` 的 incomplete terminal ordering 与 retry rollback preparation failure settlement
 
 ---
@@ -437,14 +437,25 @@ pure interrupt 不被 non-interrupt normalization 捕获；mixed cause 先执行
 |------|---------|------------------|
 | 回归 P1-A | processor 构造 retained `text-start + text-delta + clean EOF`，断言 finalized text `PartUpdated` 与 assistant `MessageUpdated(error + time.completed)` 均早于 idle | 已加并通过：`session.processor finalizes retained incomplete output before publishing idle`（`49a969975`） |
 | 回归 P1-A consumer | 模拟 run consumer 只输出 `time.end` text 并在 idle 停止，断言 `final partial` 在 idle 前可见 | 已由同一 event-timeline regression 锁定 `text:partial-3 → assistant-terminal → idle`（`49a969975`）；真实 subprocess 在最终全量阶段重跑 |
-| 回归 P1-B | 强化现有 rollback-removal-failure：process 返回 stop、request count=1、durable `UnknownError("rollback removal failed")`、finish=error、time.completed、status=idle、无 summary | 待改 |
-| 新增交叉 | rollback preparation pure/mixed interrupt 仍不 replay，MessageAbortedError 优先且 idle 在 cleanup 后收敛 | 由既有 retry-delay / mixed interrupt regressions覆盖并重跑；若实现改动暴露缺口则新增 focused case |
-| 回归 | explicit incomplete success/exhaustion、clean EOF、ordinary rollback、plugin/tool/error fences | 待重跑 |
+| 回归 P1-B | 强化现有 rollback-removal-failure：process 返回 stop、request count=1、durable `UnknownError("rollback removal failed")`、finish=error、time.completed、status=idle、无 summary | 已强化并通过：`session.processor does not request or summarize again when rollback removal fails`（`57e749efe`） |
+| 新增交叉 | rollback preparation pure/mixed interrupt 仍不 replay，MessageAbortedError 优先且 idle 在 cleanup 后收敛 | 已随 `processor-effect.test.ts` 全文件重跑通过（69/69，`57e749efe`）；最终全量阶段继续覆盖 |
+| 回归 | explicit incomplete success/exhaustion、clean EOF、ordinary rollback、plugin/tool/error fences | processor focused suite 已通过；跨层全量待重跑 |
 | 回归 | PR #14 context overflow eligible/disabled/assistant-started cases | 待重跑 |
 | E2E | `run-process.test.ts` 全文件，确认 append-only 与 authoritative DB 契约不变 | 待重跑 |
 | 全量 | Legacy session suite、LLM schema、opencode/llm typecheck、changed-file lint、`git diff --check` | 待重跑 |
 
 所有真实 retry backoff 用例必须设置大于累计 backoff 的显式 per-test timeout。
+
+P1-B 实施验证（`57e749efe`）：
+
+| 命令 | 结果 |
+|------|------|
+| `bun test packages/opencode/test/session/processor-effect.test.ts -t "session.processor does not request or summarize again when rollback removal fails"` | 1 pass / 0 fail / 11 assertions |
+| `bun test packages/opencode/test/session/processor-effect.test.ts` | 69 pass / 0 fail / 535 assertions |
+| `bun run --cwd packages/opencode typecheck` | 通过 |
+| `git diff --check` | 通过 |
+
+该 regression 同时锁定 no-next-request、无 summary launch、process 返回 `stop`、内存与 durable assistant 的 `UnknownError` / `finish="error"` / `time.completed`，以及最终 `SessionStatus idle`。最终跨层全量验证仍在下一步骤执行。
 
 ---
 
@@ -453,9 +464,9 @@ pure interrupt 不被 non-interrupt normalization 捕获；mixed cause 先执行
 | 文件 | 函数 / 行号 | 改动概述 | 状态（修复后回填） |
 |------|------------|---------|------------------|
 | `packages/opencode/src/session/processor.ts` | `halt()` / `process()` finalizer | incomplete terminal idle 延迟到 cleanup/terminal persistence 后 | 已改：`49a969975` |
-| `packages/opencode/src/session/processor.ts` | `beforeRetry` / retry schedule outer cause boundary | 标记 rollback preparation failure、保留 interrupt evidence、把 non-interrupt defect 导入 halt、设置 finish=error | 待改 |
+| `packages/opencode/src/session/processor.ts` | `beforeRetry` / retry schedule outer cause boundary | 标记 rollback preparation failure、保留 interrupt evidence、把 non-interrupt defect 导入 halt、设置 finish=error | 已改：`57e749efe` |
 | `packages/opencode/test/session/processor-effect.test.ts` | terminal ordering regression | 增加 retained unclosed partial 与 idle/message/part ordering断言 | 已加：`49a969975` |
-| `packages/opencode/test/session/processor-effect.test.ts` | rollback-removal-failure regression | 增加 terminal error/finish/completed/status/no-next-request 断言 | 待改 |
+| `packages/opencode/test/session/processor-effect.test.ts` | rollback-removal-failure regression | 增加 terminal error/finish/completed/status/no-next-request 断言 | 已改并通过：`57e749efe` |
 | `packages/opencode/test/cli/run/run-process.test.ts` | incomplete CLI E2E（如 fixture 可稳定表达） | 验证 terminal partial 在 idle 前可见；否则只重跑现有完整文件并在测试报告注明 processor fixture 是最小可控边界 | 待判定 |
 
 ---
@@ -464,9 +475,9 @@ pure interrupt 不被 non-interrupt normalization 捕获；mixed cause 先执行
 
 | 文档路径 | 要改什么 | 状态（修复后回填） |
 |---------|---------|------------------|
-| `docs/fixes/session-fix-incomplete-terminal-settlement.md` | 本八部分方案；修复后回填测试、代码与 commit 状态 | 已创建方案（`10dac571b`）并回填 P1-A（`49a969975`）；P1-B/最终验证待回填 |
-| `docs/fixes/session-fix-incomplete-stream-recovery.md` | 补充 rollback preparation fail-closed 的 terminal error/status 后置条件；补充 incomplete terminal `cleanup/message/parts happens-before idle` 契约 | 已补 P1-A terminal ordering；P1-B terminal settlement 待补 |
+| `docs/fixes/session-fix-incomplete-terminal-settlement.md` | 本八部分方案；修复后回填测试、代码与 commit 状态 | 已创建方案（`10dac571b`）并回填 P1-A（`49a969975`）与 P1-B（`57e749efe`）；最终全量验证待回填 |
+| `docs/fixes/session-fix-incomplete-stream-recovery.md` | 补充 rollback preparation fail-closed 的 terminal error/status 后置条件；补充 incomplete terminal `cleanup/message/parts happens-before idle` 契约 | 已补 P1-A terminal ordering与 P1-B terminal settlement；最终全量验证待回填 |
 | `docs/devlog/2026-08-20-incomplete-stream-recovery.md` | 记录 rebase 后独立审核发现、修复、验证与更新后度量 | 待改 |
-| 上层项目 `CLAUDE.md`（nested repo 外） | 增加“terminal idle 不得早于 durable terminal projection；retry preparation defect 必须进入 terminal cause normalization”经验 | 待改（不进入 PR） |
+| 上层项目 `CLAUDE.md`（nested repo 外） | 增加“terminal idle 不得早于 durable terminal projection；retry preparation defect 必须进入 terminal cause normalization”经验 | 已本地同步（nested repo 外，不进入 PR） |
 
 不涉及 `expectations.md`：本次是既有子计划的 bug fix，按 §7 流程处理，不新开 v2 子计划。

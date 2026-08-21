@@ -1,6 +1,6 @@
 # Issue #7 修正方案：Legacy incomplete stream 同 assistant 回滚重试
 
-> 状态：已完成；Legacy bounded recovery、分层 observability、跨层回归、最终五维审核、契约回填与 devlog 均已实施并验证
+> 状态：Legacy bounded recovery 已完成；PR #19 rebase 后 P1-A / P1-B 已修复并通过 focused regression，更新后的最终全量验证待执行
 > 日期：2026-08-19
 > Issue：[#7 — Incomplete provider stream 应按副作用状态恢复](https://github.com/lihaokun/opencode/issues/7)
 > 分析基线：`48cffdff0f83387b5ac82dafc59603b4fa2e9461`
@@ -899,10 +899,13 @@ incompleteRetryCount = 0
 - schedule 停止；
 - 不发下一 provider request；
 - flow fail closed；
+- non-interrupt failure 经 retry schedule 外层 cause normalization 进入 existing `halt()`，映射为 `UnknownError` 并设置 `finish="error"`；
+- terminal assistant 由 cleanup 持久化 `error` / `finish` / `time.completed`，随后才发布 `SessionStatus idle`；
+- pure interrupt 仍保持 `MessageAbortedError` 语义；mixed failure + interrupt 在 cause squash 前先单调锁存取消状态；
 - 不增加新的 repair/reconciliation state；
 - 不添加只为理论防御路径服务的 Snapshot 或 patch fixture。
 
-`Session.removePart()` 已提供 authoritative deletion 与 removal event，不直接操作数据库或新增 removal event。
+`Session.removePart()` 已提供 authoritative deletion 与 removal event，不直接操作数据库或新增 removal event。rollback 已删除部分 parts 后再失败时仍不承诺 crash-atomic restore 或 survivor reconciliation；本契约只保证 no-next-request 与 terminal error/status 收敛。
 
 ## 4.10 final error 与 finish
 
@@ -930,6 +933,8 @@ Session.Event.Error
 ```
 
 `idle` 是 Legacy CLI 与 stream transport 的 terminal fence；因此对 incomplete terminal，`PartUpdated / MessageUpdated happens-before idle` 是硬性契约。不能只在内存设置 error/finish 后立即发布 idle。
+
+rollback preparation failure 复用同一 terminal-idle deferral：先由 outer cause normalization 建立 `UnknownError` 与 `finish="error"`，再由 cleanup 持久化 assistant terminal state，最后发布 idle。这样不改变 rollback durability 边界，但避免 no-next-request 后 session 永久停留在 `busy` 或 assistant 缺少 terminal error。
 
 ## 4.11 retained tool attempt cleanup
 
@@ -1268,7 +1273,7 @@ fence 命中后 attempt retained，不能依靠 rollback 删除 unfinished tool 
 | Clean EOF final detail | `legacy_clean_eof_exhaustion_preserves_existing_detailed_error_finish` | 未 settled step 保留 `UNSETTLED_STEP_MESSAGE/error`；credible empty unknown 保留 `EMPTY_UNKNOWN_MESSAGE/unknown` | 已加并通过（`d17915191`） |
 | Incomplete terminal ordering | `session.processor finalizes retained incomplete output before publishing idle` | retained open text 先闭合、assistant terminal state 先持久化，随后才发布 idle | 已加并通过（`49a969975`） |
 | Missing-finish final detail | `legacy_missing_finish_exhaustion_preserves_provider_detail_and_unknown_finish` | provider detail不被generic替换，finish为`unknown` | 已加并通过（`0d133d5b2`） |
-| Rollback preparation failure | `legacy_rollback_preparation_failure_stops_before_next_request` |实际preparation failure后request count不增加 | 已加并通过（`e3e4dbc59`） |
+| Rollback preparation failure | `session.processor does not request or summarize again when rollback removal fails` | actual preparation defect 后 request count 保持 1、无 summary；process 返回 stop；durable assistant 为 `UnknownError` + `finish="error"` + `time.completed`；status 最终 idle | no-next-request 初始覆盖（`e3e4dbc59`）；terminal settlement 断言已强化并通过（`57e749efe`） |
 | Usage checkpoint | `legacy_retry_restores_assistant_finish_cost_tokens_checkpoint` | rolled-back attempt不污染retained aggregate | 已加并通过（`e3e4dbc59`、`0d133d5b2`） |
 | Summary rollback | `legacy_rolled_back_attempt_never_launches_processor_summary` | `step-finish`后rollback，failed attempt call count=0 | 已加并通过（`28b35d189`） |
 | Summary retained compatibility | `legacy_retained_attempt_releases_deferred_processor_summary_from_finalizer` | success/error/blocked/compaction/interrupt retained exits均在cleanup body前按existing数量/顺序释放一次 | 已加并通过（`28b35d189`） |
@@ -1552,6 +1557,21 @@ Prompt authoritative transcripts 删除前两次 reasoning/text/summary attempt�
 
 五维结论：实现与批准 contract 一致；遵循现有 Effect/Session 风格且未引入依赖；审核修复后无 unresolved correctness/security finding；bounded retries 与 attempt tracking 未发现新的 hot-path complexity；模块边界保持 Legacy processor/retry/adapter 内聚。root-wide `oxlint` 仍报告 unrelated baseline unused-variable warnings，本 Issue 不清理无关文件。rollback preparation failure 的非事务性残余状态与 append-only transient output 均是本文明确接受的边界，不扩展为 repair/reconciliation 或 consumer retrofit。
 
+### 6.5.15 PR #19 rebase 后 terminal settlement 修复记录
+
+2026-08-21 在 rebase 到 `origin/dev` 后的独立审核中确认两项 terminal settlement 缺口：最终 incomplete 在 retained cleanup 前发布 idle，以及 rollback preparation defect 越过 `halt()`。P1-A 由 `49a969975` / `b8eda038f` 修复并同步契约；P1-B 由 `57e749efe` 把 retry preparation non-interrupt cause 导入 terminal settlement，同时保持 pure/mixed interrupt 优先级和已批准的 non-atomic rollback boundary。
+
+P1-B focused 验证：
+
+| 命令 | 结果 |
+|---|---|
+| `bun test packages/opencode/test/session/processor-effect.test.ts -t "session.processor does not request or summarize again when rollback removal fails"` | 1 pass / 0 fail / 11 assertions |
+| `bun test packages/opencode/test/session/processor-effect.test.ts` | 69 pass / 0 fail / 535 assertions |
+| `bun run --cwd packages/opencode typecheck` | 通过 |
+| `git diff --check` | 通过 |
+
+回归证明：rollback removal projector defect 后 request count 保持 1，已丢弃 attempt 不启动 summary，process 返回 `stop`；内存与 durable assistant 均持久化 `UnknownError("rollback removal failed")`、`finish="error"`、`time.completed`，session 最终为 idle。更新后的跨层最终全量验证仍待下一步骤执行，不能用本 focused 记录替代。
+
 ## 6.6 最小复现固化要求
 
 - A/B 分别证明explicit incomplete与qualifying clean EOF；
@@ -1631,7 +1651,7 @@ Prompt authoritative transcripts 删除前两次 reasoning/text/summary attempt�
 6. [已完成] actual text-complete invocation fence + callback compatibility；ordinary 与 explicit incomplete replay 均接入并验证；
 7. [已完成] 六类 normalized tool event fence + retained partial tool cleanup assertion；ordinary 六类参数化与 explicit incomplete integration 均已验证；
 8. [已完成] assistant terminal-error fence；shared decision/preparation gate 同时适用于 ordinary 与 explicit incomplete replay；
-9. [已完成] ordinary retry 适用时复用 fences 与 same-assistant rollback preparation；已验证 authoritative attempt 隔离与 preparation failure no-next-request；
+9. [已完成] ordinary retry 适用时复用 fences 与 same-assistant rollback preparation；已验证 authoritative attempt 隔离、preparation failure no-next-request，以及 non-interrupt defect 的 terminal error/status 收敛（`57e749efe`）；
 10. [已完成] processor `step-finish` summary attempt-local deferral；rollback 丢弃，retained success/error/blocked/compaction/interrupt 由 process finalizer 在 cleanup body 前释放；
 11. [已完成] explicit incomplete recovery + independent two-retry budget；successful same-assistant replay、three-attempt exhaustion 与 incomplete→ordinary→incomplete monotonic schedule sequence 均已验证；
 12. [已完成] clean EOF recovery + shared incomplete budget + exact final error/finish；
@@ -1659,6 +1679,8 @@ Prompt authoritative transcripts 删除前两次 reasoning/text/summary attempt�
 - [x] retry前删除current attempt所有authoritative parts；
 - [x] retry前恢复assistant `finish`、`cost`、`tokens`；
 - [x] rollback preparation failure后不发next request；
+- [x] rollback preparation non-interrupt defect 收敛为 durable `UnknownError`、`finish="error"`、`time.completed` 与最终 idle；
+- [x] incomplete / rollback-failure terminal path 均保证 retained cleanup 与 assistant terminal `MessageUpdated` happens-before idle；
 - [x] 不存在Snapshot global restore或额外reconciliation state；
 - [x] clean EOF 未形成 credible step settlement 时保留 `UNSETTLED_STEP_MESSAGE` 且 finish 为 `error`；
 - [x] clean EOF 已形成 credible empty unknown step 时保留 `EMPTY_UNKNOWN_MESSAGE` 且 finish 为 `unknown`；
@@ -1760,15 +1782,13 @@ Prompt authoritative transcripts 删除前两次 reasoning/text/summary attempt�
 
 ## 8.5 实现完成后的回填
 
-最终状态：代码、测试、文档三轨已完成。
+原 Issue #7 实现的代码、测试、文档三轨已完成；PR #19 rebase 后新增确认的 P1-A / P1-B 也已实现并完成 focused regression。更新后的最终跨层全量验证尚待执行，因此本节原有 pass/total 仅是 rebase/P1 修复前的历史基线，不作为当前 HEAD 的最终退出证据。
 
 - 第六部分已回填 actual regressions、pass/total 与对应 commits；
-- 第七部分已回填 actual modified files、implementation commits 与全部核对项；
-- 第八部分已同步旧 contract amendment、classification/recovery devlog 与上层项目注意事项；
-- authoritative rollback、exact final semantics、tool cleanup、summary deferral、observability、retry-delay interrupt 与 mixed interrupt 均有 focused assertion；
-- final broad session suite 为 464 pass / 7 skip / 1 todo / 0 fail / 1668 assertions；
-- final Task 与 CLI regressions 分别为 37/37、20/20；shared schema 为 9/9；两个 package typecheck 通过；
-- root-wide lint 仍报告与本分支无关的既有 unused-variable warnings；本修复未为清理无关 warning 扩大 scope；
-- 最终独立审核未发现批准范围内 unresolved correctness、security、performance 或 scope finding。
+- 第七部分已回填 original implementation commits；P1-A / P1-B 见 §6.5.15 与 `docs/fixes/session-fix-incomplete-terminal-settlement.md`；
+- authoritative rollback、exact final semantics、tool cleanup、summary deferral、observability、retry-delay interrupt、mixed interrupt 与 terminal settlement 均有 focused assertion；
+- 历史 broad session baseline 为 464 pass / 7 skip / 1 todo / 0 fail / 1668 assertions；更新后的 current-HEAD 数值将在下一次全量验证后回填；
+- 历史 Task 与 CLI regressions 分别为 37/37、20/20；shared schema 为 9/9；两个 package typecheck 通过；current-HEAD 全量结果待回填；
+- root-wide lint 仍报告与本分支无关的既有 unused-variable warnings；本修复不为清理无关 warning 扩大 scope。
 
-已知而接受的边界保持不变：rollback preparation failure 保证不发下一 provider request，但不扩展为 crash-atomic rollback、survivor reconciliation 或 durable batch；append-only surface 不承诺历史擦除。
+已知而接受的边界保持不变：rollback preparation failure 保证不发下一 provider request，并在 cleanup 后收敛为 terminal assistant + idle；但不扩展为 crash-atomic rollback、survivor reconciliation 或 durable batch。append-only surface 不承诺历史擦除。
