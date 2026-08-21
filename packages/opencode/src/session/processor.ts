@@ -190,6 +190,7 @@ const layer = Layer.effect(
       let hasPluginActivity = false
       let hasToolActivity = false
       let terminalIdleAfterCleanup = false
+      let rollbackPreparationFailed = false
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -801,11 +802,12 @@ const layer = Layer.effect(
           return
         }
         ctx.assistantMessage.error = error
+        if (rollbackPreparationFailed && !aborted) ctx.assistantMessage.finish = "error"
         yield* events.publish(Session.Event.Error, {
           sessionID: ctx.assistantMessage.sessionID,
           error: ctx.assistantMessage.error,
         })
-        yield* status.set(ctx.sessionID, { type: "idle" })
+        if (!terminalIdleAfterCleanup) yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
       const process = Effect.fn("SessionProcessor.process")(function* (
@@ -876,6 +878,12 @@ const layer = Layer.effect(
                 },
                 beforeRetry: ({ failure }) =>
                   rollbackAttempt(failure).pipe(
+                    Effect.onError(() =>
+                      Effect.sync(() => {
+                        rollbackPreparationFailed = true
+                        terminalIdleAfterCleanup = true
+                      }),
+                    ),
                     Effect.tap(() =>
                       Effect.sync(() => {
                         if (failure instanceof IncompleteStreamControl) incompleteRetryCount++
@@ -900,6 +908,10 @@ const layer = Layer.effect(
                   yield* halt(new DOMException("Aborted", "AbortError"))
                 }
               }),
+            ),
+            Effect.catchCauseIf(
+              (cause) => !Cause.hasInterruptsOnly(cause),
+              (cause) => Effect.fail(Cause.squash(cause)),
             ),
             Effect.catch(halt),
             Effect.ensuring(

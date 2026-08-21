@@ -2603,6 +2603,7 @@ itSummaryRollback.live("session.processor does not request or summarize again wh
         summaryTimeline.length = 0
         const { processors, session, provider } = yield* boot()
         const events = yield* EventV2.Service
+        const sts = yield* SessionStatus.Service
         const chat = yield* session.create({})
         const parent = yield* user(chat.id, "rollback-removal-failure")
         const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
@@ -2615,28 +2616,41 @@ itSummaryRollback.live("session.processor does not request or summarize again wh
         const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
         ordinaryRollbackAttempts.set("rollback-removal-failure", 0)
 
-        const exit = yield* Effect.exit(
-          handle.process({
-            user: {
-              id: parent.id,
-              sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
             sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "rollback-removal-failure" }],
-            tools: {},
-          }),
-        )
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "rollback-removal-failure" }],
+          tools: {},
+        })
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        const state = yield* sts.get(chat.id)
 
-        expect(Exit.isFailure(exit)).toBe(true)
+        expect(result).toBe("stop")
         expect(ordinaryRollbackAttempts.get("rollback-removal-failure")).toBe(1)
         expect(summaryLaunches).toEqual([])
+        expect(handle.message.finish).toBe("error")
+        expect(handle.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: expect.stringContaining("rollback removal failed") },
+        })
+        expect(handle.message.time.completed).toBeNumber()
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") {
+          expect(stored.info.finish).toBe("error")
+          expect(stored.info.error).toEqual(handle.message.error)
+          expect(stored.info.time.completed).toBe(handle.message.time.completed)
+        }
+        expect(state).toMatchObject({ type: "idle" })
       }),
     { config: cfg },
   ),
