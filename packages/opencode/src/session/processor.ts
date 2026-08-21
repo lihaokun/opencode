@@ -189,6 +189,7 @@ const layer = Layer.effect(
       let attempt: PhysicalAttemptCheckpoint | undefined
       let hasPluginActivity = false
       let hasToolActivity = false
+      let terminalIdleAfterCleanup = false
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -770,18 +771,18 @@ const layer = Layer.effect(
           stack: e instanceof Error ? e.stack : undefined,
         })
         if (ctx.assistantMessage.error) {
-          yield* status.set(ctx.sessionID, { type: "idle" })
+          if (!terminalIdleAfterCleanup) yield* status.set(ctx.sessionID, { type: "idle" })
           return
         }
         if (e instanceof IncompleteStreamControl) {
           const error = new NamedError.Unknown({ message: e.message }).toObject()
           ctx.assistantMessage.error = error
           ctx.assistantMessage.finish = e.finish
+          terminalIdleAfterCleanup = true
           yield* events.publish(Session.Event.Error, {
             sessionID: ctx.assistantMessage.sessionID,
             error,
           })
-          yield* status.set(ctx.sessionID, { type: "idle" })
           return
         }
         const error = parse(e)
@@ -909,6 +910,13 @@ const layer = Layer.effect(
                 Effect.catchCauseIf(
                   (cause) => !Cause.hasInterruptsOnly(cause) && !!ctx.assistantMessage.error,
                   (cause) => halt(Cause.squash(cause)),
+                ),
+                Effect.ensuring(
+                  Effect.gen(function* () {
+                    if (!terminalIdleAfterCleanup) return
+                    terminalIdleAfterCleanup = false
+                    yield* status.set(ctx.sessionID, { type: "idle" })
+                  }),
                 ),
               ),
             ),

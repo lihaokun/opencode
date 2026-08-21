@@ -519,6 +519,15 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
       const call = settlementCalls.get(name) ?? 0
       return incompleteAttempt(name, call, `incomplete detail ${call}`)
     }
+    case "unclosed-clean-eof-exhaustion": {
+      const call = settlementCalls.get(name) ?? 0
+      const id = `${name}-text-${call}`
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id }),
+        LLMEvent.textDelta({ id, text: `partial-${call}` }),
+      )
+    }
     case "explicit-incomplete-mixed": {
       const call = settlementCalls.get(name) ?? 0
       if (call === 1) return incompleteAttempt(name, call, "first incomplete detail")
@@ -1078,6 +1087,7 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
   const appendOnlyTextDeltas: string[] = []
   const assistantUpdates: SessionV1.Assistant[] = []
   const retryStatuses: Extract<SessionStatus.Info, { type: "retry" }>[] = []
+  const terminalTimeline: string[] = []
   const off = yield* eventBridge.listen((event) => {
     if (event.type === Session.Event.Error.type) {
       const data = event.data as typeof Session.Event.Error.data.Type
@@ -1096,6 +1106,9 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
       const data = event.data as typeof SessionV1.Event.PartUpdated.data.Type
       if (data.sessionID === chat.id && data.part.messageID === msg.id) {
         removalAwareParts.set(data.part.id, structuredClone(data.part) as SessionV1.Part)
+        if (data.part.type === "text" && data.part.time?.end) {
+          terminalTimeline.push(`text:${data.part.text}`)
+        }
       }
       return Effect.void
     }
@@ -1111,12 +1124,18 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
       if (data.sessionID === chat.id && data.status.type === "retry") {
         retryStatuses.push(data.status)
       }
+      if (data.sessionID === chat.id && data.status.type === "idle") {
+        terminalTimeline.push("idle")
+      }
       return Effect.void
     }
     if (event.type === SessionV1.Event.MessageUpdated.type) {
       const data = event.data as typeof SessionV1.Event.MessageUpdated.data.Type
       if (data.sessionID === chat.id && data.info.role === "assistant" && data.info.id === msg.id) {
         assistantUpdates.push(structuredClone(data.info))
+        if (data.info.error && data.info.time.completed) {
+          terminalTimeline.push("assistant-terminal")
+        }
       }
     }
     return Effect.void
@@ -1153,6 +1172,7 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
     appendOnlyTextDeltas,
     assistantUpdates,
     retryStatuses,
+    terminalTimeline,
   }
 })
 
@@ -1930,6 +1950,39 @@ itSettlement.effect("session.processor stops after two explicit incomplete retri
         expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-2" }))
         expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "discarded-3" }))
         expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.effect("session.processor finalizes retained incomplete output before publishing idle", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const scenario = "unclosed-clean-eof-exhaustion"
+        settlementCalls.set(scenario, 0)
+        const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt(scenario, 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt(scenario, 2)
+        yield* TestClock.adjust(4_000)
+        const result = yield* Fiber.join(resultFiber)
+        const text = result.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("error")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended without a settled model step" },
+        })
+        expect(result.stored.info.role).toBe("assistant")
+        if (result.stored.info.role === "assistant") {
+          expect(result.stored.info.error).toEqual(result.message.error)
+          expect(result.stored.info.time.completed).toBeNumber()
+        }
+        expect(settlementCalls.get(scenario)).toBe(3)
+        expect(text).toMatchObject({ text: "partial-3", time: { end: expect.any(Number) } })
+        expect(result.terminalTimeline).toEqual(["text:partial-3", "assistant-terminal", "idle"])
       }),
     { config: cfg },
   ),
