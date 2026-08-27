@@ -244,6 +244,35 @@ const providerErrorLLM = Layer.succeed(
 const providerErrorEnv = LayerNode.compile(root, [...replacements, [LLM.node, providerErrorLLM]])
 const itProviderError = testEffect(providerErrorEnv)
 
+const periodicDoomLoopLLM = Layer.succeed(
+  LLM.Service,
+  singletonBatchLLM(() => {
+    const calls = [
+      { id: "call-a1", name: "lookup", input: { query: "a" } },
+      { id: "call-b1", name: "search", input: { query: "b" } },
+      { id: "call-a2", name: "lookup", input: { query: "a" } },
+      { id: "call-b2", name: "search", input: { query: "b" } },
+      { id: "call-a3", name: "lookup", input: { query: "a" } },
+      { id: "call-b3", name: "search", input: { query: "b" } },
+    ]
+    const events: LLMEvent[] = [LLMEvent.stepStart({ index: 0 })]
+    for (const call of calls) {
+      events.push(
+        LLMEvent.toolCall(call),
+        LLMEvent.toolResult({
+          id: call.id,
+          name: call.name,
+          result: { type: "json", value: { title: call.name, output: "done", metadata: {} } },
+        }),
+      )
+    }
+    events.push(LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }), LLMEvent.finish({ reason: "tool-calls" }))
+    return Stream.fromIterable(events)
+  }),
+)
+const periodicDoomLoopEnv = LayerNode.compile(root, [...replacements, [LLM.node, periodicDoomLoopLLM]])
+const itPeriodicDoomLoop = testEffect(periodicDoomLoopEnv)
+
 const fragmentFailureLLM = Layer.succeed(
   LLM.Service,
   singletonBatchLLM(() =>
@@ -698,6 +727,73 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+itPeriodicDoomLoop.live("session.processor asks doom_loop permission after three period-2 repetitions", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const asked = defer<PermissionV1.Request>()
+        const off = yield* events.listen((event) => {
+          if (event.type === "permission.asked") asked.resolve(event.data as PermissionV1.Request)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "period-2 doom loop")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const fiber = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "period-2 doom loop" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        const request = yield* Effect.promise(() => asked.promise).pipe(
+          Effect.timeoutOrElse({
+            duration: "1 second",
+            orElse: () => Effect.fail(new Error("timed out waiting for periodic doom-loop permission")),
+          }),
+        )
+        expect(request).toMatchObject({
+          sessionID: chat.id,
+          permission: "doom_loop",
+          patterns: ["search"],
+          metadata: { tool: "search", input: { query: "b" } },
+          always: ["search"],
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(tools).toHaveLength(6)
+        expect(tools.slice(0, 5).every((part) => part.state.status === "completed")).toBe(true)
+        expect(tools[5]).toMatchObject({
+          callID: "call-b3",
+          tool: "search",
+          state: { status: "running", input: { query: "b" } },
+        })
+
+        yield* Fiber.interrupt(fiber)
+      }),
+    { config: cfg },
+  ),
+)
 
 itLength.live("session.processor normalizes length into one durable terminal error", () =>
   provideTmpdirInstance(
