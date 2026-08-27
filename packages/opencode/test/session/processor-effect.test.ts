@@ -306,12 +306,12 @@ const replayedToolCallLLM = Layer.succeed(
       LLMEvent.stepStart({ index: 0 }),
       LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
       LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
+      LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
       LLMEvent.toolResult({
         id: "call-replayed",
         name: "lookup",
         result: { type: "json", value: { title: "lookup", output: "done", metadata: {} } },
       }),
-      LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
       LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
       LLMEvent.finish({ reason: "tool-calls" }),
     ),
@@ -1007,7 +1007,7 @@ itPeriodOneDoomLoop.live("session.processor stops a period-1 cycle when doom_loo
   ),
 )
 
-itReplayedToolCall.live("session.processor isolates persisted history and counts a replayed call ID once", () =>
+itReplayedToolCall.live("session.processor isolates persisted history and counts an active replayed call ID once", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
