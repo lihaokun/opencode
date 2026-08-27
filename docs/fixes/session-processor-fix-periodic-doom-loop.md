@@ -1,6 +1,6 @@
 # 修正方案 — SessionProcessor 周期性工具调用死循环检测
 
-- 状态：修正方案待确认；尚未修改生产代码或永久测试
+- 状态：修正方案已确认；核心 detector、Processor 接入与定向回归已完成，权限文档与收尾回填待后续步骤
 - 日期：2026-08-27
 - 对应问题：[#20 Periodic tool-call cycles bypass doom-loop detection](https://github.com/lihaokun/opencode/issues/20)
 - 工作分支：`fix/issue-20-periodic-doom-loop`
@@ -46,11 +46,11 @@ A B C A B C A B C ...
 - 可导致无限工具执行、额外费用、持续外部副作用以及 Session 长时间保持 busy；
 - 当前没有通用的单 provider stream 工具调用总数上限可以兜底。
 
-周期 2–10 在现实现中稳定漏检。周期 1 仍会在第三次相同调用时触发。
+周期 2–10 在修复前实现中稳定漏检。周期 1 仍会在第三次相同调用时触发。
 
 ### 1.2 已完成的 Processor 集成复现
 
-2026-08-27 在本分支临时向 `packages/opencode/test/session/processor-effect.test.ts` 加入 deterministic normalized stream；临时改动已撤回，工作树恢复干净。
+2026-08-27 先在本分支用 deterministic normalized stream 验证当前错误行为，随后把同一 fixture 改成期望 `doom_loop` request 的永久红测，并在 commit `2d6a2e178` 中提交、推送。
 
 事件序列：
 
@@ -77,7 +77,7 @@ bun test --cwd packages/opencode \
   -t "issue 20 reproduction"
 ```
 
-修复前结果：
+初始复现断言错误行为时结果为：
 
 ```text
 1 pass
@@ -85,14 +85,23 @@ bun test --cwd packages/opencode \
 0 fail
 ```
 
-该临时测试锁定的是当前错误行为：
+它确认修复前：
 
 - `SessionProcessor.process()` 返回 `"continue"`；
 - 六个 tool parts 全部进入 `completed`；
 - 第六次调用没有被默认 `doom_loop: ask` 阻塞；
 - 唯一 call ID 不影响结果，因为 detector 不比较 call ID。
 
-实施时先把该 fixture 固化成预期 `doom_loop` request 的红测，再修改生产实现。红测必须在当前 `dev` 逻辑上失败，不能保留“六次全部完成”的错误断言。
+随后把 fixture 固化成期望 `doom_loop` request 的永久红测；在未修改生产代码时，该测试按预期失败：
+
+```text
+0 pass
+42 filtered out
+1 fail
+error: timed out waiting for periodic doom-loop permission
+```
+
+该红测保留正确预期，不通过修改断言来适配生产缺陷。
 
 ### 1.3 可直接运行的算法级最小复现
 
@@ -149,7 +158,7 @@ SessionPrompt.runLoop
   → optional Permission.ask("doom_loop")
 ```
 
-当前关键位置：
+修复前关键位置：
 
 - `packages/opencode/src/session/processor.ts:30`：`DOOM_LOOP_THRESHOLD = 3`；
 - `packages/opencode/src/session/processor.ts:362-414`：`tool-call` event 与 detector；
@@ -406,16 +415,17 @@ return detected
 
 1. `ProcessorContext` 增加 `doomLoop: DoomLoop.Detector`；
 2. `SessionProcessor.create()` 初始化一个 detector；
-3. `tool-call` 仍先 `ensureToolCall()`、规范化 input，并把当前 part 更新为 `running`；
-4. 之后调用：
+3. `tool-call` 先通过 `ensureToolCall()` 取得当前 part，并记录该事件是否是该 call ID 首次从 `pending` 进入正式调用；
+4. 规范化 input，并把当前 part 更新为 `running`；
+5. 重放/重复投递的同一 call ID 不追加 detector 签名；首次投递调用：
 
    ```ts
-   if (!ctx.doomLoop.check(value.name, input)) return
+   if (!firstDelivery || !ctx.doomLoop.check(value.name, input)) return
    ```
 
-5. 命中后沿用现有 `agents.get()` 和 `permission.ask()`；
-6. 删除 `MessageV2.parts()` detector 查询；
-7. 若 `Database.Service` 在该文件不再有其它用途，删除 import、captured service 与 node dependency。
+6. 命中后沿用现有 `agents.get()` 和 `permission.ask()`；
+7. 删除 `MessageV2.parts()` detector 查询；
+8. 若 `Database.Service` 在该文件不再有其它用途，删除 import、captured service 与 node dependency。
 
 状态生命周期：
 
@@ -598,22 +608,24 @@ streak[1] >= 1
 
 | 类型            | 文件 / 计划用例                                            | 用例描述                                                                         | 状态（修复后回填） |
 | --------------- | ---------------------------------------------------------- | -------------------------------------------------------------------------------- | ------------------ |
-| 回归/集成       | `test/session/processor-effect.test.ts` — period-2 fixture | 固化第一部分真实 Processor 复现；第 6 次唯一-ID 调用产生 `doom_loop` ask         | 待加               |
+| 回归/集成       | `test/session/processor-effect.test.ts` — period-2 fixture | 固化第一部分真实 Processor 复现；第 6 次唯一-ID 调用产生 `doom_loop` ask         | 已加并通过         |
 | 兼容/集成       | 同文件 — period 1                                          | 第三个相同调用仍在原时机产生 ask                                                 | 待加               |
 | 权限/集成       | 同文件 — allow/deny/ask                                    | allow 继续、deny terminal、ask pending；permission payload 保持 `{tool,input}`   | 待加               |
 | 生命周期/集成   | 同文件 — persisted history isolation                       | 预存 message tool parts 不参与新 processor detector；active processor 内调用参与 | 待加               |
-| 回归/unit       | `test/session/doom-loop.test.ts` — period 10               | 第 30 个调用命中                                                                 | 待加               |
-| 边界/unit       | 同文件 — two repetitions                                   | 两轮不触发                                                                       | 待加               |
-| 边界/unit       | 同文件 — changed input                                     | 第三轮一个 input 改变使对应 streak 重置                                          | 待加               |
-| 误报/unit       | 同文件 — non-periodic interleaving                         | 非周期调用不触发                                                                 | 待加               |
-| 基本周期/unit   | 同文件 — divisor                                           | `ABAB` 三轮按最小周期 2 命中                                                     | 待加               |
-| ID 隔离/集成    | processor fixture 使用唯一 call IDs                        | call ID 不进入签名                                                               | 待加               |
-| 序列化兼容/unit | 同文件 — reordered object keys                             | 保持现有 `JSON.stringify` 语义，不把 key 重排视为相同                            | 待加               |
-| Oracle/property | 同文件 — optimized vs brute-force                          | 对小 alphabet 的穷举序列及确定性生成序列逐步对照 oracle                          | 待加               |
-| 资源/静态       | `processor.ts` dependency audit                            | 删除 detector 对 `MessageV2.parts`/`Database.Service` 的依赖；ring 固定容量      | 待核对             |
-| 回归            | `test/session/processor-effect.test.ts` 全文件             | processor settlement、overflow、permission、tool cleanup 无回归                  | 待跑               |
-| 回归            | `test/permission/next.test.ts`                             | permission allow/deny/ask/once/always 生命周期不变                               | 待跑               |
-| 类型            | `packages/opencode` typecheck                              | 新 detector 与 processor context 类型正确                                        | 待跑               |
+| 回归/unit       | `test/session/doom-loop.test.ts` — period 10               | 第 30 个调用命中                                                                 | 已加并通过         |
+| 边界/unit       | 同文件 — two repetitions                                   | 两轮不触发                                                                       | 已加并通过         |
+| 边界/unit       | 同文件 — changed input                                     | 第三轮一个 input 改变使对应 streak 重置                                          | 已加并通过         |
+| 误报/unit       | 同文件 — non-periodic interleaving                         | 非周期调用不触发                                                                 | 已加并通过         |
+| 基本周期/unit   | 同文件 — divisor                                           | `ABAB` 三轮按最小周期 2 命中                                                     | 已加并通过         |
+| ID 隔离/集成    | processor fixture 使用唯一 call IDs                        | call ID 不进入签名                                                               | 已加并通过         |
+| 投递幂等/集成   | 同文件 — replayed call ID                                  | 同一逻辑调用事件重复投递三次只计数一次，不产生误报                               | 已加并通过         |
+| 序列化兼容/unit | 同文件 — reordered object keys                             | 保持现有 `JSON.stringify` 语义，不把 key 重排视为相同                            | 已加并通过         |
+| ring 边界/unit  | 同文件 — wrapped noisy prefix                              | ring 覆盖旧值后仍在第三轮 period-10 的最后一个调用命中                           | 已加并通过         |
+| Oracle/property | 同文件 — optimized vs brute-force                          | 对小 alphabet 的穷举序列及确定性生成序列逐步对照 oracle                          | 已加并通过         |
+| 资源/静态       | `processor.ts` dependency audit                            | 删除 detector 对 `MessageV2.parts`/`Database.Service` 的依赖；ring 固定容量      | 已核对             |
+| 回归            | `test/session/processor-effect.test.ts` 全文件             | processor settlement、overflow、permission、tool cleanup 无回归                  | 44/44 通过         |
+| 回归            | `test/permission/next.test.ts`                             | permission allow/deny/ask/once/always 生命周期不变                               | 79/79 通过         |
+| 类型            | `packages/opencode` typecheck                              | 新 detector 与 processor context 类型正确                                        | 通过               |
 
 实施顺序：
 
@@ -642,18 +654,18 @@ bun run --cwd packages/opencode typecheck
 
 ## 第七部分：代码更新清单
 
-| 文件                                                      | 函数 / 位置                                                  | 改动概述                                                                                     | 状态（修复后回填）       |
-| --------------------------------------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------- | ------------------------ |
-| `packages/opencode/src/session/doom-loop.ts`              | 新内部 detector                                              | 固定容量 ring、周期 1–10 streak、单次签名计算                                                | 待新增                   |
-| `packages/opencode/src/session/processor.ts`              | `ProcessorContext`、`create`、`tool-call` handler、node deps | 接入 processor-local detector；删除 persisted parts 查询和不再需要的 Database dependency     | 待改                     |
-| `packages/opencode/test/session/doom-loop.test.ts`        | 新 unit suite                                                | 直接回归、oracle 交叉验证、序列化兼容                                                        | 待新增                   |
-| `packages/opencode/test/session/processor-effect.test.ts` | normalized stream/permission integration                     | 周期 1/2、唯一 ID、permission action、history isolation                                      | 待改                     |
-| `packages/opencode/test/permission/next.test.ts`          | 既有 suite                                                   | 只运行回归；除非发现真实契约缺口，否则不修改                                                 | 待跑                     |
-| `packages/web/src/content/docs/permissions.mdx`           | `doom_loop` 描述                                             | 从连续同一调用扩展为最多周期 10 的三轮重复序列；保留周期 1 说明                              | 待改                     |
-| `packages/web/src/content/docs/*/permissions.mdx`         | localized exact-rule lines                                   | 同步不再把规则描述为仅“同一调用连续三次”；保持各 locale 既有语言                             | 待评估/同步              |
-| `docs/fixes/session-processor-fix-periodic-doom-loop.md`  | 本文                                                         | 修复后回填测试、代码状态和 commit                                                            | 本计划已创建，待实施回填 |
-| `docs/devlog/2026-08-27-periodic-doom-loop-detection.md`  | 新开发日志                                                   | 记录实现、决策、测试和规定的度量表                                                           | 待新增                   |
-| `CLAUDE.md`                                               | 已知限制与注意事项                                           | 回写经验：连续相等 guard 不能覆盖有界周期；stream guard 应使用 processor-local bounded state | 待改                     |
+| 文件                                                      | 函数 / 位置                                                  | 改动概述                                                                                     | 状态（修复后回填）                  |
+| --------------------------------------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------- | ----------------------------------- |
+| `packages/opencode/src/session/doom-loop.ts`              | 新内部 detector                                              | 固定容量 ring、周期 1–10 streak、单次签名计算                                                | 已实现，commit 待回填               |
+| `packages/opencode/src/session/processor.ts`              | `ProcessorContext`、`create`、`tool-call` handler、node deps | 接入 processor-local detector；删除 persisted parts 查询和不再需要的 Database dependency     | 已实现，commit 待回填               |
+| `packages/opencode/test/session/doom-loop.test.ts`        | 新 unit suite                                                | 直接回归、oracle 交叉验证、序列化兼容                                                        | 已新增，9/9 通过                    |
+| `packages/opencode/test/session/processor-effect.test.ts` | normalized stream/permission integration                     | period-2、唯一 ID、重复投递；其余 permission/history 矩阵后续补齐                            | 部分已改，44/44 通过                |
+| `packages/opencode/test/permission/next.test.ts`          | 既有 suite                                                   | 只运行回归；除非发现真实契约缺口，否则不修改                                                 | 未修改，79/79 通过                  |
+| `packages/web/src/content/docs/permissions.mdx`           | `doom_loop` 描述                                             | 从连续同一调用扩展为最多周期 10 的三轮重复序列；保留周期 1 说明                              | 待改                                |
+| `packages/web/src/content/docs/*/permissions.mdx`         | localized exact-rule lines                                   | 同步不再把规则描述为仅“同一调用连续三次”；保持各 locale 既有语言                             | 待评估/同步                         |
+| `docs/fixes/session-processor-fix-periodic-doom-loop.md`  | 本文                                                         | 修复后回填测试、代码状态和 commit                                                            | 已回填本步骤状态；commit 待后续回填 |
+| `docs/devlog/2026-08-27-periodic-doom-loop-detection.md`  | 新开发日志                                                   | 记录实现、决策、测试和规定的度量表                                                           | 待新增                              |
+| `CLAUDE.md`                                               | 已知限制与注意事项                                           | 回写经验：连续相等 guard 不能覆盖有界周期；stream guard 应使用 processor-local bounded state | 待改                                |
 
 明确不修改：
 

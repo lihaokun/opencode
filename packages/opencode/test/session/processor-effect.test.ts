@@ -273,6 +273,27 @@ const periodicDoomLoopLLM = Layer.succeed(
 const periodicDoomLoopEnv = LayerNode.compile(root, [...replacements, [LLM.node, periodicDoomLoopLLM]])
 const itPeriodicDoomLoop = testEffect(periodicDoomLoopEnv)
 
+const replayedToolCallLLM = Layer.succeed(
+  LLM.Service,
+  singletonBatchLLM(() =>
+    Stream.make(
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
+      LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
+      LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
+      LLMEvent.toolResult({
+        id: "call-replayed",
+        name: "lookup",
+        result: { type: "json", value: { title: "lookup", output: "done", metadata: {} } },
+      }),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ),
+  ),
+)
+const replayedToolCallEnv = LayerNode.compile(root, [...replacements, [LLM.node, replayedToolCallLLM]])
+const itReplayedToolCall = testEffect(replayedToolCallEnv)
+
 const fragmentFailureLLM = Layer.succeed(
   LLM.Service,
   singletonBatchLLM(() =>
@@ -790,6 +811,62 @@ itPeriodicDoomLoop.live("session.processor asks doom_loop permission after three
         })
 
         yield* Fiber.interrupt(fiber)
+      }),
+    { config: cfg },
+  ),
+)
+
+itReplayedToolCall.live("session.processor counts a replayed call ID only once", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        let asked = 0
+        const off = yield* events.listen((event) => {
+          if (event.type === "permission.asked") asked++
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "replayed tool call")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "replayed tool call" }],
+            tools: {},
+          })
+          .pipe(
+            Effect.timeoutOrElse({
+              duration: "1 second",
+              orElse: () => Effect.fail(new Error("replayed tool call unexpectedly requested permission")),
+            }),
+          )
+
+        expect(asked).toBe(0)
+        const parts = yield* MessageV2.parts(msg.id)
+        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(tools).toHaveLength(1)
+        expect(tools[0]).toMatchObject({
+          callID: "call-replayed",
+          tool: "lookup",
+          state: { status: "completed", input: { query: "a" } },
+        })
       }),
     { config: cfg },
   ),
