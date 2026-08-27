@@ -306,12 +306,12 @@ const replayedToolCallLLM = Layer.succeed(
       LLMEvent.stepStart({ index: 0 }),
       LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
       LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
-      LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
       LLMEvent.toolResult({
         id: "call-replayed",
         name: "lookup",
         result: { type: "json", value: { title: "lookup", output: "done", metadata: {} } },
       }),
+      LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
       LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
       LLMEvent.finish({ reason: "tool-calls" }),
     ),

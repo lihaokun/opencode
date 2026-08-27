@@ -72,6 +72,7 @@ type ToolCall = {
 
 interface ProcessorContext extends Input {
   toolcalls: Record<string, ToolCall>
+  seenToolCallIDs: Set<string>
   doomLoop: DoomLoop.Detector
   shouldBreak: boolean
   snapshot: string | undefined
@@ -131,6 +132,7 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         model: input.model,
         toolcalls: {},
+        seenToolCallIDs: new Set(),
         doomLoop: DoomLoop.create(),
         shouldBreak: false,
         snapshot: initialSnapshot,
@@ -365,8 +367,8 @@ const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
-            const toolCall = yield* ensureToolCall(value)
-            const firstDelivery = toolCall.part.state.status === "pending"
+            if (ctx.seenToolCallIDs.has(value.id)) return
+            yield* ensureToolCall(value)
             const input = isRecord(value.input) ? value.input : { value: value.input }
             yield* updateToolCall(value.id, (match) => ({
               ...match,
@@ -383,8 +385,9 @@ const layer = Layer.effect(
                 ? { ...value.providerMetadata, providerExecuted: true }
                 : value.providerMetadata,
             }))
+            ctx.seenToolCallIDs.add(value.id)
 
-            if (!firstDelivery || !ctx.doomLoop.check(value.name, input)) return
+            if (!ctx.doomLoop.check(value.name, input)) return
 
             const agent = yield* agents.get(ctx.assistantMessage.agent)
             yield* permission.ask({
