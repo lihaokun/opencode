@@ -35,6 +35,11 @@ Issue 同时要求 detector state 留在 active processor 内，避免每次工�
    - 重复投递同一 call ID 不产生误报；
    - persisted tool history 不初始化新 processor 的 detector。
 5. 同步英文与 17 个 localized `permissions.mdx`，明确周期 1–10 的相同调用序列重复三轮会触发，并说明连续三次相同调用是周期 1。
+6. 固化真实 spawned-process E2E（commit `93279982e`）：
+   - 新增窄范围 OpenAI-compatible SSE fixture，覆盖 all-batched、单 call chunk、pairs、顺序 argument fragments、starts-first/reverse-interleaved fragments；
+   - 真实 `opencode run` 覆盖 period 1/2/3/10、两轮阈值、near-miss reset、period 11 上界外和配置 ask/allow/deny；
+   - 真实 `opencode serve` + SDK 覆盖 session-scoped `doom_loop` request、`once` 非持久化、后续周期再次询问及 `reject` terminal cleanup；
+   - Provider 全部使用本地 loopback `TestLLMServer`，不访问外部 API、不使用 Provider credentials。
 
 ## 关键决策
 
@@ -48,13 +53,17 @@ Issue 同时要求 detector state 留在 active processor 内，避免每次工�
 
 | 验证项                                  | 结果                                                                                              |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `test/session/doom-loop.test.ts`        | 9/9 通过，18,444 次断言                                                                           |
-| `test/session/processor-effect.test.ts` | 47/47 通过，295 次断言                                                                            |
-| `test/permission/next.test.ts`          | 79/79 通过，118 次断言                                                                            |
-| `packages/opencode` typecheck           | 通过                                                                                              |
-| `packages/web` Astro build              | 通过；仅输出既有 theme override warnings                                                          |
-| `packages/opencode` 全量测试            | 3383 pass、22 skip、1 todo、7 fail、2 errors；失败位于 MCP/HttpApi 等未改模块，因此未宣称全量通过 |
-| pre-push workspace Turbo typecheck      | 每个已推送步骤均通过，30/30 tasks                                                                 |
+| `test/session/doom-loop.test.ts`                         | 9/9 通过，18,444 次断言                                                                           |
+| `test/session/processor-effect.test.ts`                  | 47/47 通过，295 次断言                                                                            |
+| `test/permission/next.test.ts`                           | 79/79 通过，118 次断言                                                                            |
+| `test/cli/run/periodic-doom-loop-process.test.ts`        | 10/10 通过，297 次断言；真实 CLI、SQLite 和本地 Provider HTTP/SSE                                |
+| `test/cli/serve/periodic-doom-loop-process.test.ts`      | 2/2 通过，91 次断言；真实 server 子进程和 SDK `once/reject`                                     |
+| spawned-process 稳定性回归                              | `--max-concurrency 4` 连续三轮均 12/12，通过 36/36                                                |
+| Issue #20 完整定向集                                    | 147/147 通过，19,245 次断言                                                                       |
+| `packages/opencode` typecheck                            | 通过                                                                                              |
+| `packages/web` Astro build                               | 通过；仅输出既有 theme override warnings                                                          |
+| `packages/opencode` 全量测试（此前基线，本轮未重跑）     | 3383 pass、22 skip、1 todo、7 fail、2 errors；失败位于 MCP/HttpApi 等未改模块，因此未宣称全量通过 |
+| pre-push workspace Turbo typecheck                       | 端测 commit `93279982e` 正常 push 时通过，30/30 tasks                                             |
 
 ## 审核与问题处置
 
@@ -66,10 +75,14 @@ Issue 同时要求 detector state 留在 active processor 内，避免每次工�
 - 最终复审发现 settlement 后同一 ID 的完整 lifecycle replay 会创建第二个 part。commit `14e2cfa2a` 曾尝试用 processor-lifetime seen-ID set 处理，但进一步审核确认该 set 会随非周期唯一调用和 retry 无界增长，并且无法阻止先到达的 replayed `tool-input-start` 创建 pending part；
 - 因此最终修正 `d67297528` 废弃无界 set，恢复固定容量 detector + active-call gate。settlement 后完整 lifecycle replay 记录为独立 follow-up，需要先确定 provider delivery contract、持久化 call-ID 索引和有界策略；
 - 修正方案状态和公共 permission 文档滞后：分别在实现与文档步骤同步。
+- 永久端测初版在并发冷启动下暴露 60 秒 child deadline flake：真实 CLI suite 改为 `cliIt.live` 串行执行，外层 timeout 提升到 180 秒，server readiness / SDK request / polling 分别设置有界 deadline；修正后连续三轮 12/12。
+- 独立端测复审要求 exact cardinality + `{callID, tool, input, status}` 映射，避免仅比较 ID Set 掩盖 duplicate parts 或 fragment 组装错位；同时把 alternating fixture 改为相同 input、不同 tool，独立证明 tool 名属于 detector 签名。
+- near-miss 负例在 mismatch 后追加下一次匹配调用，确认 streak 已重置而不是只在 mismatch 当下返回 false。
+- SDK `once` 用同一 Session 发起第二个周期并要求出现新的 `doom_loop` request，随后以 `reject` 清理，直接防止 `once` 被错误实现为持久 allow。
 
-以下项目经对照 Issue 契约后保留为明确边界，而非混入本修复：provider-executed side effect 回滚、stream-level 总调用预算、稳定 key canonicalization、settlement 后完整 tool lifecycle replay，以及对整个多工具 cycle 的一次性 permission approval。
+以下项目经对照 Issue 契约后保留为明确边界，而非混入本修复：provider-executed side effect 回滚、stream-level 总调用预算、稳定 key canonicalization、settlement 后完整 tool lifecycle replay，以及对整个多工具 cycle 的一次性 permission approval。真实 server 端测允许 rejection 前已并发开始的工具以 `completed` 或 `error` 收敛，但要求所有 parts terminal、assistant error 持久化、continuation 不被消费；这记录现有 tool execution 并发语义，不把 side-effect rollback 偷渡为本次新契约。
 
-最终高强度复审未发现其它 detector 算法或 `doom_loop` permission lifecycle 缺陷；无界 seen-ID 方案已撤销。
+最终高强度复审未发现其它 detector 算法或 `doom_loop` permission lifecycle 缺陷；无界 seen-ID 方案已撤销，永久端测中的有效审核项均已落实。
 
 ## 经验教训
 
@@ -83,16 +96,16 @@ Issue 同时要求 detector state 留在 active processor 内，避免每次工�
 
 ## 度量
 
-> 按 `git diff --stat origin/dev...HEAD` 加本日志估算；代码行统计包含测试和文档，修改行数按替换项估算。
+> 按最终 `git diff --stat origin/dev...HEAD` 估算；代码行统计包含测试和文档，修改行数按替换项估算。全量测试数字为端测固化前的已记录基线，不外推为本轮结果。
 
 | 指标           | 数值                                                              |
 | -------------- | ----------------------------------------------------------------- |
-| 新增代码行数   | 约 1,400 行                                                       |
+| 新增代码行数   | 约 2,300 行                                                       |
 | 修改代码行数   | 约 35 行                                                          |
 | 删除代码行数   | 约 40 行                                                          |
-| 涉及文件数     | 24 个 tracked 文件（另本地更新被 exclude 的 `CLAUDE.md`）         |
-| 新增测试用例数 | 14                                                                |
-| 测试通过率     | 定向 135/135；全量 3383/3392（另 22 skip、1 todo）                |
+| 涉及文件数     | 27 个 tracked 文件（另本地更新被 exclude 的 `CLAUDE.md`）         |
+| 新增测试用例数 | 26（原定向 14 + spawned-process E2E 12）                          |
+| 测试通过率     | 定向 147/147；spawned E2E 稳定性 36/36；此前全量基线 3383/3392（另 22 skip、1 todo） |
 | 发现 bug 数    | 3（周期绕过、active replay 误报、settlement 后 lifecycle replay） |
 | 修复 bug 数    | 2（Issue #20 范围；settlement 后 replay 留作独立 follow-up）      |
-| 迭代轮次       | 设计 1 轮 / 实现 4 轮 / 修复 3 轮 / 审核 4 轮                     |
+| 迭代轮次       | 设计 1 轮 / 实现 5 轮 / 修复 5 轮 / 审核 6 轮                     |

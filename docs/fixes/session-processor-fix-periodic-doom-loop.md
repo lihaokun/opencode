@@ -1,10 +1,10 @@
 # 修正方案 — SessionProcessor 周期性工具调用死循环检测
 
-- 状态：Issue #20 范围修复完成；核心实现、135/135 定向回归、权限文档与最终审核已完成；settlement 后完整 lifecycle replay 记录为独立 follow-up；GitHub issue 回复待用户另行确认
+- 状态：Issue #20 范围修复完成；核心实现、147/147 定向回归、12 个永久 spawned-process E2E、权限文档与最终审核已完成；settlement 后完整 lifecycle replay 记录为独立 follow-up；GitHub issue 回复待用户另行确认
 - 日期：2026-08-27
 - 对应问题：[#20 Periodic tool-call cycles bypass doom-loop detection](https://github.com/lihaokun/opencode/issues/20)
 - 工作分支：`fix/issue-20-periodic-doom-loop`
-- 影响模块：`packages/opencode` SessionProcessor、内部 doom-loop detector、processor/permission 回归测试、权限说明文档
+- 影响模块：`packages/opencode` SessionProcessor、内部 doom-loop detector、processor/permission 回归测试、Provider SSE fixture、真实 CLI/server 子进程端测、权限说明文档
 - workflow 路径：`docs/workflow.md` §7 bug-fix flow + §7.1 八部分修正方案
 - 修复分类：算法内部逻辑错误，并同步扩展既有 `doom_loop` 行为契约；不修改公共 API、permission schema 或数据库 schema
 
@@ -607,7 +607,7 @@ streak[1] >= 1
 
 ## 第六部分：测试用例清单
 
-所有 provider/processor 集成测试使用现有 fake `LLM.Service` 与本地 Effect layer，不访问真实 provider。
+算法与 Processor 集成测试使用现有 fake `LLM.Service` 与本地 Effect layer。永久端测则启动真实 `opencode run` / `opencode serve` 子进程，并通过本地 loopback `TestLLMServer` 提供 OpenAI-compatible HTTP/SSE；两类测试均不访问外部 provider、不读取 Provider API credentials，也不产生外部 API 费用。
 
 | 类型            | 文件 / 计划用例                                            | 用例描述                                                                         | 状态（修复后回填）                                                 |
 | --------------- | ---------------------------------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
@@ -628,9 +628,14 @@ streak[1] >= 1
 | 资源/静态       | `processor.ts` dependency audit                            | 删除 detector 对 `MessageV2.parts`/`Database.Service` 的依赖；ring 固定容量      | 已核对                                                             |
 | 回归            | `test/session/processor-effect.test.ts` 全文件             | processor settlement、overflow、permission、tool cleanup 无回归                  | 47/47 通过                                                         |
 | 回归            | `test/permission/next.test.ts`                             | permission allow/deny/ask/once/always 生命周期不变                               | 79/79 通过                                                         |
-| 类型            | `packages/opencode` typecheck                              | 新 detector 与 processor context 类型正确                                        | 通过                                                               |
+| Provider 编码   | `test/lib/periodic-tool-calls.ts`                          | 覆盖 all-batched、单 call chunk、pairs、顺序 fragments、starts-first/reverse-interleaved fragments；保持 call index/input 组装 | 已固化：`93279982e` |
+| 真实 CLI E2E    | `test/cli/run/periodic-doom-loop-process.test.ts`          | period 1/2/3/10 正例；两轮、near-miss reset、period 11 负例；配置 ask/allow/deny；核对 SQLite tool parts 与 Provider request 数 | 10/10 通过，297 次断言；`93279982e` |
+| 真实 server E2E | `test/cli/serve/periodic-doom-loop-process.test.ts`        | `opencode serve` + SDK `once/reject`；session-scoped permission；pending call、terminal parts、continuation 与再次询问语义 | 2/2 通过，91 次断言；`93279982e` |
+| 稳定性          | 两个 spawned-process suite，`--max-concurrency 4`          | 连续三轮覆盖冷启动、HTTP/SSE、SQLite、SDK polling 与 scope cleanup                | 3 轮均 12/12，通过 36/36                                           |
+| 定向总回归      | detector + Processor + permission + 两个 process suite     | Issue #20 全部定向验证                                                           | 147/147 通过，19,245 次断言                                        |
+| 类型            | workspace pre-push typecheck                               | 新 fixture、SDK polling 与断言 helper 类型正确                                   | 30/30 Turbo tasks 通过                                             |
 | 文档构建        | `packages/web` build                                       | 18 份 permission 文档可由 Astro 正常解析并构建                                   | 通过（仅既有主题 override warnings）                               |
-| 全量回归        | `packages/opencode` 全量                                   | 检查受影响范围外的整体基线                                                       | 3383 pass；7 fail + 2 errors（MCP/HttpApi 等无关测试，未宣称全过） |
+| 全量回归（此前基线） | `packages/opencode` 全量                              | 检查受影响范围外的整体基线；本轮端测固化后未重跑                                 | 此前 3383 pass；7 fail + 2 errors（MCP/HttpApi 等无关测试，未宣称全过） |
 
 实施顺序：
 
@@ -640,7 +645,8 @@ streak[1] >= 1
 4. 跑 unit + processor 定向测试；
 5. 补 permission/lifecycle/oracle 矩阵；
 6. 跑受影响文件和 typecheck；
-7. 最后根据成本决定是否运行 `packages/opencode` 全量，并诚实分类任何基线失败。
+7. 固化真实 CLI/server 进程端测，串行验证后连续三轮做并发稳定性回归；
+8. 最后根据成本决定是否运行 `packages/opencode` 全量，并诚实分类任何基线失败。
 
 计划命令：
 
@@ -650,7 +656,11 @@ bun test --cwd packages/opencode \
   test/session/processor-effect.test.ts
 
 bun test --cwd packages/opencode test/permission/next.test.ts
-bun run --cwd packages/opencode typecheck
+bun test --cwd packages/opencode \
+  test/cli/run/periodic-doom-loop-process.test.ts \
+  test/cli/serve/periodic-doom-loop-process.test.ts \
+  --max-concurrency 1
+bun run typecheck
 ```
 
 不得修改或删除正确的失败测试来适配生产缺陷。
@@ -666,10 +676,13 @@ bun run --cwd packages/opencode typecheck
 | `packages/opencode/test/session/doom-loop.test.ts`        | 新 unit suite                                                | 直接回归、oracle 交叉验证、序列化兼容                                                        | 已新增：`47c46b134`；9/9 通过                                         |
 | `packages/opencode/test/session/processor-effect.test.ts` | normalized stream/permission integration                     | period-1/2、唯一 ID、active 重复投递、permission allow/deny/ask、history isolation           | 基础矩阵：`5fc4787dd`；最终有界修正：`d67297528`；47/47 通过          |
 | `packages/opencode/test/permission/next.test.ts`          | 既有 suite                                                   | 只运行回归；除非发现真实契约缺口，否则不修改                                                 | 未修改，79/79 通过                                                    |
+| `packages/opencode/test/lib/periodic-tool-calls.ts`       | 新 Provider SSE fixture                                     | 将逻辑 tool-call blocks 编码为五种 OpenAI-compatible chunk/fragment 组合；唯一 call ID 保持语义外 | 已新增：`93279982e`                                                |
+| `packages/opencode/test/cli/run/periodic-doom-loop-process.test.ts` | 新 spawned CLI suite                              | 真实 `opencode run` 覆盖周期边界、fragment 组合、ask/allow/deny、持久化 parts 与请求计数      | 已新增：`93279982e`；10/10 通过                                      |
+| `packages/opencode/test/cli/serve/periodic-doom-loop-process.test.ts` | 新 spawned server suite                         | 真实 `opencode serve` + SDK 覆盖 session-scoped `once/reject`、再次询问和 terminal cleanup   | 已新增：`93279982e`；2/2 通过                                       |
 | `packages/web/src/content/docs/permissions.mdx`           | `doom_loop` 描述                                             | 从连续同一调用扩展为最多周期 10 的三轮重复序列；保留周期 1 说明                              | 已改：`aab2fc06e`                                                     |
 | `packages/web/src/content/docs/*/permissions.mdx`         | localized exact-rule lines                                   | 同步不再把规则描述为仅“同一调用连续三次”；保持各 locale 既有语言                             | 已同步 17 个 locale：`aab2fc06e`                                      |
-| `docs/fixes/session-processor-fix-periodic-doom-loop.md`  | 本文                                                         | 修复后回填测试、代码状态和 commit                                                            | 已完成最终回填                                                        |
-| `docs/devlog/2026-08-27-periodic-doom-loop-detection.md`  | 新开发日志                                                   | 记录实现、决策、测试和规定的度量表                                                           | 已新增；收尾 commit                                                   |
+| `docs/fixes/session-processor-fix-periodic-doom-loop.md`  | 本文                                                         | 回填永久 E2E、测试 commit、实际验证结果和边界                                                | 已完成最终回填；本次文档收尾 commit                                   |
+| `docs/devlog/2026-08-27-periodic-doom-loop-detection.md`  | 开发日志                                                     | 记录实现、永久 E2E、测试结果和规定的度量表                                                   | 已同步；本次文档收尾 commit                                           |
 | `CLAUDE.md`                                               | 已知限制与注意事项                                           | 回写经验：连续相等 guard 不能覆盖有界周期；stream guard 应使用 processor-local bounded state | 已本地回写；受 `.git/info/exclude` 排除，未强制公开                   |
 
 明确不修改：
@@ -690,10 +703,10 @@ bun run --cwd packages/opencode typecheck
 
 | 文档路径                                                 | 要改什么                                                        | 状态（修复后回填）         |
 | -------------------------------------------------------- | --------------------------------------------------------------- | -------------------------- |
-| `docs/fixes/session-processor-fix-periodic-doom-loop.md` | 八部分根因、方案、证明、测试和实施状态                          | 已完成最终回填             |
+| `docs/fixes/session-processor-fix-periodic-doom-loop.md` | 八部分根因、方案、证明、永久 E2E、测试 commit 和实施状态         | 已完成最终回填；本次文档收尾 commit |
 | `packages/web/src/content/docs/permissions.mdx`          | 明确连续重复是周期 1；长度不超过 10 的完整序列重复三轮也会触发  | 已改：`aab2fc06e`          |
 | `packages/web/src/content/docs/*/permissions.mdx`        | 同步 localized exact trigger 说明，避免翻译继续宣称只支持周期 1 | 已同步：`aab2fc06e`        |
-| `docs/devlog/2026-08-27-periodic-doom-loop-detection.md` | 记录关键决策、测试结果和 `## 度量`                              | 已新增；收尾 commit        |
+| `docs/devlog/2026-08-27-periodic-doom-loop-detection.md` | 记录关键决策、永久端测、测试结果和 `## 度量`                     | 已同步；本次文档收尾 commit |
 | `CLAUDE.md`                                              | 已知限制与注意事项回写本次经验教训                              | 已本地回写；文件被 exclude |
 | GitHub issue #20                                         | 实施完成后回复根因、算法边界和测试证据                          | 待用户另行确认后执行       |
 
