@@ -1,6 +1,7 @@
 import { SessionID, MessageID } from "./schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { isContextOverflow } from "@opencode-ai/llm"
 import {
   APIError,
   AbortedError,
@@ -710,7 +711,9 @@ export function fromError(
         { cause: e },
       ).toObject()
     case e instanceof Error:
-      return new NamedError.Unknown({ message: errorMessage(e) }, { cause: e }).toObject()
+      return (
+        contextOverflowFromMessage(e) ?? new NamedError.Unknown({ message: errorMessage(e) }, { cause: e }).toObject()
+      )
     default:
       try {
         const parsed = ProviderError.parseStreamError(e)
@@ -736,8 +739,16 @@ export function fromError(
           ).toObject()
         }
       } catch {}
-      return new NamedError.Unknown({ message: JSON.stringify(e) }, { cause: e }).toObject()
+      return (
+        contextOverflowFromMessage(e) ?? new NamedError.Unknown({ message: JSON.stringify(e) }, { cause: e }).toObject()
+      )
   }
+}
+
+function contextOverflowFromMessage(e: unknown) {
+  const message = errorMessage(e)
+  if (!isContextOverflow(message)) return undefined
+  return new ContextOverflowError({ message }, { cause: e }).toObject()
 }
 
 export * as MessageV2 from "./message-v2"

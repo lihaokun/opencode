@@ -61,6 +61,8 @@ const ref = {
   providerID: ProviderV2.ID.make("test"),
   modelID: ModelV2.ID.make("test-model"),
 }
+const litellmContextOverflow =
+  "litellm.BadRequestError: OpenAIException - Requested token count exceeds the model's maximum context length of 307200 tokens. You requested a total of 324629 tokens: 260629 tokens from the input messages and 64000 tokens for the completion."
 
 const cfg = {
   provider: {
@@ -134,6 +136,10 @@ function contextOverflowError() {
     responseBody: JSON.stringify({ error: { message: "request entity too large" } }),
     isRetryable: false,
   })
+}
+
+function untypedContextOverflowError() {
+  return new Error(litellmContextOverflow)
 }
 
 const waitFor = <A>(check: Effect.Effect<A | undefined>, message: string) =>
@@ -470,6 +476,8 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
       )
     case "context-overflow":
       return Stream.fail(contextOverflowError())
+    case "untyped-context-overflow":
+      return Stream.fail(untypedContextOverflowError())
     case "context-overflow-after-text-start":
       return Stream.make(LLMEvent.stepStart({ index: 0 }), LLMEvent.textStart({ id: "late-text" })).pipe(
         Stream.concat(Stream.fail(contextOverflowError())),
@@ -488,6 +496,11 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
         LLMEvent.stepStart({ index: 0 }),
         LLMEvent.toolCall({ id: "late-tool-call", name: "lookup", input: {} }),
       ).pipe(Stream.concat(Stream.fail(contextOverflowError())))
+    case "untyped-context-overflow-after-tool-call":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "late-untyped-tool-call", name: "lookup", input: {} }),
+      ).pipe(Stream.concat(Stream.fail(untypedContextOverflowError())))
     case "classified-incomplete":
       return Stream.make(
         LLMEvent.stepStart({ index: 0 }),
@@ -1682,6 +1695,29 @@ itSettlement.live("session.processor recovers a context overflow when the attemp
   ),
 )
 
+itSettlement.live("session.processor recovers an untyped context overflow when the attempt is eligible", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const result = yield* runSettlement(dir, "untyped-context-overflow", {
+          recoverContextOverflow: true,
+          unfinished: true,
+        })
+
+        expect(result.result).toBe("compact")
+        expect(result.message.finish).toBeUndefined()
+        expect(result.message.error).toBeUndefined()
+        expect(result.errors).toStrictEqual([
+          {
+            name: "ContextOverflowError",
+            data: { message: litellmContextOverflow },
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
 itSettlement.effect("session.processor replays only classified provider errors as incomplete controls", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -2145,6 +2181,7 @@ for (const scenario of [
   "context-overflow-after-reasoning-start",
   "context-overflow-after-tool-input-start",
   "context-overflow-after-tool-call",
+  "untyped-context-overflow-after-tool-call",
 ]) {
   itSettlement.live(`session.processor does not recover ${scenario}`, () =>
     provideTmpdirInstance(
