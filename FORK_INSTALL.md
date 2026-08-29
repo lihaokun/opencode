@@ -1,6 +1,6 @@
 # Fork 安装说明
 
-本 fork 需要**从源码构建**并自定义版本号(当前为 `1.18.6-fmv3`),因为:
+本 fork 需要**从源码构建**并自定义版本号(当前为 `1.18.6-fmV3.5`),因为:
 
 - 官方的 `curl … | bash` 安装脚本和 `npm i -g opencode-ai` 只**下载已发布的预编译版本**,装不出我们 fork 的改动;
 - 而且官方版的**自动更新会把我们的自建二进制覆盖掉**(实测 `-fm` 被悄悄换回官方 `1.18.x`)——所以要 (1) 从源码构建、(2) 关掉自动更新。
@@ -13,7 +13,7 @@
 # 1) 构建(版本号 + channel 都用环境变量)
 bun install                                   # 会应用 patches(如 openai-compatible 修复)
 cd packages/opencode
-OPENCODE_CHANNEL=dev OPENCODE_VERSION=1.18.6-fmv3 bun run script/build.ts --single
+OPENCODE_CHANNEL=dev OPENCODE_VERSION=1.18.6-fmV3.5 bun run script/build.ts --single
 
 # 2) 安装到 PATH 生效位置(官方安装器/更新器用的就是这里)
 install -m 0755 dist/opencode-linux-x64/bin/opencode ~/.opencode/bin/opencode
@@ -21,7 +21,7 @@ install -m 0755 dist/opencode-linux-x64/bin/opencode ~/.opencode/bin/opencode
 # 3) 关闭自动更新(二选一,均无需改代码)——见下文
 ```
 
-验证:`opencode --version` 应显示 `1.18.6-fmv3`。
+验证:`opencode --version` 应显示 `1.18.6-fmV3.5`。
 
 ---
 
@@ -29,7 +29,7 @@ install -m 0755 dist/opencode-linux-x64/bin/opencode ~/.opencode/bin/opencode
 
 版本号由 `packages/script/src/index.ts` 决定,优先级:
 
-1. **`OPENCODE_VERSION` 环境变量** → 逐字采用(我们就用这个:`1.18.6-fmv3`)；
+1. **`OPENCODE_VERSION` 环境变量** → 逐字采用(我们就用这个:`1.18.6-fmV3.5`)；
 2. 否则是 preview 构建 → `0.0.0-<channel>-<时间戳>`（例：`0.0.0-dev-202608161430`）；
 3. 否则(官方发布)→ 从 npm 拉 `opencode-ai/latest` 再 bump。
 
