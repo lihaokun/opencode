@@ -12,6 +12,7 @@ import { Snapshot } from "@/snapshot"
 import { Session } from "./session"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
+import { DoomLoop } from "./doom-loop"
 import { isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
@@ -23,11 +24,9 @@ import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { Database } from "@opencode-ai/core/database/database"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Usage, type FinishReason, type LLMEvent } from "@opencode-ai/llm"
 
-const DOOM_LOOP_THRESHOLD = 3
 const INCOMPLETE_RETRY_LIMIT = 2
 const EMPTY_UNKNOWN_MESSAGE = "Provider stream ended with an unknown finish reason and no usable output"
 const UNSETTLED_STEP_MESSAGE = "Provider stream ended without a settled model step"
@@ -88,6 +87,7 @@ type ToolCall = {
 
 interface ProcessorContext extends Input {
   toolcalls: Record<string, ToolCall>
+  doomLoop: DoomLoop.Detector
   shouldBreak: boolean
   snapshot: string | undefined
   blocked: boolean
@@ -164,7 +164,6 @@ const layer = Layer.effect(
     const status = yield* SessionStatus.Service
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
-    const database = yield* Database.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -176,6 +175,7 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         model: input.model,
         toolcalls: {},
+        doomLoop: DoomLoop.create(),
         shouldBreak: false,
         snapshot: initialSnapshot,
         blocked: false,
@@ -464,7 +464,8 @@ const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
-            yield* ensureToolCall(value)
+            const toolCall = yield* ensureToolCall(value)
+            const firstDelivery = toolCall.part.state.status === "pending"
             const input = isRecord(value.input) ? value.input : { value: value.input }
             yield* updateToolCall(value.id, (match) => ({
               ...match,
@@ -482,23 +483,7 @@ const layer = Layer.effect(
                 : value.providerMetadata,
             }))
 
-            const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
-              Effect.provideService(Database.Service, database),
-            )
-            const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
-
-            if (
-              recentParts.length !== DOOM_LOOP_THRESHOLD ||
-              !recentParts.every(
-                (part) =>
-                  part.type === "tool" &&
-                  part.tool === value.name &&
-                  part.state.status !== "pending" &&
-                  JSON.stringify(part.state.input) === JSON.stringify(input),
-              )
-            ) {
-              return
-            }
+            if (!firstDelivery || !ctx.doomLoop.check(value.name, input)) return
 
             const agent = yield* agents.get(ctx.assistantMessage.agent)
             yield* permission.ask({
@@ -969,7 +954,6 @@ export const node = LayerNode.make({
     SessionStatus.node,
     Image.node,
     EventV2Bridge.node,
-    Database.node,
   ],
 })
 
