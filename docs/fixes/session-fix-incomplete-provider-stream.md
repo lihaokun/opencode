@@ -1597,3 +1597,116 @@ emission；两个 V2 projector 用例仍按仓库现状条件跳过。
 完成状态：三个 crossover 实施单元均已提交并推送至 `yixiao-issue-3`；PR #5 body 已按仓库模板同步，
 review 处理证据已发布在 `issuecomment-5175011758`。实现、测试、文档和 PR 同步门均已完成；远端 CI
 按 PR head 独立运行。整个过程未恢复 `yixiao-issue-3-retry` 的 bounded retry 草稿。
+
+---
+
+## 十一、2026-08-19 Issue #7 bounded recovery 契约修订（源码实施前）
+
+### 11.1 修订地位与适用边界
+
+本节是 [Issue #7](https://github.com/lihaokun/opencode/issues/7) 的编码前契约 amendment，详细根因、
+正确性论证、测试矩阵和实施顺序见
+`docs/fixes/session-fix-incomplete-stream-recovery.md`。
+
+前十节继续作为 Issue #3 / PR #5 在各自历史基线上的真实设计、实施和验证记录，不删除、不改写。
+但对于 **Issue #7 实施后的 Legacy Session incomplete recovery 目标行为**，本节与上述 Issue #7
+修正方案共同取代前文所有面向未来的绝对 no-retry 表述。
+
+边界如下：
+
+- 本 amendment 只约束 Legacy `SessionProcessor` 路径；
+- V2 runner、events、schema、publisher、projector、history lowering、compaction、retry 和 tests 不变；
+- 不新增 public `IncompleteStreamError`，不修改 public Legacy error union、OpenAPI 或 generated SDK；
+- 不采用 Prompt continuation，不创建新 user message、assistant ID 或 recovery turn；
+- 本节提交时源码尚未实施 bounded recovery，当前 runtime 仍保持前十节记录的 Issue #3 行为；
+- 源码实施必须按 Issue #7 修正方案逐单元推进，每单元验证并 commit 后才进入下一单元。
+
+### 11.2 Legacy bounded recovery 目标契约
+
+Issue #7 实施后的目标行为为：
+
+1. **incomplete 只有两个入口**：
+   - normalized `provider-error` 明确携带 `classification = "incomplete-stream"`；
+   - stream 无异常 clean EOF，但缺少 trusted terminal evidence，且不是 blocked、compaction 或 interrupt。
+2. adapter/source throw、auth、context overflow、rate limit、普通 API/transport error、request preparation
+   failure、plugin failure 和其它本地 failure 不因已产生 partial output 而改判 incomplete；它们继续走
+   existing `MessageV2.fromError` / `SessionRetry`。
+3. safe replay 复用同一 logical assistant 和同一 assistant ID，不进入 Prompt loop continuation。
+4. incomplete 最多执行两次 retry；连续 incomplete 最多为 initial + retry 1 + retry 2，共三个 physical
+   attempts。ordinary retry 不消耗 incomplete budget；existing Effect schedule `meta.attempt` 仍跨全部
+   physical replays 单调推进，不按错误类别重置。
+5. 以下任一 process-local evidence 建立单调 replay fence，并同时阻止 incomplete 与 ordinary provider
+   replay：
+   - registered `experimental.text.complete` matching callback 已实际开始；
+   - processor 已观察 `tool-input-start`、`tool-input-delta`、`tool-input-end`、`tool-call`、
+     `tool-result` 或 `tool-error` 中任一 normalized event；
+   - assistant 已有 terminal error。
+6. replay 获准时，下一 provider request 前必须完成 authoritative rollback preparation：删除本 physical
+   attempt 创建的 parts，并恢复 assistant `finish`、`cost`、`tokens` checkpoint。任一步失败即 fail
+   closed，不发下一 request。
+7. rollback 只保证 authoritative/materialized transcript 与 removal-aware projection 最终收敛到 retained
+   attempt；stdout、JSON/NDJSON、Mini、ACP、GitHub、share 等 append-only 或 non-removal-aware surface
+   可以保留 failed partial 后再观察 retained output。
+8. final retained attempt 保留来源对应的 existing error/finish：
+   - clean EOF 未形成 credible step settlement：`UNSETTLED_STEP_MESSAGE` + `finish="error"`；
+   - clean EOF 已形成 credible `step-finish(reason="unknown")` 且无 usable output：
+     `EMPTY_UNKNOWN_MESSAGE` + `finish="unknown"`；
+   - canonical missing raw finish：保留 provider detailed message + `finish="unknown"`；
+   - existing terminal error：error/finish/parts 原样保留。
+9. rolled-back attempt 不启动自己的 processor `step-finish` summary；final retained attempt 的 deferred
+   launches 由 process finalizer 在 existing cleanup body 前按原数量和顺序释放一次，包括 interrupt
+   exit。`prompt.ts` 与 `summary.ts` 的 API 和其它调用点不变。
+10. tool/plugin fence 命中的 attempt 不 rollback；retained pending/running tool part 继续由 existing cleanup
+    最终化为 aborted/error，不修改 tool runtime。
+
+### 11.3 前文 no-retry 陈述的解释规则
+
+| 前文陈述 | Issue #7 后的解释 |
+|----------|------------------|
+| §4.7“本次修复不自动 replay” | 仍准确描述 Issue #3 原始修复；不再是 Issue #7 实施后 Legacy safe incomplete 的绝对规则 |
+| §10 中 request count = 1、raw-missing 不 replay 的测试证据 | 保留为当时 PR #5 tree 的历史实证；受 bounded recovery 直接影响的 fixtures/expectations 将在 Issue #7 测试单元更新 |
+| “bounded retry 属于独立 follow-up” | follow-up 现由 Issue #7 修正方案正式承接；仍不得把 V2 parity、continuation 或 broad error reclassification 混入 |
+| completed/partial tool 不 replay | 继续有效，因为任一 normalized tool activity 已建立 replay fence |
+| public canonical `UnknownError` 不匹配 `SessionRetry.retryable()` | 继续有效；Issue #7 使用 processor-private incomplete control，不把 public unknown error 改为 retryable |
+| incomplete 不能误报成功 | 完全保持；bounded recovery 失败、被 fence 阻止或预算耗尽后仍落地 durable terminal error |
+
+### 11.4 编码前同步门与后续验证
+
+本 amendment 是 Issue #7 源码实施前的文档同步门。完成本节并单独 commit 后，后续单元才可开始：
+
+1. shared stable classification 与 AI SDK canonical mapping/test；
+2. Legacy processor incomplete entry、attempt state、rollback 与 bounded budget；
+3. plugin/tool/error fences、ordinary retry integration、summary deferral；
+4. Prompt/Task/CLI 既有 missing-finish fixtures 与 focused observability regressions；
+5. package-local tests、typecheck、五维审核、devlog 和文档状态回填。
+
+直接受影响的既有测试至少包括：
+
+- `packages/opencode/test/session/llm.test.ts`；
+- `packages/opencode/test/session/retry.test.ts`；
+- `packages/opencode/test/session/processor-effect.test.ts`；
+- `packages/opencode/test/session/prompt.test.ts`；
+- `packages/opencode/test/tool/task.test.ts`；
+- `packages/opencode/test/cli/run/run-process.test.ts`。
+
+本节不授权或实施任何源码/test diff；它只把 Issue #3 历史 no-retry 契约与已确认的 Issue #7
+Legacy bounded recovery 目标契约明确分层。
+
+### 11.5 2026-08-20 实施后状态回填
+
+本节 11.1—11.4 保留为编码前同步门的历史记录；其中“本节提交时源码尚未实施”“目标行为”“后续验证”等时态仅描述提交 `ad59676db` 当时的状态。Issue #7 的 Legacy bounded recovery 现已按
+`docs/fixes/session-fix-incomplete-stream-recovery.md` 完成实施与验证。
+
+完成状态：
+
+- shared classification / AI SDK mapping：`269aa2848`；
+- processor private entries、attempt state、retry hooks/fences、rollback、summary deferral、explicit/clean-EOF bounded recovery：`c10dea5ab`—`d17915191`；
+- observability 与 Prompt/Task/CLI/compaction cross-layer regressions：`31e23f984`、`602df5a50`；
+- 最终审核修复：retry-delay interrupt `bb8f5c879`、compaction timeout `9b9da8e80`、mixed Fail+Interrupt no-replay `df9eb3687`；
+- final Legacy session suite：464 pass / 7 skip / 1 todo / 0 fail / 1668 assertions；
+- Task 37/37、CLI 20/20、shared schema 9/9；`packages/llm` 与 `packages/opencode` typecheck 通过；
+- 独立五维审核无 unresolved finding，forbidden-scope diff 为空。
+
+实施后契约与 11.2 一致：safe incomplete 在同一 assistant 内最多 replay 两次；任一 actual matching text-complete invocation、任一 normalized tool event、existing terminal error 或 interrupt evidence 都 fail closed；retry 前先撤销 current attempt authoritative parts并恢复 assistant checkpoint；最终仍使用 Legacy `UnknownError`，不新增 public error 或 SDK/OpenAPI 变化。
+
+保持不变的范围边界：V2、Prompt/Task/CLI/compaction production、TUI/consumer、plugin/tool runtime、`summary.ts` 与 public Legacy error union 均无 diff。rollback preparation failure 只保证不发下一 provider request，不承诺 crash-atomic repair；append-only output 仍可保留 transient failed-attempt bytes。

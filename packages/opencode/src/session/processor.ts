@@ -28,12 +28,27 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { Usage, type FinishReason, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
+const INCOMPLETE_RETRY_LIMIT = 2
 const EMPTY_UNKNOWN_MESSAGE = "Provider stream ended with an unknown finish reason and no usable output"
 const UNSETTLED_STEP_MESSAGE = "Provider stream ended without a settled model step"
 export type Result = "compact" | "stop" | "continue"
 
 type ProcessOptions = {
   readonly recoverContextOverflow?: boolean
+}
+
+type IncompleteSource = "provider" | "clean-eof"
+
+class IncompleteStreamControl extends Error {
+  readonly _tag = "IncompleteStreamControl"
+
+  constructor(
+    readonly source: IncompleteSource,
+    message: string,
+    readonly finish: "unknown" | "error",
+  ) {
+    super(message)
+  }
 }
 
 export interface Handle {
@@ -90,6 +105,21 @@ type ProviderTurnEvidence = {
   hasAssistantStarted: boolean
 }
 
+type DeferredSummaryLaunch = Parameters<SessionSummary.Interface["summarize"]>[0]
+
+type PhysicalAttemptCheckpoint = {
+  partIDs: Set<SessionV1.Part["id"]>
+  assistant: {
+    finish: SessionV1.Assistant["finish"]
+    cost: number
+    tokens: SessionV1.Assistant["tokens"]
+  }
+  summaries: {
+    disposition: "pending" | "rollback" | "retain"
+    launches: DeferredSummaryLaunch[]
+  }
+}
+
 function providerTurnEvidence(): ProviderTurnEvidence {
   return {
     activeStep: false,
@@ -102,6 +132,20 @@ function providerTurnEvidence(): ProviderTurnEvidence {
 }
 
 type StreamEvent = LLMEvent
+
+function isToolActivityEvent(event: StreamEvent) {
+  switch (event.type) {
+    case "tool-input-start":
+    case "tool-input-delta":
+    case "tool-input-end":
+    case "tool-call":
+    case "tool-result":
+    case "tool-error":
+      return true
+    default:
+      return false
+  }
+}
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionProcessor") {}
 
@@ -142,12 +186,66 @@ const layer = Layer.effect(
       let aborted = false
       let evidence = providerTurnEvidence()
       let recoverContextOverflow = true
+      let attempt: PhysicalAttemptCheckpoint | undefined
+      let hasPluginActivity = false
+      let hasToolActivity = false
+      let terminalIdleAfterCleanup = false
+      let rollbackPreparationFailed = false
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
           providerID: input.model.providerID,
           aborted,
         })
+
+      const replayBlocked = () =>
+        hasPluginActivity ||
+        hasToolActivity ||
+        !!ctx.assistantMessage.error ||
+        ctx.blocked ||
+        ctx.needsCompaction ||
+        aborted
+
+      const createPart = <T extends SessionV1.Part>(part: T) =>
+        Effect.gen(function* () {
+          attempt?.partIDs.add(part.id)
+          return yield* session.updatePart(part)
+        })
+
+      const rollbackAttempt = Effect.fn("SessionProcessor.rollbackAttempt")(function* (failure: unknown) {
+        if (replayBlocked()) return yield* Effect.fail(failure)
+        const current = attempt
+        if (!current) return yield* Effect.fail(new Error("Missing physical attempt checkpoint"))
+        current.summaries.disposition = "rollback"
+        current.summaries.launches = []
+        if (current.partIDs.size === 0) return
+
+        ctx.currentText = undefined
+        ctx.reasoningMap = {}
+        for (const partID of current.partIDs) {
+          yield* session.removePart({
+            sessionID: ctx.sessionID,
+            messageID: ctx.assistantMessage.id,
+            partID,
+          })
+        }
+
+        ctx.assistantMessage.finish = current.assistant.finish
+        ctx.assistantMessage.cost = current.assistant.cost
+        ctx.assistantMessage.tokens = structuredClone(current.assistant.tokens)
+        yield* session.updateMessage(ctx.assistantMessage)
+      })
+
+      const releaseAttemptSummaries = Effect.fn("SessionProcessor.releaseAttemptSummaries")(function* () {
+        const current = attempt
+        if (!current || current.summaries.disposition !== "pending") return
+        current.summaries.disposition = "retain"
+        const launches = current.summaries.launches
+        current.summaries.launches = []
+        for (const launch of launches) {
+          yield* summary.summarize(launch).pipe(Effect.ignore, Effect.forkIn(scope))
+        }
+      })
 
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
         const done = ctx.toolcalls[toolCallID]?.done
@@ -262,7 +360,7 @@ const layer = Layer.effect(
           }
           return { call: ctx.toolcalls[input.id], part }
         }
-        const part = yield* session.updatePart({
+        const part = yield* createPart({
           id: PartID.ascending(),
           messageID: ctx.assistantMessage.id,
           sessionID: ctx.assistantMessage.sessionID,
@@ -305,6 +403,7 @@ const layer = Layer.effect(
       }
 
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+        if (isToolActivityEvent(value)) hasToolActivity = true
         switch (value.type) {
           case "reasoning-start":
             evidence.hasAssistantStarted = true
@@ -318,7 +417,7 @@ const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
-            yield* session.updatePart(ctx.reasoningMap[value.id])
+            yield* createPart(ctx.reasoningMap[value.id])
             return
 
           case "reasoning-delta":
@@ -452,12 +551,15 @@ const layer = Layer.effect(
           }
 
           case "provider-error":
+            if (value.classification === "incomplete-stream") {
+              return yield* Effect.fail(new IncompleteStreamControl("provider", value.message, "unknown"))
+            }
             throw new Error(value.message)
 
           case "step-start":
             evidence.activeStep = true
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
-            yield* session.updatePart({
+            yield* createPart({
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
               sessionID: ctx.sessionID,
@@ -487,7 +589,7 @@ const layer = Layer.effect(
             }
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
-            yield* session.updatePart({
+            yield* createPart({
               id: PartID.ascending(),
               reason: value.reason,
               snapshot: completedSnapshot,
@@ -507,7 +609,7 @@ const layer = Layer.effect(
             if (ctx.snapshot) {
               const patch = yield* snapshot.patch(ctx.snapshot)
               if (patch.files.length) {
-                yield* session.updatePart({
+                yield* createPart({
                   id: PartID.ascending(),
                   messageID: ctx.assistantMessage.id,
                   sessionID: ctx.sessionID,
@@ -518,12 +620,10 @@ const layer = Layer.effect(
               }
               ctx.snapshot = undefined
             }
-            yield* summary
-              .summarize({
-                sessionID: ctx.sessionID,
-                messageID: ctx.assistantMessage.parentID,
-              })
-              .pipe(Effect.ignore, Effect.forkIn(scope))
+            attempt?.summaries.launches.push({
+              sessionID: ctx.sessionID,
+              messageID: ctx.assistantMessage.parentID,
+            })
             if (
               !ctx.assistantMessage.summary &&
               isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })
@@ -544,7 +644,7 @@ const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
-            yield* session.updatePart(ctx.currentText)
+            yield* createPart(ctx.currentText)
             return
 
           case "text-delta":
@@ -564,6 +664,8 @@ const layer = Layer.effect(
             if (!ctx.currentText) return
             // oxlint-disable-next-line no-self-assign -- reactivity trigger
             ctx.currentText.text = ctx.currentText.text
+            const hooks = yield* plugin.list()
+            if (hooks.some((hook) => hook["experimental.text.complete"])) hasPluginActivity = true
             ctx.currentText.text = (yield* plugin.trigger(
               "experimental.text.complete",
               {
@@ -589,32 +691,24 @@ const layer = Layer.effect(
       })
 
       const settleIncomplete = Effect.fn("SessionProcessor.settleIncomplete")(function* () {
-        if (ctx.assistantMessage.error || ctx.blocked) return
+        if (ctx.assistantMessage.error || ctx.blocked || ctx.needsCompaction || aborted) return
         const credibleStepSettlement = evidence.completedSteps > 0 && !evidence.activeStep
         const hasVisibleText =
           evidence.hasCompletedVisibleText || (ctx.currentText !== undefined && ctx.currentText.text.trim().length > 0)
         const hasUsableOutput = hasVisibleText || evidence.hasToolEvidence
-        const message = !credibleStepSettlement
-          ? UNSETTLED_STEP_MESSAGE
-          : evidence.lastStepFinish === "unknown" && !hasUsableOutput
-            ? EMPTY_UNKNOWN_MESSAGE
-            : undefined
-        if (!message) return
-
-        const error = new NamedError.Unknown({ message }).toObject()
-        ctx.assistantMessage.error = error
-        if (!credibleStepSettlement) ctx.assistantMessage.finish = "error"
-        yield* events.publish(Session.Event.Error, {
-          sessionID: ctx.assistantMessage.sessionID,
-          error,
-        })
+        if (!credibleStepSettlement) {
+          return yield* Effect.fail(new IncompleteStreamControl("clean-eof", UNSETTLED_STEP_MESSAGE, "error"))
+        }
+        if (evidence.lastStepFinish === "unknown" && !hasUsableOutput) {
+          return yield* Effect.fail(new IncompleteStreamControl("clean-eof", EMPTY_UNKNOWN_MESSAGE, "unknown"))
+        }
       })
 
       const cleanup = Effect.fn("SessionProcessor.cleanup")(function* () {
         if (ctx.snapshot) {
           const patch = yield* snapshot.patch(ctx.snapshot)
           if (patch.files.length) {
-            yield* session.updatePart({
+            yield* createPart({
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
               sessionID: ctx.sessionID,
@@ -678,7 +772,18 @@ const layer = Layer.effect(
           stack: e instanceof Error ? e.stack : undefined,
         })
         if (ctx.assistantMessage.error) {
-          yield* status.set(ctx.sessionID, { type: "idle" })
+          if (!terminalIdleAfterCleanup) yield* status.set(ctx.sessionID, { type: "idle" })
+          return
+        }
+        if (e instanceof IncompleteStreamControl) {
+          const error = new NamedError.Unknown({ message: e.message }).toObject()
+          ctx.assistantMessage.error = error
+          ctx.assistantMessage.finish = e.finish
+          terminalIdleAfterCleanup = true
+          yield* events.publish(Session.Event.Error, {
+            sessionID: ctx.assistantMessage.sessionID,
+            error,
+          })
           return
         }
         const error = parse(e)
@@ -697,17 +802,19 @@ const layer = Layer.effect(
           return
         }
         ctx.assistantMessage.error = error
+        if (rollbackPreparationFailed && !aborted) ctx.assistantMessage.finish = "error"
         yield* events.publish(Session.Event.Error, {
           sessionID: ctx.assistantMessage.sessionID,
           error: ctx.assistantMessage.error,
         })
-        yield* status.set(ctx.sessionID, { type: "idle" })
+        if (!terminalIdleAfterCleanup) yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
       const process = Effect.fn("SessionProcessor.process")(function* (
         streamInput: LLM.StreamInput,
         options?: ProcessOptions,
       ) {
+        let incompleteRetryCount = 0
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
@@ -717,6 +824,18 @@ const layer = Layer.effect(
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
+            attempt = {
+              partIDs: new Set(),
+              assistant: {
+                finish: ctx.assistantMessage.finish,
+                cost: ctx.assistantMessage.cost,
+                tokens: structuredClone(ctx.assistantMessage.tokens),
+              },
+              summaries: {
+                disposition: "pending",
+                launches: [],
+              },
+            }
             ctx.needsCompaction = false
             evidence = providerTurnEvidence()
             ctx.currentText = undefined
@@ -749,6 +868,28 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
+                decide: ({ failure, ordinary }) => {
+                  if (replayBlocked()) return undefined
+                  if (failure instanceof IncompleteStreamControl) {
+                    if (incompleteRetryCount >= INCOMPLETE_RETRY_LIMIT) return undefined
+                    return { message: failure.message }
+                  }
+                  return ordinary
+                },
+                beforeRetry: ({ failure }) =>
+                  rollbackAttempt(failure).pipe(
+                    Effect.onError(() =>
+                      Effect.sync(() => {
+                        rollbackPreparationFailed = true
+                        terminalIdleAfterCleanup = true
+                      }),
+                    ),
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        if (failure instanceof IncompleteStreamControl) incompleteRetryCount++
+                      }),
+                    ),
+                  ),
                 set: (info) => {
                   return status.set(ctx.sessionID, {
                     type: "retry",
@@ -760,12 +901,34 @@ const layer = Layer.effect(
                 },
               }),
             ),
+            Effect.onInterrupt(() =>
+              Effect.gen(function* () {
+                aborted = true
+                if (!ctx.assistantMessage.error) {
+                  yield* halt(new DOMException("Aborted", "AbortError"))
+                }
+              }),
+            ),
+            Effect.catchCauseIf(
+              (cause) => !Cause.hasInterruptsOnly(cause),
+              (cause) => Effect.fail(Cause.squash(cause)),
+            ),
             Effect.catch(halt),
             Effect.ensuring(
-              cleanup().pipe(
+              Effect.gen(function* () {
+                yield* releaseAttemptSummaries()
+                yield* cleanup()
+              }).pipe(
                 Effect.catchCauseIf(
                   (cause) => !Cause.hasInterruptsOnly(cause) && !!ctx.assistantMessage.error,
                   (cause) => halt(Cause.squash(cause)),
+                ),
+                Effect.ensuring(
+                  Effect.gen(function* () {
+                    if (!terminalIdleAfterCleanup) return
+                    terminalIdleAfterCleanup = false
+                    yield* status.set(ctx.sessionID, { type: "idle" })
+                  }),
                 ),
               ),
             ),

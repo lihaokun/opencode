@@ -3,9 +3,11 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { EventV2 } from "@opencode-ai/core/event"
 import { expect } from "bun:test"
 import { APICallError, tool } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -35,6 +37,21 @@ const summary = Layer.succeed(
   SessionSummary.Service,
   SessionSummary.Service.of({
     summarize: () => Effect.void,
+    diff: () => Effect.succeed([]),
+    computeDiff: () => Effect.succeed([]),
+  }),
+)
+
+const summaryLaunches: Parameters<SessionSummary.Interface["summarize"]>[0][] = []
+const summaryTimeline: string[] = []
+const summaryProbe = Layer.succeed(
+  SessionSummary.Service,
+  SessionSummary.Service.of({
+    summarize: (input) => {
+      summaryLaunches.push(input)
+      summaryTimeline.push("summary")
+      return Effect.void
+    },
     diff: () => Effect.succeed([]),
     computeDiff: () => Effect.succeed([]),
   }),
@@ -188,11 +205,16 @@ const root = LayerNode.group([
   Provider.node,
   Database.node,
   EventV2Bridge.node,
+  EventV2.node,
   SessionStatus.node,
   CrossSpawnSpawner.node,
 ])
 const replacements = [
   [SessionSummary.node, summary],
+  [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
+] as const
+const summaryProbeReplacements = [
+  [SessionSummary.node, summaryProbe],
   [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
 ] as const
 const env = LayerNode.compile(
@@ -294,6 +316,61 @@ const lengthThenFailureEnv = LayerNode.compile(root, [
   [Snapshot.node, failingSnapshot],
 ])
 const itLengthThenFailure = testEffect(lengthThenFailureEnv)
+
+function retryableFailure(message: string) {
+  return new APICallError({
+    message,
+    url: "https://example.com/v1/chat/completions",
+    requestBodyValues: {},
+    statusCode: 503,
+    responseHeaders: { "retry-after-ms": "0" },
+    responseBody: '{"error":"retry"}',
+    isRetryable: true,
+  })
+}
+
+function toolFenceStream(event: LLMEvent): Stream.Stream<LLMEvent, unknown> {
+  return Stream.make(LLMEvent.stepStart({ index: 0 }), event).pipe(
+    Stream.concat(Stream.fail(retryableFailure("tool fence retry"))),
+  )
+}
+
+function incompleteAttempt(name: string, attempt: number, message: string) {
+  const id = `${name}-text-${attempt}`
+  return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.textStart({ id }),
+    LLMEvent.textDelta({ id, text: `discarded-${attempt}` }),
+    LLMEvent.textEnd({ id }),
+    LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+    LLMEvent.providerError({
+      message,
+      classification: "incomplete-stream",
+      retryable: false,
+    }),
+  )
+}
+
+function cleanEofAttempt(name: string, attempt: number) {
+  const id = `${name}-text-${attempt}`
+  return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.textStart({ id }),
+    LLMEvent.textDelta({ id, text: `discarded-${attempt}` }),
+  )
+}
+
+function successfulAttempt(name: string, attempt: number) {
+  const id = `${name}-text-${attempt}`
+  return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.textStart({ id }),
+    LLMEvent.textDelta({ id, text: `retained-${attempt}` }),
+    LLMEvent.textEnd({ id }),
+    LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+    LLMEvent.finish({ reason: "stop" }),
+  )
+}
 
 function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
   switch (name) {
@@ -411,6 +488,130 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
         LLMEvent.stepStart({ index: 0 }),
         LLMEvent.toolCall({ id: "late-tool-call", name: "lookup", input: {} }),
       ).pipe(Stream.concat(Stream.fail(contextOverflowError())))
+    case "classified-incomplete":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "classified-text" }),
+        LLMEvent.textDelta({ id: "classified-text", text: "partial" }),
+        LLMEvent.textEnd({ id: "classified-text" }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.providerError({
+          message: "specific incomplete provider failure",
+          classification: "incomplete-stream",
+          retryable: false,
+        }),
+      )
+    case "explicit-incomplete-success": {
+      const call = settlementCalls.get(name) ?? 0
+      if (call === 1) return incompleteAttempt(name, call, "first incomplete detail")
+      return successfulAttempt(name, call)
+    }
+    case "mixed-failure-interrupt": {
+      const call = settlementCalls.get(name) ?? 0
+      if (call > 1) return successfulAttempt(name, call)
+      return Stream.fromEffect(
+        Effect.failCause(
+          Cause.combine(Cause.fail(retryableFailure("mixed failure interrupt")), Cause.interrupt(123)),
+        ),
+      )
+    }
+    case "explicit-incomplete-exhaustion": {
+      const call = settlementCalls.get(name) ?? 0
+      return incompleteAttempt(name, call, `incomplete detail ${call}`)
+    }
+    case "unclosed-clean-eof-exhaustion": {
+      const call = settlementCalls.get(name) ?? 0
+      const id = `${name}-text-${call}`
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id }),
+        LLMEvent.textDelta({ id, text: `partial-${call}` }),
+      )
+    }
+    case "explicit-incomplete-mixed": {
+      const call = settlementCalls.get(name) ?? 0
+      if (call === 1) return incompleteAttempt(name, call, "first incomplete detail")
+      if (call === 2) {
+        const id = `${name}-text-${call}`
+        return Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id }),
+          LLMEvent.textDelta({ id, text: `discarded-${call}` }),
+          LLMEvent.textEnd({ id }),
+          LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        ).pipe(Stream.concat(Stream.fail(retryableFailure("ordinary failure"))))
+      }
+      if (call === 3) return incompleteAttempt(name, call, "second incomplete detail")
+      return successfulAttempt(name, call)
+    }
+    case "clean-eof-success": {
+      const call = settlementCalls.get(name) ?? 0
+      if (call === 1) return cleanEofAttempt(name, call)
+      return successfulAttempt(name, call)
+    }
+    case "mixed-incomplete-source-budget": {
+      const call = settlementCalls.get(name) ?? 0
+      if (call === 1) return incompleteAttempt(name, call, "explicit incomplete detail")
+      return cleanEofAttempt(name, call)
+    }
+    case "canonical-looking-provider-error":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+        LLMEvent.providerError({
+          message: "Provider stream ended without a terminal finish event",
+          retryable: false,
+        }),
+      )
+    case "post-output-exception":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "exception-text" }),
+        LLMEvent.textDelta({ id: "exception-text", text: "partial" }),
+        LLMEvent.textEnd({ id: "exception-text" }),
+      ).pipe(Stream.concat(Stream.fail(new Error("post-output boom"))))
+    case "terminal-error-retry":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({ index: 0, reason: "length" }),
+      ).pipe(Stream.concat(Stream.fail(retryableFailure("retry after terminal error"))))
+    case "preexisting-error-retry":
+      return Stream.fail(retryableFailure("retry with preexisting error"))
+    case "tool-fence-input-start":
+      return toolFenceStream(LLMEvent.toolInputStart({ id: "fenced-call", name: "lookup" }))
+    case "tool-fence-input-delta":
+      return toolFenceStream(LLMEvent.toolInputDelta({ id: "fenced-call", name: "lookup", text: "{" }))
+    case "tool-fence-input-end":
+      return toolFenceStream(LLMEvent.toolInputEnd({ id: "fenced-call", name: "lookup" }))
+    case "tool-fence-call":
+      return toolFenceStream(LLMEvent.toolCall({ id: "fenced-call", name: "lookup", input: {} }))
+    case "tool-fence-result":
+      return toolFenceStream(
+        LLMEvent.toolResult({
+          id: "orphan-result",
+          name: "lookup",
+          result: { type: "json", value: { output: "done" } },
+        }),
+      )
+    case "tool-fence-error":
+      return toolFenceStream(
+        LLMEvent.toolError({
+          id: "orphan-error",
+          name: "lookup",
+          message: "tool failed",
+          error: new Error("tool failed"),
+        }),
+      )
+    case "tool-fence-explicit-incomplete":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "fenced-incomplete-call", name: "lookup" }),
+        LLMEvent.providerError({
+          message: "tool incomplete detail",
+          classification: "incomplete-stream",
+          retryable: false,
+        }),
+      )
     case "blocked-permission":
       return Stream.make(
         LLMEvent.stepStart({ index: 0 }),
@@ -438,15 +639,26 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
   }
 }
 
+const settlementCalls = new Map<string, number>()
+const waitForSettlementAttempt = Effect.fn("test.waitForSettlementAttempt")(function* (
+  scenario: string,
+  count: number,
+) {
+  while ((settlementCalls.get(scenario) ?? 0) < count) yield* Effect.yieldNow
+})
 const settlementLLM = Layer.succeed(
   LLM.Service,
   singletonBatchLLM((input) => {
     const content = input.messages.at(-1)?.content
-    return settlementStream(typeof content === "string" ? content : "")
+    const scenario = typeof content === "string" ? content : ""
+    settlementCalls.set(scenario, (settlementCalls.get(scenario) ?? 0) + 1)
+    return settlementStream(scenario)
   }),
 )
 const settlementEnv = LayerNode.compile(root, [...replacements, [LLM.node, settlementLLM]])
 const itSettlement = testEffect(settlementEnv)
+const summarySettlementEnv = LayerNode.compile(root, [...summaryProbeReplacements, [LLM.node, settlementLLM]])
+const itSummarySettlement = testEffect(summarySettlementEnv)
 
 const highUsage = { inputTokens: 100, outputTokens: 1, totalTokens: 101 }
 const successorDemand = new Map<string, number>()
@@ -479,6 +691,7 @@ function boundaryBatches(name: string): Stream.Stream<LLM.LLMEventBatch, unknown
           LLMEvent.stepFinish({ index: 0, reason: "unknown", usage: highUsage }),
           LLMEvent.providerError({
             message: "Provider stream ended without a terminal finish event",
+            classification: "incomplete-stream",
             retryable: false,
           }),
         ],
@@ -531,6 +744,8 @@ const boundaryLLM = Layer.succeed(
 )
 const boundaryEnv = LayerNode.compile(root, [...replacements, [LLM.node, boundaryLLM]])
 const itBoundary = testEffect(boundaryEnv)
+const summaryBoundaryEnv = LayerNode.compile(root, [...summaryProbeReplacements, [LLM.node, boundaryLLM]])
+const itSummaryBoundary = testEffect(summaryBoundaryEnv)
 
 const textEvidencePlugin = Layer.mock(Plugin.Service)({
   trigger: <Output>(name: string, _input: unknown, output: Output) => {
@@ -545,7 +760,12 @@ const textEvidencePlugin = Layer.mock(Plugin.Service)({
     }
     return Effect.succeed(output)
   },
-  list: () => Effect.succeed([]),
+  list: () =>
+    Effect.succeed([
+      {
+        "experimental.text.complete": async () => {},
+      },
+    ]),
   init: () => Effect.void,
 })
 const textEvidenceEnv = LayerNode.compile(root, [
@@ -555,13 +775,146 @@ const textEvidenceEnv = LayerNode.compile(root, [
 ])
 const itTextEvidence = testEffect(textEvidenceEnv)
 
+const pluginFenceAttempts = new Map<string, number>()
+let pluginFenceCallbackCalls = 0
+const pluginFenceLLM = Layer.succeed(
+  LLM.Service,
+  singletonBatchLLM((input) => {
+    const content = input.messages.at(-1)?.content
+    const scenario = typeof content === "string" ? content : ""
+    const attempt = (pluginFenceAttempts.get(scenario) ?? 0) + 1
+    pluginFenceAttempts.set(scenario, attempt)
+    if (attempt > 1) {
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: `${scenario}-retained` }),
+        LLMEvent.textDelta({ id: `${scenario}-retained`, text: "retained" }),
+        LLMEvent.textEnd({ id: `${scenario}-retained` }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+    }
+    const events =
+      scenario === "registered-uninvoked"
+        ? Stream.make(LLMEvent.stepStart({ index: 0 }))
+        : Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: `${scenario}-partial` }),
+            LLMEvent.textDelta({ id: `${scenario}-partial`, text: "partial" }),
+            LLMEvent.textEnd({ id: `${scenario}-partial` }),
+          )
+    if (scenario === "plugin-incomplete") {
+      return events.pipe(
+        Stream.concat(
+          Stream.make(
+            LLMEvent.providerError({
+              message: "plugin incomplete detail",
+              classification: "incomplete-stream",
+              retryable: false,
+            }),
+          ),
+        ),
+      )
+    }
+    return events.pipe(
+      Stream.concat(
+        Stream.fail(
+          new APICallError({
+            message: "plugin fence retry",
+            url: "https://example.com/v1/chat/completions",
+            requestBodyValues: {},
+            statusCode: 503,
+            responseHeaders: { "retry-after-ms": "0" },
+            responseBody: '{"error":"retry"}',
+            isRetryable: true,
+          }),
+        ),
+      ),
+    )
+  }),
+)
+const pluginFencePlugin = Layer.mock(Plugin.Service)({
+  trigger: <Output>(name: string, _input: unknown, output: Output) => {
+    if (
+      name === "experimental.text.complete" &&
+      typeof output === "object" &&
+      output !== null &&
+      "text" in output &&
+      typeof output.text === "string"
+    ) {
+      pluginFenceCallbackCalls++
+      output.text = `${output.text}:plugin`
+    }
+    return Effect.succeed(output)
+  },
+  list: () =>
+    Effect.succeed([
+      {
+        "experimental.text.complete": async () => {},
+      },
+    ]),
+  init: () => Effect.void,
+})
+const pluginFenceEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, pluginFenceLLM],
+  [Plugin.node, pluginFencePlugin],
+])
+const itPluginFence = testEffect(pluginFenceEnv)
+
+const throwingTextCompletePlugin = Layer.mock(Plugin.Service)({
+  trigger: <Output>(name: string, _input: unknown, output: Output) => {
+    if (name !== "experimental.text.complete") return Effect.succeed(output)
+    pluginFenceCallbackCalls++
+    return Effect.die(
+      new APICallError({
+        message: "plugin callback retry",
+        url: "https://example.com/plugin",
+        requestBodyValues: {},
+        statusCode: 503,
+        responseHeaders: { "retry-after-ms": "0" },
+        responseBody: '{"error":"plugin"}',
+        isRetryable: true,
+      }),
+    )
+  },
+  list: () =>
+    Effect.succeed([
+      {
+        "experimental.text.complete": async () => {},
+      },
+    ]),
+  init: () => Effect.void,
+})
+const throwingTextCompleteEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, pluginFenceLLM],
+  [Plugin.node, throwingTextCompletePlugin],
+])
+const itThrowingTextComplete = testEffect(throwingTextCompleteEnv)
+
+const noTextCompletePlugin = Layer.mock(Plugin.Service)({
+  trigger: <Output>(_name: string, _input: unknown, output: Output) => Effect.succeed(output),
+  list: () => Effect.succeed([]),
+  init: () => Effect.void,
+})
+const noTextCompleteEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, pluginFenceLLM],
+  [Plugin.node, noTextCompletePlugin],
+])
+const itNoTextComplete = testEffect(noTextCompleteEnv)
+
+let attemptEvidenceAttempts = 0
+const waitForAttemptEvidence = Effect.fn("test.waitForAttemptEvidence")(function* (count: number) {
+  while (attemptEvidenceAttempts < count) yield* Effect.yieldNow
+})
 const attemptEvidenceLLM = Layer.effect(
   LLM.Service,
   Effect.sync(() => {
-    let attempt = 0
     return singletonBatchLLM(() => {
-      attempt++
-      if (attempt > 1) {
+      attemptEvidenceAttempts++
+      if (attemptEvidenceAttempts > 1) {
         return Stream.make(
           LLMEvent.stepStart({ index: 0 }),
           LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
@@ -595,13 +948,64 @@ const attemptEvidenceLLM = Layer.effect(
 const attemptEvidenceEnv = LayerNode.compile(root, [...replacements, [LLM.node, attemptEvidenceLLM]])
 const itAttemptEvidence = testEffect(attemptEvidenceEnv)
 
+const ordinaryRollbackAttempts = new Map<string, number>()
+const ordinaryRollbackLLM = Layer.succeed(
+  LLM.Service,
+  singletonBatchLLM((input) => {
+    const content = input.messages.at(-1)?.content
+    const scenario = typeof content === "string" ? content : ""
+    const attempt = (ordinaryRollbackAttempts.get(scenario) ?? 0) + 1
+    ordinaryRollbackAttempts.set(scenario, attempt)
+    if (attempt > 1) {
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "retained-text" }),
+        LLMEvent.textDelta({ id: "retained-text", text: "retained" }),
+        LLMEvent.textEnd({ id: "retained-text" }),
+        LLMEvent.stepFinish({
+          index: 0,
+          reason: "stop",
+          usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+        }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+    }
+    const events =
+      scenario === "rollback-removal-failure"
+        ? Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "failed-removal-text" }),
+            LLMEvent.textDelta({ id: "failed-removal-text", text: "discarded" }),
+            LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+          )
+        : Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.reasoningStart({ id: "discarded-reasoning" }),
+            LLMEvent.reasoningDelta({ id: "discarded-reasoning", text: "discarded reasoning" }),
+            LLMEvent.reasoningEnd({ id: "discarded-reasoning" }),
+            LLMEvent.textStart({ id: "discarded-text" }),
+            LLMEvent.textDelta({ id: "discarded-text", text: "discarded" }),
+            LLMEvent.stepFinish({
+              index: 0,
+              reason: "unknown",
+              usage: { inputTokens: 11, outputTokens: 7, totalTokens: 18 },
+            }),
+          )
+    return events.pipe(Stream.concat(Stream.fail(retryableFailure("ordinary retry"))))
+  }),
+)
+const ordinaryRollbackEnv = LayerNode.compile(root, [...replacements, [LLM.node, ordinaryRollbackLLM]])
+const itOrdinaryRollback = testEffect(ordinaryRollbackEnv)
+const summaryRollbackEnv = LayerNode.compile(root, [...summaryProbeReplacements, [LLM.node, ordinaryRollbackLLM]])
+const itSummaryRollback = testEffect(summaryRollbackEnv)
+
+let compactionAttempts = 0
 const compactionAttemptLLM = Layer.effect(
   LLM.Service,
   Effect.sync(() => {
-    let attempt = 0
     const batches = (): Stream.Stream<LLM.LLMEventBatch, unknown> => {
-      attempt++
-      if (attempt > 1) {
+      compactionAttempts++
+      if (compactionAttempts > 1) {
         return Stream.fromIterable([
           [LLMEvent.stepStart({ index: 0 })],
           [LLMEvent.textStart({ id: "attempt-2-text" })],
@@ -631,6 +1035,21 @@ const compactionAttemptLLM = Layer.effect(
 const compactionAttemptEnv = LayerNode.compile(root, [...replacements, [LLM.node, compactionAttemptLLM]])
 const itCompactionAttempt = testEffect(compactionAttemptEnv)
 
+const summaryInterruptLLM = Layer.succeed(
+  LLM.Service,
+  singletonBatchLLM(() =>
+    Stream.make(
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+    ).pipe(Stream.concat(Stream.never)),
+  ),
+)
+const summaryInterruptEnv = LayerNode.compile(root, [
+  ...summaryProbeReplacements,
+  [LLM.node, summaryInterruptLLM],
+])
+const itSummaryInterrupt = testEffect(summaryInterruptEnv)
+
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
   const session = yield* Session.Service
@@ -645,6 +1064,8 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
     limit?: { context: number; output: number }
     recoverContextOverflow?: boolean
     unfinished?: boolean
+    error?: NonNullable<SessionV1.Assistant["error"]>
+    assistant?: Partial<Pick<SessionV1.Assistant, "finish" | "cost" | "tokens">>
   },
 ) {
   const { processors, session, provider } = yield* boot()
@@ -652,17 +1073,71 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
   const chat = yield* session.create({})
   const parent = yield* user(chat.id, scenario)
   const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-  if (options?.unfinished) {
-    delete msg.finish
+  if (options?.unfinished) delete msg.finish
+  if (options?.error) msg.error = options.error
+  if (options?.assistant) Object.assign(msg, options.assistant)
+  if (options?.unfinished || options?.error || options?.assistant) {
     yield* session.updateMessage(msg)
   }
   const base = yield* provider.getModel(ref.providerID, ref.modelID)
   const mdl = options?.limit ? { ...base, limit: options.limit } : base
   const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+  const removedParts: SessionV1.Part["id"][] = []
+  const removalAwareParts = new Map<SessionV1.Part["id"], SessionV1.Part>()
+  const appendOnlyTextDeltas: string[] = []
+  const assistantUpdates: SessionV1.Assistant[] = []
+  const retryStatuses: Extract<SessionStatus.Info, { type: "retry" }>[] = []
+  const terminalTimeline: string[] = []
   const off = yield* eventBridge.listen((event) => {
-    if (event.type !== Session.Event.Error.type) return Effect.void
-    const data = event.data as typeof Session.Event.Error.data.Type
-    if (data.sessionID === chat.id && data.error) errors.push(data.error)
+    if (event.type === Session.Event.Error.type) {
+      const data = event.data as typeof Session.Event.Error.data.Type
+      if (data.sessionID === chat.id && data.error) errors.push(data.error)
+      return Effect.void
+    }
+    if (event.type === SessionV1.Event.PartRemoved.type) {
+      const data = event.data as typeof SessionV1.Event.PartRemoved.data.Type
+      if (data.sessionID === chat.id && data.messageID === msg.id) {
+        removedParts.push(data.partID)
+        removalAwareParts.delete(data.partID)
+      }
+      return Effect.void
+    }
+    if (event.type === SessionV1.Event.PartUpdated.type) {
+      const data = event.data as typeof SessionV1.Event.PartUpdated.data.Type
+      if (data.sessionID === chat.id && data.part.messageID === msg.id) {
+        removalAwareParts.set(data.part.id, structuredClone(data.part) as SessionV1.Part)
+        if (data.part.type === "text" && data.part.time?.end) {
+          terminalTimeline.push(`text:${data.part.text}`)
+        }
+      }
+      return Effect.void
+    }
+    if (event.type === SessionV1.Event.PartDelta.type) {
+      const data = event.data as typeof SessionV1.Event.PartDelta.data.Type
+      if (data.sessionID === chat.id && data.messageID === msg.id && data.field === "text") {
+        appendOnlyTextDeltas.push(data.delta)
+      }
+      return Effect.void
+    }
+    if (event.type === SessionStatus.Event.Status.type) {
+      const data = event.data as typeof SessionStatus.Event.Status.data.Type
+      if (data.sessionID === chat.id && data.status.type === "retry") {
+        retryStatuses.push(data.status)
+      }
+      if (data.sessionID === chat.id && data.status.type === "idle") {
+        terminalTimeline.push("idle")
+      }
+      return Effect.void
+    }
+    if (event.type === SessionV1.Event.MessageUpdated.type) {
+      const data = event.data as typeof SessionV1.Event.MessageUpdated.data.Type
+      if (data.sessionID === chat.id && data.info.role === "assistant" && data.info.id === msg.id) {
+        assistantUpdates.push(structuredClone(data.info))
+        if (data.info.error && data.info.time.completed) {
+          terminalTimeline.push("assistant-terminal")
+        }
+      }
+    }
     return Effect.void
   })
   const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
@@ -692,6 +1167,12 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
     stored: yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id }),
     parts: yield* MessageV2.parts(msg.id),
     errors,
+    removedParts,
+    removalAwareParts: [...removalAwareParts.values()],
+    appendOnlyTextDeltas,
+    assistantUpdates,
+    retryStatuses,
+    terminalTimeline,
   }
 })
 
@@ -857,11 +1338,17 @@ itLengthThenFailure.live("session.processor preserves length across a later snap
   ),
 )
 
-itSettlement.live("session.processor rejects an empty unknown finish with one durable error", () =>
+itSettlement.effect("session.processor exhausts clean EOF retries for an empty unknown finish", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
-        const result = yield* runSettlement(dir, "empty-unknown")
+        settlementCalls.set("empty-unknown", 0)
+        const resultFiber = yield* runSettlement(dir, "empty-unknown").pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("empty-unknown", 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt("empty-unknown", 2)
+        yield* TestClock.adjust(4_000)
+        const result = yield* Fiber.join(resultFiber)
         const expected = {
           name: "UnknownError",
           data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
@@ -877,17 +1364,26 @@ itSettlement.live("session.processor rejects an empty unknown finish with one du
         }
         expect(result.errors).toHaveLength(1)
         expect(result.errors[0]).toMatchObject(expected)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
+        expect(result.removedParts).toHaveLength(4)
+        expect(settlementCalls.get("empty-unknown")).toBe(3)
       }),
     { config: cfg },
   ),
 )
 
-itSettlement.live("session.processor excludes reasoning, whitespace, and pending tool input from usable output", () =>
+itSettlement.effect("session.processor excludes reasoning and whitespace from usable output", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
-        for (const scenario of ["unknown-reasoning", "unknown-whitespace", "unknown-pending-tool"]) {
-          const result = yield* runSettlement(dir, scenario)
+        for (const scenario of ["unknown-reasoning", "unknown-whitespace"]) {
+          settlementCalls.set(scenario, 0)
+          const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
+          yield* waitForSettlementAttempt(scenario, 1)
+          yield* TestClock.adjust(2_000)
+          yield* waitForSettlementAttempt(scenario, 2)
+          yield* TestClock.adjust(4_000)
+          const result = yield* Fiber.join(resultFiber)
           expect(result.result).toBe("stop")
           expect(result.message.finish).toBe("unknown")
           expect(result.message.error).toMatchObject({
@@ -895,18 +1391,57 @@ itSettlement.live("session.processor excludes reasoning, whitespace, and pending
             data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
           })
           expect(result.errors).toHaveLength(1)
+          expect(settlementCalls.get(scenario)).toBe(3)
+          expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
         }
       }),
     { config: cfg },
   ),
 )
 
-itSettlement.live("session.processor rejects every stream without a credible final step settlement", () =>
+itSettlement.live("session.processor fences clean EOF replay after pending tool input", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const scenario = "unknown-pending-tool"
+        settlementCalls.set(scenario, 0)
+        const result = yield* runSettlement(dir, scenario)
+        const tools = result.parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
+        })
+        expect(result.retryStatuses).toEqual([])
+        expect(settlementCalls.get(scenario)).toBe(1)
+        expect(tools).toContainEqual(
+          expect.objectContaining({
+            state: expect.objectContaining({
+              status: "error",
+              error: "Tool execution aborted",
+              metadata: expect.objectContaining({ interrupted: true }),
+            }),
+          }),
+        )
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.effect("session.processor exhausts every clean EOF without a credible final step settlement", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
         for (const scenario of ["empty", "final-only", "multi-step-incomplete"]) {
-          const result = yield* runSettlement(dir, scenario)
+          settlementCalls.set(scenario, 0)
+          const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
+          yield* waitForSettlementAttempt(scenario, 1)
+          yield* TestClock.adjust(2_000)
+          yield* waitForSettlementAttempt(scenario, 2)
+          yield* TestClock.adjust(4_000)
+          const result = yield* Fiber.join(resultFiber)
           const expected = {
             name: "UnknownError",
             data: { message: "Provider stream ended without a settled model step" },
@@ -917,17 +1452,26 @@ itSettlement.live("session.processor rejects every stream without a credible fin
           expect(result.message.error).toMatchObject(expected)
           expect(result.errors).toHaveLength(1)
           expect(result.errors[0]).toMatchObject(expected)
+          expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
+          expect(settlementCalls.get(scenario)).toBe(3)
         }
       }),
     { config: cfg },
   ),
 )
 
-itSettlement.live("session.processor gives no-step settlement priority over an earlier empty unknown", () =>
+itSettlement.effect("session.processor preserves no-step priority after clean EOF retry exhaustion", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
-        const result = yield* runSettlement(dir, "unknown-then-incomplete")
+        const scenario = "unknown-then-incomplete"
+        settlementCalls.set(scenario, 0)
+        const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt(scenario, 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt(scenario, 2)
+        yield* TestClock.adjust(4_000)
+        const result = yield* Fiber.join(resultFiber)
 
         expect(result.result).toBe("stop")
         expect(result.message.finish).toBe("error")
@@ -936,6 +1480,8 @@ itSettlement.live("session.processor gives no-step settlement priority over an e
           data: { message: "Provider stream ended without a settled model step" },
         })
         expect(result.errors).toHaveLength(1)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
+        expect(settlementCalls.get(scenario)).toBe(3)
       }),
     { config: cfg },
   ),
@@ -1003,7 +1549,7 @@ itBoundary.live("session.processor keeps raw-defined unknown overflow compatible
   ),
 )
 
-itBoundary.live("session.processor gives an empty unknown error priority over compaction", () =>
+itBoundary.live("session.processor excludes compaction cutoff from clean EOF incomplete detection", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
@@ -1012,16 +1558,10 @@ itBoundary.live("session.processor gives an empty unknown error priority over co
           limit: { context: 20, output: 10 },
         })
 
-        expect(result.result).toBe("stop")
-        expect(result.message.error).toMatchObject({
-          name: "UnknownError",
-          data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
-        })
-        expect(result.errors).toHaveLength(1)
-        expect(result.errors[0]).toMatchObject({
-          name: "UnknownError",
-          data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
-        })
+        expect(result.result).toBe("compact")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toBeUndefined()
+        expect(result.errors).toEqual([])
         expect(successorDemand.get("empty-unknown-overflow")).toBe(0)
       }),
     { config: cfg },
@@ -1046,6 +1586,53 @@ itBoundary.live("session.processor gives length and blocked terminals priority o
         expect(blocked.result).toBe("stop")
         expect(blocked.message.error).toBeUndefined()
         expect(blocked.errors).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor blocks replay after an attempt creates a terminal assistant error", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("terminal-error-retry", 0)
+        const result = yield* runSettlement(dir, "terminal-error-retry")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("length")
+        expect(result.message.error?.name).toBe("MessageOutputLengthError")
+        expect(result.errors.map((error) => error.name)).toEqual(["MessageOutputLengthError"])
+        expect(settlementCalls.get("terminal-error-retry")).toBe(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor preserves a preexisting terminal error while denying replay", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const error = new SessionV1.ContentFilterError({ message: "blocked first" }).toObject()
+        settlementCalls.set("preexisting-error-retry", 0)
+        const result = yield* runSettlement(dir, "preexisting-error-retry", { error })
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("end_turn")
+        expect(result.message.error).toEqual(error)
+        expect(result.stored.info.role).toBe("assistant")
+        if (result.stored.info.role === "assistant") {
+          expect(result.stored.info.finish).toBe("end_turn")
+          expect(result.stored.info.error).toEqual(error)
+        }
+        expect(result.errors).toEqual([])
+        expect(settlementCalls.get("preexisting-error-retry")).toBe(1)
+
+        settlementCalls.set("empty", 0)
+        const cleanEof = yield* runSettlement(dir, "empty", { error })
+        expect(cleanEof.result).toBe("stop")
+        expect(cleanEof.message.error).toEqual(error)
+        expect(cleanEof.retryStatuses).toEqual([])
+        expect(settlementCalls.get("empty")).toBe(1)
       }),
     { config: cfg },
   ),
@@ -1095,6 +1682,43 @@ itSettlement.live("session.processor recovers a context overflow when the attemp
   ),
 )
 
+itSettlement.effect("session.processor replays only classified provider errors as incomplete controls", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("classified-incomplete", 0)
+        const classifiedFiber = yield* runSettlement(dir, "classified-incomplete").pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("classified-incomplete", 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt("classified-incomplete", 2)
+        yield* TestClock.adjust(4_000)
+        const classified = yield* Fiber.join(classifiedFiber)
+        expect(classified.result).toBe("stop")
+        expect(classified.message.finish).toBe("unknown")
+        expect(classified.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "specific incomplete provider failure" },
+        })
+        expect(classified.errors).toHaveLength(1)
+        expect(classified.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
+        expect(settlementCalls.get("classified-incomplete")).toBe(3)
+
+        settlementCalls.set("canonical-looking-provider-error", 0)
+        const unclassified = yield* runSettlement(dir, "canonical-looking-provider-error")
+        expect(unclassified.result).toBe("stop")
+        expect(unclassified.message.finish).toBe("unknown")
+        expect(unclassified.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended without a terminal finish event" },
+        })
+        expect(unclassified.errors).toHaveLength(1)
+        expect(unclassified.retryStatuses).toEqual([])
+        expect(settlementCalls.get("canonical-looking-provider-error")).toBe(1)
+      }),
+    { config: cfg },
+  ),
+)
+
 itSettlement.live("session.processor persists context overflow when attempt recovery is disabled", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -1122,6 +1746,395 @@ itSettlement.live("session.processor persists context overflow when attempt reco
           expect(result.stored.info.time.completed).toBe(result.message.time.completed)
         }
         expect(result.errors).toEqual([result.message.error])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSummarySettlement.effect("session.processor retries an explicit incomplete stream on the same assistant", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const baselineTokens: SessionV1.Assistant["tokens"] = {
+          total: 101,
+          input: 41,
+          output: 37,
+          reasoning: 13,
+          cache: { read: 7, write: 3 },
+        }
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        settlementCalls.set("explicit-incomplete-success", 0)
+        const resultFiber = yield* runSettlement(dir, "explicit-incomplete-success", {
+          assistant: {
+            finish: "end_turn",
+            cost: 7,
+            tokens: baselineTokens,
+          },
+        }).pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("explicit-incomplete-success", 1)
+        yield* TestClock.adjust(2_000)
+        const result = yield* Fiber.join(resultFiber)
+        const finalIDs = new Set(result.parts.map((part) => part.id))
+
+        expect(result.result).toBe("continue")
+        expect(result.message.id).toBe(result.stored.info.id)
+        expect(result.message.finish).toBe("stop")
+        expect(result.message.cost).toBe(7)
+        expect(result.message.error).toBeUndefined()
+        expect(settlementCalls.get("explicit-incomplete-success")).toBe(2)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1])
+        expect(result.retryStatuses.map((state) => state.message)).toEqual(["first incomplete detail"])
+        expect(result.removedParts).toHaveLength(3)
+        expect(result.removedParts.every((partID) => !finalIDs.has(partID))).toBe(true)
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-1" }))
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "retained-2" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+        expect(result.assistantUpdates).toContainEqual(
+          expect.objectContaining({
+            id: result.message.id,
+            finish: "end_turn",
+            cost: 7,
+            tokens: baselineTokens,
+          }),
+        )
+        expect(summaryLaunches).toEqual([
+          {
+            sessionID: result.message.sessionID,
+            messageID: result.message.parentID,
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor records an aborted error when interrupted during retry delay", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("explicit-incomplete-success", 0)
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const sts = yield* SessionStatus.Service
+        const retrying = defer<void>()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "explicit-incomplete-success")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+          const data = event.data as typeof SessionStatus.Event.Status.data.Type
+          if (data.sessionID === chat.id && data.status.type === "retry") retrying.resolve()
+          return Effect.void
+        })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "explicit-incomplete-success" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* Effect.promise(() => retrying.promise)
+        yield* Fiber.interrupt(run)
+        const exit = yield* Fiber.await(run)
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        const parts = yield* MessageV2.parts(msg.id)
+        const state = yield* sts.get(chat.id)
+        yield* off
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+        expect(settlementCalls.get("explicit-incomplete-success")).toBe(1)
+        expect(parts).toEqual([])
+        expect(handle.message.error?.name).toBe("MessageAbortedError")
+        expect(handle.message.time.completed).toBeDefined()
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") {
+          expect(stored.info.error?.name).toBe("MessageAbortedError")
+          expect(stored.info.time.completed).toBeDefined()
+        }
+        expect(state).toMatchObject({ type: "idle" })
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor does not replay a mixed failure and interrupt", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("mixed-failure-interrupt", 0)
+        const { processors, session, provider } = yield* boot()
+        const sts = yield* SessionStatus.Service
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "mixed-failure-interrupt")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "mixed-failure-interrupt" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        const exit = yield* Fiber.await(run)
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        const state = yield* sts.get(chat.id)
+
+        expect(Exit.isSuccess(exit)).toBe(true)
+        if (Exit.isSuccess(exit)) expect(exit.value).toBe("stop")
+        expect(settlementCalls.get("mixed-failure-interrupt")).toBe(1)
+        expect(handle.message.error?.name).toBe("MessageAbortedError")
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") expect(stored.info.error?.name).toBe("MessageAbortedError")
+        expect(state).toMatchObject({ type: "idle" })
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.effect("session.processor stops after two explicit incomplete retries", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("explicit-incomplete-exhaustion", 0)
+        const resultFiber = yield* runSettlement(dir, "explicit-incomplete-exhaustion").pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("explicit-incomplete-exhaustion", 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt("explicit-incomplete-exhaustion", 2)
+        yield* TestClock.adjust(4_000)
+        const result = yield* Fiber.join(resultFiber)
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "incomplete detail 3" },
+        })
+        expect(result.errors).toHaveLength(1)
+        expect(settlementCalls.get("explicit-incomplete-exhaustion")).toBe(3)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
+        expect(result.retryStatuses.map((state) => state.message)).toEqual([
+          "incomplete detail 1",
+          "incomplete detail 2",
+        ])
+        expect(result.removedParts).toHaveLength(6)
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-1" }))
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-2" }))
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "discarded-3" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.effect("session.processor finalizes retained incomplete output before publishing idle", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const scenario = "unclosed-clean-eof-exhaustion"
+        settlementCalls.set(scenario, 0)
+        const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt(scenario, 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt(scenario, 2)
+        yield* TestClock.adjust(4_000)
+        const result = yield* Fiber.join(resultFiber)
+        const text = result.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("error")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended without a settled model step" },
+        })
+        expect(result.stored.info.role).toBe("assistant")
+        if (result.stored.info.role === "assistant") {
+          expect(result.stored.info.error).toEqual(result.message.error)
+          expect(result.stored.info.time.completed).toBeNumber()
+        }
+        expect(settlementCalls.get(scenario)).toBe(3)
+        expect(text).toMatchObject({ text: "partial-3", time: { end: expect.any(Number) } })
+        expect(result.terminalTimeline).toEqual(["text:partial-3", "assistant-terminal", "idle"])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.effect("session.processor keeps one retry ordinal and an independent incomplete budget", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("explicit-incomplete-mixed", 0)
+        const resultFiber = yield* runSettlement(dir, "explicit-incomplete-mixed").pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("explicit-incomplete-mixed", 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt("explicit-incomplete-mixed", 3)
+        yield* TestClock.adjust(8_000)
+        const result = yield* Fiber.join(resultFiber)
+
+        expect(result.result).toBe("continue")
+        expect(result.message.finish).toBe("stop")
+        expect(result.message.error).toBeUndefined()
+        expect(settlementCalls.get("explicit-incomplete-mixed")).toBe(4)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2, 3])
+        expect(result.retryStatuses.map((state) => state.message)).toEqual([
+          "first incomplete detail",
+          "ordinary failure",
+          "second incomplete detail",
+        ])
+        expect(result.removedParts).toHaveLength(9)
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "retained-4" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itSummarySettlement.effect("session.processor retries an unsettled clean EOF on the same assistant", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        settlementCalls.set("clean-eof-success", 0)
+        const resultFiber = yield* runSettlement(dir, "clean-eof-success").pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("clean-eof-success", 1)
+        yield* TestClock.adjust(2_000)
+        const result = yield* Fiber.join(resultFiber)
+        const finalIDs = new Set(result.parts.map((part) => part.id))
+
+        expect(result.result).toBe("continue")
+        expect(result.message.id).toBe(result.stored.info.id)
+        expect(result.message.finish).toBe("stop")
+        expect(result.message.error).toBeUndefined()
+        expect(settlementCalls.get("clean-eof-success")).toBe(2)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1])
+        expect(result.retryStatuses.map((state) => state.message)).toEqual([
+          "Provider stream ended without a settled model step",
+        ])
+        expect(result.removedParts).toHaveLength(2)
+        expect(result.removedParts.every((partID) => !finalIDs.has(partID))).toBe(true)
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-1" }))
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "retained-2" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+        expect(summaryLaunches).toEqual([
+          {
+            sessionID: result.message.sessionID,
+            messageID: result.message.parentID,
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.effect("session.processor shares one incomplete budget across explicit and clean EOF sources", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const scenario = "mixed-incomplete-source-budget"
+        settlementCalls.set(scenario, 0)
+        const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt(scenario, 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt(scenario, 2)
+        yield* TestClock.adjust(4_000)
+        const result = yield* Fiber.join(resultFiber)
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("error")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Provider stream ended without a settled model step" },
+        })
+        expect(settlementCalls.get(scenario)).toBe(3)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2])
+        expect(result.retryStatuses.map((state) => state.message)).toEqual([
+          "explicit incomplete detail",
+          "Provider stream ended without a settled model step",
+        ])
+        expect(result.removedParts).toHaveLength(5)
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-1" }))
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded-2" }))
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "discarded-3" }))
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.effect("session.processor converges removal-aware views while append-only output keeps transient text", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const scenario = "explicit-incomplete-success"
+        settlementCalls.set(scenario, 0)
+        const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt(scenario, 1)
+        yield* TestClock.adjust(2_000)
+        const result = yield* Fiber.join(resultFiber)
+        const authoritativeIDs = result.parts.map((part) => part.id).toSorted()
+        const removalAwareIDs = result.removalAwareParts.map((part) => part.id).toSorted()
+        const authoritativeText = result.parts
+          .filter((part): part is SessionV1.TextPart => part.type === "text")
+          .map((part) => part.text)
+        const removalAwareText = result.removalAwareParts
+          .filter((part): part is SessionV1.TextPart => part.type === "text")
+          .map((part) => part.text)
+
+        expect(result.result).toBe("continue")
+        expect(authoritativeIDs).toEqual(removalAwareIDs)
+        expect(authoritativeText).toEqual(["retained-2"])
+        expect(removalAwareText).toEqual(["retained-2"])
+        expect(result.appendOnlyTextDeltas).toEqual(["discarded-1", "retained-2"])
+        expect(result.removedParts).toHaveLength(3)
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor leaves post-output stream exceptions on the ordinary error path", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        settlementCalls.set("post-output-exception", 0)
+        const result = yield* runSettlement(dir, "post-output-exception")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: "post-output boom" },
+        })
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial" }))
+        expect(result.errors).toHaveLength(1)
+        expect(settlementCalls.get("post-output-exception")).toBe(1)
       }),
     { config: cfg },
   ),
@@ -1157,6 +2170,73 @@ for (const scenario of [
     ),
   )
 }
+itSettlement.live("session.processor fences ordinary replay for every normalized tool event", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        for (const [scenario, retainsTool] of [
+          ["tool-fence-input-start", true],
+          ["tool-fence-input-delta", true],
+          ["tool-fence-input-end", true],
+          ["tool-fence-call", true],
+          ["tool-fence-result", false],
+          ["tool-fence-error", false],
+        ] as const) {
+          settlementCalls.set(scenario, 0)
+          const result = yield* runSettlement(dir, scenario)
+          const tools = result.parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+
+          expect(result.result).toBe("stop")
+          expect(result.message.error).toMatchObject({ data: { message: "tool fence retry" } })
+          expect(result.errors).toHaveLength(1)
+          expect(settlementCalls.get(scenario)).toBe(1)
+          expect(tools.every((part) => part.state.status !== "pending" && part.state.status !== "running")).toBe(true)
+          if (retainsTool) {
+            expect(tools).toContainEqual(
+              expect.objectContaining({
+                state: expect.objectContaining({
+                  status: "error",
+                  error: "Tool execution aborted",
+                  metadata: expect.objectContaining({ interrupted: true }),
+                }),
+              }),
+            )
+          } else {
+            expect(tools).toEqual([])
+          }
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettlement.live("session.processor blocks explicit incomplete replay after normalized tool activity", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const scenario = "tool-fence-explicit-incomplete"
+        settlementCalls.set(scenario, 0)
+        const result = yield* runSettlement(dir, scenario)
+        const tools = result.parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toMatchObject({ data: { message: "tool incomplete detail" } })
+        expect(result.retryStatuses).toEqual([])
+        expect(settlementCalls.get(scenario)).toBe(1)
+        expect(tools).toContainEqual(
+          expect.objectContaining({
+            state: expect.objectContaining({
+              status: "error",
+              error: "Tool execution aborted",
+              metadata: expect.objectContaining({ interrupted: true }),
+            }),
+          }),
+        )
+      }),
+    { config: cfg },
+  ),
+)
 
 itSettlement.live("session.processor does not replace a blocked tool turn with an incomplete-stream error", () =>
   provideTmpdirInstance(
@@ -1166,6 +2246,7 @@ itSettlement.live("session.processor does not replace a blocked tool turn with a
           ["blocked-permission", new PermissionV1.RejectedError().message],
           ["blocked-question", new Question.RejectedError().message],
         ] as const) {
+          settlementCalls.set(scenario, 0)
           const result = yield* runSettlement(dir, scenario)
 
           expect(result.result).toBe("stop")
@@ -1180,6 +2261,7 @@ itSettlement.live("session.processor does not replace a blocked tool turn with a
               }),
             }),
           )
+          expect(settlementCalls.get(scenario)).toBe(1)
         }
       }),
     { config: cfg },
@@ -1190,6 +2272,8 @@ itTextEvidence.live("session.processor bases usable text evidence on the plugin-
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
+        settlementCalls.set("plugin-fill", 0)
+        settlementCalls.set("plugin-clear", 0)
         const filled = yield* runSettlement(dir, "plugin-fill")
         expect(filled.result).toBe("continue")
         expect(filled.message.error).toBeUndefined()
@@ -1202,16 +2286,387 @@ itTextEvidence.live("session.processor bases usable text evidence on the plugin-
           data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
         })
         expect(cleared.parts).toContainEqual(expect.objectContaining({ type: "text", text: "" }))
+        expect(cleared.retryStatuses).toEqual([])
+        expect(settlementCalls.get("plugin-clear")).toBe(1)
       }),
     { config: cfg },
   ),
 )
 
-itAttemptEvidence.live("session.processor resets finish and output evidence before a retry attempt", () =>
+itPluginFence.live("session.processor blocks ordinary replay after an actual text-complete callback", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
-        const result = yield* runSettlement(dir, "retry-attempt")
+        pluginFenceAttempts.set("plugin-invoked", 0)
+        pluginFenceCallbackCalls = 0
+        const result = yield* runSettlement(dir, "plugin-invoked")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.error).toMatchObject({ data: { message: "plugin fence retry" } })
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial:plugin" }))
+        expect(pluginFenceCallbackCalls).toBe(1)
+        expect(pluginFenceAttempts.get("plugin-invoked")).toBe(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itPluginFence.live("session.processor blocks explicit incomplete replay after a text-complete callback", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        pluginFenceAttempts.set("plugin-incomplete", 0)
+        pluginFenceCallbackCalls = 0
+        const result = yield* runSettlement(dir, "plugin-incomplete")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.finish).toBe("unknown")
+        expect(result.message.error).toMatchObject({ data: { message: "plugin incomplete detail" } })
+        expect(result.retryStatuses).toEqual([])
+        expect(pluginFenceCallbackCalls).toBe(1)
+        expect(pluginFenceAttempts.get("plugin-incomplete")).toBe(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itThrowingTextComplete.live("session.processor keeps the text-complete fence when a callback throws", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        pluginFenceAttempts.set("plugin-throws", 0)
+        pluginFenceCallbackCalls = 0
+        const result = yield* runSettlement(dir, "plugin-throws")
+
+        expect(result.result).toBe("stop")
+        expect(result.message.error).toMatchObject({ data: { message: "plugin callback retry" } })
+        expect(pluginFenceCallbackCalls).toBe(1)
+        expect(pluginFenceAttempts.get("plugin-throws")).toBe(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itPluginFence.live("session.processor does not fence a registered text-complete hook before invocation", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        pluginFenceAttempts.set("registered-uninvoked", 0)
+        pluginFenceCallbackCalls = 0
+        const result = yield* runSettlement(dir, "registered-uninvoked")
+
+        expect(result.result).toBe("continue")
+        expect(result.message.error).toBeUndefined()
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "retained:plugin" }))
+        expect(pluginFenceCallbackCalls).toBe(1)
+        expect(pluginFenceAttempts.get("registered-uninvoked")).toBe(2)
+      }),
+    { config: cfg },
+  ),
+)
+
+itNoTextComplete.live("session.processor does not fence text completion when no matching hook exists", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        pluginFenceAttempts.set("no-matching-hook", 0)
+        pluginFenceCallbackCalls = 0
+        const result = yield* runSettlement(dir, "no-matching-hook")
+
+        expect(result.result).toBe("continue")
+        expect(result.message.error).toBeUndefined()
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "retained" }))
+        expect(pluginFenceCallbackCalls).toBe(0)
+        expect(pluginFenceAttempts.get("no-matching-hook")).toBe(2)
+      }),
+    { config: cfg },
+  ),
+)
+
+itOrdinaryRollback.live("session.processor rolls back ordinary attempts on the same assistant", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const baselineTokens: SessionV1.Assistant["tokens"] = {
+          total: 101,
+          input: 41,
+          output: 37,
+          reasoning: 13,
+          cache: { read: 7, write: 3 },
+        }
+        ordinaryRollbackAttempts.set("ordinary-rollback", 0)
+        const result = yield* runSettlement(dir, "ordinary-rollback", {
+          assistant: {
+            finish: "end_turn",
+            cost: 7,
+            tokens: baselineTokens,
+          },
+        })
+        const finalIDs = new Set(result.parts.map((part) => part.id))
+
+        expect(result.result).toBe("continue")
+        expect(result.message.id).toBe(result.stored.info.id)
+        expect(result.message.finish).toBe("stop")
+        expect(result.message.cost).toBe(7)
+        expect(result.message.error).toBeUndefined()
+        expect(ordinaryRollbackAttempts.get("ordinary-rollback")).toBe(2)
+        expect(result.removedParts).toHaveLength(4)
+        expect(result.removedParts.every((partID) => !finalIDs.has(partID))).toBe(true)
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded" }))
+        expect(result.parts).not.toContainEqual(
+          expect.objectContaining({ type: "reasoning", text: "discarded reasoning" }),
+        )
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "retained" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+        expect(result.assistantUpdates).toContainEqual(
+          expect.objectContaining({
+            id: result.message.id,
+            finish: "end_turn",
+            cost: 7,
+            tokens: baselineTokens,
+          }),
+        )
+        expect(result.assistantUpdates.every((update) => update.id === result.message.id)).toBe(true)
+      }),
+    { config: cfg },
+  ),
+)
+
+itSummarySettlement.effect("session.processor releases retained summaries before cleanup", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        const events = yield* EventV2Bridge.Service
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
+          const data = event.data as typeof SessionV1.Event.MessageUpdated.data.Type
+          if (data.info.role === "assistant" && data.info.time.completed) summaryTimeline.push("cleanup")
+          return Effect.void
+        })
+
+        const normal = yield* runSettlement(dir, "unknown-visible")
+        yield* off
+
+        expect(normal.result).toBe("continue")
+        expect(summaryLaunches).toEqual([
+          {
+            sessionID: normal.message.sessionID,
+            messageID: normal.message.parentID,
+          },
+        ])
+        expect(summaryTimeline).toEqual(["summary", "cleanup"])
+
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        settlementCalls.set("classified-incomplete", 0)
+        const failedFiber = yield* runSettlement(dir, "classified-incomplete").pipe(Effect.forkChild)
+        yield* waitForSettlementAttempt("classified-incomplete", 1)
+        yield* TestClock.adjust(2_000)
+        yield* waitForSettlementAttempt("classified-incomplete", 2)
+        yield* TestClock.adjust(4_000)
+        const failed = yield* Fiber.join(failedFiber)
+        expect(failed.result).toBe("stop")
+        expect(summaryLaunches).toEqual([
+          {
+            sessionID: failed.message.sessionID,
+            messageID: failed.message.parentID,
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSummaryBoundary.live("session.processor releases retained blocked and compaction summaries", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        successorDemand.set("blocked-overflow", 0)
+        const blocked = yield* runSettlement(dir, "blocked-overflow", {
+          limit: { context: 20, output: 10 },
+        })
+        expect(blocked.result).toBe("stop")
+        expect(summaryLaunches).toHaveLength(1)
+        expect(summaryLaunches[0]).toEqual({
+          sessionID: blocked.message.sessionID,
+          messageID: blocked.message.parentID,
+        })
+
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        successorDemand.set("raw-defined-overflow", 0)
+        const compact = yield* runSettlement(dir, "raw-defined-overflow", {
+          limit: { context: 20, output: 10 },
+        })
+        expect(compact.result).toBe("compact")
+        expect(summaryLaunches).toHaveLength(1)
+        expect(summaryLaunches[0]).toEqual({
+          sessionID: compact.message.sessionID,
+          messageID: compact.message.parentID,
+        })
+      }),
+    { config: cfg },
+  ),
+)
+
+itSummaryInterrupt.live("session.processor releases retained summaries on interrupt", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        const database = yield* Database.Service
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "summary-interrupt")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
+          const data = event.data as typeof SessionV1.Event.MessageUpdated.data.Type
+          if (data.sessionID === chat.id && data.info.role === "assistant" && data.info.time.completed) {
+            summaryTimeline.push("cleanup")
+          }
+          return Effect.void
+        })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "summary-interrupt" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* waitFor(
+          MessageV2.parts(msg.id).pipe(
+            Effect.map((parts) => parts.some((part) => part.type === "step-finish") || undefined),
+            Effect.provideService(Database.Service, database),
+          ),
+          "timed out waiting for summary step",
+        )
+        yield* Fiber.interrupt(run)
+        const exit = yield* Fiber.await(run)
+        yield* off
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(summaryLaunches).toEqual([{ sessionID: chat.id, messageID: parent.id }])
+        expect(summaryTimeline).toEqual(["summary", "cleanup"])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSummaryRollback.live("session.processor discards rolled-back summary launches", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        ordinaryRollbackAttempts.set("ordinary-rollback", 0)
+        const result = yield* runSettlement(dir, "ordinary-rollback")
+
+        expect(result.result).toBe("continue")
+        expect(ordinaryRollbackAttempts.get("ordinary-rollback")).toBe(2)
+        expect(summaryLaunches).toEqual([
+          {
+            sessionID: result.message.sessionID,
+            messageID: result.message.parentID,
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itSummaryRollback.live("session.processor does not request or summarize again when rollback removal fails", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        summaryLaunches.length = 0
+        summaryTimeline.length = 0
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2.Service
+        const sts = yield* SessionStatus.Service
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "rollback-removal-failure")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        yield* events.project(SessionV1.Event.PartRemoved, (event) =>
+          event.data.sessionID === chat.id
+            ? Effect.die(new Error("rollback removal failed"))
+            : Effect.void,
+        )
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        ordinaryRollbackAttempts.set("rollback-removal-failure", 0)
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "rollback-removal-failure" }],
+          tools: {},
+        })
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        const state = yield* sts.get(chat.id)
+
+        expect(result).toBe("stop")
+        expect(ordinaryRollbackAttempts.get("rollback-removal-failure")).toBe(1)
+        expect(summaryLaunches).toEqual([])
+        expect(handle.message.finish).toBe("error")
+        expect(handle.message.error).toMatchObject({
+          name: "UnknownError",
+          data: { message: expect.stringContaining("rollback removal failed") },
+        })
+        expect(handle.message.time.completed).toBeNumber()
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") {
+          expect(stored.info.finish).toBe("error")
+          expect(stored.info.error).toEqual(handle.message.error)
+          expect(stored.info.time.completed).toBe(handle.message.time.completed)
+        }
+        expect(state).toMatchObject({ type: "idle" })
+      }),
+    { config: cfg },
+  ),
+)
+
+itAttemptEvidence.effect("session.processor rolls back ordinary output before bounded clean EOF retries", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        attemptEvidenceAttempts = 0
+        const resultFiber = yield* runSettlement(dir, "retry-attempt").pipe(Effect.forkChild)
+        yield* waitForAttemptEvidence(2)
+        yield* TestClock.adjust(4_000)
+        yield* waitForAttemptEvidence(3)
+        yield* TestClock.adjust(8_000)
+        const result = yield* Fiber.join(resultFiber)
 
         expect(result.result).toBe("stop")
         expect(result.message.finish).toBe("unknown")
@@ -1219,29 +2674,35 @@ itAttemptEvidence.live("session.processor resets finish and output evidence befo
           name: "UnknownError",
           data: { message: "Provider stream ended with an unknown finish reason and no usable output" },
         })
-        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "first attempt" }))
-        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(2)
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "first attempt" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+        expect(result.removedParts).toHaveLength(7)
+        expect(result.retryStatuses.map((state) => state.attempt)).toEqual([1, 2, 3])
+        expect(attemptEvidenceAttempts).toBe(4)
         expect(result.errors).toHaveLength(1)
       }),
     { config: cfg },
   ),
 )
 
-itCompactionAttempt.live("session.processor resets compaction state before a retry attempt", () =>
+itCompactionAttempt.live("session.processor does not replay after compaction is requested", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
+        compactionAttempts = 0
         const result = yield* runSettlement(dir, "retry-compaction-state", {
           limit: { context: 20, output: 10 },
         })
 
-        expect(result.result).toBe("continue")
+        expect(result.result).toBe("stop")
         expect(result.message.finish).toBe("stop")
-        expect(result.message.error).toBeUndefined()
+        expect(result.message.error).toMatchObject({ data: { message: "rate limit" } })
         expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "first attempt" }))
-        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "second attempt" }))
-        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(2)
-        expect(result.errors).toEqual([])
+        expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "second attempt" }))
+        expect(result.parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+        expect(result.removedParts).toEqual([])
+        expect(result.errors).toHaveLength(1)
+        expect(compactionAttempts).toBe(1)
       }),
     { config: cfg },
   ),
@@ -1699,13 +3160,16 @@ it.live("session.processor keeps reasoning with empty tool call arrays in one pa
   ),
 )
 
-it.live("session.processor finalizes pending reasoning when a compatible stream ends incomplete", () =>
+it.live("session.processor removes pending reasoning before retrying a compatible incomplete stream", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
         const { processors, session, provider } = yield* boot()
 
-        yield* llm.push(reply().reason("one").text("bridge").streamError())
+        yield* llm.push(
+          reply().reason("one").text("bridge").streamError(),
+          reply().reason("two").text("done").stop(),
+        )
 
         const chat = yield* session.create({})
         const parent = yield* user(chat.id, "reason")
@@ -1737,14 +3201,17 @@ it.live("session.processor finalizes pending reasoning when a compatible stream 
         const parts = yield* MessageV2.parts(msg.id)
         const reasoning = parts.filter((part): part is SessionV1.ReasoningPart => part.type === "reasoning")
 
-        expect(value).toBe("stop")
-        expect(yield* llm.calls).toBe(1)
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(2)
         expect(reasoning).toHaveLength(1)
-        expect(reasoning[0]).toMatchObject({ text: "one", time: { end: expect.any(Number) } })
-        expect(JSON.stringify(handle.message.error)).toContain("terminal finish event")
+        expect(reasoning[0]).toMatchObject({ text: "two", time: { end: expect.any(Number) } })
+        expect(parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "bridge" }))
+        expect(parts).toContainEqual(expect.objectContaining({ type: "text", text: "done" }))
+        expect(handle.message.error).toBeUndefined()
       }),
     { config: (url) => providerCfg(url) },
   ),
+  15_000,
 )
 
 it.live("session.processor effect tests reset reasoning state across retries", () =>

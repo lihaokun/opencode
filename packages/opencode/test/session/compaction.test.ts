@@ -1066,17 +1066,24 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
-    "keeps a summary without a settled model step out of completed compactions",
+    "keeps only the final summary attempt after unsettled retry exhaustion",
     () => {
       const stub = llm()
-      stub.push(
-        Stream.make(
-          LLMEvent.textStart({ id: "txt-unsettled" }),
-          LLMEvent.textDelta({ id: "txt-unsettled", text: "partial summary" }),
-          LLMEvent.textEnd({ id: "txt-unsettled" }),
-          LLMEvent.finish({ reason: "stop", usage: basicUsage() }),
-        ),
-      )
+      for (const [index, text] of [
+        "discarded summary 1",
+        "discarded summary 2",
+        "final partial summary",
+      ].entries()) {
+        const id = `txt-unsettled-${index}`
+        stub.push(
+          Stream.make(
+            LLMEvent.textStart({ id }),
+            LLMEvent.textDelta({ id, text }),
+            LLMEvent.textEnd({ id }),
+            LLMEvent.finish({ reason: "stop", usage: basicUsage() }),
+          ),
+        )
+      }
       return Effect.gen(function* () {
         const ssn = yield* SessionNs.Service
         const events = yield* EventV2Bridge.Service
@@ -1109,12 +1116,15 @@ describe("session.compaction.process", () => {
             data: { message: "Provider stream ended without a settled model step" },
           })
         }
-        expect(summary?.parts).toContainEqual(expect.objectContaining({ type: "text", text: "partial summary" }))
+        expect(summary?.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded summary 1" }))
+        expect(summary?.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded summary 2" }))
+        expect(summary?.parts).toContainEqual(expect.objectContaining({ type: "text", text: "final partial summary" }))
         expect(seen).toContain(SessionNs.Event.Error.type)
         expect(seen).not.toContain(SessionCompaction.Event.Compacted.type)
       }).pipe(withCompaction({ llm: stub.llmLayer }))
     },
     { git: true },
+    15_000,
   )
 
   itCompaction.instance(

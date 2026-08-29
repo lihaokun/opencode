@@ -157,6 +157,7 @@ function mapNormally(
           events.push(
             LLMEvent.providerError({
               message: incompleteStreamMessage,
+              classification: "incomplete-stream",
               retryable: false,
             }),
           )
