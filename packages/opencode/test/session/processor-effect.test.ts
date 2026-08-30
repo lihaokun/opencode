@@ -61,6 +61,8 @@ const ref = {
   providerID: ProviderV2.ID.make("test"),
   modelID: ModelV2.ID.make("test-model"),
 }
+const litellmContextOverflow =
+  "litellm.BadRequestError: OpenAIException - Requested token count exceeds the model's maximum context length of 307200 tokens. You requested a total of 324629 tokens: 260629 tokens from the input messages and 64000 tokens for the completion."
 
 const cfg = {
   provider: {
@@ -134,6 +136,10 @@ function contextOverflowError() {
     responseBody: JSON.stringify({ error: { message: "request entity too large" } }),
     isRetryable: false,
   })
+}
+
+function untypedContextOverflowError() {
+  return new Error(litellmContextOverflow)
 }
 
 const waitFor = <A>(check: Effect.Effect<A | undefined>, message: string) =>
@@ -265,6 +271,82 @@ const providerErrorLLM = Layer.succeed(
 )
 const providerErrorEnv = LayerNode.compile(root, [...replacements, [LLM.node, providerErrorLLM]])
 const itProviderError = testEffect(providerErrorEnv)
+
+const periodicDoomLoopLLM = Layer.succeed(
+  LLM.Service,
+  singletonBatchLLM(() => {
+    const calls = [
+      { id: "call-a1", name: "lookup", input: { query: "a" } },
+      { id: "call-b1", name: "search", input: { query: "b" } },
+      { id: "call-a2", name: "lookup", input: { query: "a" } },
+      { id: "call-b2", name: "search", input: { query: "b" } },
+      { id: "call-a3", name: "lookup", input: { query: "a" } },
+      { id: "call-b3", name: "search", input: { query: "b" } },
+    ]
+    const events: LLMEvent[] = [LLMEvent.stepStart({ index: 0 })]
+    for (const call of calls) {
+      events.push(
+        LLMEvent.toolCall(call),
+        LLMEvent.toolResult({
+          id: call.id,
+          name: call.name,
+          result: { type: "json", value: { title: call.name, output: "done", metadata: {} } },
+        }),
+      )
+    }
+    events.push(LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }), LLMEvent.finish({ reason: "tool-calls" }))
+    return Stream.fromIterable(events)
+  }),
+)
+const periodicDoomLoopEnv = LayerNode.compile(root, [...replacements, [LLM.node, periodicDoomLoopLLM]])
+const itPeriodicDoomLoop = testEffect(periodicDoomLoopEnv)
+
+const periodOneDoomLoopLLM = Layer.succeed(
+  LLM.Service,
+  singletonBatchLLM(() => {
+    const calls = [
+      { id: "call-a1", name: "lookup", input: { query: "a" } },
+      { id: "call-a2", name: "lookup", input: { query: "a" } },
+      { id: "call-a3", name: "lookup", input: { query: "a" } },
+    ]
+    const events: LLMEvent[] = [LLMEvent.stepStart({ index: 0 })]
+    for (const call of calls) {
+      events.push(
+        LLMEvent.toolCall(call),
+        LLMEvent.toolResult({
+          id: call.id,
+          name: call.name,
+          result: { type: "json", value: { title: call.name, output: "done", metadata: {} } },
+        }),
+      )
+    }
+    events.push(LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }), LLMEvent.finish({ reason: "tool-calls" }))
+    return Stream.fromIterable(events)
+  }),
+)
+const periodOneDoomLoopEnv = LayerNode.compile(root, [...replacements, [LLM.node, periodOneDoomLoopLLM]])
+const itPeriodOneDoomLoop = testEffect(periodOneDoomLoopEnv)
+
+const replayedToolCallLLM = Layer.succeed(
+  LLM.Service,
+  singletonBatchLLM(() =>
+    Stream.make(
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
+      LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
+      LLMEvent.toolCall({ id: "call-replayed", name: "lookup", input: { query: "a" } }),
+      LLMEvent.toolResult({
+        id: "call-replayed",
+        name: "lookup",
+        result: { type: "json", value: { title: "lookup", output: "done", metadata: {} } },
+      }),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ),
+  ),
+)
+const replayedToolCallEnv = LayerNode.compile(root, [...replacements, [LLM.node, replayedToolCallLLM]])
+const itReplayedToolCall = testEffect(replayedToolCallEnv)
 
 const fragmentFailureLLM = Layer.succeed(
   LLM.Service,
@@ -470,6 +552,8 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
       )
     case "context-overflow":
       return Stream.fail(contextOverflowError())
+    case "untyped-context-overflow":
+      return Stream.fail(untypedContextOverflowError())
     case "context-overflow-after-text-start":
       return Stream.make(LLMEvent.stepStart({ index: 0 }), LLMEvent.textStart({ id: "late-text" })).pipe(
         Stream.concat(Stream.fail(contextOverflowError())),
@@ -488,6 +572,11 @@ function settlementStream(name: string): Stream.Stream<LLMEvent, unknown> {
         LLMEvent.stepStart({ index: 0 }),
         LLMEvent.toolCall({ id: "late-tool-call", name: "lookup", input: {} }),
       ).pipe(Stream.concat(Stream.fail(contextOverflowError())))
+    case "untyped-context-overflow-after-tool-call":
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "late-untyped-tool-call", name: "lookup", input: {} }),
+      ).pipe(Stream.concat(Stream.fail(untypedContextOverflowError())))
     case "classified-incomplete":
       return Stream.make(
         LLMEvent.stepStart({ index: 0 }),
@@ -1180,6 +1269,315 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
 // Tests
 // ---------------------------------------------------------------------------
 
+itPeriodicDoomLoop.live("session.processor asks doom_loop permission after three period-2 repetitions", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const asked = defer<PermissionV1.Request>()
+        const off = yield* events.listen((event) => {
+          if (event.type === "permission.asked") asked.resolve(event.data as PermissionV1.Request)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "period-2 doom loop")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const fiber = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "period-2 doom loop" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        const request = yield* Effect.promise(() => asked.promise).pipe(
+          Effect.timeoutOrElse({
+            duration: "1 second",
+            orElse: () => Effect.fail(new Error("timed out waiting for periodic doom-loop permission")),
+          }),
+        )
+        expect(request).toMatchObject({
+          sessionID: chat.id,
+          permission: "doom_loop",
+          patterns: ["search"],
+          metadata: { tool: "search", input: { query: "b" } },
+          always: ["search"],
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(tools).toHaveLength(6)
+        expect(tools.slice(0, 5).every((part) => part.state.status === "completed")).toBe(true)
+        expect(tools[5]).toMatchObject({
+          callID: "call-b3",
+          tool: "search",
+          state: { status: "running", input: { query: "b" } },
+        })
+
+        yield* Fiber.interrupt(fiber)
+      }),
+    { config: cfg },
+  ),
+)
+
+itPeriodOneDoomLoop.live("session.processor preserves period-1 doom_loop ask behavior", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const asked = defer<PermissionV1.Request>()
+        const off = yield* events.listen((event) => {
+          if (event.type === "permission.asked") asked.resolve(event.data as PermissionV1.Request)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "period-1 doom loop")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const fiber = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "period-1 doom loop" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        const request = yield* Effect.promise(() => asked.promise).pipe(
+          Effect.timeoutOrElse({
+            duration: "1 second",
+            orElse: () => Effect.fail(new Error("timed out waiting for period-1 doom-loop permission")),
+          }),
+        )
+        expect(request).toMatchObject({
+          sessionID: chat.id,
+          permission: "doom_loop",
+          patterns: ["lookup"],
+          metadata: { tool: "lookup", input: { query: "a" } },
+          always: ["lookup"],
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(tools).toHaveLength(3)
+        expect(tools.slice(0, 2).every((part) => part.state.status === "completed")).toBe(true)
+        expect(tools[2]).toMatchObject({
+          callID: "call-a3",
+          tool: "lookup",
+          state: { status: "running", input: { query: "a" } },
+        })
+
+        yield* Fiber.interrupt(fiber)
+      }),
+    { config: cfg },
+  ),
+)
+
+itPeriodOneDoomLoop.live("session.processor continues a period-1 cycle when doom_loop is allowed", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        let asked = 0
+        const off = yield* events.listen((event) => {
+          if (event.type === "permission.asked") asked++
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "allowed period-1 doom loop")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "allowed period-1 doom loop" }],
+          tools: {},
+        })
+
+        expect(result).toBe("continue")
+        expect(asked).toBe(0)
+        const parts = yield* MessageV2.parts(msg.id)
+        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(tools).toHaveLength(3)
+        expect(tools.every((part) => part.state.status === "completed")).toBe(true)
+      }),
+    { config: { ...cfg, permission: { doom_loop: "allow" } } },
+  ),
+)
+
+itPeriodOneDoomLoop.live("session.processor stops a period-1 cycle when doom_loop is denied", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        let asked = 0
+        const off = yield* events.listen((event) => {
+          if (event.type === "permission.asked") asked++
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "denied period-1 doom loop")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "denied period-1 doom loop" }],
+          tools: {},
+        })
+
+        expect(result).toBe("stop")
+        expect(asked).toBe(0)
+        expect(handle.message.error).toBeDefined()
+        const parts = yield* MessageV2.parts(msg.id)
+        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(tools).toHaveLength(3)
+        expect(tools.slice(0, 2).every((part) => part.state.status === "completed")).toBe(true)
+        expect(tools[2]).toMatchObject({
+          callID: "call-a3",
+          tool: "lookup",
+          state: { status: "error", input: { query: "a" }, error: "Tool execution aborted" },
+        })
+      }),
+    { config: { ...cfg, permission: { doom_loop: "deny" } } },
+  ),
+)
+
+itReplayedToolCall.live("session.processor isolates persisted history and counts an active replayed call ID once", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        let asked = 0
+        const off = yield* events.listen((event) => {
+          if (event.type === "permission.asked") asked++
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "replayed tool call")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        for (const callID of ["history-1", "history-2"]) {
+          yield* session.updatePart({
+            id: PartID.ascending(),
+            messageID: msg.id,
+            sessionID: chat.id,
+            type: "tool",
+            callID,
+            tool: "lookup",
+            state: {
+              status: "completed",
+              input: { query: "a" },
+              output: "done",
+              title: "lookup",
+              metadata: {},
+              time: { start: 1, end: 2 },
+            },
+          } satisfies SessionV1.ToolPart)
+        }
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "replayed tool call" }],
+            tools: {},
+          })
+          .pipe(
+            Effect.timeoutOrElse({
+              duration: "1 second",
+              orElse: () => Effect.fail(new Error("replayed tool call unexpectedly requested permission")),
+            }),
+          )
+
+        expect(asked).toBe(0)
+        const parts = yield* MessageV2.parts(msg.id)
+        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(tools).toHaveLength(3)
+        expect(
+          tools.filter((part) => part.callID.startsWith("history-")).every((part) => part.state.status === "completed"),
+        ).toBe(true)
+        expect(tools.find((part) => part.callID === "call-replayed")).toMatchObject({
+          callID: "call-replayed",
+          tool: "lookup",
+          state: { status: "completed", input: { query: "a" } },
+        })
+      }),
+    { config: cfg },
+  ),
+)
+
 itLength.live("session.processor normalizes length into one durable terminal error", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -1682,6 +2080,29 @@ itSettlement.live("session.processor recovers a context overflow when the attemp
   ),
 )
 
+itSettlement.live("session.processor recovers an untyped context overflow when the attempt is eligible", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const result = yield* runSettlement(dir, "untyped-context-overflow", {
+          recoverContextOverflow: true,
+          unfinished: true,
+        })
+
+        expect(result.result).toBe("compact")
+        expect(result.message.finish).toBeUndefined()
+        expect(result.message.error).toBeUndefined()
+        expect(result.errors).toStrictEqual([
+          {
+            name: "ContextOverflowError",
+            data: { message: litellmContextOverflow },
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
 itSettlement.effect("session.processor replays only classified provider errors as incomplete controls", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -2145,6 +2566,7 @@ for (const scenario of [
   "context-overflow-after-reasoning-start",
   "context-overflow-after-tool-input-start",
   "context-overflow-after-tool-call",
+  "untyped-context-overflow-after-tool-call",
 ]) {
   itSettlement.live(`session.processor does not recover ${scenario}`, () =>
     provideTmpdirInstance(

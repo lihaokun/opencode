@@ -13,6 +13,8 @@ import { Identifier } from "../../src/id/id"
 
 const sessionID = SessionID.make("session")
 const providerID = ProviderV2.ID.make("test")
+const litellmContextOverflow =
+  "litellm.BadRequestError: OpenAIException - Requested token count exceeds the model's maximum context length of 307200 tokens. You requested a total of 324629 tokens: 260629 tokens from the input messages and 64000 tokens for the completion."
 const model: Provider.Model = {
   id: ModelV2.ID.make("test-model"),
   providerID,
@@ -1466,6 +1468,37 @@ describe("session.message-v2.fromError", () => {
       })
       const result = MessageV2.fromError(error, { providerID })
       expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
+    })
+  })
+
+  test("detects context overflow from untyped provider errors", () => {
+    const cases = [new Error(litellmContextOverflow), litellmContextOverflow, { message: litellmContextOverflow }]
+
+    cases.forEach((input) => {
+      expect(MessageV2.fromError(input, { providerID })).toStrictEqual({
+        name: "ContextOverflowError",
+        data: { message: litellmContextOverflow },
+      })
+    })
+  })
+
+  test("keeps generic non-overflow fallbacks unchanged", () => {
+    const input = { message: "ordinary provider failure" }
+
+    expect(MessageV2.fromError(new Error(input.message), { providerID })).toStrictEqual({
+      name: "UnknownError",
+      data: { message: input.message },
+    })
+    expect(MessageV2.fromError(input, { providerID })).toStrictEqual({
+      name: "UnknownError",
+      data: { message: JSON.stringify(input) },
+    })
+  })
+
+  test("does not classify generic rate-limit errors as context overflow", () => {
+    expect(MessageV2.fromError(new Error("rate limit: too many tokens"), { providerID })).toStrictEqual({
+      name: "UnknownError",
+      data: { message: "rate limit: too many tokens" },
     })
   })
 

@@ -822,6 +822,15 @@ OpenCode 全量失败分类：
 
 范围只记录 V1 既有压缩机制的并发窗口：compaction marker 创建或 summary 进行期间写入新 user，可能导致一个输入未被单独处理或 original/replay 顺序反转。它同时存在于旧的异常驱动压缩与新增 preflight 路径，但不是三态 token 导致，本次不修改 task ownership、replay ordering 或 admission 架构。
 
+### 8.4 untyped provider error 分类补充
+
+后续修复 [session-fix-untyped-context-overflow.md](./session-fix-untyped-context-overflow.md) 扩展了本方案的
+错误分类入口：typed `APICallError` 与 structured stream parser 均未覆盖、原本会落入 `UnknownError` 的
+generic failure，在 message 命中 shared `isContextOverflow()` 时同样生成既有 `ContextOverflowError`。
+
+该补充不修改本文件定义的 preflight、processor recovery gate、三态 episode token 或 compaction replay
+语义；它只让 LiteLLM/openai-compatible gateway 的 untyped overflow failure 能进入同一条既有恢复路径。
+
 ---
 
 ## 反模式自检
