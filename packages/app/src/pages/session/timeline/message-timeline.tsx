@@ -53,6 +53,7 @@ import type {
   UserMessage,
 } from "@opencode-ai/sdk/v2"
 import { showToast } from "@/utils/toast"
+import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from "@/utils/session-export"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
 import { Popover as KobaltePopover } from "@kobalte/core/popover"
 import { normalize } from "@opencode-ai/session-ui/session-diff"
@@ -62,11 +63,11 @@ import { SessionContextUsage } from "@/components/session-context-usage"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { useLanguage } from "@/context/language"
 import { useSessionKey } from "@/pages/session/session-layout"
+import { useSessionArchive } from "@/pages/session/session-archive"
 import { selectProjectedMessages } from "./model"
 import { useServerSDK } from "@/context/server-sdk"
 import { usePlatform } from "@/context/platform"
 import { useSettings } from "@/context/settings"
-import { useTabs } from "@/context/tabs"
 import { legacySessionHref, requireServerKey, sessionHref } from "@/utils/session-route"
 import { useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
@@ -162,10 +163,7 @@ function TimelineDiffSummaryRow(props: { diffs: SummaryDiff[] }) {
     >
       <div data-slot="session-turn-diffs-header">
         <span data-slot="session-turn-diffs-label">
-          {language.t(
-            props.diffs.length === 1 ? "ui.sessionTurn.diffs.changed.one" : "ui.sessionTurn.diffs.changed.other",
-            { count: String(props.diffs.length) },
-          )}
+          {language.plural("ui.sessionTurn.diffs.changed", props.diffs.length)}
         </span>
         <DiffChanges changes={props.diffs} />
         <Show when={overflow() > 0}>
@@ -266,8 +264,8 @@ export function MessageTimeline(props: {
   const sdk = useSDK()
   const sync = useSync()
   const settings = useSettings()
-  const tabs = useTabs()
   const dialog = useDialog()
+  const sessionArchive = useSessionArchive()
   const language = useLanguage()
   const { params, sessionKey } = useSessionKey()
   const ownerSessionKey = sessionKey()
@@ -645,7 +643,7 @@ export function MessageTimeline(props: {
   const viewShare = () => {
     const url = shareUrl()
     if (!url) return
-    platform.openLink(url)
+    platform.openExternal(url)
   }
 
   const errorMessage = (err: unknown) => {
@@ -789,53 +787,27 @@ export function MessageTimeline(props: {
     titleMutation.mutate({ id, title: next })
   }
 
-  const navigateAfterSessionRemoval = (sessionID: string, parentID?: string, nextSessionID?: string) => {
-    if (params.id !== sessionID) return
-    const href = (id: string) =>
-      params.serverKey ? sessionHref(requireServerKey(params.serverKey), id) : legacySessionHref(sdk().directory, id)
-    if (parentID) {
-      navigate(href(parentID))
-      return
-    }
-    if (nextSessionID) {
-      navigate(href(nextSessionID))
-      return
-    }
-    if (params.serverKey) {
-      tabs.newDraft({ server: requireServerKey(params.serverKey), directory: sdk().directory })
-      return
-    }
-    navigate(`/${params.dir}/session`)
-  }
-
-  const archiveSession = async (sessionID: string) => {
-    const session = sync().session.get(sessionID)
-    if (!session) return
-    if ((await sdk().protocol) !== "v1") return
-
-    const sessions = sync().data.session ?? []
-    const index = sessions.findIndex((s) => s.id === sessionID)
-    const nextSession = index === -1 ? undefined : (sessions[index + 1] ?? sessions[index - 1])
-
-    await sdk()
-      .client.session.update({ sessionID, directory: sdk().directory, time: { archived: Date.now() } })
-      .then(() => {
-        sync().set(
-          produce((draft) => {
-            const index = draft.session.findIndex((s) => s.id === sessionID)
-            if (index !== -1) draft.session.splice(index, 1)
-          }),
-        )
-        sync().session.evict(sessionID)
-        navigateAfterSessionRemoval(sessionID, session.parentID, nextSession?.id)
-        notifySessionTabsRemoved({ directory: sdk().directory, sessionIDs: [sessionID] })
+  const exportSession = async (sessionID: string) => {
+    try {
+      const data = await fetchSessionExport({
+        sessionID,
+        client: sdk().client,
       })
-      .catch((err) => {
-        showToast({
-          title: language.t("common.requestFailed"),
-          description: errorMessage(err),
-        })
+      const filename = sessionExportFilename(data.info)
+      downloadSessionExport(filename, data)
+      showToast({
+        variant: "success",
+        icon: "circle-check",
+        title: language.t("toast.session.export.success.title"),
+        description: language.t("toast.session.export.success.description", { filename }),
       })
+    } catch (err) {
+      showToast({
+        variant: "error",
+        title: language.t("toast.session.export.failed.title"),
+        description: err instanceof Error ? err.message : language.t("toast.session.export.failed.description"),
+      })
+    }
   }
 
   const deleteSession = async (sessionID: string) => {
@@ -887,7 +859,7 @@ export function MessageTimeline(props: {
       }
     }
 
-    navigateAfterSessionRemoval(sessionID, session.parentID, nextSession?.id)
+    sessionArchive.navigateAfterRemoval(sessionID, session.parentID, nextSession?.id)
 
     sync().set(
       produce((draft) => {
@@ -1105,7 +1077,7 @@ export function MessageTimeline(props: {
         return (
           <TimelineRowFrame row={commentStripRow}>
             <div class="w-full px-4 md:px-5 pb-2">
-              <div class="ml-auto max-w-[82%] overflow-x-auto no-scrollbar">
+              <div class="ms-auto max-w-[82%] overflow-x-auto no-scrollbar">
                 <div class="flex w-max min-w-full justify-end gap-2">
                   <Index each={comments()}>
                     {(comment) => (
@@ -1566,7 +1538,10 @@ export function MessageTimeline(props: {
                                     </DropdownMenu.ItemLabel>
                                   </DropdownMenu.Item>
                                 </Show>
-                                <DropdownMenu.Item onSelect={() => void archiveSession(id)}>
+                                <DropdownMenu.Item onSelect={() => exportSession(id)}>
+                                  <DropdownMenu.ItemLabel>{language.t("common.export")}</DropdownMenu.ItemLabel>
+                                </DropdownMenu.Item>
+                                <DropdownMenu.Item onSelect={() => void sessionArchive.archive(id)}>
                                   <DropdownMenu.ItemLabel>{language.t("common.archive")}</DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
                                 <DropdownMenu.Separator />
@@ -1637,7 +1612,10 @@ export function MessageTimeline(props: {
                                   {language.t("session.share.action.share")}...
                                 </MenuV2.Item>
                               </Show>
-                              <MenuV2.Item onSelect={() => void archiveSession(id)}>
+                              <MenuV2.Item onSelect={() => exportSession(id)}>
+                                {language.t("common.export")}...
+                              </MenuV2.Item>
+                              <MenuV2.Item onSelect={() => void sessionArchive.archive(id)}>
                                 {language.t("common.archive")}
                               </MenuV2.Item>
                               <MenuV2.Separator />

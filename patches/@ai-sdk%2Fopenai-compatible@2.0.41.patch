@@ -1,6 +1,15 @@
 diff --git a/dist/index.js b/dist/index.js
 --- a/dist/index.js
 +++ b/dist/index.js
+@@ -696,7 +696,7 @@ var OpenAICompatibleChatLanguageModel = class {
+               finishReason = { unified: "error", raw: void 0 };
+               controller.enqueue({
+                 type: "error",
+-                error: chunk.value.error.message
++                error: chunk.value.error
+               });
+               return;
+             }
 @@ -755,7 +755,7 @@ var OpenAICompatibleChatLanguageModel = class {
                  delta: delta.content
                });
@@ -13,6 +22,15 @@ diff --git a/dist/index.js b/dist/index.js
 diff --git a/dist/index.mjs b/dist/index.mjs
 --- a/dist/index.mjs
 +++ b/dist/index.mjs
+@@ -683,7 +683,7 @@ var OpenAICompatibleChatLanguageModel = class {
+               finishReason = { unified: "error", raw: void 0 };
+               controller.enqueue({
+                 type: "error",
+-                error: chunk.value.error.message
++                error: chunk.value.error
+               });
+               return;
+             }
 @@ -742,7 +742,7 @@ var OpenAICompatibleChatLanguageModel = class {
                  delta: delta.content
                });
@@ -25,6 +43,15 @@ diff --git a/dist/index.mjs b/dist/index.mjs
 diff --git a/src/chat/openai-compatible-chat-language-model.ts b/src/chat/openai-compatible-chat-language-model.ts
 --- a/src/chat/openai-compatible-chat-language-model.ts
 +++ b/src/chat/openai-compatible-chat-language-model.ts
+@@ -442,7 +442,7 @@ export class OpenAICompatibleChatLanguageModel implements LanguageModelV3 {
+               finishReason = { unified: 'error', raw: undefined };
+               controller.enqueue({
+                 type: 'error',
+-                error: chunk.value.error.message,
++                error: chunk.value.error,
+               });
+               return;
+             }
 @@ -519,7 +519,7 @@ export class OpenAICompatibleChatLanguageModel
                });
              }

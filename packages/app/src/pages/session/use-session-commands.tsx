@@ -12,6 +12,7 @@ import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
 import { useTerminal } from "@/context/terminal"
 import { showToast } from "@/utils/toast"
+import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from "@/utils/session-export"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { extractPromptFromParts } from "@/utils/prompt"
 import {
@@ -20,8 +21,9 @@ import {
   earliestMessage,
   latestMessage,
 } from "@/utils/session-message"
-import { UserMessage } from "@opencode-ai/sdk/v2"
+import type { UserMessage } from "@opencode-ai/sdk/v2"
 import { useSessionLayout } from "@/pages/session/session-layout"
+import { useSessionArchive } from "@/pages/session/session-archive"
 import { createSessionOwnership } from "./session-ownership"
 import { useLocal } from "@/context/local"
 
@@ -56,6 +58,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
   const navigate = useNavigate()
   const { params, sessionKey, tabs, view } = useSessionLayout()
   const sessionOwnership = createSessionOwnership(sessionKey)
+  const sessionArchive = useSessionArchive()
   const openDialog = async <T,>(load: () => Promise<T>, show: (value: T) => void) => {
     const owner = sessionOwnership.capture()
     const value = await load()
@@ -104,6 +107,12 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
   const visibleUserMessages = () => {
     const revert = info()?.revert
     if (!revert) return userMessages()
+    if (revert.messageTimeCreated !== undefined) {
+      return userMessages().filter((message) => compareMessageToRevert(message, revert) < 0)
+    }
+
+    const boundary = userMessages().findIndex((message) => message.id === revert.messageID)
+    if (boundary >= 0) return userMessages().slice(0, boundary)
     return userMessages().filter((message) => compareMessageToRevert(message, revert) < 0)
   }
 
@@ -236,6 +245,31 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       )
   }
 
+  const exportSession = async () => {
+    const sessionID = params.id
+    if (!sessionID) return
+    try {
+      const data = await fetchSessionExport({
+        sessionID,
+        client: sdk().client,
+      })
+      const filename = sessionExportFilename(data.info)
+      downloadSessionExport(filename, data)
+      showToast({
+        variant: "success",
+        icon: "circle-check",
+        title: language.t("toast.session.export.success.title"),
+        description: language.t("toast.session.export.success.description", { filename }),
+      })
+    } catch (err) {
+      showToast({
+        variant: "error",
+        title: language.t("toast.session.export.failed.title"),
+        description: err instanceof Error ? err.message : language.t("toast.session.export.failed.description"),
+      })
+    }
+  }
+
   const openFile = () => {
     void openDialog(
       () => import("@/components/dialog-select-file"),
@@ -316,7 +350,14 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     const promptSession = prompt.capture()
     const revert = info()?.revert
     const messages = userMessages()
-    const message = latestMessage(messages, (item) => !revert || compareMessageToRevert(item, revert) < 0)
+    const boundary =
+      revert?.messageTimeCreated === undefined && revert
+        ? messages.findIndex((message) => message.id === revert.messageID)
+        : -1
+    const message =
+      boundary >= 0
+        ? messages[boundary - 1]
+        : latestMessage(messages, (item) => !revert || compareMessageToRevert(item, revert) < 0)
     if (!message) return
     const parts = sync().data.part[message.id]
 
@@ -347,7 +388,14 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     const revert = info()?.revert
     if (!revert) return
 
-    const next = earliestMessage(messages, (message) => compareMessageToRevert(message, revert) > 0)
+    const boundary =
+      revert.messageTimeCreated === undefined
+        ? messages.findIndex((message) => message.id === revert.messageID)
+        : -1
+    const next =
+      boundary >= 0
+        ? messages[boundary + 1]
+        : earliestMessage(messages, (message) => compareMessageToRevert(message, revert) > 0)
     if (!next) {
       await runCommand({
         owner,
@@ -465,6 +513,24 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       slash: "fork",
       disabled: !params.id || visibleUserMessages().length === 0,
       onSelect: fork,
+    }),
+    sessionCommand({
+      id: "session.export",
+      title: language.t("command.session.export"),
+      description: language.t("command.session.export.description"),
+      slash: "export",
+      disabled: !params.id,
+      onSelect: exportSession,
+    }),
+    sessionCommand({
+      id: "session.archive",
+      title: language.t("command.session.archive"),
+      keybind: "mod+shift+backspace",
+      disabled: !params.id,
+      onSelect: () => {
+        const id = params.id
+        if (id) void sessionArchive.archive(id)
+      },
     }),
   ]
 

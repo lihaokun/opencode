@@ -176,12 +176,17 @@ function formatAssistantFailure(
     return formatOutputLengthFailure(result, sessionID, limits)
   }
 
-  const output = [`Subagent task failed: ${error.name}`, `Child session: ${sessionID}`]
-  const message = typeof error.data?.message === "string" ? error.data.message : undefined
-  if (!message) return output.join("\n")
+  const message = typeof error.data?.message === "string" ? error.data.message : error.name
+  return formatSubagentFailure(`${error.name}: ${message}`, sessionID, limits)
+}
 
+function formatSubagentFailure(
+  message: string,
+  sessionID: SessionID,
+  limits: { maxLines: number; maxBytes: number },
+) {
   const bounded = boundTaskMarkupText(message, limits)
-  output.push("Message:", bounded.text)
+  const output = [`Subagent failed (task_id: ${sessionID}): ${bounded.text}`]
   if (bounded.truncated) {
     output.push("", `Error message truncated. Full context is available in child session ${sessionID}`)
   }
@@ -348,6 +353,10 @@ export const TaskTool = Tool.define(
           return yield* Effect.fail(
             new Error(formatAssistantFailure({ info: result.info, parts: result.parts }, nextSession.id, limits)),
           )
+        }
+        const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
+        if (failed?.type === "tool" && failed.state.status === "error") {
+          return yield* Effect.fail(new Error(formatSubagentFailure(failed.state.error, nextSession.id, limits)))
         }
         const incompleteFinish =
           result.info.finish === undefined ? "missing" : result.info.finish === "unknown" ? "unknown" : undefined

@@ -424,10 +424,8 @@ export function plan(input: { slug: string; time: { created: number } }, instanc
 }
 
 export const getUsage = (input: { model: Provider.Model; usage: Usage; metadata?: ProviderMetadata }) => {
-  const safe = (value: number) => {
-    if (!Number.isFinite(value)) return 0
-    return Math.max(0, value)
-  }
+  const finite = (value: number) => (Number.isFinite(value) ? value : 0)
+  const safe = (value: number) => Math.max(0, finite(value))
   const inputTokens = safe(input.usage.inputTokens ?? 0)
   const outputTokens = safe(input.usage.outputTokens ?? 0)
   const reasoningTokens = safe(input.usage.reasoningTokens ?? 0)
@@ -481,13 +479,13 @@ export const getUsage = (input: { model: Provider.Model; usage: Usage; metadata?
         ? new Decimal(totalNanoAiu).div(100_000_000_000).toNumber()
         : safe(
             new Decimal(0)
-              .add(new Decimal(tokens.input).mul(costInfo?.input ?? 0).div(1_000_000))
-              .add(new Decimal(tokens.output).mul(costInfo?.output ?? 0).div(1_000_000))
-              .add(new Decimal(tokens.cache.read).mul(costInfo?.cache?.read ?? 0).div(1_000_000))
-              .add(new Decimal(tokens.cache.write).mul(costInfo?.cache?.write ?? 0).div(1_000_000))
+              .add(new Decimal(tokens.input).mul(finite(costInfo?.input ?? 0)).div(1_000_000))
+              .add(new Decimal(tokens.output).mul(finite(costInfo?.output ?? 0)).div(1_000_000))
+              .add(new Decimal(tokens.cache.read).mul(finite(costInfo?.cache?.read ?? 0)).div(1_000_000))
+              .add(new Decimal(tokens.cache.write).mul(finite(costInfo?.cache?.write ?? 0)).div(1_000_000))
               // TODO: update models.dev to have better pricing model, for now:
               // charge reasoning tokens at the same rate as output tokens
-              .add(new Decimal(tokens.reasoning).mul(costInfo?.output ?? 0).div(1_000_000))
+              .add(new Decimal(tokens.reasoning).mul(finite(costInfo?.output ?? 0)).div(1_000_000))
               .toNumber(),
           ),
     tokens,
@@ -684,9 +682,7 @@ const layer: Layer.Layer<
           })
         }
       }
-      return yield* Effect.forEach(rows, (row) =>
-        hydrateRow(db, row).pipe(Effect.map((info) => ({ ...info, project: projects.get(row.project_id) ?? null }))),
-      )
+      return rows.map((row) => ({ ...fromRow(row), project: projects.get(row.project_id) ?? null }))
     })
 
     const children = Effect.fn("Session.children")(function* (parentID: SessionID) {
@@ -696,7 +692,7 @@ const layer: Layer.Layer<
         .where(and(eq(SessionTable.parent_id, parentID)))
         .all()
         .pipe(Effect.orDie)
-      return yield* Effect.forEach(rows, (row) => hydrateRow(db, row))
+      return rows.map(fromRow)
     })
 
     const remove: Interface["remove"] = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -797,9 +793,9 @@ const layer: Layer.Layer<
       })
       const msgs = yield* messages({ sessionID: input.sessionID })
       const idMap = new Map<string, MessageID>()
+      const target = input.messageID ? msgs.findIndex((msg) => msg.info.id === input.messageID) : msgs.length
 
-      for (const msg of msgs) {
-        if (input.messageID && msg.info.id === input.messageID) break
+      for (const msg of msgs.slice(0, target < 0 ? msgs.length : target)) {
         const newID = MessageID.ascending()
         idMap.set(msg.info.id, newID)
 
@@ -1109,10 +1105,7 @@ function listByProject(
     .orderBy(desc(SessionTable.time_updated))
     .limit(limit)
     .all()
-    .pipe(
-      Effect.orDie,
-      Effect.flatMap((rows) => Effect.forEach(rows, (row) => hydrateRow(db, row))),
-    )
+    .pipe(Effect.orDie, Effect.map((rows) => rows.map(fromRow)))
 }
 
 export const node = LayerNode.make({

@@ -5,7 +5,8 @@ import { LLMRequestPrep } from "@/session/llm/request"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
-import { jsonSchema } from "ai"
+import { generateText, jsonSchema, type ModelMessage } from "ai"
+import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock"
 
 describe("ProviderTransform.options - setCacheKey", () => {
   const sessionID = "test-session-123"
@@ -523,6 +524,7 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
     expect(result.reasoningEffort).toBe("medium")
     expect(result.reasoningSummary).toBeUndefined()
     expect(result.include).toBeUndefined()
+    expect(result.textVerbosity).toBeUndefined()
   })
 
   test("azure chat completions omit Responses-only reasoning options after variants merge", async () => {
@@ -681,14 +683,34 @@ describe("ProviderTransform.options - gpt-5 reasoningEffort", () => {
     expect(result.reasoningEffort).toBeUndefined()
   })
 
-  test("gpt-5.5 should NOT set reasoningEffort", () => {
+  test("gpt-5.5 should NOT set reasoningEffort for the completions API", () => {
     const result = ProviderTransform.options({
       model: createModel("gpt-5.5"),
+      sessionID,
+      providerOptions: { useCompletionUrls: true },
+    })
+
+    expect(result.reasoningEffort).toBeUndefined()
+  })
+
+  test("gpt-5.6 should NOT set reasoningEffort for the completions API", () => {
+    const result = ProviderTransform.options({
+      model: createModel("gpt-5.6"),
+      sessionID,
+      providerOptions: { useCompletionUrls: true },
+    })
+
+    expect(result.reasoningEffort).toBeUndefined()
+  })
+
+  test("gpt-5.6 should set reasoningEffort for the responses API", () => {
+    const result = ProviderTransform.options({
+      model: createModel("gpt-5.6"),
       sessionID,
       providerOptions: {},
     })
 
-    expect(result.reasoningEffort).toBeUndefined()
+    expect(result.reasoningEffort).toBe("medium")
   })
 })
 
@@ -2341,6 +2363,134 @@ describe("ProviderTransform.message - anthropic empty content filtering", () => 
     expect(result[1].content[0]).toEqual({ type: "text", text: "Answer" })
   })
 
+  describe("Bedrock reasoning replay", () => {
+    const model = {
+      ...anthropicModel,
+      id: "amazon-bedrock/anthropic.claude-opus-4-6",
+      providerID: "amazon-bedrock",
+      api: {
+        id: "anthropic.claude-opus-4-6",
+        url: "https://bedrock-runtime.us-east-1.amazonaws.com",
+        npm: "@ai-sdk/amazon-bedrock",
+      },
+    }
+
+    for (const cached of [false, true]) {
+      test(`omits unsigned reasoning before SDK conversion (caching: ${cached})`, async () => {
+        const selected = cached
+          ? model
+          : { ...model, id: "amazon-bedrock/openai.gpt-oss-120b", api: { ...model.api, id: "openai.gpt-oss-120b" } }
+        const messages = ProviderTransform.message(
+          [
+            { role: "user", content: "Think" },
+            { role: "assistant", content: [{ type: "text", text: "Earlier answer" }] },
+            {
+              role: "assistant",
+              content: [
+                { type: "reasoning", text: "Partial thought" },
+                { type: "text", text: "" },
+              ],
+            },
+            { role: "user", content: "Continue" },
+          ],
+          selected,
+          {},
+        )
+        expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "user"])
+        expect(messages[1].providerOptions?.bedrock?.cachePoint).toEqual(cached ? { type: "default" } : undefined)
+        const provider = createAmazonBedrock({
+          apiKey: "test-key",
+          region: "us-east-1",
+          fetch: Object.assign(
+            async (...args: Parameters<typeof fetch>) => {
+              const body = JSON.parse(String(args[1]?.body))
+              expect(body.messages).toEqual([
+                { role: "user", content: [{ text: "Think" }] },
+                {
+                  role: "assistant",
+                  content: [{ text: "Earlier answer" }, ...(cached ? [{ cachePoint: { type: "default" } }] : [])],
+                },
+                {
+                  role: "user",
+                  content: [{ text: "Continue" }, ...(cached ? [{ cachePoint: { type: "default" } }] : [])],
+                },
+              ])
+              return Response.json({
+                output: { message: { role: "assistant", content: [{ text: "Recovered" }] } },
+                stopReason: "end_turn",
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              })
+            },
+            { preconnect: () => undefined },
+          ),
+        })
+        const result = await generateText({ model: provider(selected.api.id), messages, maxRetries: 0 })
+        expect(result.text).toBe("Recovered")
+      })
+    }
+
+    for (const namespace of ["bedrock", "amazon-bedrock", "custom-bedrock"]) {
+      for (const field of ["signature", "redactedContent", "redactedData"]) {
+        test(`preserves ${namespace}.${field} on empty reasoning`, () => {
+          const result = ProviderTransform.message(
+            [
+              {
+                role: "assistant",
+                content: [{ type: "reasoning", text: "", providerOptions: { [namespace]: { [field]: "opaque" } } }],
+              },
+            ],
+            namespace === "custom-bedrock" ? { ...model, providerID: namespace } : model,
+            {},
+          )
+          expect(result).toHaveLength(1)
+          expect(result[0].content).toEqual([
+            { type: "reasoning", text: "", providerOptions: { bedrock: { [field]: "opaque" } } },
+          ])
+        })
+      }
+    }
+
+    test("uses stored provider metadata when it will overwrite the SDK namespace", () => {
+      const result = ProviderTransform.message(
+        [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "reasoning",
+                text: "Partial thought",
+                providerOptions: { "amazon-bedrock": {}, bedrock: { signature: "overwritten" } },
+              },
+            ],
+          },
+        ],
+        model,
+        {},
+      )
+      expect(result).toEqual([])
+    })
+
+    test("keeps text and tool calls next to unsigned reasoning", () => {
+      const content: ModelMessage["content"] = [
+        { type: "text", text: "Answer" },
+        { type: "tool-call", toolCallId: "call_1", toolName: "lookup", input: {} },
+      ]
+      const result = ProviderTransform.message(
+        [{ role: "assistant", content: [{ type: "reasoning", text: "Partial thought" }, ...content] }],
+        model,
+        {},
+      )
+      expect(result).toHaveLength(1)
+      expect(result[0].content).toEqual(content)
+    })
+
+    test("does not remove unsigned reasoning for other providers", () => {
+      const content: ModelMessage["content"] = [{ type: "reasoning", text: "Partial thought" }]
+      const result = ProviderTransform.message([{ role: "assistant", content }], anthropicModel, {})
+      expect(result[0].content).toEqual(content)
+    })
+  })
+
   test("does not filter for non-anthropic providers", () => {
     const openaiModel = {
       ...anthropicModel,
@@ -3186,7 +3336,113 @@ describe("ProviderTransform.message - cache control on gateway", () => {
 
 describe("ProviderTransform.temperature - Cohere North", () => {
   test("defaults north-mini-code models to 1.0", () => {
-    expect(ProviderTransform.temperature({ id: "cohere/North-Mini-Code-1-0-latest" } as any)).toBe(1.0)
+    expect(
+      ProviderTransform.temperature({
+        id: "cohere/North-Mini-Code-1-0-latest",
+        api: { id: "North-Mini-Code-1-0-latest" },
+      } as any),
+    ).toBe(1.0)
+  })
+})
+
+describe("ProviderTransform sampling defaults - Qwen", () => {
+  test.each(["Qwen3.8-27B", "qwen3-coder-30b-a3b-instruct"])('leaves sampling unset for "%s"', (id) => {
+    const model = {
+      id: `custom/${id}`,
+      api: { id },
+    } as any
+
+    expect(ProviderTransform.temperature(model)).toBeUndefined()
+    expect(ProviderTransform.topP(model)).toBeUndefined()
+    expect(ProviderTransform.topK(model)).toBeUndefined()
+  })
+})
+
+describe("ProviderTransform sampling defaults - Gemini", () => {
+  const model = (id: string) =>
+    ({
+      id: `google/${id}`,
+      api: { id },
+    }) as any
+
+  const alias = (id: string, apiID: string) =>
+    ({
+      id,
+      api: { id: apiID },
+    }) as any
+
+  test.each([
+    "gemini-3.5-flash-lite",
+    "gemini-3-5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3-6-flash",
+    "gemini-4-pro",
+    "gemini-future",
+  ])("omits deprecated sampling controls for %s", (id) => {
+    expect(ProviderTransform.temperature(model(id))).toBeUndefined()
+    expect(ProviderTransform.topP(model(id))).toBeUndefined()
+    expect(ProviderTransform.topK(model(id))).toBeUndefined()
+  })
+
+  test.each([
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash-lite",
+    "gemini-2-5-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-3-pro-image",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-pro-preview",
+    "gemini-3-1-pro-preview",
+    "gemini-3.5-flash",
+    "gemini-3-5-flash",
+  ])("preserves sampling defaults for %s", (id) => {
+    expect(ProviderTransform.temperature(model(id))).toBe(1)
+    expect(ProviderTransform.topP(model(id))).toBe(0.95)
+    expect(ProviderTransform.topK(model(id))).toBe(64)
+  })
+
+  test("uses the API model ID for configured aliases", () => {
+    const deprecated = alias("google/gemini-3.5-flash", "google/gemini-3.6-flash")
+    expect(ProviderTransform.temperature(deprecated)).toBeUndefined()
+    expect(ProviderTransform.topP(deprecated)).toBeUndefined()
+    expect(ProviderTransform.topK(deprecated)).toBeUndefined()
+
+    const supported = alias("my-gemini", "google/gemini-2.5-flash")
+    expect(ProviderTransform.temperature(supported)).toBe(1)
+    expect(ProviderTransform.topP(supported)).toBe(0.95)
+    expect(ProviderTransform.topK(supported)).toBe(64)
+  })
+})
+
+describe("ProviderTransform sampling defaults - DeepSeek", () => {
+  const model = (providerID: string, id: string) =>
+    ({
+      id: `${providerID}/${id}`,
+      providerID,
+      api: { id },
+    }) as any
+
+  test.each([
+    ["deepseek", "deepseek-v4-flash"],
+    ["opencode", "deepseek-v4-flash"],
+    ["opencode-go", "deepseek-v4-flash"],
+    ["openrouter", "deepseek/deepseek-v4-flash-0731"],
+    ["ollama-cloud", "deepseek-v4-flash:0731"],
+  ])("defaults top_p for %s/%s", (providerID, id) => {
+    expect(ProviderTransform.temperature(model(providerID, id))).toBeUndefined()
+    expect(ProviderTransform.topP(model(providerID, id))).toBe(0.95)
+    expect(ProviderTransform.topK(model(providerID, id))).toBeUndefined()
+  })
+
+  test.each([
+    ["openrouter", "deepseek/deepseek-v4-flash"],
+    ["vercel", "deepseek/deepseek-v4-flash"],
+    ["custom", "deepseek-ai/DeepSeek-V4-Flash"],
+  ])("preserves legacy defaults for %s/%s", (providerID, id) => {
+    expect(ProviderTransform.temperature(model(providerID, id))).toBeUndefined()
+    expect(ProviderTransform.topP(model(providerID, id))).toBeUndefined()
+    expect(ProviderTransform.topK(model(providerID, id))).toBeUndefined()
   })
 })
 
@@ -3257,6 +3513,7 @@ describe("ProviderTransform.reasoningVariants", () => {
     ["@ai-sdk/togetherai", { reasoningEffort: "high" }],
     ["venice-ai-sdk-provider", { reasoningEffort: "high" }],
     ["ai-gateway-provider", { reasoningEffort: "high" }],
+    ["merge-gateway-ai-sdk-provider", { reasoningEffort: "high" }],
     ["@ai-sdk/amazon-bedrock", { reasoningConfig: { type: "enabled", maxReasoningEffort: "high" } }],
   ])("converts effort for %s", (npm, expected, ...args) => {
     const id = args[0] as string | undefined
@@ -5923,6 +6180,25 @@ describe("ProviderTransform.providerOptions - ai-gateway-provider", () => {
     // which @ai-sdk/openai-compatible never reads, silently dropping reasoningEffort.
     const result = ProviderTransform.providerOptions(createModel(), { reasoningEffort: "high" })
     expect(result).toEqual({ openaiCompatible: { reasoningEffort: "high" } })
+  })
+})
+
+describe("ProviderTransform.providerOptions - merge-gateway-ai-sdk-provider", () => {
+  const model = {
+    id: "merge-gateway/openai/gpt-5.6-sol",
+    providerID: "merge-gateway",
+    api: {
+      id: "openai/gpt-5.6-sol",
+      url: "https://api-gateway.merge.dev/v1/ai-sdk",
+      npm: "merge-gateway-ai-sdk-provider",
+    },
+    capabilities: { reasoning: true },
+  } as any
+
+  test("routes normalized effort under the adapter's mergeGateway key", () => {
+    expect(ProviderTransform.providerOptions(model, { reasoningEffort: "high" })).toEqual({
+      mergeGateway: { reasoningEffort: "high" },
+    })
   })
 })
 

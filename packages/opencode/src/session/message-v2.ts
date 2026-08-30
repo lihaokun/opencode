@@ -582,9 +582,9 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
 
 // filterCompacted reorders messages for model consumption
 // ([compaction-user, summary, ...retained tail..., continue-user]), so array
-// position is not chronological. Derive each binding from the persisted
-// creation time and use the ID only as a stable same-millisecond tie-breaker.
-// tasks are compaction/subtask parts attached to user messages newer than the
+// position is not chronological. Derive each binding from persisted creation
+// time and use the ID only as a deterministic same-millisecond tie-breaker.
+// Tasks are compaction/subtask parts attached to user messages newer than the
 // latest finished assistant — i.e. unprocessed work.
 export function latest(msgs: WithParts[]) {
   let user: User | undefined

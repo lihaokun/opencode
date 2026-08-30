@@ -58,12 +58,10 @@ const layer = Layer.effect(
       )
       for (const entry of entries) {
         const file = path.join(TRUNCATION_DIR, entry)
-        const info = yield* fs.stat(file).pipe(Effect.catch(() => Effect.void))
-        const modified = info?.mtime.pipe(
-          Option.map((date) => date.getTime()),
-          Option.getOrElse(() => 0),
-        )
-        if (modified !== undefined && modified < cutoff) yield* fs.remove(file).pipe(Effect.catch(() => Effect.void))
+        const info = yield* fs.stat(file).pipe(Effect.catch(() => Effect.succeed(undefined)))
+        const mtime = info && Option.getOrUndefined(info.mtime)
+        if (!mtime || mtime.getTime() >= cutoff) continue
+        yield* fs.remove(file).pipe(Effect.catch(() => Effect.void))
       }
     })
 
