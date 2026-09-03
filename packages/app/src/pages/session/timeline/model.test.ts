@@ -13,16 +13,19 @@ const assistant = (id: string, created = Number(id.slice(4))) =>
   ({ id, role: "assistant", time: { created } }) as AssistantMessage
 
 describe("timeline model", () => {
-  test("selects users and applies the revert boundary", () => {
-    const messages: Message[] = [user("msg_1"), assistant("msg_2"), user("msg_3"), user("msg_5")]
+  test("selects users and applies an exact timestamp-less revert boundary by array position", () => {
+    const messages: Message[] = [user("msg_z", 100), assistant("msg_a", 150), user("msg_b", 200), user("msg_c", 300)]
     const users = selectUserMessages(messages)
 
-    expect(users.map((message) => message.id)).toEqual(["msg_1", "msg_3", "msg_5"])
-    expect(selectVisibleUserMessages(users, { messageID: "msg_5" }).map((message) => message.id)).toEqual([
-      "msg_1",
-      "msg_3",
-    ])
+    expect(users.map((message) => message.id)).toEqual(["msg_z", "msg_b", "msg_c"])
+    expect(selectVisibleUserMessages(users, { messageID: "msg_b" }).map((message) => message.id)).toEqual(["msg_z"])
     expect(selectVisibleUserMessages(users)).toBe(users)
+  })
+
+  test("falls back to raw IDs when a timestamp-less revert boundary is missing", () => {
+    const users = [user("msg_a", 100), user("msg_c", 200)]
+
+    expect(selectVisibleUserMessages(users, { messageID: "msg_b" }).map((message) => message.id)).toEqual(["msg_a"])
   })
 
   test("applies a persisted revert boundary across the ID rollover", () => {

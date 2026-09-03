@@ -35,9 +35,15 @@ export function selectRevertedMessages<T extends ChronologicalMessage>(
   messages: readonly T[],
   revert: MessageRevertBoundary,
 ) {
-  const reverted = messages.filter((message) => compareMessageToRevert(message, revert) >= 0)
-  if (revert.messageTimeCreated === undefined) return reverted
-  return reverted.toSorted(compareMessageChronology)
+  if (revert.messageTimeCreated === undefined) {
+    const boundary = messages.findIndex((message) => message.id === revert.messageID)
+    if (boundary >= 0) return messages.slice(boundary)
+    return messages.filter((message) => compareMessageToRevert(message, revert) >= 0)
+  }
+
+  return messages
+    .filter((message) => compareMessageToRevert(message, revert) >= 0)
+    .toSorted(compareMessageChronology)
 }
 
 export function latestMessage<T extends ChronologicalMessage>(
@@ -61,6 +67,14 @@ export function earliestMessage<T extends ChronologicalMessage>(
       T | undefined
     >((earliest, message) => (!earliest || compareMessageChronology(message, earliest) < 0 ? message : earliest), undefined)
 }
+
+export function compareMessages(a: Pick<Message, "id" | "time">, b: Pick<Message, "id" | "time">) {
+  const left = messageKey(a)
+  const right = messageKey(b)
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
+export const messageKey = (message: Pick<Message, "id" | "time">) => message.time.created + message.id
 
 function compareID(left: string, right: string) {
   return left < right ? -1 : left > right ? 1 : 0

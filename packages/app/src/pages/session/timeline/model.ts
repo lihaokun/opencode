@@ -110,7 +110,12 @@ export function isTimelineReady(messages: Message[] | undefined, loading: boolea
 
 export function selectVisibleUserMessages(messages: UserMessage[], revert?: MessageRevertBoundary) {
   if (!revert) return messages
-  if (revert.messageTimeCreated === undefined) return messages.filter((message) => message.id < revert.messageID)
+  if (revert.messageTimeCreated !== undefined) {
+    return messages.filter((message) => compareMessageToRevert(message, revert) < 0)
+  }
+
+  const boundary = messages.findIndex((message) => message.id === revert.messageID)
+  if (boundary >= 0) return messages.slice(0, boundary)
   return messages.filter((message) => compareMessageToRevert(message, revert) < 0)
 }
 
@@ -125,8 +130,13 @@ export function selectProjectedMessages<T extends { id: string; time: { created:
   const boundary =
     revert?.messageTimeCreated === undefined ? sessionMessages.find(hidden) : earliestMessage(sessionMessages, hidden)
   if (!boundary) return messages
-  if (revert?.messageTimeCreated === undefined) return messages.filter((message) => message.id < boundary.id)
-  return messages.filter((message) => compareMessageChronology(message, boundary) < 0)
+  if (revert?.messageTimeCreated !== undefined) {
+    return messages.filter((message) => compareMessageChronology(message, boundary) < 0)
+  }
+
+  const index = messages.findIndex((message) => message.id === boundary.id)
+  if (index >= 0) return messages.slice(0, index)
+  return messages.filter((message) => message.id < boundary.id)
 }
 
 export async function loadOlderTimeline(input: {

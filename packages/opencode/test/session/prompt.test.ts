@@ -396,6 +396,17 @@ function partialWithoutFinish(input: { text?: string; reason?: string; usage: Us
   })
 }
 
+function vendorFinish(text: string, reason: string) {
+  const chunk = (delta: Record<string, unknown>, finish?: string) => ({
+    id: "chatcmpl-test",
+    object: "chat.completion.chunk",
+    choices: [{ delta, ...(finish ? { finish_reason: finish } : {}) }],
+  })
+  return raw({
+    chunks: [chunk({ role: "assistant" }), chunk({ content: text }), chunk({}, reason)],
+  })
+}
+
 function toolWithoutFinish(name: string, input: unknown, usage?: Usage) {
   const chunk = (delta: Record<string, unknown>) => ({
     id: "chatcmpl-test",
@@ -589,7 +600,7 @@ noLLMServer.instance(
 )
 
 noLLMServer.instance(
-  "loop exits without a provider request across the message ID rollover",
+  "loop exits without a provider request for a historical rollover transcript with a stale parent",
   () =>
     Effect.gen(function* () {
       const prompt = yield* SessionPrompt.Service
@@ -635,7 +646,7 @@ noLLMServer.instance(
       yield* sessions.updateMessage({
         id: terminalAssistantID,
         role: "assistant",
-        // Production assistants created during the rollover inherited the
+        // Historical assistants created during the rollover inherited the
         // pre-wrap user selected by the old raw-ID latest() implementation.
         parentID: preWrapUserID,
         sessionID: chat.id,
@@ -656,6 +667,46 @@ noLLMServer.instance(
       expect(preWrapAssistantID > terminalAssistantID).toBe(true)
       expect(postWrapUserID).not.toBe(preWrapUserID)
       expect(result.info.id).toBe(terminalAssistantID)
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "loop exits for a completed parent turn with nonmonotonic message IDs",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const userID = MessageID.make("msg_z_user")
+      const assistantID = MessageID.make("msg_a_assistant")
+      yield* sessions.updateMessage({
+        id: userID,
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: 100 },
+      })
+      yield* sessions.updateMessage({
+        id: assistantID,
+        role: "assistant",
+        parentID: userID,
+        sessionID: chat.id,
+        mode: "build",
+        agent: "build",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: 200, completed: 201 },
+        finish: "stop",
+      })
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(result.info.id).toBe(assistantID)
     }),
   { config: cfg },
 )
@@ -1049,6 +1100,35 @@ it.instance("loop keeps only the final partial text after bounded retry exhausti
     expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded partial 1" }))
     expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded partial 2" }))
     expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "final partial answer" }))
+  }),
+  15_000,
+)
+
+it.instance("loop continues an unknown finish that carries no incomplete-stream error", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "vendor finish marker" }],
+    })
+    yield* llm.push(vendorFinish("first turn answer", "vendor_stop"), reply().text("second turn answer").stop())
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(yield* llm.hits).toHaveLength(2)
+    expect(yield* llm.pending).toBe(0)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("stop")
+      expect(result.info.error).toBeUndefined()
+    }
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "second turn answer" }))
   }),
   15_000,
 )
@@ -2348,6 +2428,34 @@ it.instance("loop continues when finish is tool-calls", () =>
       parts: [{ type: "text", text: "hello" }],
     })
     yield* llm.tool("first", { value: "first" })
+    yield* llm.text("second")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    expect(yield* llm.calls).toBe(2)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
+      expect(result.info.finish).toBe("stop")
+    }
+  }),
+)
+
+it.instance("loop continues when finish is unknown", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.push(reply())
     yield* llm.text("second")
 
     const result = yield* prompt.loop({ sessionID: session.id })

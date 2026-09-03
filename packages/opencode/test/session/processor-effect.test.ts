@@ -17,6 +17,7 @@ import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionProcessor } from "../../src/session/processor"
+import { SessionRetry } from "../../src/session/retry"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
@@ -91,6 +92,10 @@ const cfg = {
       },
     },
   },
+}
+
+function advanceRetryClock(attempt: number) {
+  return TestClock.adjust(SessionRetry.delay(attempt, undefined, 1))
 }
 
 function providerCfg(url: string) {
@@ -1743,9 +1748,9 @@ itSettlement.effect("session.processor exhausts clean EOF retries for an empty u
         settlementCalls.set("empty-unknown", 0)
         const resultFiber = yield* runSettlement(dir, "empty-unknown").pipe(Effect.forkChild)
         yield* waitForSettlementAttempt("empty-unknown", 1)
-        yield* TestClock.adjust(2_000)
+        yield* advanceRetryClock(1)
         yield* waitForSettlementAttempt("empty-unknown", 2)
-        yield* TestClock.adjust(4_000)
+        yield* advanceRetryClock(2)
         const result = yield* Fiber.join(resultFiber)
         const expected = {
           name: "UnknownError",
@@ -1778,9 +1783,9 @@ itSettlement.effect("session.processor excludes reasoning and whitespace from us
           settlementCalls.set(scenario, 0)
           const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
           yield* waitForSettlementAttempt(scenario, 1)
-          yield* TestClock.adjust(2_000)
+          yield* advanceRetryClock(1)
           yield* waitForSettlementAttempt(scenario, 2)
-          yield* TestClock.adjust(4_000)
+          yield* advanceRetryClock(2)
           const result = yield* Fiber.join(resultFiber)
           expect(result.result).toBe("stop")
           expect(result.message.finish).toBe("unknown")
@@ -1836,9 +1841,9 @@ itSettlement.effect("session.processor exhausts every clean EOF without a credib
           settlementCalls.set(scenario, 0)
           const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
           yield* waitForSettlementAttempt(scenario, 1)
-          yield* TestClock.adjust(2_000)
+          yield* advanceRetryClock(1)
           yield* waitForSettlementAttempt(scenario, 2)
-          yield* TestClock.adjust(4_000)
+          yield* advanceRetryClock(2)
           const result = yield* Fiber.join(resultFiber)
           const expected = {
             name: "UnknownError",
@@ -1866,9 +1871,9 @@ itSettlement.effect("session.processor preserves no-step priority after clean EO
         settlementCalls.set(scenario, 0)
         const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
         yield* waitForSettlementAttempt(scenario, 1)
-        yield* TestClock.adjust(2_000)
+        yield* advanceRetryClock(1)
         yield* waitForSettlementAttempt(scenario, 2)
-        yield* TestClock.adjust(4_000)
+        yield* advanceRetryClock(2)
         const result = yield* Fiber.join(resultFiber)
 
         expect(result.result).toBe("stop")
@@ -2110,9 +2115,9 @@ itSettlement.effect("session.processor replays only classified provider errors a
         settlementCalls.set("classified-incomplete", 0)
         const classifiedFiber = yield* runSettlement(dir, "classified-incomplete").pipe(Effect.forkChild)
         yield* waitForSettlementAttempt("classified-incomplete", 1)
-        yield* TestClock.adjust(2_000)
+        yield* advanceRetryClock(1)
         yield* waitForSettlementAttempt("classified-incomplete", 2)
-        yield* TestClock.adjust(4_000)
+        yield* advanceRetryClock(2)
         const classified = yield* Fiber.join(classifiedFiber)
         expect(classified.result).toBe("stop")
         expect(classified.message.finish).toBe("unknown")
@@ -2194,7 +2199,7 @@ itSummarySettlement.effect("session.processor retries an explicit incomplete str
           },
         }).pipe(Effect.forkChild)
         yield* waitForSettlementAttempt("explicit-incomplete-success", 1)
-        yield* TestClock.adjust(2_000)
+        yield* advanceRetryClock(1)
         const result = yield* Fiber.join(resultFiber)
         const finalIDs = new Set(result.parts.map((part) => part.id))
 
@@ -2348,9 +2353,9 @@ itSettlement.effect("session.processor stops after two explicit incomplete retri
         settlementCalls.set("explicit-incomplete-exhaustion", 0)
         const resultFiber = yield* runSettlement(dir, "explicit-incomplete-exhaustion").pipe(Effect.forkChild)
         yield* waitForSettlementAttempt("explicit-incomplete-exhaustion", 1)
-        yield* TestClock.adjust(2_000)
+        yield* advanceRetryClock(1)
         yield* waitForSettlementAttempt("explicit-incomplete-exhaustion", 2)
-        yield* TestClock.adjust(4_000)
+        yield* advanceRetryClock(2)
         const result = yield* Fiber.join(resultFiber)
 
         expect(result.result).toBe("stop")
@@ -2384,9 +2389,9 @@ itSettlement.effect("session.processor finalizes retained incomplete output befo
         settlementCalls.set(scenario, 0)
         const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
         yield* waitForSettlementAttempt(scenario, 1)
-        yield* TestClock.adjust(2_000)
+        yield* advanceRetryClock(1)
         yield* waitForSettlementAttempt(scenario, 2)
-        yield* TestClock.adjust(4_000)
+        yield* advanceRetryClock(2)
         const result = yield* Fiber.join(resultFiber)
         const text = result.parts.find((part): part is SessionV1.TextPart => part.type === "text")
 
@@ -2416,9 +2421,9 @@ itSettlement.effect("session.processor keeps one retry ordinal and an independen
         settlementCalls.set("explicit-incomplete-mixed", 0)
         const resultFiber = yield* runSettlement(dir, "explicit-incomplete-mixed").pipe(Effect.forkChild)
         yield* waitForSettlementAttempt("explicit-incomplete-mixed", 1)
-        yield* TestClock.adjust(2_000)
+        yield* advanceRetryClock(1)
         yield* waitForSettlementAttempt("explicit-incomplete-mixed", 3)
-        yield* TestClock.adjust(8_000)
+        yield* advanceRetryClock(3)
         const result = yield* Fiber.join(resultFiber)
 
         expect(result.result).toBe("continue")
@@ -2448,7 +2453,7 @@ itSummarySettlement.effect("session.processor retries an unsettled clean EOF on 
         settlementCalls.set("clean-eof-success", 0)
         const resultFiber = yield* runSettlement(dir, "clean-eof-success").pipe(Effect.forkChild)
         yield* waitForSettlementAttempt("clean-eof-success", 1)
-        yield* TestClock.adjust(2_000)
+        yield* advanceRetryClock(1)
         const result = yield* Fiber.join(resultFiber)
         const finalIDs = new Set(result.parts.map((part) => part.id))
 
@@ -2485,9 +2490,9 @@ itSettlement.effect("session.processor shares one incomplete budget across expli
         settlementCalls.set(scenario, 0)
         const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
         yield* waitForSettlementAttempt(scenario, 1)
-        yield* TestClock.adjust(2_000)
+        yield* advanceRetryClock(1)
         yield* waitForSettlementAttempt(scenario, 2)
-        yield* TestClock.adjust(4_000)
+        yield* advanceRetryClock(2)
         const result = yield* Fiber.join(resultFiber)
 
         expect(result.result).toBe("stop")
@@ -2519,7 +2524,7 @@ itSettlement.effect("session.processor converges removal-aware views while appen
         settlementCalls.set(scenario, 0)
         const resultFiber = yield* runSettlement(dir, scenario).pipe(Effect.forkChild)
         yield* waitForSettlementAttempt(scenario, 1)
-        yield* TestClock.adjust(2_000)
+        yield* advanceRetryClock(1)
         const result = yield* Fiber.join(resultFiber)
         const authoritativeIDs = result.parts.map((part) => part.id).toSorted()
         const removalAwareIDs = result.removalAwareParts.map((part) => part.id).toSorted()
@@ -2885,9 +2890,9 @@ itSummarySettlement.effect("session.processor releases retained summaries before
         settlementCalls.set("classified-incomplete", 0)
         const failedFiber = yield* runSettlement(dir, "classified-incomplete").pipe(Effect.forkChild)
         yield* waitForSettlementAttempt("classified-incomplete", 1)
-        yield* TestClock.adjust(2_000)
+        yield* advanceRetryClock(1)
         yield* waitForSettlementAttempt("classified-incomplete", 2)
-        yield* TestClock.adjust(4_000)
+        yield* advanceRetryClock(2)
         const failed = yield* Fiber.join(failedFiber)
         expect(failed.result).toBe("stop")
         expect(summaryLaunches).toEqual([
@@ -3085,9 +3090,9 @@ itAttemptEvidence.effect("session.processor rolls back ordinary output before bo
         attemptEvidenceAttempts = 0
         const resultFiber = yield* runSettlement(dir, "retry-attempt").pipe(Effect.forkChild)
         yield* waitForAttemptEvidence(2)
-        yield* TestClock.adjust(4_000)
+        yield* advanceRetryClock(2)
         yield* waitForAttemptEvidence(3)
-        yield* TestClock.adjust(8_000)
+        yield* advanceRetryClock(3)
         const result = yield* Fiber.join(resultFiber)
 
         expect(result.result).toBe("stop")
@@ -3767,6 +3772,110 @@ it.live("session.processor effect tests retry recognized structured json errors"
         expect(value).toBe("continue")
         expect(yield* llm.calls).toBe(2)
         expect(parts.some((part) => part.type === "text" && part.text === "after")).toBe(true)
+        expect(handle.message.error).toBeUndefined()
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor effect tests retry OpenAI-compatible midstream server errors", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.push(raw({ chunks: [{ error: { type: "server_error", code: "server_error", message: "xxx" } }] }))
+        yield* llm.text("after")
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry midstream server error")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "retry midstream server error" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(2)
+        expect(parts.some((part) => part.type === "text" && part.text === "after")).toBe(true)
+        expect(handle.message.error).toBeUndefined()
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor effect tests retry network_error finish reasons", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.push(
+          raw({
+            chunks: [
+              {
+                id: "chatcmpl-network-error",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "network_error" }],
+              },
+            ],
+          }),
+        )
+        yield* llm.text("after retry")
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry network error")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "retry network error" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(2)
+        expect(parts.some((part) => part.type === "text" && part.text === "after retry")).toBe(true)
         expect(handle.message.error).toBeUndefined()
       }),
     { config: (url) => providerCfg(url) },

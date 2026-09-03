@@ -1099,7 +1099,11 @@ const layer = Layer.effect(
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
-          if (lastAssistant?.error && MessageV2.compareChronology(lastUser, lastAssistant) < 0) {
+          const lastAssistantBelongsToLatestTurn =
+            lastAssistant !== undefined &&
+            (lastAssistant.parentID === lastUser.id || MessageV2.compareChronology(lastUser, lastAssistant) < 0)
+
+          if (lastAssistant?.error && lastAssistantBelongsToLatestTurn) {
             yield* Effect.logInfo("exiting loop after assistant error", {
               "session.id": sessionID,
               messageID: lastAssistant.id,
@@ -1121,9 +1125,9 @@ const layer = Layer.effect(
 
           if (
             lastAssistant?.finish &&
-            !["tool-calls"].includes(lastAssistant.finish) &&
+            !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
             !hasToolCalls &&
-            MessageV2.compareChronology(lastUser, lastAssistant) < 0
+            lastAssistantBelongsToLatestTurn
           ) {
             const orphan = lastAssistantMsg?.parts.find(
               (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),

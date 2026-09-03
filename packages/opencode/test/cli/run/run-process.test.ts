@@ -301,14 +301,16 @@ describe("opencode run (non-interactive subprocess)", () => {
         const childID = taskPart?.state?.metadata?.sessionId
 
         expect(taskPart?.state?.status).toBe("error")
-        expect(taskPart?.state?.error).toContain("Subagent task failed: UnknownError")
-        expect(taskPart?.state?.error).toContain("Provider stream ended without a terminal finish event")
+        expect(taskPart?.state?.error).toContain('state="error"')
+        expect(taskPart?.state?.error).toContain("<task_error>")
+        expect(taskPart?.state?.error).toContain("UnknownError: Provider stream ended without a terminal finish event")
         for (const reasoning of childReasoning) expect(taskPart?.state?.error).not.toContain(reasoning)
         expect(events.some((event) => event.type === "text" && JSON.stringify(event.part).includes(recovery))).toBe(
           true,
         )
         expect(childID).toEqual(expect.any(String))
         if (!childID) return
+        expect(taskPart?.state?.error).toContain(`Subagent failed (task_id: ${childID}): UnknownError`)
 
         const escapedChildID = childID.replaceAll("'", "''")
         const stored = yield* opencode.spawn([
@@ -403,11 +405,13 @@ describe("opencode run (non-interactive subprocess)", () => {
         const childID = taskPart?.state?.metadata?.sessionId
 
         expect(taskPart?.state?.status).toBe("error")
-        expect(taskPart?.state?.error).toContain("Subagent task failed: UnknownError")
-        expect(taskPart?.state?.error).toContain("Provider stream ended without a terminal finish event")
+        expect(taskPart?.state?.error).toContain('state="error"')
+        expect(taskPart?.state?.error).toContain("<task_error>")
+        expect(taskPart?.state?.error).toContain("UnknownError: Provider stream ended without a terminal finish event")
         expect(events.some((event) => event.type === "text" && bodyIncludes(event, recovery))).toBe(true)
         expect(childID).toEqual(expect.any(String))
         if (!childID) return
+        expect(taskPart?.state?.error).toContain(`Subagent failed (task_id: ${childID}): UnknownError`)
 
         const escapedChildID = childID.replaceAll("'", "''")
         const stored = yield* opencode.spawn([
@@ -690,6 +694,29 @@ describe("opencode run (non-interactive subprocess)", () => {
     TEST_TIMEOUT_MS,
   )
 
+  // The test provider's SSE error item is interpreted by the SDK as an unknown
+  // finish, not a fatal provider/session error. Unknown finishes should continue
+  // the prompt loop so a subsequent response can complete the run.
+  cliIt.concurrent(
+    "unknown stream finish preserves partial output and continues",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        yield* llm.push(
+          reply().text("partial response").tool("bash", {
+            command: "printf tool",
+            description: "Print deterministic output",
+          }),
+        )
+        yield* llm.fail("upstream provider exploded mid-stream")
+        yield* llm.text("recovered")
+        const result = yield* opencode.run("trigger midstream error", { timeoutMs: 30_000 })
+        expect(result.exitCode).toBe(0)
+        expect(result.stdout).toBe("partial response\nrecovered\n")
+        expect(result.stderr).not.toContain("upstream provider exploded mid-stream")
+      }),
+    60_000,
+  )
+
   // --format json puts one JSON object per line on stdout for each emitted
   // event. Consumers (CI scripts, tooling) parse this stream. Asserts the
   // shape so a future event-emit change has to update this expectation.
@@ -838,6 +865,41 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(events.filter((event) => event.type === "error")).toHaveLength(1)
       }),
     TEST_TIMEOUT_MS,
+  )
+
+  cliIt.concurrent(
+    "--format json records an unknown stream finish and continuation",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        yield* llm.push(
+          reply().text("partial json").tool("bash", {
+            command: "printf tool",
+            description: "Print deterministic output",
+          }),
+        )
+        yield* llm.fail("provider failed")
+        yield* llm.text("recovered")
+        const result = yield* opencode.run("fail after output", { format: "json" })
+
+        const events = opencode.parseJsonEvents(result.stdout)
+        expect(result.exitCode).toBe(0)
+        expect(events.map((event) => event.type)).toEqual([
+          "step_start",
+          "text",
+          "tool_use",
+          "step_finish",
+          "step_start",
+          "step_finish",
+          "step_start",
+          "text",
+          "step_finish",
+        ])
+        expect(events[1]?.part).toEqual(expect.objectContaining({ type: "text", text: "partial json" }))
+        expect(events[5]?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
+        expect(events[7]?.part).toEqual(expect.objectContaining({ type: "text", text: "recovered" }))
+        expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "stop" }))
+      }),
+    60_000,
   )
 
   cliIt.concurrent(
