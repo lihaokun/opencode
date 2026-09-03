@@ -396,6 +396,17 @@ function partialWithoutFinish(input: { text?: string; reason?: string; usage: Us
   })
 }
 
+function vendorFinish(text: string, reason: string) {
+  const chunk = (delta: Record<string, unknown>, finish?: string) => ({
+    id: "chatcmpl-test",
+    object: "chat.completion.chunk",
+    choices: [{ delta, ...(finish ? { finish_reason: finish } : {}) }],
+  })
+  return raw({
+    chunks: [chunk({ role: "assistant" }), chunk({ content: text }), chunk({}, reason)],
+  })
+}
+
 function toolWithoutFinish(name: string, input: unknown, usage?: Usage) {
   const chunk = (delta: Record<string, unknown>) => ({
     id: "chatcmpl-test",
@@ -1089,6 +1100,35 @@ it.instance("loop keeps only the final partial text after bounded retry exhausti
     expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded partial 1" }))
     expect(result.parts).not.toContainEqual(expect.objectContaining({ type: "text", text: "discarded partial 2" }))
     expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "final partial answer" }))
+  }),
+  15_000,
+)
+
+it.instance("loop continues an unknown finish that carries no incomplete-stream error", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "vendor finish marker" }],
+    })
+    yield* llm.push(vendorFinish("first turn answer", "vendor_stop"), reply().text("second turn answer").stop())
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(yield* llm.hits).toHaveLength(2)
+    expect(yield* llm.pending).toBe(0)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("stop")
+      expect(result.info.error).toBeUndefined()
+    }
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "second turn answer" }))
   }),
   15_000,
 )
