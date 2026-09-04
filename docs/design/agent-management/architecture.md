@@ -1,6 +1,7 @@
 # 架构设计 — agent-management
 
 - 状态：架构阶段，等待确认
+- 工具表面：四个（调研 §12 已撤销 `agent_get`）
 - 日期：2026-09-04
 - 对应问题：[lihaokun/opencode#23](https://github.com/lihaokun/opencode/issues/23)
 - 上游依据：`docs/research/agent-management-research.md`（调研阶段已确认）
@@ -13,7 +14,7 @@
 | 编号 | 目标 | 调研出处 |
 |---|---|---|
 | G1 | 可靠列出当前 Agent 树及各成员状态 | §1 缺口 1 |
-| G2 | 查询指定 Agent 的身份、关系与状态 | §1 缺口 2 |
+| G2 | 查询指定 Agent 的身份、关系与状态 | §1 缺口 2；由 roster 行承载，不单列工具（调研 §12） |
 | G3 | 同一 Agent 树内任意方向的直接消息 | §1 缺口 3 |
 | G4 | 主动停止不再需要或失控的 Agent，保留上下文 | §1 缺口 4 |
 | G5 | 身份统一为可寻址、可恢复的 Session，消除 `task_id` 的语义错位 | §1 缺口 5 |
@@ -22,7 +23,7 @@
 
 ## 2. 核心流程
 
-五个工具共用一条骨架：**解析目标 → 权限判定 → 执行 → 渲染**。差异只在第三步。
+四个工具共用一条骨架：**解析目标 → 权限判定 → 执行 → 渲染**。差异只在第三步。
 
 ```
 模型
@@ -32,7 +33,6 @@
      └─ 执行：
          agent           → M4 AgentLifecycle.createOrAdopt → M3 AgentInbox.deliver
          agent_list      → M1 AgentTree.tree      + M2 AgentStatusProjection.of
-         agent_get       → M1 AgentTree.locate    + M2 AgentStatusProjection.of
          agent_send      → M3 AgentInbox.deliver
          agent_stop      → M4 AgentLifecycle.stop → 逐层 M3 AgentInbox.deliver
 ```
@@ -79,7 +79,6 @@
   - status: AgentStatus — 见上
   - depth: NonNegativeInt — 相对树根的深度，根为 0
   - time_created: number — Session 创建时间（epoch ms）
-  - time_updated: number — Session 最后一次被写入的时间（epoch ms）
 
 类型不变量：
   - depth == 0 ⟺ parent_id == undefined
@@ -206,7 +205,7 @@
 副作用：无
 ```
 
-**为什么终态取自 assistant 消息而非 `BackgroundJob`**：`BackgroundJob` 是进程内注册表，重启即失。assistant 消息的 `error` / `finish` 是持久化字段。调研 §8 要求"进程重启后持久化的子 Session 仍可列出"，若终态依赖 `BackgroundJob`，重启后 `failed` 与 `cancelled` 会退化成 `idle`，`agent_get` 随之失去意义。代价是 `running` 仍然是进程内真相，见 §7 H1。
+**为什么终态取自 assistant 消息而非 `BackgroundJob`**：`BackgroundJob` 是进程内注册表，重启即失。assistant 消息的 `error` / `finish` 是持久化字段。调研 §8 要求"进程重启后持久化的子 Session 仍可列出"，若终态依赖 `BackgroundJob`，重启后 `failed` 与 `cancelled` 会退化成 `idle`，roster 的状态列随之失去意义。代价是 `running` 仍然是进程内真相，见 §7 H1。
 
 ### 4.3 M3 AgentInbox
 
@@ -277,9 +276,10 @@
   - 调用发生在某个 Session 的工具执行上下文中，调用者 SessionID 可知
 
 后置条件（Ensures）：
-  - 对模型暴露且仅暴露 agent / agent_list / agent_get / agent_send / agent_stop
+  - 对模型暴露且仅暴露 agent / agent_list / agent_send / agent_stop（调研 §12）
+  - 保留隐藏兼容入口 task：不进模型工具列表，收到旧 task_id 时规范化为 session_id 后转发给同一实现，不建立第二条执行路径（调研 §8）
   - 所有工具的目标参数名为 session_id，不出现 task_id / agent_id / run_id
-  - agent_send / agent_stop / agent_get 在目标不属于调用者所在树时失败，不产生副作用
+  - agent_send / agent_stop 在目标不属于调用者所在树时失败，不产生副作用
   - agent_stop 在目标不是调用者后代时失败，不产生副作用
   - 输出为即时快照，不提供 wait / timeout / 轮询
 
@@ -297,7 +297,7 @@
 接口：M5 AgentTools → M1 AgentTree
 
 输入数据：caller: SessionID，target: SessionID | undefined
-输出数据：AgentTreeView（tree）/ AgentInfo（locate）/ boolean（isSameTree、isDescendant）
+输出数据：AgentTreeView（tree）/ boolean（isSameTree、isDescendant）
 
 协议约定：
   - 调用方责任：caller 取自工具执行上下文，不接受模型提供的值
@@ -360,6 +360,8 @@
 | 停止级联到整棵子树 | 与既有停止语义一致，且避免"停了父、子 Agent 变孤儿继续消耗"；是否改为只停目标本身列为 follow-up（issue #26） |
 | `agent_send` 不经 `BackgroundJob.extend` | extend 把新执行挂在上一次执行之后，是 run 边界而非 turn 边界，且排队期间消息不落库 |
 | 权限不对称：send 全向、stop 仅后代 | 见 §4.5 |
+| 不设 `agent_get`，状态并入 roster 每一行 | Claude Code 只有 `ListAgents` 且每行自带 busy/idle，无单 Agent 查询工具；其最接近的 `TaskOutput` 已废弃且按 task_id 寻址、阻塞等待、轮询状态，三者均为调研 §6 排除项。多一个工具只是把同一份信息换个形状再发一次。详见调研 §12 |
+| 保留隐藏的 `task` 兼容入口 | 调研 §8：旧插件、权限配置与显式调用仍需可用，但不进模型工具列表；入口只把 `task_id` 规范化为 `session_id` 后转发同一实现，不维护第二套状态、执行路径或测试基准 |
 | 一个 Agent 任一时刻至多一个活动执行 | 调研 §7 的概念定义（`Execution = Agent 当前的内部执行状态`，单数）。这是 `session_id` 足以作唯一标识的前提：允许并行执行则 `agent_stop(session_id)` 无法指明停哪一个，`run_id` 必然回归，调研 §4.2 的否决随之失效。机制由 I3 维护 |
 | 消息不是 call，不承诺 per-message 结果 | 一个 Agent 处理完当前消息序列后只交付一个最终结果，而非每条消息各配一个。上游 #45480 第 5 项的相反前提（每次调用应有独立结果）已被调研 §10 否决。由此不引入 correlation ID、per-message output 槽或 `run_id`。机制由 I4 维护 |
 
@@ -369,7 +371,8 @@
 
 ```
 G1 「列出 Agent 树及状态」   → M1 AgentTree（主）+ M2 AgentStatusProjection（辅）+ M5（渲染）
-G2 「查询指定 Agent」        → M1（主）+ M2（辅）+ M5（渲染）
+G2 「查询指定 Agent」        → 与 G1 同路径：M1（主）+ M2（辅）+ M5（渲染）；
+                               调用方从 roster 中按 session_id 取行，不单列工具
 G3 「同树任意方向消息」      → M3 AgentInbox（主）+ M1（同树判定）
 G4 「停止并保留上下文」      → M4 AgentLifecycle（主）+ M3（终止通知）+ M1（后代判定）
 G5 「身份统一」              → M5 AgentTools（表面约束）+ M1（身份解析）
