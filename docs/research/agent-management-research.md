@@ -1,6 +1,6 @@
 # Agent 管理能力调研
 
-- 状态：调研阶段已确认（2026-09-04），进入架构阶段
+- 状态：调研阶段已确认（2026-09-04）；2026-09-05 修订工具表面为四个，见 §5 与 §12
 - 日期：2026-08-31
 - 对应问题：[lihaokun/opencode#23](https://github.com/lihaokun/opencode/issues/23)
 - 调研范围：现有 `task`/Subagent 能力及其管理面；不涉及实现
@@ -86,7 +86,6 @@ Agent 间消息和恢复能力后，继续称为 Task 会混淆“执行者”�
 |---|---|
 | `agent` | 创建新 Agent，或用既有 `session_id` 显式恢复 Agent |
 | `agent_list` | 列出同一 Agent 树中的主 Agent 与全部 Subagent |
-| `agent_get` | 查询一个 Agent 的身份、关系和当前状态 |
 | `agent_send` | 向同一 Agent 树中的任意 Agent 发送消息 |
 | `agent_stop` | 停止调用者有权控制的 Agent 当前执行 |
 
@@ -123,7 +122,7 @@ Agent 间消息和恢复能力后，继续称为 Task 会混淆“执行者”�
 - 每次发送都是同一 Session 中的追加消息，不创建新的 Task、run 或独立结果承诺；
 - Agent 处理完当前消息序列后只交付一个最终结果；中间 assistant 消息继续保存在 Session transcript 中；
 - 工具名保持 `agent_send`。`agent_message_send` 信息重复，且不符合其余
-  `agent_list/get/stop` 的 `<资源>_<动作>` 命名。
+  `agent_list/stop` 的 `<资源>_<动作>` 命名。
 
 ### 5.4 `agent_stop`
 
@@ -138,7 +137,7 @@ Agent 间消息和恢复能力后，继续称为 Task 会混淆“执行者”�
 
 ### 5.5 查询与通知
 
-- `agent_list` 返回紧凑 roster，`agent_get` 返回单个 Agent 详情；
+- `agent_list` 返回 roster，每行自带该 Agent 的当前状态；不设独立的单 Agent 查询工具（理由见 §12）；
 - 查询是即时快照，不提供 `wait`、timeout 或轮询模式；
 - 完成、失败、取消均通过现有父 Session 自动通知通道交付；
 - 状态必须区分当前确实在运行与 Session 存在但没有活动执行；准确状态枚举在架构阶段定义。
@@ -179,7 +178,6 @@ Task = 工作描述，不再承担 Agent 身份
 ```text
 agent
 agent_list
-agent_get
 agent_send
 agent_stop
 ```
@@ -210,8 +208,7 @@ Session 仍可列出，随后通过 `agent_send(session_id, message)` 启动新�
 |---|---|---|---|---|
 | 创建 Agent | `agent` | `Agent` | `spawn_agent` | 对齐 |
 | 显式恢复 Agent | `agent(session_id)` | 恢复已有 Agent/Subagent | `followup_task` | 对齐 |
-| 列出 Agent 树 | `agent_list` | Agent panel/team roster | `list_agents` | 对齐 |
-| 查询单个 Agent | `agent_get` | 查看 Agent transcript/status | `list_agents` 提供树和状态 | 本方案提供更直接的单项查询 |
+| 列出 Agent 树及状态 | `agent_list` | `ListAgents`（每行自带 busy/idle） | `list_agents` 提供树和状态 | 对齐；三方均由 roster 承载状态，均无单 Agent 查询工具 |
 | 给运行中 Agent 发消息 | `agent_send` | `SendMessage` | `send_message` | 对齐 |
 | 给 idle Agent 发消息并恢复 | `agent_send` | `SendMessage` 自动恢复 | `followup_task` | 功能覆盖，不额外拆工具 |
 | 父子通信 | 同一 Agent 树内支持 | 支持 | 支持 | 对齐 |
@@ -240,9 +237,9 @@ Codex 官方把消息排队与启动/恢复拆成 `send_message` 和 `followup_t
 
 | 需求簇 | 代表 issue / PR | 本方案对应 | 覆盖结论 |
 |---|---|---|---|
-| 后台 Agent roster 与状态 | [#41914](https://github.com/anomalyco/opencode/issues/41914)、[#37431](https://github.com/anomalyco/opencode/issues/37431)、[#39583](https://github.com/anomalyco/opencode/issues/39583)、[#36989](https://github.com/anomalyco/opencode/issues/36989) | `agent_list`、`agent_get` | 核心能力覆盖；slash command/sidebar 非首版 |
-| 状态、输出与外部控制 API | [#36518](https://github.com/anomalyco/opencode/issues/36518)、[#41377](https://github.com/anomalyco/opencode/issues/41377) | `agent_get`、`agent_stop` | 模型工具核心覆盖；HTTP/SDK 与 optional-lane 专用控制非首版 |
-| 实时进度和最后消息 | [#27898](https://github.com/anomalyco/opencode/issues/27898)、[#42368](https://github.com/anomalyco/opencode/issues/42368) | `agent_get` 即时快照 | 不提供流式预览，也不伪造 last-activity 心跳 |
+| 后台 Agent roster 与状态 | [#41914](https://github.com/anomalyco/opencode/issues/41914)、[#37431](https://github.com/anomalyco/opencode/issues/37431)、[#39583](https://github.com/anomalyco/opencode/issues/39583)、[#36989](https://github.com/anomalyco/opencode/issues/36989) | `agent_list`（roster 自带状态） | 核心能力覆盖；slash command/sidebar 非首版 |
+| 状态、输出与外部控制 API | [#36518](https://github.com/anomalyco/opencode/issues/36518)、[#41377](https://github.com/anomalyco/opencode/issues/41377) | `agent_list`、`agent_stop` | 模型工具核心覆盖；HTTP/SDK 与 optional-lane 专用控制非首版 |
+| 实时进度和最后消息 | [#27898](https://github.com/anomalyco/opencode/issues/27898)、[#42368](https://github.com/anomalyco/opencode/issues/42368) | `agent_list` 即时快照 | 不提供流式预览，也不伪造 last-activity 心跳；最后消息由 session_id 直接读取历史获得 |
 | 给子 Session 发送后续提示 | [#41667](https://github.com/anomalyco/opencode/issues/41667)、[#35728](https://github.com/anomalyco/opencode/issues/35728) | `agent_send` | 核心能力覆盖；专用 composer 非首版 |
 | 运行中 steer/cancel/abort | [#38966](https://github.com/anomalyco/opencode/issues/38966)、[#42670](https://github.com/anomalyco/opencode/issues/42670)、[PR #32425](https://github.com/anomalyco/opencode/pull/32425)、[PR #34947](https://github.com/anomalyco/opencode/pull/34947) | `agent_send`、`agent_stop` | steering 与停止覆盖；不拆 soft-cancel/hard-abort 三套公开工具 |
 | 取消后台 Subagent | [#36423](https://github.com/anomalyco/opencode/issues/36423) | `agent_stop` | 覆盖 |
@@ -250,7 +247,7 @@ Codex 官方把消息排队与启动/恢复拆成 `send_message` 和 `followup_t
 | 兄弟 Agent 通信 | [#38964](https://github.com/anomalyco/opencode/issues/38964) | 同树任意方向的 `agent_send` | 覆盖 |
 | 不同根 Session 通信 | [#38965](https://github.com/anomalyco/opencode/issues/38965) | 无 | 明确非目标 |
 | Agent Teams 与命名消息 | [#12711](https://github.com/anomalyco/opencode/issues/12711)、[PR #12730](https://github.com/anomalyco/opencode/pull/12730) | 稳定 SessionID、Agent 树、消息 | 核心寻址和通信覆盖；共享 Task List、多模型团队和团队 TUI 非首版 |
-| Persistent daemon push/pull | [#23775](https://github.com/anomalyco/opencode/issues/23775) | `agent_get`/`agent_send` 可表达 pull/push | 不提供常驻 daemon、工作区监听或崩溃恢复 |
+| Persistent daemon push/pull | [#23775](https://github.com/anomalyco/opencode/issues/23775) | `agent_list`/`agent_send` 可表达 pull/push | 不提供常驻 daemon、工作区监听或崩溃恢复 |
 | 既有后台管理实现提议 | [PR #15994](https://github.com/anomalyco/opencode/pull/15994)、[PR #40923](https://github.com/anomalyco/opencode/pull/40923)、[PR #34281](https://github.com/anomalyco/opencode/pull/34281) | 作为实现调研输入 | 不直接照搬额外 `task_status`/`agents_status` 工具 |
 | Task 生命周期与取消正确性 | [#45480](https://github.com/anomalyco/opencode/issues/45480)、[PR #45482](https://github.com/anomalyco/opencode/pull/45482) | 管理面可以观察和停止 Agent | 只采纳通知、状态、停止和孤儿清理风险；不采纳“每条追加消息应有独立结果”的前提 |
 | 完成通知与孤儿清理 | [#35066](https://github.com/anomalyco/opencode/issues/35066)、[#42286](https://github.com/anomalyco/opencode/issues/42286)、[#37314](https://github.com/anomalyco/opencode/issues/37314) | 自动通知、`agent_stop` 依赖底层正确性 | 属于实现前置与独立 bug，不增加公开工具 |
@@ -274,10 +271,45 @@ per-message output slot、correlation ID 或公开 `run_id`。
 ```text
 agent
 agent_list
-agent_get
 agent_send
 agent_stop
 ```
 
 `task` 仅作为不向模型展示的兼容入口；Claude Code 是产品语义基线，Codex 用于验证能力完整性；OpenCode
 上游提议矩阵用于确认覆盖与非目标边界，不用于扩张首版范围。
+
+## 12. 修订：工具表面由五个收敛为四个（2026-09-05）
+
+初版推荐 `agent` / `agent_list` / `agent_get` / `agent_send` / `agent_stop` 五个工具。架构阶段核对 Claude Code
+实际工具集时发现 §9 对照表的「查询单个 Agent」一行不准确，据此撤销 `agent_get`。
+
+### 事实修正
+
+Claude Code 的 Agent 管理面实际只有四个模型可调用工具：`Agent`、`ListAgents`、`SendMessage`、`TaskStop`。
+不存在"查询单个 Agent"的工具。
+
+- §9 原先在该行的 Claude Code 列写的是「查看 Agent transcript/status」。那是**用户界面能力**——人可以打开某个
+  Agent 的 transcript 查看——不是模型可调用的工具。填在工具对照列会读成 Claude Code 有对应工具。
+- `ListAgents` 的每一行自带该 Agent 当前是 busy 还是 idle。**状态由 roster 承载，因此不需要第二个查询工具。**
+- 最接近单项查询的 `TaskOutput` 已被 Claude Code 标记 DEPRECATED，替代方式是结果随工具返回值和完成通知
+  自动送达。它按 `task_id` 寻址、`block=true` 阻塞等待、`block=false` 轮询状态——正是 §6 已排除的三样东西。
+
+### 结论
+
+`agent_get` 是 Claude Code 和 Codex 都没有的新增工具，而它要解决的需求（知道某个 Agent 现在是什么状态）
+本就应当由 roster 承载。多一个工具只是把同一份信息换个形状再发一次。
+
+首版规范表面因此为四个：
+
+```text
+agent
+agent_list
+agent_send
+agent_stop
+```
+
+- 原 §1 缺口 2「无法查询一个指定 Agent」仍然成立，由 `agent_list` 的 roster 行满足，不再单列工具；
+- §5.5 的「状态必须区分当前确实在运行与 Session 存在但没有活动执行」不变，落在 roster 的每一行上；
+- 「最后消息」一类需求由调用方拿 `session_id` 直接读 Session 历史获得，不为此新增工具，也不提供流式预览。
+
+本次修订只删工具、不加工具，其余章节的身份模型、消息语义、停止语义与非目标边界均不受影响。
