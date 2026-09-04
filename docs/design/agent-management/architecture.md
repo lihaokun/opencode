@@ -53,17 +53,18 @@
 数据结构：AgentStatus
 
 字段：
-  - value: "running" | "idle" | "failed" | "cancelled" — Agent 当前的对外状态
+  - value: "running" | "idle" — Agent 此刻是否有活动执行
 
 类型不变量：
-  - 取值封闭于上述四个字面量，不引入 "stopped"（调研 §5.4 已定：终态统一用 cancelled）
-  - running 与其余三值互斥：running 表示"此刻确有活动执行"，其余三值均表示"无活动执行"
+  - 取值封闭于上述两个字面量
+  - 二者互斥且穷尽
 
 语义：
   - running    进程内存在该 Session 的活动执行（SessionStatus 为 busy 或 retry）
-  - idle       无活动执行，且最近一次执行正常结束，或该 Session 从未执行过
-  - failed     无活动执行，且最近一次执行以错误结束
-  - cancelled  无活动执行，且最近一次执行被停止
+  - idle       无活动执行
+
+不表达终态：执行的结局（完成 / 失败 / 取消）不进入本枚举，由既有父 Session 自动通知通道
+  交付（调研 §5.5）。roster 只回答"此刻还在跑吗"，不重复通知已经送达过的结论。
 
 跨模块共享性：跨模块共享 — consumer: M2 AgentStatusProjection（产出）、M5 AgentTools（渲染）
 ```
@@ -192,11 +193,7 @@
 
 后置条件（Ensures）：
   - SessionStatus.get(id).type ∈ {busy, retry} ⇒ 结果为 running
-  - 否则取该 Session 最后一条 assistant 消息 m：
-      m 不存在                              ⇒ idle
-      m.error.name == "MessageAbortedError" ⇒ cancelled
-      m.error 存在（其余任何 name）          ⇒ failed
-      以上皆否                              ⇒ idle
+  - 否则 ⇒ 结果为 idle
   - 结果为即时快照，不提供 wait / timeout / 轮询（调研 §5.5）
 
 不变式（Invariants）：
@@ -205,7 +202,7 @@
 副作用：无
 ```
 
-**为什么终态取自 assistant 消息而非 `BackgroundJob`**：`BackgroundJob` 是进程内注册表，重启即失。assistant 消息的 `error` / `finish` 是持久化字段。调研 §8 要求"进程重启后持久化的子 Session 仍可列出"，若终态依赖 `BackgroundJob`，重启后 `failed` 与 `cancelled` 会退化成 `idle`，roster 的状态列随之失去意义。代价是 `running` 仍然是进程内真相，见 §7 H1。
+**为什么状态只有两值**：调研 §5.5 只要求区分"当前确实在运行"与"Session 存在但没有活动执行"，这正好是两个值。执行的结局早已通过既有通知通道送达等待方，roster 再复述一遍是冗余；Claude Code 的 `ListAgents` 同样只给 busy / idle。由此本模块不读 `BackgroundJob`，也不从消息历史反推终态，投影只有一个来源。
 
 ### 4.3 M3 AgentInbox
 
@@ -356,7 +353,8 @@
 | 状态终态取自 assistant 消息，不取自 `BackgroundJob` | 后者是进程内注册表，重启即失；见 §4.2 |
 | 消息身份取自目标 Session | 否则一条消息会改写目标的 agent 与模型并落库；见 §4.3 |
 | 停止自底向上并逐层等待通知交付 | 否则子 Agent 的终止通知会复活刚被停掉的父 Agent；见 §4.4 |
-| 终止通知复用完成 / 失败通道，不新增状态词 | 调研 §5.4：终态、通知状态与输出字段统一用 `cancelled`，不引入 `stopped` |
+| 终止通知复用完成 / 失败通道，不新增状态词 | 调研 §5.4：通知状态与输出字段统一用 `cancelled`，不引入 `stopped` |
+| `AgentStatus` 只有 running / idle 两值 | 调研 §5.5 只要求区分在跑与不在跑；结局由通知通道交付，roster 不复述。与 Claude Code `ListAgents` 的 busy / idle 一致。副产物：状态投影只读 `SessionStatus`，无需第二个来源 |
 | 停止级联到整棵子树 | 与既有停止语义一致，且避免"停了父、子 Agent 变孤儿继续消耗"；是否改为只停目标本身列为 follow-up（issue #26） |
 | `agent_send` 不经 `BackgroundJob.extend` | extend 把新执行挂在上一次执行之后，是 run 边界而非 turn 边界，且排队期间消息不落库 |
 | 权限不对称：send 全向、stop 仅后代 | 见 §4.5 |
@@ -395,9 +393,10 @@ G5 「身份统一」              → M5 AgentTools（表面约束）+ M1（身
 
 ```
 H1: running 是进程内真相。SessionStatus 存于 InstanceState，进程重启后清空。
-    因此崩溃前正在执行的 Agent 重启后投影为 idle（若其最后一条 assistant 消息无 error）。
+    因此崩溃前正在执行的 Agent 重启后一律投影为 idle。
     — 来源：既有基础设施；调研 §6「不包含进程崩溃后的自动继续执行」，本架构不提供崩溃恢复，
-      故不修复该退化
+      故不修复该退化。重启后进程内所有执行本就已经终止，idle 与事实一致，
+      失真的只是"它当初是怎么结束的"，而那条信息在结束时已由通知通道送达过
 
 H2: Session 的 parentID 链无环且深度有限。
     — 来源：子 Session 只在创建时绑定 parentID 且此后不变；深度另有上限约束
