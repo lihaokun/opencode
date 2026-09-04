@@ -19,7 +19,7 @@
 | G4 | 主动停止不再需要或失控的 Agent，保留上下文 | §1 缺口 4 |
 | G5 | 身份统一为可寻址、可恢复的 Session，消除 `task_id` 的语义错位 | §1 缺口 5 |
 
-非目标沿用调研 §6，不在此重复。本文档额外承担调研明确甩给架构阶段的三笔欠账：状态枚举（§4.1）、停止级联与终止通知契约（§5.4 / §6.4）、消息交付顺序（§5.3 / §6.3）。
+非目标沿用调研 §6，不在此重复。本文档额外承担调研甩给架构阶段的四笔欠账：工具 schema（本文档 §4.6）、状态枚举（本文档 §3 `AgentStatus`）、停止级联与终止通知契约（本文档 §4.4，对应调研 §5.4）、消息交付顺序（本文档 §4.3，对应调研 §5.3）。
 
 ## 2. 核心流程
 
@@ -43,7 +43,7 @@
 
 **停止（G4）**：`agent_stop` 先由 M1 解出目标子树并按深度分层，然后**自底向上**逐层：取消该层 → 等待该层的终止通知交付到各自父 Agent → 再取消上一层。目标本身最后取消，它的终止通知交给树外的父 Agent。
 
-**状态投影（G1/G2）**：进程内活动执行以 `SessionStatus` 为准；无活动执行时，从 Session 最后一条 assistant 消息的持久化字段推导终态。这样进程重启后仍能区分"正常结束"与"失败/被停止"。
+**状态投影（G1/G2）**：只读 `SessionStatus`——busy 或 retry 即 `running`，否则 `idle`。roster 不表达执行结局，结局由既有通知通道在结束时送达等待方。
 
 ## 3. 核心数据结构
 
@@ -138,6 +138,34 @@
 ```
 
 ```
+数据结构：Accepted
+
+字段：
+  - target: SessionID — 消息已被写入的目标 Agent
+
+类型不变量：
+  - 该值存在 ⇒ 对应 AgentMessage 已持久化进 target 的 Session（见 §7 I2）
+  - 不携带目标的执行结果，也不表示目标已开始或已完成处理
+
+跨模块共享性：跨模块共享 — consumer: M3 AgentInbox（产出）、M4 AgentLifecycle（依赖它排序）、M5 AgentTools（渲染）
+```
+
+```
+数据结构：StopOutcome
+
+字段：
+  - stopped: SessionID[] — 本次停止实际处理的成员，按 StopPlan.layers 的处理顺序排列
+  - notified: SessionID[] — 收到终止通知的父 Agent；停止集内的父不在其中
+  - failed: { session_id: SessionID, reason: string }[] — 未能完成停止的成员及原因
+
+类型不变量：
+  - stopped ∪ failed.map(session_id) = ⋃ StopPlan.layers
+  - failed 非空 ⇒ M5 必须把它显式呈现给调用方，不得静默丢弃（见 §5 M5→M4 接口协议）
+
+跨模块共享性：跨模块共享 — consumer: M4 AgentLifecycle（产出）、M5 AgentTools（渲染）
+```
+
+```
 数据结构：StopPlan
 
 字段：
@@ -186,7 +214,7 @@
 ```
 模块名称：AgentStatusProjection
 
-功能描述：把进程内执行状态与 Session 的持久化终态合成为对外的 AgentStatus。
+功能描述：把进程内执行状态投影为对外的 AgentStatus。
 
 前置条件（Requires）：
   - 入参 session_id 对应的 Session 存在
@@ -267,7 +295,7 @@
 ```
 模块名称：AgentTools
 
-功能描述：五个模型可调用工具的参数 schema、权限门与输出渲染；本 feature 唯一对模型暴露的表面。
+功能描述：四个模型可调用工具的参数 schema（见 §4.6）、权限门与输出渲染；本 feature 唯一对模型暴露的表面。
 
 前置条件（Requires）：
   - 调用发生在某个 Session 的工具执行上下文中，调用者 SessionID 可知
@@ -288,6 +316,40 @@
 
 **权限的不对称**：`agent_send` 允许同树内任意方向（子→父、兄弟之间均可），`agent_stop` 只允许停后代。理由是两者的破坏性不同——投递一条消息由接收方自行决定如何处理，接收方保有主动权；停止则单方面中断对方的执行，允许子 Agent 停止父 Agent 会让编排失去可预测的控制方向。
 
+### 4.6 工具 schema
+
+调研 §7 要求架构阶段定义工具 schema。四个工具的参数如下；所有目标参数一律名为 `session_id`。
+
+```
+工具：agent
+  description:    string    — 3-5 词的任务简述，用于 roster 与 UI
+  prompt:         string    — 交给该 Agent 的任务正文
+  subagent_type:  string    — agent 定义名；创建时必填，恢复时忽略
+  session_id?:    string    — 给出即恢复该 Agent，不创建新的
+  background?:    boolean   — 异步启动，立即返回；结局经通知通道送达
+返回：AgentInfo
+
+工具：agent_list
+  （无参数；范围恒为调用者所在的 Agent 树）
+返回：AgentTreeView.members，每行含 status
+
+工具：agent_send
+  session_id:     string    — 目标，须与调用者同树
+  message:        string    — 正文；系统前缀由 M3 添加，调用方不可覆盖
+返回：Accepted
+
+工具：agent_stop
+  session_id:     string    — 目标，须为调用者的后代
+返回：StopOutcome
+```
+
+**待定：`agent(session_id, prompt)` 与 `agent_send(session_id, message)` 的边界。**
+两者都是"向既有 Agent 追加一条 user message 并使其运行"，机制完全相同，差别只在意图表述。
+调研 §9 把二者分列（对应 Codex 的 `followup_task` 与 `send_message`），但同一节又写明
+「本方案选择 Claude Code 的产品语义，由一个 `agent_send` 覆盖两种目标状态」。
+若确认二者机制同一，`agent` 的 `session_id` 参数可以去掉，恢复统一由 `agent_send` 承担，
+表面进一步收敛为三个工具。此项需在架构确认时裁定，不由细化阶段自行决定。
+
 ## 5. 模块间接口规约
 
 ```
@@ -304,7 +366,7 @@
 ```
 接口：M5 AgentTools → M2 AgentStatusProjection
 
-输入数据：AgentInfo（不含 status）
+输入数据：session_id: SessionID
 输出数据：AgentStatus
 
 协议约定：
@@ -350,7 +412,6 @@
 | 决策 | 理由 |
 |---|---|
 | 唯一公开标识用 `session_id` | 调研 §4.2 已否决 `run_id`；Agent 的上下文、历史、父子关系本就存在 Session 上，再引入并行身份只增加误用面 |
-| 状态终态取自 assistant 消息，不取自 `BackgroundJob` | 后者是进程内注册表，重启即失；见 §4.2 |
 | 消息身份取自目标 Session | 否则一条消息会改写目标的 agent 与模型并落库；见 §4.3 |
 | 停止自底向上并逐层等待通知交付 | 否则子 Agent 的终止通知会复活刚被停掉的父 Agent；见 §4.4 |
 | 终止通知复用完成 / 失败通道，不新增状态词 | 调研 §5.4：通知状态与输出字段统一用 `cancelled`，不引入 `stopped` |
@@ -378,9 +439,9 @@ G5 「身份统一」              → M5 AgentTools（表面约束）+ M1（身
 
 ### 模块协作论证
 
-**G1/G2**：G1 要求"可靠列出树与状态"。M1 的后置条件保证 AgentTreeView 自封闭且有稳定序，即树本身完整；M2 的后置条件保证每个成员得到四值之一且语义互斥。二者拼接即"完整成员集合 × 明确状态"，故 G1 成立。G2 是 G1 在单成员上的投影，同理成立。
+**G1/G2**：G1 要求"可靠列出树与状态"。M1 的后置条件保证 AgentTreeView 自封闭且有稳定序，即树本身完整；M2 的后置条件保证每个成员得到 running / idle 之一且二者互斥穷尽。二者拼接即"完整成员集合 × 明确状态"，故 G1 成立。G2 是 G1 在单成员上的投影，同理成立。
 
-**G3**：G3 要求"同树任意方向的消息能被目标处理"。M1 的 `isSameTree` 保证方向合法性判定完备；M3 的后置条件分两种目标状态给出了处理保证——running 时进入当前 run 的下一个 provider turn，非 running 时起新 run 消费。两种状态覆盖了 AgentStatus 的全部取值（running 与其余三值互斥且穷尽），故任意目标状态下消息都会被处理，G3 成立。
+**G3**：G3 要求"同树任意方向的消息能被目标处理"。M1 的 `isSameTree` 保证方向合法性判定完备；M3 的后置条件分两种目标状态给出了处理保证——running 时进入当前 run 的下一个 provider turn，非 running 时起新 run 消费。两种状态覆盖了 AgentStatus 的全部取值（running 与 idle 互斥且穷尽），故任意目标状态下消息都会被处理，G3 成立。
 
 **G4**：G4 要求"停止且保留上下文，且等待方不被静默挂起"。M4 的后置条件给出前半部分（终止执行、不删除任何 Session 与历史、可恢复、幂等）。后半部分由 I1 保证：每个被停 Agent 的父都会收到终止通知，除非该父自己也在停止集内——那种情况下它同样被停止，不存在"仍在等待"的主体。故不存在被静默挂起的等待方，G4 成立。
 
