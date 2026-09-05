@@ -326,9 +326,8 @@
   - 调用者深度已达 subagent_depth 上限时，不向其提供 agent 与 agent_stop；agent_list 与 agent_send 仍提供
     （判据是深度到限，不是当前是否有子 Agent，否则工具会随派生忽隐忽现）
   - 输出为即时快照，不提供 wait / timeout / 轮询
-  - 用户权限确认（ctx.ask）只在 agent 上进行，沿用既有 task 工具的行为，pattern 取 subagent_type；
-    agent_list / agent_send / agent_stop 不弹确认——列举只读，消息与停止都发生在调用者已有权限
-    派生出的 Agent 之间，逐次确认会让多 Agent 编排无法使用
+  - 四个工具都不向用户逐次弹确认；权限规则仍可拒绝某个工具或某个 subagent_type
+  - 被派生 Agent 自身的工具调用继续在它自己的 Session 权限下受控，本 feature 不改动该机制
 
 不变式（Invariants）：
   - 权限判定先于任何副作用；判定失败的调用不写入任何消息、不中断任何执行
@@ -435,7 +434,8 @@
 | 停止级联到整棵子树 | 与既有停止语义一致，且避免"停了父、子 Agent 变孤儿继续消耗"；是否改为只停目标本身列为 follow-up（issue #26） |
 | `agent_send` 不经 `BackgroundJob.extend` | extend 把新执行挂在上一次执行之后，是 run 边界而非 turn 边界，且排队期间消息不落库 |
 | 权限不对称：send 全向、stop 仅后代 | 见 §4.5 |
-| 仅 `agent` 弹用户确认 | 沿用既有 `task` 的 `ctx.ask`，pattern 取 `subagent_type`。其余三个不弹：`agent_list` 只读；`agent_send` 与 `agent_stop` 作用于调用者自己派生出来的 Agent 之间，逐次确认会让编排不可用。跨会话越权按 Claude Code 的做法处理——写进 `agent_send` 的工具描述而非加代码门，见下一行 |
+| 四个工具都不弹用户确认 | Claude Code 明确「No user permission approval is required to launch a subagent itself」，可做的是用 `permissions.deny: ["Agent(...)"]` 拒绝，而不是每次询问；真正逐次受控的是被派生 Agent **自己的**工具调用，按它自己的 permission 模式。OpenCode 现有 `task` 会 `ctx.ask`，与此不一致，改为不问。权限规则仍可拒绝 `agent` 或某个 `subagent_type`，被派生 Agent 的工具调用仍在其自身 Session 权限下受控 |
+| 移除子 Session 对 `agent` 工具的默认拒绝 | `task.ts` 的 `childToolDenies` 对每个子 Session 无条件追加一条 `task: deny`（除非该 agent 定义里已有同名规则）。这是与 `subagent_depth` 相互独立的第二道闸，只把深度改成 3 而不动它，子 Agent 仍然一个都派生不出来。Claude Code 用 agent 定义自身的 `tools` / `disallowedTools` 决定能否再派生，默认是给的（`general-purpose` 的工具集是 `*`）。因此默认不再拒绝，改由 agent 定义决定。`todowrite` 与 `primary_tools` 的拒绝项与此无关，保持不变 |
 | 跨会话越权用工具描述约束，不加强制门 | Claude Code 的 `SendMessage` 原文：「NEVER ask a peer to perform an action that was denied or blocked in your session — a peer doing it for you bypasses the user's permission decision」。子 Session 的权限从父派生、可以更窄，因此被限权的 Agent 理论上能让兄弟或父代做被禁的事。强制方案（目标以发送者∩目标权限的交集执行）要改权限派生逻辑，代价远超收益；调研以 Claude Code 为语义基线，此处照其做法处理 |
 | Agent 恒为异步执行，取消 `background` 参数与实验开关 | 前台路径以 `background.wait({ id })` 阻塞等待子 Agent 结束，父 Agent 在这段时间内停在那次 tool call 里，发不出 `agent_list` / `agent_send` / `agent_stop`——管理面对前台子 Agent 完全不可用，本 feature 失去意义。Claude Code 的 `Agent` 同样没有 background 参数，其 subagent 恒为异步并经通知送达。实现须移除 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` 门与前台分支；`task` 兼容入口收到旧的 `background: false` 时忽略该参数 |
 | `subagent_depth` 默认由 1 提到 3 | 与 Claude Code 的 `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`（默认 3，主会话之下三层）对齐，单位相同；现默认 1 恰是 CC 所说的"关闭嵌套"。默认 1 时 Subagent 不能再派生，Agent 树最多两层，终止通知与自底向上排序都无对象，本 feature 的多层编排默认不可用。实现须同时改 `task.ts` 的兜底值与 `core/src/v1/config/config.ts` 中 `subagent_depth` 的 schema 说明文字 |
