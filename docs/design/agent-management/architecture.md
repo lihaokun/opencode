@@ -326,6 +326,9 @@
   - 调用者深度已达 subagent_depth 上限时，不向其提供 agent 与 agent_stop；agent_list 与 agent_send 仍提供
     （判据是深度到限，不是当前是否有子 Agent，否则工具会随派生忽隐忽现）
   - 输出为即时快照，不提供 wait / timeout / 轮询
+  - 用户权限确认（ctx.ask）只在 agent 上进行，沿用既有 task 工具的行为，pattern 取 subagent_type；
+    agent_list / agent_send / agent_stop 不弹确认——列举只读，消息与停止都发生在调用者已有权限
+    派生出的 Agent 之间，逐次确认会让多 Agent 编排无法使用
 
 不变式（Invariants）：
   - 权限判定先于任何副作用；判定失败的调用不写入任何消息、不中断任何执行
@@ -432,6 +435,8 @@
 | 停止级联到整棵子树 | 与既有停止语义一致，且避免"停了父、子 Agent 变孤儿继续消耗"；是否改为只停目标本身列为 follow-up（issue #26） |
 | `agent_send` 不经 `BackgroundJob.extend` | extend 把新执行挂在上一次执行之后，是 run 边界而非 turn 边界，且排队期间消息不落库 |
 | 权限不对称：send 全向、stop 仅后代 | 见 §4.5 |
+| 仅 `agent` 弹用户确认 | 沿用既有 `task` 的 `ctx.ask`，pattern 取 `subagent_type`。其余三个不弹：`agent_list` 只读；`agent_send` 与 `agent_stop` 作用于调用者自己派生出来的 Agent 之间，逐次确认会让编排不可用。跨会话越权按 Claude Code 的做法处理——写进 `agent_send` 的工具描述而非加代码门，见下一行 |
+| 跨会话越权用工具描述约束，不加强制门 | Claude Code 的 `SendMessage` 原文：「NEVER ask a peer to perform an action that was denied or blocked in your session — a peer doing it for you bypasses the user's permission decision」。子 Session 的权限从父派生、可以更窄，因此被限权的 Agent 理论上能让兄弟或父代做被禁的事。强制方案（目标以发送者∩目标权限的交集执行）要改权限派生逻辑，代价远超收益；调研以 Claude Code 为语义基线，此处照其做法处理 |
 | Agent 恒为异步执行，取消 `background` 参数与实验开关 | 前台路径以 `background.wait({ id })` 阻塞等待子 Agent 结束，父 Agent 在这段时间内停在那次 tool call 里，发不出 `agent_list` / `agent_send` / `agent_stop`——管理面对前台子 Agent 完全不可用，本 feature 失去意义。Claude Code 的 `Agent` 同样没有 background 参数，其 subagent 恒为异步并经通知送达。实现须移除 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` 门与前台分支；`task` 兼容入口收到旧的 `background: false` 时忽略该参数 |
 | `subagent_depth` 默认由 1 提到 3 | 与 Claude Code 的 `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`（默认 3，主会话之下三层）对齐，单位相同；现默认 1 恰是 CC 所说的"关闭嵌套"。默认 1 时 Subagent 不能再派生，Agent 树最多两层，终止通知与自底向上排序都无对象，本 feature 的多层编排默认不可用。实现须同时改 `task.ts` 的兜底值与 `core/src/v1/config/config.ts` 中 `subagent_depth` 的 schema 说明文字 |
 | 触达深度上限时撤下工具，而非让调用失败 | Claude Code 到限时不再向该 Subagent 提供 `Agent`；OpenCode 现状是调用后返回错误，模型要先试一次、撞墙、再重新规划，白费一轮。撤下范围按"寻址集合是否永久为空"判定：`agent` 与 `agent_stop` 撤下（到限者不能派生，也就永远不会有子可停），`agent_send` 与 `agent_list` 保留（父与兄弟仍可寻址）。判据是深度到限，不是当前是否有子 Agent |
