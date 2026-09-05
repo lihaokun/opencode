@@ -518,6 +518,9 @@ transcript 留下记录，且它此刻在运行），对级联中间层而言是
 | 唯一公开标识用 `session_id` | 调研 §4.2 已否决 `run_id`；Agent 的上下文、历史、父子关系本就存在 Session 上，再引入并行身份只增加误用面 |
 | 消息身份取自目标 Session | 否则一条消息会改写目标的 agent 与模型并落库；见 §4.3 |
 | 停止自底向上并逐层等待通知交付 | 否则子 Agent 的终止通知会复活刚被停掉的父 Agent；见 §4.4 |
+| 新增 M6 AgentExecution，作为唯一的执行注册者与结局通知生产者 | 既有自动通知只存在于 `tool/task.ts` 的闭包里（`notify` / `inject`），不是 `SessionPrompt` 或 `BackgroundJob` 自带的全局行为。首轮设计把它当成免费的既成事实，创建与 idle 恢复两条路径因此都没有结局交付者。独立成模块还解决了依赖成环：M3 需要它起执行、M4 需要它取消，若把职责塞进 M4 则 M3→M4、M4→M3 互相依赖 |
+| 结局判定照既有执行体六条分支逐条复制 | `runTask` 的分类（非 assistant ／ abort ／ error 或 length ／ tool part 失败 ／ incomplete ／ 最后一条 text）决定通知的**内容**。首轮设计只写了通道不写内容，等于没定义 Agent 的最终结果是什么。见 §3 `ExecutionOutcome` |
+| `StopOutcome` 区分 transitioned 与 unchanged | `SessionRunState.cancel` 对 idle 目标是成功空操作。若把所有未抛异常者都算作已停止并发通知，重复 stop 会重复发通知（违反幂等），本就 idle 的成员也会收到取消通知（不真实） |
 | 终止通知复用完成 / 失败通道，不新增状态词 | 调研 §5.4：通知状态与输出字段统一用 `cancelled`，不引入 `stopped` |
 | `AgentStatus` 只有 running / idle 两值 | 调研 §5.5 只要求区分在跑与不在跑；结局由通知通道交付，roster 不复述。与 Claude Code `ListAgents` 的 busy / idle 一致。副产物：状态投影只读 `SessionStatus`，无需第二个来源 |
 | 停止级联到整棵子树 | 与既有停止语义一致，且避免"停了父、子 Agent 变孤儿继续消耗"；是否改为只停目标本身列为 follow-up（issue #26） |
@@ -632,19 +635,23 @@ I5: 结局通知单一生产者
 
 共享资源：
   - Session 运行状态注册表：SessionID → 活动执行句柄
-  - 后台执行注册表：SessionID → 执行记录（进程内）
-  - 目标子树各 Session 的消息历史（持久化）
+  - 后台执行注册表：SessionID → 执行记录（进程内），job id 即 SessionID
+  - 各成员父 Session 的消息历史（持久化）——取消通知写入处
 
 顺序约束（Ordering Constraints）：
-  - deliver(a 的终止通知) must happen-before cancel(parent(a))，当 parent(a) ∉ 停止集
+  - 对实际发生转变的 a：persist(a 的取消通知) must happen-before cancel(parent(a))，
+    当 parent(a) ∈ 停止集（父不在停止集时它恒为发起者，不会被取消，无约束对象）
   - cancel(layers[i]) must happen-before cancel(layers[i+1])
   - 同一层内的取消可并发，层与层之间串行
+  - 通知的持久化与取消的排序由 M6 `cancelAndAwaitNotice` 的返回语义承担，
+    不依赖 watcher fiber 的调度时机
 
 Rely-Guarantee 条件：
   - Rely（环境承诺）：停止期间不会有外部调用对同一子树发起第二次 stop
     （幂等性使重复 stop 无害，但并发的两次 stop 不保证层序交错后的通知顺序）
   - Guarantee（自身承诺）：stop 只中断执行，不删除 Session、消息或历史；
-    不向停止集内的 Agent 投递会使其重新运行的消息
+    自身不投递任何通知（通知由 M6 单一生产，见 I5）；
+    不向停止集内已取消的 Agent 投递会使其重新运行的消息
 
 线程安全性结论：
   - M4.stop 在 Rely 成立时安全。并发的同子树 stop 属于已知未覆盖场景，
