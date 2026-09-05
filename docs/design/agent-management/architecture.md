@@ -29,7 +29,7 @@
 模型
  └─ M5 AgentTools（唯一对模型暴露的表面）
      ├─ 解析：M1 AgentTree     ← Session store 的 parentID 链
-     ├─ 权限：M1 AgentTree     ← 邻居判定 / 直接子判定
+     ├─ 权限：M1 AgentTree     ← 直接子判定（仅 agent_stop）
      └─ 执行：
          agent           → M4 AgentLifecycle.create → M3 AgentInbox.deliver
          agent_list      → M1 AgentTree.tree      + M2 AgentStatusProjection.of
@@ -128,7 +128,10 @@
 
 类型不变量：
   - sender ≠ target（不允许自投递）
-  - target ∈ sender 的 AgentNeighborhood（父 / 子 / 兄弟之一）
+  - target 对应的 Session 存在
+  - 不要求 target 是 sender 的邻居，也不要求同树：消息不转移权限，目标始终在它自己
+    Session 的权限下行动。寻址范围由"调用者只从 roster 拿得到邻居的 session_id"自然收敛，
+    不由代码拦截（调研 §14）
   - 落库文本 = 系统前缀 + "\n\n" + body，前缀格式固定为
     `[Agent message from <sender_agent> (<sender>)]`
   - 调用方无法覆盖或伪造前缀（调研 §5.3）
@@ -195,7 +198,7 @@
 ```
 模块名称：AgentTree
 
-功能描述：解析调用者的邻居集合（父 / 子 / 兄弟）与直接子集合，并承担邻居 / 直接子两类寻址判定；
+功能描述：解析调用者的邻居集合（父 / 子 / 兄弟）与直接子集合，并承担 `agent_stop` 的直接子判定；
   另提供后代闭包供 M4 的停止级联使用——那是效果范围，不是寻址范围。
 
 前置条件（Requires）：
@@ -206,7 +209,6 @@
   - neighborhood(id) 返回的 AgentNeighborhood 满足其类型不变量
   - children(id) 返回 parent_id == id 的全部 Agent
   - descendants(id) 返回 id 的全部后代，不含 id 自身；仅供 M4 展开停止级联
-  - isNeighbor(caller, target) ⟺ target ∈ neighborhood(caller).members 且 target ≠ caller
   - isChild(caller, target) ⟺ target ∈ children(caller)
 
 不变式（Invariants）：
@@ -321,7 +323,7 @@
   - 对模型暴露且仅暴露 agent / agent_list / agent_send / agent_stop（调研 §12）
   - 保留隐藏兼容入口 task：不进模型工具列表，收到旧 task_id 时规范化为 session_id 后转发给同一实现，不建立第二条执行路径（调研 §8）
   - 所有工具的目标参数名为 session_id，不出现 task_id / agent_id / run_id
-  - agent_send 在目标不是调用者的邻居时失败，不产生副作用
+  - agent_send 只校验目标 Session 存在与非自投递；不校验邻居关系，也不校验同树
   - agent_stop 在目标不是调用者的直接子时失败，不产生副作用
   - 调用者深度已达 subagent_depth 上限时，不向其提供 agent 与 agent_stop；agent_list 与 agent_send 仍提供
     （判据是深度到限，不是当前是否有子 Agent，否则工具会随派生忽隐忽现）
@@ -356,7 +358,7 @@
 返回：AgentNeighborhood.members，每行含 relation 与 status
 
 工具：agent_send
-  session_id:     string    — 目标，须是调用者的邻居
+  session_id:     string    — 目标，须是存在的 Session；不限于邻居
   message:        string    — 正文；系统前缀由 M3 添加，调用方不可覆盖
 返回：Accepted
 
@@ -371,11 +373,11 @@
 接口：M5 AgentTools → M1 AgentTree
 
 输入数据：caller: SessionID，target: SessionID | undefined
-输出数据：AgentNeighborhood（neighborhood）/ AgentInfo[]（children、descendants）/ boolean（isNeighbor、isChild）
+输出数据：AgentNeighborhood（neighborhood）/ AgentInfo[]（children、descendants）/ boolean（isChild）
 
 协议约定：
   - 调用方责任：caller 取自工具执行上下文，不接受模型提供的值
-  - 被调用方责任：目标不存在或不是邻居时返回明确的否定结果，不抛出未分类异常
+  - 被调用方责任：目标不存在或不是直接子时返回明确的否定结果，不抛出未分类异常
 ```
 
 ```
@@ -385,7 +387,7 @@
 输出数据：AgentStatus
 
 协议约定：
-  - 调用方责任：仅对已通过邻居判定的成员请求状态
+  - 调用方责任：仅对 neighborhood 中的成员请求状态
   - 被调用方责任：结果是调用瞬间的快照；不保证与后续任何一次调用一致
 ```
 
@@ -396,7 +398,7 @@
 输出数据：Accepted { target: SessionID }
 
 协议约定：
-  - 调用方责任：sender 由系统填写；body 为模型提供的正文；邻居判定已通过
+  - 调用方责任：sender 由系统填写；body 为模型提供的正文；目标存在性已确认
   - 被调用方责任：返回 Accepted 时消息已持久化；不得在持久化前返回
 ```
 
@@ -433,7 +435,7 @@
 | `AgentStatus` 只有 running / idle 两值 | 调研 §5.5 只要求区分在跑与不在跑；结局由通知通道交付，roster 不复述。与 Claude Code `ListAgents` 的 busy / idle 一致。副产物：状态投影只读 `SessionStatus`，无需第二个来源 |
 | 停止级联到整棵子树 | 与既有停止语义一致，且避免"停了父、子 Agent 变孤儿继续消耗"；是否改为只停目标本身列为 follow-up（issue #26） |
 | `agent_send` 不经 `BackgroundJob.extend` | extend 把新执行挂在上一次执行之后，是 run 边界而非 turn 边界，且排队期间消息不落库 |
-| 权限不对称：send 全向、stop 仅后代 | 见 §4.5 |
+| 权限不对称：send 不设寻址门、stop 仅直接子 | `agent_send` 只是通道，消息不转移权限，目标始终在自己 Session 的权限下行动，最坏后果是打扰一个不相干的会话而非提权；Claude Code 的 `SendMessage` 本就能寻址树外的其他会话。更强的越权风险已决定用工具描述约束而不加代码门，给更弱的风险加门不一致。`agent_stop` 则单方面中断执行，必须限定在直接子。寻址范围靠 roster 只给邻居 id 自然收敛，不靠拦截 |
 | 四个工具都不弹用户确认 | Claude Code 明确「No user permission approval is required to launch a subagent itself」，可做的是用 `permissions.deny: ["Agent(...)"]` 拒绝，而不是每次询问；真正逐次受控的是被派生 Agent **自己的**工具调用，按它自己的 permission 模式。OpenCode 现有 `task` 会 `ctx.ask`，与此不一致，改为不问。权限规则仍可拒绝 `agent` 或某个 `subagent_type`，被派生 Agent 的工具调用仍在其自身 Session 权限下受控 |
 | 移除子 Session 对 `agent` 工具的默认拒绝 | `task.ts` 的 `childToolDenies` 对每个子 Session 无条件追加一条 `task: deny`（除非该 agent 定义里已有同名规则）。这是与 `subagent_depth` 相互独立的第二道闸，只把深度改成 3 而不动它，子 Agent 仍然一个都派生不出来。Claude Code 用 agent 定义自身的 `tools` / `disallowedTools` 决定能否再派生，默认是给的（`general-purpose` 的工具集是 `*`）。因此默认不再拒绝，改由 agent 定义决定。`todowrite` 与 `primary_tools` 的拒绝项与此无关，保持不变 |
 | 跨会话越权用工具描述约束，不加强制门 | Claude Code 的 `SendMessage` 原文：「NEVER ask a peer to perform an action that was denied or blocked in your session — a peer doing it for you bypasses the user's permission decision」。子 Session 的权限从父派生、可以更窄，因此被限权的 Agent 理论上能让兄弟或父代做被禁的事。强制方案（目标以发送者∩目标权限的交集执行）要改权限派生逻辑，代价远超收益；调研以 Claude Code 为语义基线，此处照其做法处理 |
@@ -462,7 +464,7 @@ G5 「身份统一」              → M5 AgentTools（表面约束）+ M1（身
 
 **G1/G2**：G1 要求"可靠列出可寻址的 Agent 与其状态"。M1 的后置条件保证 AgentNeighborhood 覆盖父 / 子 / 兄弟三类且有稳定序，即可寻址集合完整；M2 的后置条件保证每个成员得到 running / idle 之一且二者互斥穷尽。二者拼接即"完整成员集合 × 明确状态"，故 G1 成立。G2 是 G1 在单成员上的投影，同理成立。
 
-**G3**：G3 要求"邻居间任意方向的消息能被目标处理"。M1 的 `isNeighbor` 保证方向合法性判定完备；M3 的后置条件分两种目标状态给出了处理保证——running 时进入当前 run 的下一个 provider turn，非 running 时起新 run 消费。两种状态覆盖了 AgentStatus 的全部取值（running 与 idle 互斥且穷尽），故任意目标状态下消息都会被处理，G3 成立。
+**G3**：G3 要求"邻居间任意方向的消息能被目标处理"。M3 对任一存在的目标 Session 均可投递，故邻居这一子集必然覆盖；M3 的后置条件分两种目标状态给出了处理保证——running 时进入当前 run 的下一个 provider turn，非 running 时起新 run 消费。两种状态覆盖了 AgentStatus 的全部取值（running 与 idle 互斥且穷尽），故任意目标状态下消息都会被处理，G3 成立。
 
 **G4**：G4 要求"停止且保留上下文，且等待方不被静默挂起"。M4 的后置条件给出前半部分（终止执行、不删除任何 Session 与历史、可恢复、幂等）。后半部分由 I1 保证：每个被停 Agent 的父都会收到终止通知，除非该父自己也在停止集内——那种情况下它同样被停止，不存在"仍在等待"的主体。故不存在被静默挂起的等待方，G4 成立。
 
