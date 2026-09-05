@@ -90,7 +90,8 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 本细化不引入新的跨模块类型。架构 §3 已定义 `AgentStatus` / `AgentInfo` / `AgentNeighborhood` /
 `AgentMessage` / `Accepted` / `StopOutcome` / `StopPlan`，此处不重复。
 
-新增的五个错误类型见 §3，属**模块私有**（仅本 feature 产出与消费），不进架构文档数据结构节。
+新增的五个错误类型见 §3。按 §2.4 的判定原则，它们被 M1/M3/M4/M6 产出、被 M5 消费，出现在多个模块的
+接口规约里，因此属**跨模块共享**，已同步登记进架构 §3 数据结构节。
 
 ## 5. 模块细化
 
@@ -132,7 +133,7 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 
 - **功能描述**：取 `id` 的直接子。`depth` 是子的深度，由调用方给出（父深度 +1），本函数不自行推算。
 - **调用关系**：callers: M1 `neighborhood`/`descendants`、M4 `plan`；callees: `Session.children`。
-- **实现思路**：调用 `Session.children(id)`，逐项经 `toInfo(session, "child", depth)` 转换。
+- **实现思路**：调用 `Session.children(id)`，逐项经 `toInfo(session, "child", depth, status)` 转换，`status` 由调用方逐项提供。
   `Session.children` 的 ensures 是"返回 parent_id == id 的全部 Session"，对不存在的 id 返回空数组而非失败，
   故本函数无失败分支；`AgentNotFound` 保留在签名中仅为与 M1 其余函数一致，实际不产生。
 - **正确性论证**：trivial —— 单次 callee 调用加逐项纯转换，无分支、无循环、无副作用。
@@ -172,12 +173,30 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 - **正确性论证**：trivial —— 单次读取加一次相等比较；`parentID` 在创建时绑定且不变（H2），故该比较
   等价于"target ∈ children(caller)"，无需再拉子列表。
 
-#### 5.1.5 `toInfo(session, relation, depth) -> AgentInfo`
+#### 5.1.5 `toInfo(session, relation, depth, status) -> AgentInfo`
 
-- **功能描述**：把 `Session.Info` 转成 `AgentInfo` 骨架，`status` 留空由 M2 填。
+- **功能描述**：把 `Session.Info` 转成完整 `AgentInfo`。`status` 由调用方给出——`AgentInfo.status`
+  是必填字段，本函数不产出不完整的值：`agent_list` 先经 M2 `of` 取状态再传入，`create` 直接传 `running`
+  （执行刚注册）。
 - **正确性论证**：trivial —— 纯字段映射，无分支。`depth` 由调用方传入：`neighborhood` 中
   self 的 depth 需一次向上遍历取得，见 §5.5.5 `callerDepth`，其余成员的 depth 由 self 推出
   （parent = self−1，child = self+1，sibling = self）。
+
+#### 5.1.6 `callerDepth(id: SessionID) -> Effect<NonNegativeInt, AgentNotFound>`
+
+- **功能描述**：从 `id` 起沿 `parentID` 向上遍历计数，主 Agent 为 0。
+- **调用关系**：callers: M1 `neighborhood`、M4 `create`、M4 `plan`、M5 `available`；callees: `Session.get`。
+- **归属说明**：本函数是父子链遍历，与 M1 其余函数同源。首轮把它放在 M5，而 M1 与 M4 都要调用，
+  形成 M5→M4/M1 与 M4/M1→M5 的反向依赖；归入 M1 后调用图恢复单向。
+- **实现思路**：
+  1. `depth = 0`，`current = Session.get(id)`。失败 → `AgentNotFound{id}`。
+  2. 循环：`current.parentID` 非空时，`depth += 1`，`current = Session.get(current.parentID)`。
+  3. `parentID` 为空 → 返回 `depth`。
+  - **终止性**：`parentID` 链无环且深度有限（H2），每步严格上移一层，必然到达 `parentID == undefined`。
+  - 与既有 `task.ts:236-242` 的深度计算口径一致，实现时二者共用同一函数，避免漂移。
+- **正确性论证**：非平凡（含循环 + 跨模块调用）。前置：`id` 对应的 Session 存在；链无环（H2）。
+  论证：不变量"depth 等于已上移的层数"在初始成立，每轮 +1 且上移一层保持；退出时 `current` 是根，
+  故 depth 等于 `id` 到根的边数。后置：返回值即 `id` 的深度，主 Agent 为 0。副作用：只读。
 
 ### 5.2 M2 AgentStatusProjection
 
@@ -389,55 +408,69 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 - **调用关系**：callers: M3 `deliver`；callees: `BackgroundJob.get`、`BackgroundJob.start`、
   M6 `runExecution`、M6 `watch`。
 - **实现思路**：
-  1. `BackgroundJob.get(target)`。job id 即 SessionID（清单 §4.2 保留的身份约定）。
-  2. 分支：存在且 `status === "running"` → **空操作直接返回**。既有 watcher 继续持有唯一交付权，
+  1. `Session.get(target)` 取标题与 agent 名，供步骤 3 的 job 元数据用。失败 → `AgentNotFound{target}`，
+     无副作用。这是本函数 `AgentNotFound` 失败通道的唯一来源。
+  2. `BackgroundJob.get(target)`。job id 即 SessionID（清单 §4.2 保留的身份约定）。
+  3. 分支：存在且 `status === "running"` → **空操作直接返回**。既有 watcher 继续持有唯一交付权，
      本次消息进入该执行的消息序列（架构 I4）。
-  3. 否则（无 job，或 job 已 settled）→ `BackgroundJob.start({ id: target, type: "agent", title, metadata,
-     run: runExecution(target) })`。
-     - callee 契约：`start` 在同 id 已有 running job 时返回既有 info 而不新起（既有语义），故与步骤 2
+  4. 否则（无 job，或 job 已 settled）→ 先为本次执行建一个 `Deferred<void>` 存入
+     `noticeDelivered: Map<SessionID, Deferred<void>>`（供 `cancelAndAwaitNotice` 等待），
+     再 `BackgroundJob.start({ id: target, type: "agent", title, metadata, run: runExecution(target) })`。
+     - callee 契约：`start` 在同 id 已有 running job 时返回既有 info 而不新起（既有语义），故与步骤 3
        双重保险，不会并行注册。
-  4. 注册 watcher：`watch(target)`，fork 不等待。
-  5. 返回。
+     - Deferred 必须在 `start` 之前建：执行可能瞬间结算，`watch` 会立刻去完成它。
+  5. 注册 watcher：`watch(target)`，fork 不等待。
+  6. 返回。
 - **正确性论证**：
   - 前置：目标 Session 存在，且其待处理消息已落库（M3→M6 接口协议的调用方责任）。
-  - 论证：步骤 2 与步骤 3 的 `start` 语义构成两道去重，任一生效都保证同一时刻同一 target 只有一个
-    running job，因此只有一个 watcher —— I4 由此保持。步骤 4 在步骤 3 之后，故不会为空操作分支
-    重复注册 watcher。
-  - 后置：返回后目标必有一次在跑的执行，且其 watcher 恰一个。
-  - 副作用论证：(1) 可能注册一次后台执行与一个 watcher —— 步骤 3、4；(2) 不写消息、不改 Session 字段。
+  - 论证：步骤 3 与步骤 4 的 `start` 语义构成两道去重，任一生效都保证同一时刻同一 target 只有一个
+    running job，因此只有一个 watcher —— I4 由此保持。步骤 5 在步骤 4 之后且只在非空操作分支执行，
+    故不会为已有执行重复注册 watcher。
+  - 后置：返回后目标必有一次在跑的执行，其 watcher 恰一个，且该次执行的 `noticeDelivered` 已就位。
+  - 副作用论证：(1) 可能注册一次后台执行、一个 watcher 与一个 Deferred —— 步骤 4、5；
+    (2) 不写消息、不改 Session 字段。
 
-#### 5.5.2 `runExecution(target: SessionID) -> Effect<ExecutionOutcome>`
+#### 5.5.2 `runExecution(target: SessionID) -> Effect<string, ExecutionFailure>`
 
-- **功能描述**：驱动目标 Session 的 loop，按六条分支判定本次执行的结局。
+- **功能描述**：驱动目标 Session 的 loop，按六条分支判定结局，并把结局**映射到 Effect 的三种出口**，
+  使后台执行的结算状态自然带上分类。
 - **调用关系**：callers: M6 `ensure`（作为 job 的 run 体）；callees: `SessionPrompt.loop`、
   既有渲染函数 `formatAssistantFailure` / `formatSubagentFailure` / `formatIncompleteResponse`、
   `hasUsableOutput`、`lastVisibleText`、`Truncate.limits`。
+- **为什么返回值不是 `ExecutionOutcome`**：后台执行的状态由 run 体的 Effect **exit** 推出——成功记
+  `completed`、失败记 `error`、中断记 `cancelled`。若把结局作为成功值返回，job 将永远结算为
+  `completed`，`watch` 看不到失败与取消，`cancelAndAwaitNotice` 也永远等不到取消结算。既有执行体正是
+  用 `succeed` / `fail` / `interrupt` 三种出口承载分类，本函数照此复制。
 - **实现思路**：
   1. `loop({ sessionID: target })`，得 `result`。
      - callee 契约：经 `ensureRunning` —— Running 时加入既有执行，Idle 时新起。本函数是 job 的 run 体，
-       调用时目标必为 Idle（步骤 2 已排除 running），故走新起分支。
-  2. 按序判定，先命中者胜（清单 §5，逐条复制不简化）：
-     a. `result.info.role !== "assistant"` → `{ kind: "failed", text: "非 assistant 结果" }`
-     b. `result.info.error?.name === "MessageAbortedError"` → `{ kind: "cancelled" }`
-        —— 这是 `cancelled` 终态的唯一自然来源
-     c. `result.info.error` 存在，或 `result.info.finish === "length"` →
-        `{ kind: "failed", text: formatAssistantFailure(result, target, limits) }`
-     d. `result.parts.findLast(tool && state.status === "error")` 命中 →
-        `{ kind: "failed", text: formatSubagentFailure(该 tool 的 error, target, limits) }`
-     e. `finish` 为 `undefined` 或 `"unknown"`，且 `!hasUsableOutput(result)` →
-        `{ kind: "failed", text: formatIncompleteResponse(target, finish) }`
-     f. 以上皆否 → `{ kind: "completed", text: lastVisibleText(result) }`
-        —— **最后一条** text part，不是 `allVisibleText` 的全部拼接；后者只用于失败时的摘录
-  3. 返回该 `ExecutionOutcome`。
+       调用时目标必为 Idle（`ensure` 步骤 2 已排除 running），故走新起分支。
+  2. 按序判定，先命中者胜，各自映射到指定出口（清单 §5，逐条复制不简化）：
+
+     | # | 条件 | Effect 出口 | job 结算 | `watch` 读到 |
+     |---|---|---|---|---|
+     | a | `result.info.role !== "assistant"` | `fail(协议异常文本)` | `error` | `info.error` |
+     | b | `error.name === "MessageAbortedError"` | `Effect.interrupt` | `cancelled` | 无正文，由 `renderTermination` 现产 |
+     | c | `error` 存在，或 `finish === "length"` | `fail(formatAssistantFailure(...))` | `error` | `info.error` |
+     | d | 最后一个 tool part 状态为 error | `fail(formatSubagentFailure(...))` | `error` | `info.error` |
+     | e | `finish` 缺失或 `"unknown"`，且 `!hasUsableOutput` | `fail(formatIncompleteResponse(...))` | `error` | `info.error` |
+     | f | 以上皆否 | `succeed(lastVisibleText(result))` | `completed` | `info.output` |
+
+     f 取**最后一条** text part，不是 `allVisibleText` 的全部拼接；后者只用于失败时的摘录。
+  3. 各失败渲染的截断上界统一取 `Truncate.limits()`。
 - **正确性论证**：
   - 前置：目标 Session 存在且当前无在跑执行。
-  - 论证：六条按序求值且第 f 条是无条件兜底，故分支穷尽，不存在落空的执行 —— 满足
-    `ExecutionOutcome` 的类型不变量。b 在 c 之前是必要的：`MessageAbortedError` 也是一种 `error`，
-    若顺序颠倒，取消会被误报为失败。d 在 e 之前同理：工具失败时 `finish` 可能同时缺失，
-    工具错误的信息量更大。各渲染函数的截断上界由 `Truncate.limits()` 统一提供。
-  - 后置：返回的结局属于三种 kind 之一，正文已受截断约束。
-  - 副作用论证：`loop` 会驱动目标 Session 产生 assistant 消息与工具调用 —— 这是执行本身，非本函数
-    额外引入；本函数自身不写入任何消息。
+  - 论证：
+    - 六条按序求值且 f 是无条件兜底，分支穷尽，不存在落空的执行。
+    - **b 必须在 c 之前**：`MessageAbortedError` 本身也是一种 `error`，顺序颠倒会把取消误报为失败，
+      且 job 会结算成 `error` 而非 `cancelled`，`cancelAndAwaitNotice` 随之失效。
+    - **d 在 e 之前**：工具失败时 `finish` 可能同时缺失；工具错误的信息量更大，先命中更有用。
+    - 三种出口与 `BackgroundJob` 的结算规则一一对应（成功→completed、失败→error、
+      中断→cancelled），故 `watch` 能仅凭 job 状态区分三类结局，无需第二个信息通道。
+  - 后置：Effect 出口与 job 结算状态一致；成功时正文为最后一条可见文本，失败时为对应渲染，
+    取消时无正文。
+  - 副作用论证：`loop` 会驱动目标 Session 产生 assistant 消息与工具调用——这是执行本身，非本函数
+    额外引入；本函数不写入任何消息。
 
 #### 5.5.3 `watch(target: SessionID) -> Effect<void>`
 
@@ -455,7 +488,10 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
      - 照既有 `inject` 的写法（清单 §6.2 标为保留）：它已经在用目标自己的 agent，正是所需。
      - **投递目标是 `target.parentID`，不是调用者**（清单 §6.3）：`agent_send` 可由兄弟发起，
        两者不同。既有代码恒用 `ctx.sessionID` 是因为旧路径下调用者恒等于父。
-  5. 标记该结局通知已持久化（供 `cancelAndAwaitNotice` 等待），返回。
+  5. 完成 `noticeDelivered.get(target)` 这个 Deferred，表示本次执行的结局通知已持久化，随后移除该表项。
+     - 步骤 2 的无父分支同样要完成它——那种情况下没有通知可发，但等待方仍须被释放，否则
+       `cancelAndAwaitNotice` 会永久阻塞。
+  6. 返回。
 - **正确性论证**：
   - 前置：目标已注册执行。
   - 论证：步骤 1 的 `wait` ensures 是"job 结算后返回其 info"，故步骤 3 拿到的状态是终态。
@@ -477,7 +513,9 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
        若不先判断就调用，会把"本来就没在跑"误报成"已停止"并触发不实通知。
   3. 否则 → `SessionRunState.cancel(target)`。
      - callee 契约：`Effect<void>`，无失败通道；取消该 Session 的后台 job 与活动执行。
-  4. 等待步骤 3 引发的结算被 `watch` 消费且其通知已持久化（`watch` 步骤 5 的标记）。
+  4. 等待 `noticeDelivered.get(target)`（由 `ensure` 步骤 4 建立、`watch` 步骤 5 完成）。
+     该 Deferred 完成即表示本次执行的取消通知已写入目标的父 Session。
+     - 目标无父时 `watch` 仍会完成它（见 `watch` 步骤 5 的分支），故不会永久阻塞。
   5. 返回 `{ transitioned: true }`。
 - **正确性论证**：
   - 前置：目标 Session 存在。
@@ -566,14 +604,12 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
   `failed` 非空时的渲染是协议硬要求，不得省略或折叠。后置：返回文本如实反映哪些成员被停止、
   哪些父收到通知、哪些失败。副作用：委托给 M4。
 
-#### 5.6.5 `available(ctx) -> Effect<ToolName[]>` 与 `callerDepth(id)`
+#### 5.6.5 `available(ctx) -> Effect<ToolName[]>`
 
 - **功能描述**：按调用者深度决定向模型暴露哪些工具。
-- **调用关系**：callers: 工具注册；callees: `Session.get`。
+- **调用关系**：callers: 工具注册；callees: M1 `callerDepth`。
 - **实现思路**：
-  1. `callerDepth(id)`：从 `id` 起沿 `parentID` 向上遍历计数，主 Agent 为 0。
-     - **终止性**：`parentID` 链无环且深度有限（H2），每步严格上移一层，故必然到达 `parentID == undefined`。
-     - 与既有 `task.ts` 的深度计算完全一致，实现时抽为共享函数，避免两处口径漂移。
+  1. M1 `callerDepth(ctx.sessionID)` 得 depth。callee 契约见 §5.1.6：只读，终止性已论证。
   2. 分支：`depth >= cfg.subagent_depth` → 返回 `[agent_list, agent_send]`；
      否则返回 `[agent, agent_list, agent_send, agent_stop]`。
   3. 判据是深度到限，**不是**当前是否有子 Agent（架构 §6）——否则 `agent_stop` 会随派生忽隐忽现。

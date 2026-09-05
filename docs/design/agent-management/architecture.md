@@ -176,8 +176,15 @@
   6. 以上皆否                                       ⇒ completed，正文取**最后一条** text part
      （不是全部 text 拼接——全部拼接只用于失败时的摘录）
 
+映射到执行出口（后台执行的结算状态由 run 体的 Effect exit 推出，不另设信息通道）：
+  - 第 6 条 ⇒ 成功出口 ⇒ 结算 completed，正文进 output
+  - 第 1、3、4、5 条 ⇒ 失败出口，正文即失败文本 ⇒ 结算 error，正文进 error
+  - 第 2 条 ⇒ 中断出口 ⇒ 结算 cancelled，正文在交付时现产
+
 类型不变量：
   - 六条判定按序求值，先命中者胜；覆盖穷尽，不存在落空的执行
+  - 第 2 条必须先于第 3 条求值：MessageAbortedError 本身也是一种 error，顺序颠倒会把取消
+    误报为失败，且结算成 error 而非 cancelled
   - 正文长度受既有截断上界约束，超出时附截断提示并指向 session_id
 
 跨模块共享性：跨模块共享 — consumer: M6 AgentExecution（产出并交付）、M5 AgentTools（渲染）
@@ -199,6 +206,25 @@
   - 不设 notified 字段：通知接收方恒为各成员的父，可由成员反查，单列会与真实送达情况漂移
 
 跨模块共享性：跨模块共享 — consumer: M4 AgentLifecycle（产出）、M5 AgentTools（渲染）
+```
+
+```
+数据结构：本 feature 的失败类型
+
+字段：
+  - AgentNotFound     { session_id }      目标 Session 不存在
+  - AgentTypeNotFound { subagent_type }   创建时指定的 agent 定义不存在
+  - NotAChild         { caller, target }  agent_stop 的目标不是调用者的直接子
+  - SelfDelivery      { target }          agent_send 的目标是发送者自己
+  - DepthLimitReached { depth, limit }    创建时已达嵌套上限
+
+类型不变量：
+  - 五者互斥，均为可预期的调用方错误，不用于表达内部缺陷
+  - M1/M3/M4/M6 只产出这些类型，不吞错也不转成 undefined
+  - M5 是唯一把它们渲染为模型可读文本的地方
+
+跨模块共享性：跨模块共享 — producer: M1 AgentTree、M3 AgentInbox、M4 AgentLifecycle、
+  M6 AgentExecution；consumer: M5 AgentTools
 ```
 
 ```
