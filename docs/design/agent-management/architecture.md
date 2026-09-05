@@ -19,7 +19,7 @@
 | G4 | 主动停止不再需要或失控的 Agent，保留上下文 | §1 缺口 4 |
 | G5 | 身份统一为可寻址、可恢复的 Session，消除 `task_id` 的语义错位 | §1 缺口 5 |
 
-非目标沿用调研 §6，不在此重复。本文档额外承担调研甩给架构阶段的四笔欠账：工具 schema（本文档 §4.6）、状态枚举（本文档 §3 `AgentStatus`）、停止级联与终止通知契约（本文档 §4.4，对应调研 §5.4）、消息交付顺序（本文档 §4.3，对应调研 §5.3）。
+非目标沿用调研 §6，不在此重复。本文档额外承担调研甩给架构阶段的四笔欠账：工具 schema（本文档 §4.7）、状态枚举（本文档 §3 `AgentStatus`）、停止级联与终止通知契约（本文档 §4.4，对应调研 §5.4）、消息交付顺序（本文档 §4.3，对应调研 §5.3）。
 
 ## 2. 核心流程
 
@@ -31,10 +31,12 @@
      ├─ 解析：M1 AgentTree     ← Session store 的 parentID 链
      ├─ 权限：M1 AgentTree     ← 直接子判定（仅 agent_stop）
      └─ 执行：
-         agent           → M4 AgentLifecycle.create → M3 AgentInbox.deliver
-         agent_list      → M1 AgentTree.tree      + M2 AgentStatusProjection.of
-         agent_send      → M3 AgentInbox.deliver
-         agent_stop      → M4 AgentLifecycle.stop → 逐层 M3 AgentInbox.deliver
+         agent           → M4 create → M3 deliver → M6 ensure
+         agent_list      → M1 neighborhood + M2 of
+         agent_send      → M3 deliver → M6 ensure
+         agent_stop      → M4 stop → 逐层 M6 cancelAndAwaitNotice
+
+     结局交付（完成 / 失败 / 取消）：M6 的 watcher，唯一生产者 → 目标 Agent 的父 Session
 ```
 
 三条值得单独展开的路径：
@@ -158,16 +160,43 @@
 ```
 
 ```
+数据结构：ExecutionOutcome
+
+字段：
+  - kind: "completed" | "failed" | "cancelled" — 一次执行的结局
+  - text: string — 交付给父 Agent 的正文
+
+语义与判定顺序（照既有 task 执行体逐条复制，不简化）：
+  1. 返回的不是 assistant 消息                      ⇒ failed，正文说明协议异常
+  2. error.name == "MessageAbortedError"           ⇒ cancelled（这是 cancelled 的唯一自然来源）
+  3. error 存在，或 finish == "length"              ⇒ failed，正文为既有 assistant 失败渲染
+     （错误名与消息；输出超长时带 token 数、部分输出摘录与截断提示）
+  4. 最后一个 tool part 状态为 error                ⇒ failed，正文为既有 subagent 工具失败渲染
+  5. finish 缺失或为 "unknown"，且无可用输出         ⇒ failed，正文为既有 incomplete 渲染
+  6. 以上皆否                                       ⇒ completed，正文取**最后一条** text part
+     （不是全部 text 拼接——全部拼接只用于失败时的摘录）
+
+类型不变量：
+  - 六条判定按序求值，先命中者胜；覆盖穷尽，不存在落空的执行
+  - 正文长度受既有截断上界约束，超出时附截断提示并指向 session_id
+
+跨模块共享性：跨模块共享 — consumer: M6 AgentExecution（产出并交付）、M5 AgentTools（渲染）
+```
+
+```
 数据结构：StopOutcome
 
 字段：
-  - stopped: SessionID[] — 本次停止实际处理的成员，按 StopPlan.layers 的处理顺序排列
-  - notified: SessionID[] — 收到终止通知的父 Agent；停止集内的父不在其中
-  - failed: { session_id: SessionID, reason: string }[] — 未能完成停止的成员及原因
+  - transitioned: SessionID[] — 本次由"有活动执行"转为"已取消"的成员，其取消通知已持久化
+  - unchanged: SessionID[] — 调用时本就无活动执行的成员；未取消、未产生通知
+  - failed: { session_id: SessionID, reason: string }[] — 取消过程中出错的成员及原因
 
 类型不变量：
-  - stopped ∪ failed.map(session_id) = ⋃ StopPlan.layers
-  - failed 非空 ⇒ M5 必须把它显式呈现给调用方，不得静默丢弃（见 §5 M5→M4 接口协议）
+  - transitioned ∪ unchanged ∪ failed.map(session_id) = ⋃ StopPlan.layers，三者两两不交
+  - transitioned 中每个成员的取消通知在返回前已持久化（见 §7 I1）
+  - unchanged 非空不构成错误：stop 幂等，重复调用只会让成员落入 unchanged
+  - failed 非空 ⇒ M5 必须逐条呈现，不得静默丢弃（见 §5 M5→M4 接口协议）
+  - 不设 notified 字段：通知接收方恒为各成员的父，可由成员反查，单列会与真实送达情况漂移
 
 跨模块共享性：跨模块共享 — consumer: M4 AgentLifecycle（产出）、M5 AgentTools（渲染）
 ```
@@ -191,7 +220,7 @@
 
 ## 4. 模块划分与功能规约
 
-五个模块。M1–M4 是机制，M5 是唯一对模型暴露的表面。
+六个模块。M1–M4 与 M6 是机制，M5 是唯一对模型暴露的表面。M6 是唯一的执行注册者与结局通知生产者。
 
 ### 4.1 M1 AgentTree
 
@@ -245,7 +274,7 @@
 ```
 模块名称：AgentInbox
 
-功能描述：构造带系统发送者前缀的消息，以目标 Session 自身的身份写入并唤醒目标。
+功能描述：构造带系统发送者前缀的消息，以目标 Session 自身的身份写入，并确保目标存在一次在跑的执行。
 
 前置条件（Requires）：
   - message 满足 AgentMessage 的全部类型不变量
@@ -253,68 +282,114 @@
 
 后置条件（Ensures）：
   - 返回前，消息已作为 user message 持久化进目标 Session
-  - 消息携带的 agent / model 取自目标 Session，不取自调用者
-  - 目标此刻 running ⇒ 消息在其当前 run 的下一个 provider turn 进入上下文，不新起 run
-  - 目标此刻非 running ⇒ 起一个新 run 消费该消息
+  - 消息携带的 agent / model / variant 显式取自目标 Session 当前持久化的值，不取自调用者，
+    也不省略——省略会让 createUserMessage 回退到 agent 定义的模型并覆盖目标的绑定
+  - 落库后调用 M6 `ensure(target)`；由 M6 决定是加入既有执行还是新起一次
   - 调用方不阻塞等待目标完成，返回值只表示"已接受"
 
 不变式（Invariants）：
-  - I4（见 §7）：一个 Agent 处理完当前消息序列后只交付一个最终结果，不为单条消息建立结果承诺；
-    中间 assistant 消息留在 transcript
+  - I2（见 §7）：返回 Accepted ⇒ 消息已持久化
 
-副作用：写入目标 Session 一条 user message；可能启动目标 Session 的一次 run
+副作用：写入目标 Session 一条 user message；经 M6 可能启动目标 Session 的一次执行
 ```
 
 **身份取自目标而非调用者**：消息落进目标 Session 后，目标 `runLoop` 每一轮都从最新 user message 重新解析 agent 与 model，且解析结果会写回 Session。若透传调用者的选择，一条消息会把目标换成发送者的 agent 和模型并持久化。发送者身份由正文前缀承载即可，不进入执行参数（调研 §5.3「Agent 名称只用于可读性」）。
+
+**为什么必须显式传而不是省略**：`createUserMessage` 的解析优先级是
+`input.model ?? agent 定义的 model ?? Session 当前 model`。省略 `model` 时 agent 定义的模型排在
+Session 当前模型之前，一条消息就会改写并持久化目标的绑定。因此三项都要显式取目标当前值传入。
 
 ### 4.4 M4 AgentLifecycle
 
 ```
 模块名称：AgentLifecycle
 
-功能描述：创建 Agent；停止目标 Agent 及其后代的当前执行，并保证终止通知在父 Agent 被取消之前送达。恢复既有 Agent 不经本模块，由 M3 承担（调研 §13）。
+功能描述：创建 Agent；停止目标 Agent 及其后代的当前执行。恢复既有 Agent 不经本模块，由 M3 承担
+  （调研 §13）；执行注册与结局交付不经本模块，由 M6 承担。
 
 前置条件（Requires）：
-  - create: 目标 agent 定义存在；未超过 subagent 深度上限
-  - stop: 调用方已通过 M1 的权限判定；target 存在
+  - create: 目标 agent 定义存在；未超过 subagent 深度上限；调用者的 assistant 消息可读（继承 model/variant 用）
+  - stop: 调用方已通过 M1 的直接子判定；target 存在
 
 后置条件（Ensures）：
   - create 总是新建一个以调用者为 parentID 的子 Session，不复用既有 Session
-  - stop 终止 ⋃ StopPlan.layers 中每个成员的当前执行
+  - create 的初始任务经 M3 投递，因而与后续消息走同一条路径
+  - stop 对 ⋃ StopPlan.layers 中每个成员调用 M6 `cancelAndAwaitNotice`
   - stop 不删除任何 Session、消息或历史
   - stop 后目标仍可经 agent_send 恢复
-  - stop 幂等：对已无活动执行的目标重复调用不产生额外效果，也不报错
-  - 对 layers 的处理自底向上：处理 layers[i] 前，layers[0..i-1] 的终止通知均已交付
-  - notify_boundary 非空时，target 的终止通知交付给它
+  - stop 幂等：目标已无活动执行时，M6 报告"未发生转变"，不产生取消通知，也不报错
+  - 对 layers 的处理自底向上：处理 layers[i] 前，layers[0..i-1] 中**实际发生转变**者的取消通知
+    均已持久化
+  - StopOutcome 只报告真实发生的停止与真实送达的通知
 
 不变式（Invariants）：
-  - I1（见 §7）：任一被停止 Agent 的终止通知交付，发生在其父 Agent 被取消之前
+  - I1（见 §7）
 
-副作用：中断目标子树的执行 fiber；向每个被停 Agent 的父 Session 写入一条终止通知消息
+副作用：经 M6 中断目标子树各成员的执行；不自行投递任何通知
 ```
 
-**为什么必须自底向上**：终止通知复用 M3 的投递语义，而 M3 对非 running 目标会起新 run。若自顶向下取消，子 Agent 的通知会投递给一个刚被停掉的父 Agent 并把它重新唤醒——等于停止操作自己复活了它要停的东西。自底向上使每条通知投递时其接收方仍在运行，命中"加入当前 run"分支。
+**为什么必须自底向上**：理由是防复活。取消通知由 M6 的 watcher 投递，而投递会让非 running 的目标
+起一次新执行。级联中孙的取消通知要投给子，若自顶向下取消，子已经停了，这条通知会把它重新唤醒——
+停止操作自己复活了它要停的东西。自底向上使每条通知投递时接收方仍在运行，只加入其当前执行。
 
-**为什么终止通知必须存在**：取消不能静默结束。通知与完成、失败走同一条通道，是一条普通消息，
-正常唤醒接收方（调研 §5.4）。接收方分两类：
-
-- **发起停止的 Agent**（即 target 的父，因为 target 必是它的直接子）。它虽然知道自己下了命令，
-  但通知在它的 transcript 里留下记录，且它此刻在运行，消息加入当前 run，无副作用。
-- **级联中每个被停 Agent 的父**。这些父自己也在停止集内，它们同样会被取消。
-
-**为什么必须自底向上**：理由是防复活，不是"有第三方在等"。终止通知复用 M3 的投递语义，
-而 M3 对非 running 目标会起新 run。级联中孙的取消通知要投给子，若自顶向下取消，子已经停了，
-这条通知会把它重新唤醒——停止操作自己复活了它要停的东西。自底向上使每条通知投递时接收方仍在运行，
-命中"加入当前 run"分支。
+**为什么终止通知必须存在**：取消不能静默结束。通知与完成、失败由同一个生产者（M6 的 watcher）
+产出、走同一条通道（调研 §5.4）。接收方是被停 Agent 的父：对末层而言是发起停止者本人（通知在其
+transcript 留下记录，且它此刻在运行），对级联中间层而言是同样在停止集内的父。
 
 该场景要求 Agent 树至少三层，因此本架构把 `subagent_depth` 的默认值提到 3（见 §6）。
 
-### 4.5 M5 AgentTools
+### 4.5 M6 AgentExecution
+
+```
+模块名称：AgentExecution
+
+功能描述：Agent 执行的注册、结局判定与结局交付。是本 feature 中**唯一**的执行注册者与结局通知
+  生产者——完成、失败、取消三种结局都由它产出，交付给该 Agent 的父 Session。
+
+前置条件（Requires）：
+  - ensure: 目标 Session 存在，且其待处理消息已落库
+  - cancelAndAwaitNotice: 目标 Session 存在
+
+后置条件（Ensures）：
+  - ensure(target)：目标已有在跑的执行 ⇒ 空操作，既有 watcher 继续持有唯一的结局交付权；
+    目标无在跑的执行 ⇒ 以 target 的 SessionID 为 job id 注册一次执行，并注册**恰一个** watcher
+  - 执行体驱动目标 Session 的 loop，结束后按 §3 `ExecutionOutcome` 的分类给出结局
+  - watcher 在执行结算后把结局交付给**目标 Session 的 parentID 所指 Agent**，而非发起调用者
+    ——`agent_send` 可由兄弟发起，两者不同
+  - 目标无 parentID（主 Agent）⇒ 不交付，人在 UI 上直接看到
+  - cancelAndAwaitNotice(target)：目标有在跑的执行 ⇒ 取消它，等待其取消结局**已持久化**后返回
+    `{ transitioned: true }`；目标无在跑的执行 ⇒ 不取消、不产生通知，返回 `{ transitioned: false }`
+
+不变式（Invariants）：
+  - I4（见 §7）：一次执行只注册一个 watcher，只交付一个最终结局。执行期间追加的消息由既有执行
+    消费，不注册第二个 watcher，也不产生第二个结局
+  - I5（见 §7）：结局通知只有 M6 一个生产者
+
+副作用：注册 / 取消后台执行；向目标 Agent 的父 Session 写入一条结局消息
+```
+
+**三条分支各由谁持有 watcher**：
+
+| 触发 | 目标状态 | 谁起执行 | 谁持 watcher | 结局交给谁 |
+|---|---|---|---|---|
+| `agent` 创建 | 新建，必为 idle | M6 `ensure` | 本次注册的 watcher | 新 Agent 的父（= 创建者） |
+| `agent_send` 发给 running | running | 不起，空操作 | **既有 watcher** | 目标的父 |
+| `agent_send` 发给 idle | idle | M6 `ensure` | 本次注册的 watcher | 目标的父 |
+
+第二行是 I4 成立的关键：向运行中的 Agent 连发多条消息不会各自产生结局，它们进入同一次执行的
+消息序列，由那一个 watcher 交付一次最终结果。
+
+**为什么结局交给目标的父而非发起者**：调研 §5.5 写明"完成、失败、取消均通过现有**父 Session**
+自动通知通道交付"。兄弟发消息时发起者只拿到 `Accepted`；它若需要结果，经由父 Agent 协调。
+既有 `inject` 恒向 `ctx.sessionID` 投递是因为旧路径下调用者恒等于父，新路径下不再成立，
+必须从目标的 `parentID` 解析。
+
+### 4.6 M5 AgentTools
 
 ```
 模块名称：AgentTools
 
-功能描述：四个模型可调用工具的参数 schema（见 §4.6）、权限门与输出渲染；本 feature 唯一对模型暴露的表面。
+功能描述：四个模型可调用工具的参数 schema（见 §4.7）、权限门与输出渲染；本 feature 唯一对模型暴露的表面。
 
 前置条件（Requires）：
   - 调用发生在某个 Session 的工具执行上下文中，调用者 SessionID 可知
@@ -339,7 +414,7 @@
 
 **权限的不对称**：`agent_send` 可发给任一邻居（父、子、兄弟），`agent_stop` 只能停直接子。理由是两者的破坏性不同——投递一条消息由接收方自行决定如何处理，接收方保有主动权；停止则单方面中断对方的执行，允许子 Agent 停止父或兄弟会让编排失去可预测的控制方向。停止的**效果**仍级联到目标的整棵后代，但那不扩大寻址范围：孙辈是连带结果，不是可选目标（调研 §14）。
 
-### 4.6 工具 schema
+### 4.7 工具 schema
 
 调研 §7 要求架构阶段定义工具 schema。四个工具的参数如下；所有目标参数一律名为 `session_id`。
 
@@ -403,14 +478,26 @@
 ```
 
 ```
-接口：M4 AgentLifecycle → M3 AgentInbox
+接口：M3 AgentInbox → M6 AgentExecution
 
-输入数据：AgentMessage（body 为终止通知文本，sender 为被停止的 Agent）
-输出数据：Accepted
+输入数据：target: SessionID
+输出数据：void
 
 协议约定：
-  - 调用方责任：仅在该层全部成员已取消后投递；投递目标为被停 Agent 的父
-  - 被调用方责任：与 §5 第三条接口相同——返回即已持久化，M4 依赖这一点来排序（见 §7 I1）
+  - 调用方责任：调用前消息已持久化进目标 Session，否则新起的执行会读不到它
+  - 被调用方责任：目标已有在跑的执行时为空操作，不注册第二个 watcher（见 §7 I4）
+```
+
+```
+接口：M4 AgentLifecycle → M6 AgentExecution
+
+输入数据：target: SessionID
+输出数据：{ transitioned: boolean }
+
+协议约定：
+  - 调用方责任：按 StopPlan.layers 自底向上逐层调用，处理下一层前必须收齐本层返回
+  - 被调用方责任：transitioned 为 true 时，该成员的取消通知在返回前**已持久化**；
+    为 false 时未取消也未产生通知。M4 依赖前者来满足 I1，依赖后者来满足幂等
 ```
 
 ```
@@ -456,8 +543,8 @@
 G1 「列出 Agent 树及状态」   → M1 AgentTree（主）+ M2 AgentStatusProjection（辅）+ M5（渲染）
 G2 「查询指定 Agent」        → 与 G1 同路径：M1（主）+ M2（辅）+ M5（渲染）；
                                调用方从 roster 中按 session_id 取行，不单列工具
-G3 「邻居间任意方向消息」    → M3 AgentInbox（主）+ M1（邻居判定）
-G4 「停止并保留上下文」      → M4 AgentLifecycle（主）+ M3（终止通知）+ M1（直接子判定 + 后代展开）
+G3 「邻居间任意方向消息」    → M3 AgentInbox（主）+ M6（执行注册与结局交付）
+G4 「停止并保留上下文」      → M4 AgentLifecycle（主）+ M6（取消与取消通知）+ M1（直接子判定 + 后代展开）
 G5 「身份统一」              → M5 AgentTools（表面约束）+ M1（身份解析）
 ```
 
@@ -500,12 +587,13 @@ H2: Session 的 parentID 链无环且深度有限。
 
 ```
 I1: 停止排序不变量
-    对任意被停止的 Agent a，若 a 的父 p 也在本次停止集内，
-    则「a 的终止通知已持久化」happens-before「p 被取消」。
-    （p 不在停止集内时 p 恒为发起停止者，它全程在运行，无排序要求。）
-    维护方：M4 AgentLifecycle 排序 / M3 AgentInbox 提供"返回即已持久化"的保证
-    preservation：M4 按 StopPlan.layers 自底向上推进，处理第 i 层前必须已收到第 0..i-1 层
-      全部通知投递的 Accepted 返回。M3 的接口协议规定 Accepted 意味着已落库，
+    对任意**实际发生转变**的 Agent a，若 a 的父 p 也在本次停止集内，
+    则「a 的取消通知已持久化」happens-before「p 被取消」。
+    （p 不在停止集内时 p 恒为发起停止者，它全程在运行，无排序要求；
+      a 未发生转变时不产生通知，无排序对象。）
+    维护方：M4 AgentLifecycle 排序 / M6 AgentExecution 提供"返回即已持久化"的保证
+    preservation：M4 按 StopPlan.layers 自底向上推进，处理第 i 层前必须收齐第 0..i-1 层
+      全部 `cancelAndAwaitNotice` 的返回。该接口协议规定 transitioned 为 true 时通知已落库，
       因此排序是结构性的，不依赖调度时序。
 
 I2: 接受即持久化
@@ -522,11 +610,19 @@ I3: 单活动执行
       本不变量塌陷的代价是回到 run_id（见 §6），故实现阶段须有回归钉住该机制。
 
 I4: 单一最终结果
-    ∀ Agent a，a 处理完当前消息序列后只向等待方交付一个最终结果，而非每条输入消息各一个。
-    维护方：M3 AgentInbox（不为单条消息建立结果承诺）；机制由既有单 output 槽语义提供
-    preservation：M3 的投递只向目标追加 user message，不注册任何 per-message 的完成回调；
-      既有后台执行对每个 Agent 只保留最新一次最终输出，并在无待处理执行时才结算完成信号。
-      中间 assistant 消息不因此丢失，它们留在 Session transcript 中可按 session_id 读取。
+    ∀ Agent a，a 的一次执行只注册一个 watcher、只交付一个最终结局；执行期间追加的消息进入
+    同一消息序列，不产生第二个结局。
+    维护方：M6 AgentExecution
+    preservation：M3 落库后调用 M6 `ensure`；`ensure` 对已有在跑执行的目标是空操作，
+      因此不会注册第二个 watcher。既有后台执行对每个 Agent 只保留最新一次最终输出，
+      并在无待处理执行时才结算。中间 assistant 消息留在 Session transcript 中可按 session_id 读取。
+
+I5: 结局通知单一生产者
+    完成、失败、取消三种结局通知只由 M6 的 watcher 产出。
+    维护方：M6 AgentExecution
+    preservation：M4 `stop` 只调 M6 取消，不自行投递任何通知；M3 只投递 agent_send 的消息，
+      不产出结局。由此不存在同一结局被两处各发一次的路径——这正是首轮设计
+      "既让 watcher 补 cancelled 分支、又让 stop 手工投递"造成重复通知的根因。
 ```
 
 ## 8. 并发规约
