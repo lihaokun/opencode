@@ -1,7 +1,7 @@
 # 架构设计 — agent-management
 
 - 状态：架构阶段，等待确认
-- 工具表面：四个（调研 §12 已撤销 `agent_get`）
+- 工具表面：四个（调研 §12 撤销 `agent_get`；§13 把恢复统一交给 `agent_send`）
 - 日期：2026-09-04
 - 对应问题：[lihaokun/opencode#23](https://github.com/lihaokun/opencode/issues/23)
 - 上游依据：`docs/research/agent-management-research.md`（调研阶段已确认）
@@ -31,7 +31,7 @@
      ├─ 解析：M1 AgentTree     ← Session store 的 parentID 链
      ├─ 权限：M1 AgentTree     ← 同树判定 / 后代判定
      └─ 执行：
-         agent           → M4 AgentLifecycle.createOrAdopt → M3 AgentInbox.deliver
+         agent           → M4 AgentLifecycle.create → M3 AgentInbox.deliver
          agent_list      → M1 AgentTree.tree      + M2 AgentStatusProjection.of
          agent_send      → M3 AgentInbox.deliver
          agent_stop      → M4 AgentLifecycle.stop → 逐层 M3 AgentInbox.deliver
@@ -89,7 +89,7 @@
   - session_id 全局唯一，且是本 feature 唯一的公开标识（调研 §5.1）
 
 生命周期：
-  - 创建：由 M4 AgentLifecycle.createOrAdopt 在创建子 Session 时产生
+  - 创建：由 M4 AgentLifecycle.create 在创建子 Session 时产生
   - 修改：status 为投影值，不落库；其余字段随 Session 变化
   - 删除：本 feature 不删除 Session；Agent 停止后 AgentInfo 仍可查
 
@@ -264,18 +264,17 @@
 ```
 模块名称：AgentLifecycle
 
-功能描述：创建或恢复 Agent；停止目标 Agent 及其后代的当前执行，并保证终止通知在父 Agent 被取消之前送达。
+功能描述：创建 Agent；停止目标 Agent 及其后代的当前执行，并保证终止通知在父 Agent 被取消之前送达。恢复既有 Agent 不经本模块，由 M3 承担（调研 §13）。
 
 前置条件（Requires）：
-  - createOrAdopt: 目标 agent 定义存在；未超过 subagent 深度上限
+  - create: 目标 agent 定义存在；未超过 subagent 深度上限
   - stop: 调用方已通过 M1 的权限判定；target 存在
 
 后置条件（Ensures）：
-  - createOrAdopt(session_id 已给定) 恢复同一 Session，保留其上下文与历史
-  - createOrAdopt(未给 session_id) 创建以调用者为 parentID 的新子 Session
+  - create 总是新建一个以调用者为 parentID 的子 Session，不复用既有 Session
   - stop 终止 ⋃ StopPlan.layers 中每个成员的当前执行
   - stop 不删除任何 Session、消息或历史
-  - stop 后目标仍可经 agent 或 agent_send 恢复
+  - stop 后目标仍可经 agent_send 恢复
   - stop 幂等：对已无活动执行的目标重复调用不产生额外效果，也不报错
   - 对 layers 的处理自底向上：处理 layers[i] 前，layers[0..i-1] 的终止通知均已交付
   - notify_boundary 非空时，target 的终止通知交付给它
@@ -324,9 +323,9 @@
 工具：agent
   description:    string    — 3-5 词的任务简述，用于 roster 与 UI
   prompt:         string    — 交给该 Agent 的任务正文
-  subagent_type:  string    — agent 定义名；创建时必填，恢复时忽略
-  session_id?:    string    — 给出即恢复该 Agent，不创建新的
+  subagent_type:  string    — agent 定义名
   background?:    boolean   — 异步启动，立即返回；结局经通知通道送达
+（无 session_id 参数：一次 agent 调用总是新建；恢复既有 Agent 用 agent_send，见调研 §13）
 返回：AgentInfo
 
 工具：agent_list
@@ -342,13 +341,6 @@
   session_id:     string    — 目标，须为调用者的后代
 返回：StopOutcome
 ```
-
-**待定：`agent(session_id, prompt)` 与 `agent_send(session_id, message)` 的边界。**
-两者都是"向既有 Agent 追加一条 user message 并使其运行"，机制完全相同，差别只在意图表述。
-调研 §9 把二者分列（对应 Codex 的 `followup_task` 与 `send_message`），但同一节又写明
-「本方案选择 Claude Code 的产品语义，由一个 `agent_send` 覆盖两种目标状态」。
-若确认二者机制同一，`agent` 的 `session_id` 参数可以去掉，恢复统一由 `agent_send` 承担，
-表面进一步收敛为三个工具。此项需在架构确认时裁定，不由细化阶段自行决定。
 
 ## 5. 模块间接口规约
 
@@ -399,8 +391,8 @@
 ```
 接口：M5 AgentTools → M4 AgentLifecycle
 
-输入数据：caller: SessionID，target: SessionID（stop）/ 创建参数（createOrAdopt）
-输出数据：AgentInfo（createOrAdopt）/ StopOutcome { stopped: SessionID[] }（stop）
+输入数据：caller: SessionID，target: SessionID（stop）/ 创建参数（create）
+输出数据：AgentInfo（create）/ StopOutcome（stop）
 
 协议约定：
   - 调用方责任：后代判定已通过（stop）

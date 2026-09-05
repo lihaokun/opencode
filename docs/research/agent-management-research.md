@@ -1,6 +1,6 @@
 # Agent 管理能力调研
 
-- 状态：调研阶段已确认（2026-09-04）；2026-09-05 修订工具表面为四个，见 §5 与 §12
+- 状态：调研阶段已确认（2026-09-04）；2026-09-05 两次修订工具表面，见 §12、§13
 - 日期：2026-08-31
 - 对应问题：[lihaokun/opencode#23](https://github.com/lihaokun/opencode/issues/23)
 - 调研范围：现有 `task`/Subagent 能力及其管理面；不涉及实现
@@ -84,7 +84,7 @@ Agent 间消息和恢复能力后，继续称为 Task 会混淆“执行者”�
 
 | 工具 | 职责 |
 |---|---|
-| `agent` | 创建新 Agent，或用既有 `session_id` 显式恢复 Agent |
+| `agent` | 创建新 Agent；恢复既有 Agent 由 `agent_send` 承担（见 §13） |
 | `agent_list` | 列出同一 Agent 树中的主 Agent 与全部 Subagent |
 | `agent_send` | 向同一 Agent 树中的任意 Agent 发送消息 |
 | `agent_stop` | 停止调用者有权控制的 Agent 当前执行 |
@@ -129,7 +129,7 @@ Agent 间消息和恢复能力后，继续称为 Task 会混淆“执行者”�
 - 停止范围包含目标 Agent 及其后代的当前执行，顺序为从最深后代到目标 Agent 自底向上；
 - 每个 Agent 进入 `cancelled` 后，通过现有父 Session 通知通道交付 `cancelled` 通知；若父 Agent 也在本次停止范围内，再继续取消父 Agent；
 - 取消不删除任何 Session 或历史；
-- 停止后仍可通过 `agent` 或 `agent_send` 恢复；
+- 停止后仍可通过 `agent_send` 恢复；
 - 重复停止是幂等操作；
 - 主 Agent 可以停止其后代；Subagent 只能停止自己的后代，不能停止父 Agent、主 Agent 或兄弟 Agent；
 - 工具动作名为 `agent_stop`，终态、通知状态和输出字段统一使用 `cancelled`，不增加 `stopped` 状态；
@@ -207,7 +207,7 @@ Session 仍可列出，随后通过 `agent_send(session_id, message)` 启动新�
 | 能力 | 本方案 | Claude Code | Codex | 结论 |
 |---|---|---|---|---|
 | 创建 Agent | `agent` | `Agent` | `spawn_agent` | 对齐 |
-| 显式恢复 Agent | `agent(session_id)` | 恢复已有 Agent/Subagent | `followup_task` | 对齐 |
+| 恢复既有 Agent | `agent_send` | `SendMessage`（`Agent` 始终新建） | `followup_task` | 对齐；三方均由消息通道承担恢复 |
 | 列出 Agent 树及状态 | `agent_list` | `ListAgents`（每行自带 busy/idle） | `list_agents` 提供树和状态 | 对齐；三方均由 roster 承载状态，均无单 Agent 查询工具 |
 | 给运行中 Agent 发消息 | `agent_send` | `SendMessage` | `send_message` | 对齐 |
 | 给 idle Agent 发消息并恢复 | `agent_send` | `SendMessage` 自动恢复 | `followup_task` | 功能覆盖，不额外拆工具 |
@@ -313,3 +313,31 @@ agent_stop
 - 「最后消息」一类需求由调用方拿 `session_id` 直接读 Session 历史获得，不为此新增工具，也不提供流式预览。
 
 本次修订只删工具、不加工具，其余章节的身份模型、消息语义、停止语义与非目标边界均不受影响。
+
+## 13. 修订：恢复既有 Agent 统一由 `agent_send` 承担（2026-09-05）
+
+初版 §5 给 `agent` 两个职责：创建新 Agent，或用既有 `session_id` 显式恢复。架构阶段写工具 schema 时
+发现 `agent(session_id, prompt)` 与 `agent_send(session_id, message)` 是同一机制——都是向既有 Agent
+追加一条 user message 并使其运行，差别只在意图叫法。
+
+§9 原先把二者分列（对应 Codex 的 `followup_task` 与 `send_message`），但同一节已写明「本方案选择
+Claude Code 的产品语义，由一个 `agent_send` 覆盖两种目标状态，避免为底层动作粒度增加新工具」。
+两处自相矛盾，按后者裁定。
+
+Claude Code 的 `Agent` 工具文档也明写：`SendMessage` 用于继续一个已存在的 Agent，**而一次新的
+`Agent` 调用总是重新开始**。
+
+### 结论
+
+- `agent` 只负责创建，schema 不含 `session_id`；
+- 恢复既有 Agent 一律经 `agent_send(session_id, message)`，目标 idle 时自然起新执行（§5.3 已有此语义）；
+- 工具数量不变，仍是四个——本次去掉的是一个参数，不是一个工具。
+
+```text
+agent        创建
+agent_list   roster
+agent_send   消息；对 idle 目标即恢复
+agent_stop   停止
+```
+
+与 Claude Code 的 `Agent` / `ListAgents` / `SendMessage` / `TaskStop` 逐项对应。
