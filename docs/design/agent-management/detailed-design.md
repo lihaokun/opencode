@@ -56,13 +56,14 @@
 
 ## 3. 错误处理策略
 
-**错误模型**：沿用仓库既有的 Effect typed error。本 feature 定义四个失败类型，均为可预期的调用方错误，
+**错误模型**：沿用仓库既有的 Effect typed error。本 feature 定义五个失败类型，均为可预期的调用方错误，
 不使用异常，不使用 `Effect.orDie`。
 
 ```
 AgentNotFound      { session_id }         目标 Session 不存在
+AgentTypeNotFound  { subagent_type }      agent 创建时指定的 agent 定义不存在
 NotAChild          { caller, target }     agent_stop 的目标不是调用者的直接子
-SelfDelivery       { session_id }         agent_send 的目标是自己
+SelfDelivery       { target }             agent_send 的目标是发送者自己
 DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 ```
 
@@ -79,7 +80,7 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 本细化不引入新的跨模块类型。架构 §3 已定义 `AgentStatus` / `AgentInfo` / `AgentNeighborhood` /
 `AgentMessage` / `Accepted` / `StopOutcome` / `StopPlan`，此处不重复。
 
-新增的四个错误类型见 §3，属**模块私有**（仅本 feature 产出与消费），不进架构文档数据结构节。
+新增的五个错误类型见 §3，属**模块私有**（仅本 feature 产出与消费），不进架构文档数据结构节。
 
 ## 5. 模块细化
 
@@ -117,29 +118,32 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
   - 后置：返回值满足 `AgentNeighborhood` 全部类型不变量。
   - 副作用论证：只调用 `Session.get` / `Session.children`，两者的功能规约均声明只读，故无副作用。
 
-#### 5.1.2 `children(id: SessionID) -> Effect<AgentInfo[], AgentNotFound>`
+#### 5.1.2 `children(id: SessionID, depth: NonNegativeInt) -> Effect<AgentInfo[], AgentNotFound>`
 
-- **功能描述**：取 `id` 的直接子。
+- **功能描述**：取 `id` 的直接子。`depth` 是子的深度，由调用方给出（父深度 +1），本函数不自行推算。
 - **调用关系**：callers: M1 `neighborhood`/`descendants`、M4 `plan`；callees: `Session.children`。
-- **实现思路**：调用 `Session.children(id)`，逐项经 `toInfo` 转换，relation 置 `child`。
+- **实现思路**：调用 `Session.children(id)`，逐项经 `toInfo(session, "child", depth)` 转换。
   `Session.children` 的 ensures 是"返回 parent_id == id 的全部 Session"，对不存在的 id 返回空数组而非失败，
   故本函数无失败分支；`AgentNotFound` 保留在签名中仅为与 M1 其余函数一致，实际不产生。
 - **正确性论证**：trivial —— 单次 callee 调用加逐项纯转换，无分支、无循环、无副作用。
 
-#### 5.1.3 `descendants(id: SessionID) -> Effect<AgentInfo[], AgentNotFound>`
+#### 5.1.3 `descendants(id: SessionID, baseDepth: NonNegativeInt) -> Effect<AgentInfo[], AgentNotFound>`
 
-- **功能描述**：取 `id` 的后代闭包，不含 `id` 自身。仅供 M4 展开停止级联。
+- **功能描述**：取 `id` 的后代闭包，不含 `id` 自身。每个成员的 `depth` 由展开层数相对 `baseDepth`
+  递推得出，供 M4 `plan` 分层使用。仅供 M4 展开停止级联。
 - **调用关系**：callers: M4 `plan`；callees: M1 `children`。
 - **实现思路**：
-  1. `frontier = [id]`，`acc = []`，`seen = {id}`。
-  2. 循环：`frontier` 非空时，取出全部元素，对每个调用 `children`，把结果中 `session_id ∉ seen` 的
-     加入 `acc`、加入 `seen`、构成 `next`。`frontier = next`。
+  1. `frontier = [id]`，`acc = []`，`seen = {id}`，`level = baseDepth`。
+  2. 循环：`frontier` 非空时，`level += 1`，取出全部元素，对每个调用 `children(m, level)`，把结果中
+     `session_id ∉ seen` 的加入 `acc`、加入 `seen`、构成 `next`。`frontier = next`。
+     - 同一轮取出的成员深度相同，故该轮所有子的 depth 均为 `level`，无需逐节点回溯。
      - 分支：`children` 返回空 → 该分支不贡献 `next`，其余分支照常。
      - `seen` 去重是防御性的：H2 已排除环，去重只保证即使存储异常也必然终止。
   3. `frontier` 为空 → 退出循环，返回 `acc`。
   - **终止性**：每轮加入 `acc` 的成员都新入 `seen` 且永不移除，`seen` 单调增长；Session 总数有限
     （H2：深度有限，且每层成员有限），故 `seen` 有上界，循环必然终止。
-  - **循环不变量**：`acc == seen \ {id}`，且 `acc` 中每个成员都是 `id` 的后代。
+  - **循环不变量**：`acc == seen \ {id}`；`acc` 中每个成员都是 `id` 的后代；且其 `depth` 等于
+    `baseDepth + 从 id 到它的边数`。
 - **正确性论证**：
   - 前置：`id` 对应的 Session 存在；parentID 链无环（H2）。
   - 论证：
@@ -231,13 +235,17 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
     - 目标 running 时由 `ensureRunning` 的 Running 分支保证不新起 run，满足后置条件"不新起 run"；
       非 running 时由 Idle 分支新起，满足"起一个新 run 消费该消息"。二分支覆盖 `AgentStatus` 全部取值。
   - 后置：返回 `Accepted` ⇒ 消息已落库；目标按其当时状态被加入或被启动。
+  - **I4 保持论证**：步骤 3 只向目标追加一条 user message，步骤 4 只唤醒；两步都不注册任何
+    per-message 的完成回调，也不为本条消息分配独立的结果槽。目标的最终结果仍由既有后台执行
+    在无待处理执行时结算一次，故"一个 Agent 处理完当前消息序列后只交付一个最终结果"不被本函数破坏。
+    中间 assistant 消息留在目标 transcript 中，可按 `session_id` 读取。
   - 副作用论证：(1) 目标 Session 多一条 user message —— 步骤 3；(2) 可能启动目标的一次执行 —— 步骤 4；
     (3) 不写 `SessionStatus`、不改目标的 agent/model 绑定（步骤 3 显式传目标自己的 agent、不传 model）。
     无其它共享状态写入。
 
 ### 5.4 M4 AgentLifecycle
 
-#### 5.4.1 `create(input) -> Effect<AgentInfo, DepthLimitReached | AgentNotFound>`
+#### 5.4.1 `create(input) -> Effect<AgentInfo, DepthLimitReached | AgentTypeNotFound | AgentNotFound>`
 
 - **功能描述**：新建一个以调用者为父的子 Agent 并投递初始任务。
 - **调用关系**：callers: M5 `agent`；callees: `Session.get`、`Session.create`、
@@ -247,7 +255,7 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
   2. 分支：`d >= cfg.subagent_depth`（默认 3）→ 返回 `DepthLimitReached{d, limit}`，无副作用。
      该检查在 M5 撤下工具之外**保留为第二道防线**：工具可见性由 M5 决定，但兼容入口 `task` 与
      插件直调仍可能绕过工具列表。
-  3. 解析 `subagent_type` 对应的 agent 定义。不存在 → `AgentNotFound`（复用同一错误类型，data 带类型名）。
+  3. 解析 `subagent_type` 对应的 agent 定义。不存在 → `AgentTypeNotFound{subagent_type}`，无副作用。
   4. 计算子 Session 权限：`deriveSubagentSessionPermission({ parentSessionPermission, subagent })`，
      再叠加既有 `childToolDenies` 中**保留**的两项（`todowrite`、`primary_tools`）。
      不再叠加对 `agent` 的 deny（§2.3）。
@@ -278,14 +286,15 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 - **实现思路**：
   1. M1 `isChild(caller, target)`。为假 → `NotAChild{caller, target}`，无副作用。
      callee 契约：`isChild` 只读，失败通道为 `AgentNotFound`（目标不存在时）。
-  2. M1 `descendants(target)` 得后代集合 `desc`。callee 契约：返回后代闭包，不含 target 自身，只读。
-  3. 按 `depth` 把 `desc ∪ {target}` 分桶。target 的 depth 已知（调用者深度 +1），后代的 depth
-     由 `descendants` 逐层展开时记录。
-  4. 桶按 depth **降序**排列成 `layers`，即 `layers[0]` 为最深层，末层恰为 `[target]`。
+  2. `targetDepth = callerDepth(caller) + 1`（由步骤 1 已确认 target 是 caller 的直接子）。
+  3. M1 `descendants(target, targetDepth)` 得后代集合 `desc`，每个成员已带 `depth`。
+     callee 契约：返回后代闭包，不含 target 自身；成员 depth = `targetDepth` + 到 target 的边数；只读。
+  4. 按 `depth` 把 `desc ∪ {target}` 分桶。target 自身的 depth 为 `targetDepth`。
+  5. 桶按 depth **降序**排列成 `layers`，即 `layers[0]` 为最深层，末层恰为 `[target]`。
      - 边界：`desc` 为空时 `layers == [[target]]`，仍满足"末元素恰为 `[target]`"。
-  5. `notify_boundary = caller`。由步骤 1 已确认 `target.parentID === caller`，故该值恒为 target 的父，
+  6. `notify_boundary = caller`。由步骤 1 已确认 `target.parentID === caller`，故该值恒为 target 的父，
      且恒不在 `⋃ layers` 内（caller 不是自己的后代，H2 排除环）。
-  6. 返回 `{ target, layers, notify_boundary }`。
+  7. 返回 `{ target, layers, notify_boundary }`。
 - **正确性论证**：
   - 前置：`caller` 与 `target` 对应的 Session 均存在。
   - 论证：
@@ -309,7 +318,11 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
           是空操作（幂等，架构 §4.4）。
         - 单个成员抛出未预期异常时捕获，记入 `failed{session_id, reason}`，**不中断本层其余成员**，
           也不中断后续层（§3 传播规则）。成功者记入 `stopped`。
-     b. 对该层每个成员，向其父投递终止通知：`deliver({ target: parentOf(m), sender: m, ... })`。
+     b. 对该层每个成员 `m`，向其父投递终止通知：`deliver({ target: m.parent_id, sender: m.session_id, ... })`。
+        - `m.parent_id` 取自 `AgentInfo`，由 `plan` 经 `descendants` / `children` 填好，无需另查。
+        - 末层的成员恰是 target，其 `parent_id` 等于 `notify_boundary`（= caller），
+          故架构 M4 的"notify_boundary 非空时，target 的终止通知交付给它"由本步统一覆盖，
+          不需要单独一条分支。
         - 通知文本由 §5.4.4 `renderTermination` 产出。
         - **await 本层全部 `Accepted` 返回后**才进入下一层。这是 I1 的实现点。
         - 投递失败记入 `failed`，不中断。
@@ -330,6 +343,8 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
       —— 它正在执行本次 `agent_stop` 调用。
     - 单成员失败只写 `failed` 不中断 ⇒ 后置的"stopped ∪ failed = ⋃ layers"由步骤 3a 的二分穷尽保证。
   - 后置：`StopOutcome` 满足其类型不变量；目标子树全部成员的当前执行已终止或已记入 `failed`。
+    "停止后仍可经 `agent_send` 恢复"由副作用论证第 (3) 条给出：本函数不删除任何 Session 或消息，
+    被停成员的 Session 与历史完整存续，故 `deliver` 对其仍可投递并经 Idle 分支新起执行。
   - 副作用论证：(1) 子树各成员的活动执行被中断 —— 步骤 3a；(2) 各成员的父 Session 各多一条通知消息
     —— 步骤 3b 经 `deliver`；(3) 不删除任何 Session、消息或历史（`cancel` 的既有语义只中断执行）。
 
@@ -343,19 +358,23 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 
 ### 5.5 M5 AgentTools
 
+**本模块共同约束**：四个工具**都不调用 `ctx.ask`**（架构 §6）。权限规则仍可在工具注册层拒绝某个工具
+或某个 `subagent_type`；被派生 Agent 自身的工具调用继续在它自己的 Session 权限下受控，本 feature
+不改动该机制。以下各函数不再重复这一条。
+
 #### 5.5.1 `agent(params, ctx) -> Effect<string>`
 
 - **功能描述**：创建子 Agent 并渲染结果。
 - **调用关系**：callees: M4 `create`。
 - **实现思路**：
   1. 从 `ctx.sessionID` 取 caller，不接受模型提供的调用者身份（架构 §5 接口协议）。
-  2. **不调用 `ctx.ask`**（架构 §6）。权限规则仍可在工具注册层拒绝本工具或某个 `subagent_type`。
-  3. 调 M4 `create({ caller, subagent_type, description, prompt })`。
-  4. 分支：成功 → 渲染 `AgentInfo`（含 `session_id`，供后续 `agent_send` / `agent_stop` 寻址）；
-     `DepthLimitReached` → 渲染"已达嵌套上限"；`AgentNotFound` → 渲染"未知 agent 类型"。
-  5. 返回文本。
+  2. 调 M4 `create({ caller, subagent_type, description, prompt })`。
+  3. 分支：成功 → 渲染 `AgentInfo`（含 `session_id`，供后续 `agent_send` / `agent_stop` 寻址）；
+     `DepthLimitReached` → 渲染"已达嵌套上限"；`AgentTypeNotFound` → 渲染"未知 agent 类型"；
+     `AgentNotFound` → 渲染"调用者 Session 不存在"。
+  4. 返回文本。
 - **正确性论证**：非平凡（跨模块调用）。前置：调用发生在某 Session 的工具上下文中。论证：步骤 1 使
-  caller 不可伪造；步骤 3 的所有失败在步骤 4 被穷尽映射为文本，无未处理分支；成功路径的副作用完全
+  caller 不可伪造；步骤 2 的所有失败在步骤 3 被穷尽映射为文本，无未处理分支；成功路径的副作用完全
   由 `create` 承担，本函数自身不写 Session。后置：返回模型可读文本。副作用：委托给 M4，本函数无。
 
 #### 5.5.2 `agent_list(ctx) -> Effect<string>`
@@ -436,10 +455,13 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
       返回值三路处理
 - [x] 所有 if / else / switch 分支已覆盖 —— `neighborhood` 的有无父、`of` 的三支状态、`deliver` 的
       running/非 running、`stop` 的单成员成功/失败、`available` 的到限/未到限均已刻画
-- [x] 所有退出点（成功 / 失败 / 异常）已刻画 —— §3 定义四个失败类型，每个函数的失败分支均标注
+- [x] 所有退出点（成功 / 失败 / 异常）已刻画 —— §3 定义五个失败类型，每个函数的失败分支均标注
       "无副作用"或说明已产生的副作用
 - [x] 所有 callee 调用显式引用其 pre / post —— `Session.children`、`SessionStatus.get`、`prompt(noReply)`、
       `loop`/`ensureRunning`、`SessionRunState.cancel` 的契约均在使用点引述
+- [x] 每个模块的函数覆盖该模块在架构 §4 的全部 Ensures 与不变式 —— M3 的 I4 在 `deliver` 有独立保持论证；
+      M4 的"停止后可恢复"由 `stop` 的副作用论证第 (3) 条给出，"notify_boundary 交付"由 `stop` 步骤 3b
+      统一覆盖；M5 的"四个工具都不弹确认"提到模块前言，不逐函数重复
 - [x] 所有循环有终止性论证 —— `descendants`（`seen` 单调增长且有上界）、`stop`（层数有限）、
       `callerDepth`（每步上移一层，链无环有限）
 - [x] 所有上游事实显式列出 —— H2（parentID 链无环且深度有限）在 `neighborhood` / `descendants` /
