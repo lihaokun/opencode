@@ -1,6 +1,6 @@
 # 架构设计 — agent-management
 
-- 状态：架构阶段，等待确认
+- 状态：架构阶段已确认（2026-09-06），进入细化阶段
 - 工具表面：四个（调研 §12 撤销 `agent_get`；§13 把恢复统一交给 `agent_send`）
 - 日期：2026-09-04
 - 对应问题：[lihaokun/opencode#23](https://github.com/lihaokun/opencode/issues/23)
