@@ -289,6 +289,8 @@
 
 **为什么终止通知必须存在**：调研 §5.4 授权主 Agent 停止其后代。停掉一个孙 Agent 时，当初以后台方式启动它、此刻仍在运行的中间 Subagent 正等待自动通知；不发通知它将永远等待，而工具描述又要求它不要轮询。通知与完成、失败走同一条通道，是一条普通消息，正常唤醒接收方（调研 §5.4）。
 
+该场景要求 Agent 树至少三层，因此本架构把 `subagent_depth` 的默认值提到 2（见 §6）。若停留在原默认值 1，树最多两层，父只可能是主 Agent 自己，通知与排序都无对象。
+
 ### 4.5 M5 AgentTools
 
 ```
@@ -324,7 +326,9 @@
   description:    string    — 3-5 词的任务简述，用于 roster 与 UI
   prompt:         string    — 交给该 Agent 的任务正文
   subagent_type:  string    — agent 定义名
-  background?:    boolean   — 异步启动，立即返回；结局经通知通道送达
+  background?:    boolean   — 异步启动，立即返回；结局经通知通道送达。
+                              仅在 OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS 开启时暴露；
+                              未开启时该参数不进 schema，一切执行为前台（见 §9 缺口 4）
 （无 session_id 参数：一次 agent 调用总是新建；恢复既有 Agent 用 agent_send，见调研 §13）
 返回：AgentInfo
 
@@ -411,6 +415,7 @@
 | 停止级联到整棵子树 | 与既有停止语义一致，且避免"停了父、子 Agent 变孤儿继续消耗"；是否改为只停目标本身列为 follow-up（issue #26） |
 | `agent_send` 不经 `BackgroundJob.extend` | extend 把新执行挂在上一次执行之后，是 run 边界而非 turn 边界，且排队期间消息不落库 |
 | 权限不对称：send 全向、stop 仅后代 | 见 §4.5 |
+| `subagent_depth` 默认由 1 提到 2 | 默认 1 时 `task.ts` 的 `depth >= (cfg.subagent_depth ?? 1)` 会挡住 Subagent 再派生 Subagent，Agent 树最多两层。两层下唯一的停止者与唯一的父都是主 Agent，终止通知与自底向上排序都退化为空转，本 feature 的多层编排能力默认不可用。提到 2 后主 Agent 可派生子、子可派生孙、孙被挡住，三层结构默认成立。实现须同时改 `task.ts` 的兜底值与 `core/src/v1/config/config.ts` 中 `subagent_depth` 的 schema 说明文字 |
 | 不设 `agent_get`，状态并入 roster 每一行 | Claude Code 只有 `ListAgents` 且每行自带 busy/idle，无单 Agent 查询工具；其最接近的 `TaskOutput` 已废弃且按 task_id 寻址、阻塞等待、轮询状态，三者均为调研 §6 排除项。多一个工具只是把同一份信息换个形状再发一次。详见调研 §12 |
 | 保留隐藏的 `task` 兼容入口 | 调研 §8：旧插件、权限配置与显式调用仍需可用，但不进模型工具列表；入口只把 `task_id` 规范化为 `session_id` 后转发同一实现，不维护第二套状态、执行路径或测试基准 |
 | 一个 Agent 任一时刻至多一个活动执行 | 调研 §7 的概念定义（`Execution = Agent 当前的内部执行状态`，单数）。这是 `session_id` 足以作唯一标识的前提：允许并行执行则 `agent_stop(session_id)` 无法指明停哪一个，`run_id` 必然回归，调研 §4.2 的否决随之失效。机制由 I3 维护 |
@@ -542,14 +547,25 @@ Rely-Guarantee 条件：
     这与两个人同时向一个会话打字的既有语义一致，不引入新的竞态类别
 ```
 
-## 9. 已知缺口
+## 9. 与 Claude Code 的有意差异
+
+工具集合逐项对应 Claude Code（`Agent` / `ListAgents` / `SendMessage` / `TaskStop`），但两处语义有意不同，
+不应被读成处处对齐：
+
+| 项 | Claude Code | 本方案 | 理由 |
+|---|---|---|---|
+| 停止范围 | `TaskStop` 按 id 停一个后台任务，文档未述子树级联 | 级联整棵子树，自底向上 | 防止停掉父之后子 Agent 变孤儿继续消耗（#37314）；备选方案见 issue #26 |
+| roster 范围 | `ListAgents` 跨 in-process subagent、teammate、本机其他会话、云端会话 | 仅调用者所在的一棵 Agent 树 | 调研 §6 明确排除跨互不相关根 Session 的通信与编排 |
+
+## 10. 已知缺口
 
 以下三项在本架构中显式存在，不被本架构修复，实现阶段须单独核对：
 
 1. **拆解期间新派生的后代不在停止集内**。既有子树展开按一次快照进行，快照之后派生的后代不在停止集内。
 2. **停止后代时的执行现场不可恢复**。停止保留 Session 与历史，但不保留中断点；恢复是从历史继续，不是从断点续跑。调研 §6 已将 Suspend 语义列为非目标。
 3. **崩溃后 running 退化为 idle**（H1）。本架构不提供崩溃恢复。
+4. **后台执行受实验开关控制**。`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` 未开启时，`background` 参数不进 schema，所有 Agent 执行为前台。连带影响：自动通知通道只服务后台执行，因此「结局由通知通道交付」这一前提在默认配置下不成立，`AgentStatus` 两值方案的信息完整性随之下降。本架构不改动该开关，实现阶段须明确首版是否要求开启。
 
-## 10. 下一阶段
+## 11. 下一阶段
 
 架构确认后进入 §4.3 细化阶段，产出 `docs/design/agent-management/detailed-design.md`，需满足 §4.3.1 完整性 6 条与 §4.3.2 函数正确性论证。届时按 §2.3 步骤 2 为契约变更分配 subplan-id，feature 短称取 `agm`。
