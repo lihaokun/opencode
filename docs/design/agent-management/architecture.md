@@ -326,9 +326,8 @@
   description:    string    — 3-5 词的任务简述，用于 roster 与 UI
   prompt:         string    — 交给该 Agent 的任务正文
   subagent_type:  string    — agent 定义名
-  background?:    boolean   — 异步启动，立即返回；结局经通知通道送达。
-                              仅在 OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS 开启时暴露；
-                              未开启时该参数不进 schema，一切执行为前台（见 §9 缺口 4）
+（无 background 参数：Agent 恒为异步执行，调用立即返回 AgentInfo，
+  结局经既有通知通道送达。前台模式与本 feature 不兼容，见 §6）
 （无 session_id 参数：一次 agent 调用总是新建；恢复既有 Agent 用 agent_send，见调研 §13）
 返回：AgentInfo
 
@@ -415,6 +414,7 @@
 | 停止级联到整棵子树 | 与既有停止语义一致，且避免"停了父、子 Agent 变孤儿继续消耗"；是否改为只停目标本身列为 follow-up（issue #26） |
 | `agent_send` 不经 `BackgroundJob.extend` | extend 把新执行挂在上一次执行之后，是 run 边界而非 turn 边界，且排队期间消息不落库 |
 | 权限不对称：send 全向、stop 仅后代 | 见 §4.5 |
+| Agent 恒为异步执行，取消 `background` 参数与实验开关 | 前台路径以 `background.wait({ id })` 阻塞等待子 Agent 结束，父 Agent 在这段时间内停在那次 tool call 里，发不出 `agent_list` / `agent_send` / `agent_stop`——管理面对前台子 Agent 完全不可用，本 feature 失去意义。Claude Code 的 `Agent` 同样没有 background 参数，其 subagent 恒为异步并经通知送达。实现须移除 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` 门与前台分支；`task` 兼容入口收到旧的 `background: false` 时忽略该参数 |
 | `subagent_depth` 默认由 1 提到 2 | 默认 1 时 `task.ts` 的 `depth >= (cfg.subagent_depth ?? 1)` 会挡住 Subagent 再派生 Subagent，Agent 树最多两层。两层下唯一的停止者与唯一的父都是主 Agent，终止通知与自底向上排序都退化为空转，本 feature 的多层编排能力默认不可用。提到 2 后主 Agent 可派生子、子可派生孙、孙被挡住，三层结构默认成立。实现须同时改 `task.ts` 的兜底值与 `core/src/v1/config/config.ts` 中 `subagent_depth` 的 schema 说明文字 |
 | 不设 `agent_get`，状态并入 roster 每一行 | Claude Code 只有 `ListAgents` 且每行自带 busy/idle，无单 Agent 查询工具；其最接近的 `TaskOutput` 已废弃且按 task_id 寻址、阻塞等待、轮询状态，三者均为调研 §6 排除项。多一个工具只是把同一份信息换个形状再发一次。详见调研 §12 |
 | 保留隐藏的 `task` 兼容入口 | 调研 §8：旧插件、权限配置与显式调用仍需可用，但不进模型工具列表；入口只把 `task_id` 规范化为 `session_id` 后转发同一实现，不维护第二套状态、执行路径或测试基准 |
@@ -564,7 +564,7 @@ Rely-Guarantee 条件：
 1. **拆解期间新派生的后代不在停止集内**。既有子树展开按一次快照进行，快照之后派生的后代不在停止集内。
 2. **停止后代时的执行现场不可恢复**。停止保留 Session 与历史，但不保留中断点；恢复是从历史继续，不是从断点续跑。调研 §6 已将 Suspend 语义列为非目标。
 3. **崩溃后 running 退化为 idle**（H1）。本架构不提供崩溃恢复。
-4. **后台执行受实验开关控制**。`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` 未开启时，`background` 参数不进 schema，所有 Agent 执行为前台。连带影响：自动通知通道只服务后台执行，因此「结局由通知通道交付」这一前提在默认配置下不成立，`AgentStatus` 两值方案的信息完整性随之下降。本架构不改动该开关，实现阶段须明确首版是否要求开启。
+4. **移除前台分支会波及既有测试**。前台路径当前承载着子 Agent 错误如何呈现给父 Agent 的一批断言（CLI run 相关用例走的就是这条路）。恒为异步后这些用例的观察点从 tool 返回值移到通知消息，实现阶段须逐条迁移而非删除。
 
 ## 11. 下一阶段
 
