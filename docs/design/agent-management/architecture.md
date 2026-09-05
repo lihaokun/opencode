@@ -15,7 +15,7 @@
 |---|---|---|
 | G1 | 可靠列出当前 Agent 树及各成员状态 | §1 缺口 1 |
 | G2 | 查询指定 Agent 的身份、关系与状态 | §1 缺口 2；由 roster 行承载，不单列工具（调研 §12） |
-| G3 | 同一 Agent 树内任意方向的直接消息 | §1 缺口 3 |
+| G3 | 邻居（父 / 子 / 兄弟）间任意方向的直接消息 | §1 缺口 3；范围见调研 §14 |
 | G4 | 主动停止不再需要或失控的 Agent，保留上下文 | §1 缺口 4 |
 | G5 | 身份统一为可寻址、可恢复的 Session，消除 `task_id` 的语义错位 | §1 缺口 5 |
 
@@ -29,7 +29,7 @@
 模型
  └─ M5 AgentTools（唯一对模型暴露的表面）
      ├─ 解析：M1 AgentTree     ← Session store 的 parentID 链
-     ├─ 权限：M1 AgentTree     ← 同树判定 / 后代判定
+     ├─ 权限：M1 AgentTree     ← 邻居判定 / 直接子判定
      └─ 执行：
          agent           → M4 AgentLifecycle.create → M3 AgentInbox.deliver
          agent_list      → M1 AgentTree.tree      + M2 AgentStatusProjection.of
@@ -79,6 +79,7 @@
   - title: string — Session 标题，供人读
   - status: AgentStatus — 见上
   - depth: NonNegativeInt — 相对树根的深度，根为 0
+  - relation: "self" | "parent" | "child" | "sibling" — 相对查询发起者的关系（调研 §14）
   - time_created: number — Session 创建时间（epoch ms）
 
 类型不变量：
@@ -97,18 +98,21 @@
 ```
 
 ```
-数据结构：AgentTreeView
+数据结构：AgentNeighborhood
 
 字段：
-  - root: SessionID — 调用者所在树的根 Session
-  - members: AgentInfo[] — 树内全部成员，含 root 自身
   - caller: SessionID — 发起查询的 Agent
+  - members: AgentInfo[] — 调用者的邻居，含调用者自身
 
 类型不变量：
   - caller ∈ members.map(session_id)
-  - ∀ m ∈ members, m.parent_id == undefined ∨ m.parent_id ∈ members.map(session_id)
-    （树是自封闭的：除根外每个成员的父都在集合内）
-  - members 按 (depth, time_created) 升序，保证输出稳定
+  - ∀ m ∈ members, m.relation ∈ {self, parent, child, sibling}，且恰有一个成员 relation == self
+  - 邻居集合的定义：
+      parent  = caller.parent_id 对应的 Agent（caller 为主 Agent 时不存在）
+      child   = parent_id == caller 的全部 Agent
+      sibling = parent_id == caller.parent_id 且 ≠ caller 的全部 Agent（caller 为主 Agent 时为空）
+  - 不含祖父、孙、叔伯、侄、堂兄弟等任何非邻居成员（调研 §14）
+  - members 按 (relation, time_created) 升序，保证输出稳定
 
 跨模块共享性：跨模块共享 — consumer: M1（产出）、M5（渲染 roster）
 ```
@@ -124,7 +128,7 @@
 
 类型不变量：
   - sender ≠ target（不允许自投递）
-  - sender 与 target 属于同一棵 AgentTreeView
+  - target ∈ sender 的 AgentNeighborhood（父 / 子 / 兄弟之一）
   - 落库文本 = 系统前缀 + "\n\n" + body，前缀格式固定为
     `[Agent message from <sender_agent> (<sender>)]`
   - 调用方无法覆盖或伪造前缀（调研 §5.3）
@@ -171,13 +175,13 @@
 字段：
   - target: SessionID — 停止的子树根
   - layers: SessionID[][] — 按深度分层的成员，layers[0] 为最深层，末层为 target 自身
-  - notify_boundary: SessionID | undefined — target 的父 Agent；不在停止集内时非空
+  - notify_boundary: SessionID — target 的父 Agent，即发起停止者；恒非空，且恒不在停止集内
 
 类型不变量：
   - ⋃ layers = target 的后代闭包 ∪ {target}
   - ∀ i < j，layers[i] 中成员的 depth > layers[j] 中成员的 depth（自底向上）
   - layers 末元素恰为 [target]
-  - notify_boundary ∉ ⋃ layers
+  - notify_boundary ∉ ⋃ layers（因 target 必是发起者的直接子，其父即发起者）
 
 跨模块共享性：模块私有 — 仅 M4 AgentLifecycle 使用；列在此处是因为它承载 §7 的 I1 不变量
 ```
@@ -191,17 +195,19 @@
 ```
 模块名称：AgentTree
 
-功能描述：从任一 SessionID 解析出所属 Agent 树、祖先链与后代闭包，并承担同树 / 后代两类权限判定。
+功能描述：解析调用者的邻居集合（父 / 子 / 兄弟）与直接子集合，并承担邻居 / 直接子两类寻址判定；
+  另提供后代闭包供 M4 的停止级联使用——那是效果范围，不是寻址范围。
 
 前置条件（Requires）：
   - 入参 session_id 对应的 Session 在 store 中存在
   - Session 的 parentID 链无环（由 Session 创建路径保证，见 §7 H2）
 
 后置条件（Ensures）：
-  - tree(id) 返回的 AgentTreeView 满足其类型不变量（自封闭、稳定序）
-  - descendants(id) 返回 id 的全部后代，不含 id 自身，不含任何祖先或兄弟
-  - isSameTree(a, b) ⟺ root(a) == root(b)
-  - isDescendant(a, b) ⟺ a ∈ descendants(b)
+  - neighborhood(id) 返回的 AgentNeighborhood 满足其类型不变量
+  - children(id) 返回 parent_id == id 的全部 Agent
+  - descendants(id) 返回 id 的全部后代，不含 id 自身；仅供 M4 展开停止级联
+  - isNeighbor(caller, target) ⟺ target ∈ neighborhood(caller).members 且 target ≠ caller
+  - isChild(caller, target) ⟺ target ∈ children(caller)
 
 不变式（Invariants）：
   - 解析过程只读 Session store，不改变任何 Session 状态
@@ -287,9 +293,19 @@
 
 **为什么必须自底向上**：终止通知复用 M3 的投递语义，而 M3 对非 running 目标会起新 run。若自顶向下取消，子 Agent 的通知会投递给一个刚被停掉的父 Agent 并把它重新唤醒——等于停止操作自己复活了它要停的东西。自底向上使每条通知投递时其接收方仍在运行，命中"加入当前 run"分支。
 
-**为什么终止通知必须存在**：调研 §5.4 授权主 Agent 停止其后代。停掉一个孙 Agent 时，当初以后台方式启动它、此刻仍在运行的中间 Subagent 正等待自动通知；不发通知它将永远等待，而工具描述又要求它不要轮询。通知与完成、失败走同一条通道，是一条普通消息，正常唤醒接收方（调研 §5.4）。
+**为什么终止通知必须存在**：取消不能静默结束。通知与完成、失败走同一条通道，是一条普通消息，
+正常唤醒接收方（调研 §5.4）。接收方分两类：
 
-该场景要求 Agent 树至少三层，因此本架构把 `subagent_depth` 的默认值提到 2（见 §6）。若停留在原默认值 1，树最多两层，父只可能是主 Agent 自己，通知与排序都无对象。
+- **发起停止的 Agent**（即 target 的父，因为 target 必是它的直接子）。它虽然知道自己下了命令，
+  但通知在它的 transcript 里留下记录，且它此刻在运行，消息加入当前 run，无副作用。
+- **级联中每个被停 Agent 的父**。这些父自己也在停止集内，它们同样会被取消。
+
+**为什么必须自底向上**：理由是防复活，不是"有第三方在等"。终止通知复用 M3 的投递语义，
+而 M3 对非 running 目标会起新 run。级联中孙的取消通知要投给子，若自顶向下取消，子已经停了，
+这条通知会把它重新唤醒——停止操作自己复活了它要停的东西。自底向上使每条通知投递时接收方仍在运行，
+命中"加入当前 run"分支。
+
+该场景要求 Agent 树至少三层，因此本架构把 `subagent_depth` 的默认值提到 3（见 §6）。
 
 ### 4.5 M5 AgentTools
 
@@ -305,8 +321,10 @@
   - 对模型暴露且仅暴露 agent / agent_list / agent_send / agent_stop（调研 §12）
   - 保留隐藏兼容入口 task：不进模型工具列表，收到旧 task_id 时规范化为 session_id 后转发给同一实现，不建立第二条执行路径（调研 §8）
   - 所有工具的目标参数名为 session_id，不出现 task_id / agent_id / run_id
-  - agent_send / agent_stop 在目标不属于调用者所在树时失败，不产生副作用
-  - agent_stop 在目标不是调用者后代时失败，不产生副作用
+  - agent_send 在目标不是调用者的邻居时失败，不产生副作用
+  - agent_stop 在目标不是调用者的直接子时失败，不产生副作用
+  - 调用者深度已达 subagent_depth 上限时，不向其提供 agent 与 agent_stop；agent_list 与 agent_send 仍提供
+    （判据是深度到限，不是当前是否有子 Agent，否则工具会随派生忽隐忽现）
   - 输出为即时快照，不提供 wait / timeout / 轮询
 
 不变式（Invariants）：
@@ -315,7 +333,7 @@
 副作用：委托给 M1–M4；本模块自身不直接操作 Session
 ```
 
-**权限的不对称**：`agent_send` 允许同树内任意方向（子→父、兄弟之间均可），`agent_stop` 只允许停后代。理由是两者的破坏性不同——投递一条消息由接收方自行决定如何处理，接收方保有主动权；停止则单方面中断对方的执行，允许子 Agent 停止父 Agent 会让编排失去可预测的控制方向。
+**权限的不对称**：`agent_send` 可发给任一邻居（父、子、兄弟），`agent_stop` 只能停直接子。理由是两者的破坏性不同——投递一条消息由接收方自行决定如何处理，接收方保有主动权；停止则单方面中断对方的执行，允许子 Agent 停止父或兄弟会让编排失去可预测的控制方向。停止的**效果**仍级联到目标的整棵后代，但那不扩大寻址范围：孙辈是连带结果，不是可选目标（调研 §14）。
 
 ### 4.6 工具 schema
 
@@ -332,16 +350,16 @@
 返回：AgentInfo
 
 工具：agent_list
-  （无参数；范围恒为调用者所在的 Agent 树）
-返回：AgentTreeView.members，每行含 status
+  （无参数；范围恒为调用者的邻居：父、子、兄弟）
+返回：AgentNeighborhood.members，每行含 relation 与 status
 
 工具：agent_send
-  session_id:     string    — 目标，须与调用者同树
+  session_id:     string    — 目标，须是调用者的邻居
   message:        string    — 正文；系统前缀由 M3 添加，调用方不可覆盖
 返回：Accepted
 
 工具：agent_stop
-  session_id:     string    — 目标，须为调用者的后代
+  session_id:     string    — 目标，须是调用者的直接子；停止会连带其整棵后代
 返回：StopOutcome
 ```
 
@@ -351,11 +369,11 @@
 接口：M5 AgentTools → M1 AgentTree
 
 输入数据：caller: SessionID，target: SessionID | undefined
-输出数据：AgentTreeView（tree）/ boolean（isSameTree、isDescendant）
+输出数据：AgentNeighborhood（neighborhood）/ AgentInfo[]（children、descendants）/ boolean（isNeighbor、isChild）
 
 协议约定：
   - 调用方责任：caller 取自工具执行上下文，不接受模型提供的值
-  - 被调用方责任：目标不存在或不在同树时返回明确的否定结果，不抛出未分类异常
+  - 被调用方责任：目标不存在或不是邻居时返回明确的否定结果，不抛出未分类异常
 ```
 
 ```
@@ -365,7 +383,7 @@
 输出数据：AgentStatus
 
 协议约定：
-  - 调用方责任：仅对已通过同树判定的成员请求状态
+  - 调用方责任：仅对已通过邻居判定的成员请求状态
   - 被调用方责任：结果是调用瞬间的快照；不保证与后续任何一次调用一致
 ```
 
@@ -376,7 +394,7 @@
 输出数据：Accepted { target: SessionID }
 
 协议约定：
-  - 调用方责任：sender 由系统填写；body 为模型提供的正文；同树判定已通过
+  - 调用方责任：sender 由系统填写；body 为模型提供的正文；邻居判定已通过
   - 被调用方责任：返回 Accepted 时消息已持久化；不得在持久化前返回
 ```
 
@@ -415,7 +433,8 @@
 | `agent_send` 不经 `BackgroundJob.extend` | extend 把新执行挂在上一次执行之后，是 run 边界而非 turn 边界，且排队期间消息不落库 |
 | 权限不对称：send 全向、stop 仅后代 | 见 §4.5 |
 | Agent 恒为异步执行，取消 `background` 参数与实验开关 | 前台路径以 `background.wait({ id })` 阻塞等待子 Agent 结束，父 Agent 在这段时间内停在那次 tool call 里，发不出 `agent_list` / `agent_send` / `agent_stop`——管理面对前台子 Agent 完全不可用，本 feature 失去意义。Claude Code 的 `Agent` 同样没有 background 参数，其 subagent 恒为异步并经通知送达。实现须移除 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` 门与前台分支；`task` 兼容入口收到旧的 `background: false` 时忽略该参数 |
-| `subagent_depth` 默认由 1 提到 2 | 默认 1 时 `task.ts` 的 `depth >= (cfg.subagent_depth ?? 1)` 会挡住 Subagent 再派生 Subagent，Agent 树最多两层。两层下唯一的停止者与唯一的父都是主 Agent，终止通知与自底向上排序都退化为空转，本 feature 的多层编排能力默认不可用。提到 2 后主 Agent 可派生子、子可派生孙、孙被挡住，三层结构默认成立。实现须同时改 `task.ts` 的兜底值与 `core/src/v1/config/config.ts` 中 `subagent_depth` 的 schema 说明文字 |
+| `subagent_depth` 默认由 1 提到 3 | 与 Claude Code 的 `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`（默认 3，主会话之下三层）对齐，单位相同；现默认 1 恰是 CC 所说的"关闭嵌套"。默认 1 时 Subagent 不能再派生，Agent 树最多两层，终止通知与自底向上排序都无对象，本 feature 的多层编排默认不可用。实现须同时改 `task.ts` 的兜底值与 `core/src/v1/config/config.ts` 中 `subagent_depth` 的 schema 说明文字 |
+| 触达深度上限时撤下工具，而非让调用失败 | Claude Code 到限时不再向该 Subagent 提供 `Agent`；OpenCode 现状是调用后返回错误，模型要先试一次、撞墙、再重新规划，白费一轮。撤下范围按"寻址集合是否永久为空"判定：`agent` 与 `agent_stop` 撤下（到限者不能派生，也就永远不会有子可停），`agent_send` 与 `agent_list` 保留（父与兄弟仍可寻址）。判据是深度到限，不是当前是否有子 Agent |
 | 不设 `agent_get`，状态并入 roster 每一行 | Claude Code 只有 `ListAgents` 且每行自带 busy/idle，无单 Agent 查询工具；其最接近的 `TaskOutput` 已废弃且按 task_id 寻址、阻塞等待、轮询状态，三者均为调研 §6 排除项。多一个工具只是把同一份信息换个形状再发一次。详见调研 §12 |
 | 保留隐藏的 `task` 兼容入口 | 调研 §8：旧插件、权限配置与显式调用仍需可用，但不进模型工具列表；入口只把 `task_id` 规范化为 `session_id` 后转发同一实现，不维护第二套状态、执行路径或测试基准 |
 | 一个 Agent 任一时刻至多一个活动执行 | 调研 §7 的概念定义（`Execution = Agent 当前的内部执行状态`，单数）。这是 `session_id` 足以作唯一标识的前提：允许并行执行则 `agent_stop(session_id)` 无法指明停哪一个，`run_id` 必然回归，调研 §4.2 的否决随之失效。机制由 I3 维护 |
@@ -429,16 +448,16 @@
 G1 「列出 Agent 树及状态」   → M1 AgentTree（主）+ M2 AgentStatusProjection（辅）+ M5（渲染）
 G2 「查询指定 Agent」        → 与 G1 同路径：M1（主）+ M2（辅）+ M5（渲染）；
                                调用方从 roster 中按 session_id 取行，不单列工具
-G3 「同树任意方向消息」      → M3 AgentInbox（主）+ M1（同树判定）
-G4 「停止并保留上下文」      → M4 AgentLifecycle（主）+ M3（终止通知）+ M1（后代判定）
+G3 「邻居间任意方向消息」    → M3 AgentInbox（主）+ M1（邻居判定）
+G4 「停止并保留上下文」      → M4 AgentLifecycle（主）+ M3（终止通知）+ M1（直接子判定 + 后代展开）
 G5 「身份统一」              → M5 AgentTools（表面约束）+ M1（身份解析）
 ```
 
 ### 模块协作论证
 
-**G1/G2**：G1 要求"可靠列出树与状态"。M1 的后置条件保证 AgentTreeView 自封闭且有稳定序，即树本身完整；M2 的后置条件保证每个成员得到 running / idle 之一且二者互斥穷尽。二者拼接即"完整成员集合 × 明确状态"，故 G1 成立。G2 是 G1 在单成员上的投影，同理成立。
+**G1/G2**：G1 要求"可靠列出可寻址的 Agent 与其状态"。M1 的后置条件保证 AgentNeighborhood 覆盖父 / 子 / 兄弟三类且有稳定序，即可寻址集合完整；M2 的后置条件保证每个成员得到 running / idle 之一且二者互斥穷尽。二者拼接即"完整成员集合 × 明确状态"，故 G1 成立。G2 是 G1 在单成员上的投影，同理成立。
 
-**G3**：G3 要求"同树任意方向的消息能被目标处理"。M1 的 `isSameTree` 保证方向合法性判定完备；M3 的后置条件分两种目标状态给出了处理保证——running 时进入当前 run 的下一个 provider turn，非 running 时起新 run 消费。两种状态覆盖了 AgentStatus 的全部取值（running 与 idle 互斥且穷尽），故任意目标状态下消息都会被处理，G3 成立。
+**G3**：G3 要求"邻居间任意方向的消息能被目标处理"。M1 的 `isNeighbor` 保证方向合法性判定完备；M3 的后置条件分两种目标状态给出了处理保证——running 时进入当前 run 的下一个 provider turn，非 running 时起新 run 消费。两种状态覆盖了 AgentStatus 的全部取值（running 与 idle 互斥且穷尽），故任意目标状态下消息都会被处理，G3 成立。
 
 **G4**：G4 要求"停止且保留上下文，且等待方不被静默挂起"。M4 的后置条件给出前半部分（终止执行、不删除任何 Session 与历史、可恢复、幂等）。后半部分由 I1 保证：每个被停 Agent 的父都会收到终止通知，除非该父自己也在停止集内——那种情况下它同样被停止，不存在"仍在等待"的主体。故不存在被静默挂起的等待方，G4 成立。
 
@@ -473,8 +492,9 @@ H2: Session 的 parentID 链无环且深度有限。
 
 ```
 I1: 停止排序不变量
-    对任意被停止的 Agent a，若 a 的父 p 不在本次停止集内，
+    对任意被停止的 Agent a，若 a 的父 p 也在本次停止集内，
     则「a 的终止通知已持久化」happens-before「p 被取消」。
+    （p 不在停止集内时 p 恒为发起停止者，它全程在运行，无排序要求。）
     维护方：M4 AgentLifecycle 排序 / M3 AgentInbox 提供"返回即已持久化"的保证
     preservation：M4 按 StopPlan.layers 自底向上推进，处理第 i 层前必须已收到第 0..i-1 层
       全部通知投递的 Accepted 返回。M3 的接口协议规定 Accepted 意味着已落库，

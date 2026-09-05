@@ -1,6 +1,6 @@
 # Agent 管理能力调研
 
-- 状态：调研阶段已确认（2026-09-04）；2026-09-05 两次修订工具表面，见 §12、§13
+- 状态：调研阶段已确认（2026-09-04）；2026-09-05 三次修订，见 §12、§13、§14
 - 日期：2026-08-31
 - 对应问题：[lihaokun/opencode#23](https://github.com/lihaokun/opencode/issues/23)
 - 调研范围：现有 `task`/Subagent 能力及其管理面；不涉及实现
@@ -100,7 +100,7 @@ Agent 间消息和恢复能力后，继续称为 Task 会混淆“执行者”�
 
 - 根 Session 是主 Agent；
 - 带 `parentID` 的子 Session 是 Subagent；
-- `agent_list` 从调用者所在的根 Session 出发，返回同一棵 Agent 树；
+- `agent_list` 返回调用者的邻居：父、子、兄弟，并标注关系（见 §14）；
 - 不增加独立 `team_id`。
 
 ### 5.3 `agent_send`
@@ -131,7 +131,7 @@ Agent 间消息和恢复能力后，继续称为 Task 会混淆“执行者”�
 - 取消不删除任何 Session 或历史；
 - 停止后仍可通过 `agent_send` 恢复；
 - 重复停止是幂等操作；
-- 主 Agent 可以停止其后代；Subagent 只能停止自己的后代，不能停止父 Agent、主 Agent 或兄弟 Agent；
+- 停止目标限于调用者的直接子 Agent；不能停止父 Agent、主 Agent 或兄弟 Agent（见 §14）。停止一个子 Agent 会连带终止它的整棵后代，那是效果不是寻址范围；
 - 工具动作名为 `agent_stop`，终态、通知状态和输出字段统一使用 `cancelled`，不增加 `stopped` 状态；
 - 不使用 `run_id` 防御陈旧或重复调用。
 
@@ -341,3 +341,47 @@ agent_stop   停止
 ```
 
 与 Claude Code 的 `Agent` / `ListAgents` / `SendMessage` / `TaskStop` 逐项对应。
+
+## 14. 修订：可见与可寻址范围收敛为邻居（2026-09-05）
+
+初版 §5.2 让 `agent_list` 从调用者所在的**根 Session** 出发返回整棵 Agent 树，§5.4 允许停止任意**后代**。
+架构阶段核对 Claude Code 后收敛为邻居模型。
+
+### Claude Code 的实际范围
+
+`ListAgents` 的第一句就是范围定义：
+
+> Lists agents **you can SendMessage to** — **in-process subagents you spawned**, the teammates on your
+> team, other local Claude sessions...
+
+范围等于**可寻址集合**，subagent 一维是**自己派生的**，不是整棵树。`SendMessage` 的 `to` 佐证：
+`"main"`（父方向，仅 background subagent 可用）、teammate 名（兄弟方向）、`ListAgents` 中的 agent
+（自己派生的子）。合起来正是父 + 兄弟 + 子。
+
+### 结论
+
+- **可见**：`agent_list` 只返回父、子、兄弟，每行标注关系；调用者因此只持有这些 Agent 的 `session_id`；
+- **可发**：`agent_send` 的目标限于同一邻居集合。同树但非邻居的叔伯、侄、堂兄弟不可达；
+- **可停**：`agent_stop` 的目标限于直接子 Agent。停止会连带终止其整棵后代——那是**效果**，不是寻址范围，
+  不需要能列出孙辈才能停子；
+- 三者共用同一个邻居集合，**能看见什么就能发什么，能停的是其中的子集**，不存在"能操作但列不出来"的不对称。
+
+### 嵌套深度
+
+Claude Code 以环境变量 `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` 控制嵌套层数，**默认 3**（主会话之下三层），
+设为 1 即关闭嵌套。OpenCode 的对应项是配置字段 `subagent_depth`，语义单位相同，当前默认 1（等于关闭嵌套）。
+本 feature 将其默认值改为 **3**，与 Claude Code 一致。
+
+触限时的行为一并对齐：Claude Code 在到限时**撤下工具**而非让调用失败。OpenCode 现状是调用时返回错误，
+模型要先试一次、撞墙、再重新规划，白费一轮。改为到限时不再向该 Agent 提供相应工具，且撤下范围按
+"寻址集合是否永久为空"判定：
+
+| 工具 | 到限时 | 理由 |
+|---|---|---|
+| `agent` | 撤下 | 不能再派生 |
+| `agent_stop` | 撤下 | 只能停子，而它永远不会有子 |
+| `agent_send` | 保留 | 父与兄弟仍可寻址 |
+| `agent_list` | 保留 | 父与兄弟仍可见 |
+
+判据是**深度到限**，不是"当前没有子 Agent"——未到限但暂时无子的 Agent 必须保留 `agent_stop`，
+否则工具会随派生忽隐忽现。
