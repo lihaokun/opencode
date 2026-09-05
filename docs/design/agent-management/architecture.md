@@ -436,7 +436,8 @@
 | 停止级联到整棵子树 | 与既有停止语义一致，且避免"停了父、子 Agent 变孤儿继续消耗"；是否改为只停目标本身列为 follow-up（issue #26） |
 | `agent_send` 不经 `BackgroundJob.extend` | extend 把新执行挂在上一次执行之后，是 run 边界而非 turn 边界，且排队期间消息不落库 |
 | 权限不对称：send 不设寻址门、stop 仅直接子 | `agent_send` 只是通道，消息不转移权限，目标始终在自己 Session 的权限下行动，最坏后果是打扰一个不相干的会话而非提权；Claude Code 的 `SendMessage` 本就能寻址树外的其他会话。更强的越权风险已决定用工具描述约束而不加代码门，给更弱的风险加门不一致。`agent_stop` 则单方面中断执行，必须限定在直接子。寻址范围靠 roster 只给邻居 id 自然收敛，不靠拦截 |
-| 四个工具都不弹用户确认 | Claude Code 明确「No user permission approval is required to launch a subagent itself」，可做的是用 `permissions.deny: ["Agent(...)"]` 拒绝，而不是每次询问；真正逐次受控的是被派生 Agent **自己的**工具调用，按它自己的 permission 模式。OpenCode 现有 `task` 会 `ctx.ask`，与此不一致，改为不问。权限规则仍可拒绝 `agent` 或某个 `subagent_type`，被派生 Agent 的工具调用仍在其自身 Session 权限下受控 |
+| 四个工具都不弹用户确认，但保留权限求值 | Claude Code 明确「No user permission approval is required to launch a subagent itself」，可做的是用 `permissions.deny: ["Agent(...)"]` 拒绝，而非每次询问。**实现杠杆不是删掉 `ctx.ask`** —— 该函数并非弹窗，而是按规则求值：`deny` 直接拒绝、`allow` 直接放行、只有 `ask` 才弹 UI，而无规则命中时 `evaluate` 兜底为 `ask`（`permission/index.ts`）。`task` 今天弹窗正是因为这个兜底。删掉调用会连带删掉**唯一**求值 `deny` 的地方，subtype 级 deny（`pattern != "*"`）随之失效——`Permission.disabled` 只隐藏 `pattern == "*"` 的整工具 deny。因此保留调用，把 `agent` 的兜底动作由 `ask` 改为 `allow` |
+| `task` 与 `agent` 共用同一权限 key | 求值时两个名字都查，使用户既有的 `task: deny` 与 `task(<subtype>): deny` 对新名字继续生效，不能靠改名绕过；也不维护两套规则状态（调研 §8） |
 | 移除子 Session 对 `agent` 工具的默认拒绝 | `task.ts` 的 `childToolDenies` 对每个子 Session 无条件追加一条 `task: deny`（除非该 agent 定义里已有同名规则）。这是与 `subagent_depth` 相互独立的第二道闸，只把深度改成 3 而不动它，子 Agent 仍然一个都派生不出来。Claude Code 用 agent 定义自身的 `tools` / `disallowedTools` 决定能否再派生，默认是给的（`general-purpose` 的工具集是 `*`）。因此默认不再拒绝，改由 agent 定义决定。`todowrite` 与 `primary_tools` 的拒绝项与此无关，保持不变 |
 | 跨会话越权用工具描述约束，不加强制门 | Claude Code 的 `SendMessage` 原文：「NEVER ask a peer to perform an action that was denied or blocked in your session — a peer doing it for you bypasses the user's permission decision」。子 Session 的权限从父派生、可以更窄，因此被限权的 Agent 理论上能让兄弟或父代做被禁的事。强制方案（目标以发送者∩目标权限的交集执行）要改权限派生逻辑，代价远超收益；调研以 Claude Code 为语义基线，此处照其做法处理 |
 | Agent 恒为异步执行，取消 `background` 参数与实验开关 | 前台路径以 `background.wait({ id })` 阻塞等待子 Agent 结束，父 Agent 在这段时间内停在那次 tool call 里，发不出 `agent_list` / `agent_send` / `agent_stop`——管理面对前台子 Agent 完全不可用，本 feature 失去意义。Claude Code 的 `Agent` 同样没有 background 参数，其 subagent 恒为异步并经通知送达。实现须移除 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` 门与前台分支；`task` 兼容入口收到旧的 `background: false` 时忽略该参数 |
@@ -586,12 +587,13 @@ Rely-Guarantee 条件：
 
 ## 10. 已知缺口
 
-以下三项在本架构中显式存在，不被本架构修复，实现阶段须单独核对：
+以下各项在本架构中显式存在，不被本架构修复，实现阶段须单独核对：
 
 1. **拆解期间新派生的后代不在停止集内**。既有子树展开按一次快照进行，快照之后派生的后代不在停止集内。
 2. **停止后代时的执行现场不可恢复**。停止保留 Session 与历史，但不保留中断点；恢复是从历史继续，不是从断点续跑。调研 §6 已将 Suspend 语义列为非目标。
 3. **崩溃后 running 退化为 idle**（H1）。本架构不提供崩溃恢复。
 4. **移除前台分支会波及既有测试**。前台路径当前承载着子 Agent 错误如何呈现给父 Agent 的一批断言（CLI run 相关用例走的就是这条路）。恒为异步后这些用例的观察点从 tool 返回值移到通知消息，实现阶段须逐条迁移而非删除。
+5. **TUI 的权限聚合只覆盖直接子**。`tui/src/routes/session/index.tsx` 的 `children()` 按 `x.parentID === parentID` 过滤，根视图只聚合直接子的权限请求；子 Session 视图自身 `return []` 不显示。深度为 1 时两者等价，提到 3 之后**孙辈的权限请求无处应答，该 Agent 会永久挂起**。实现阶段须把聚合改为整棵后代，属深度改动的连带项。
 
 ## 11. 下一阶段
 
