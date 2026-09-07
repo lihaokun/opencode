@@ -40,6 +40,8 @@
 | `SessionPrompt.prompt(input)` | M3 投递消息 | `noReply: true` 时只落库并返回该 message，不进 loop |
 | `SessionPrompt.loop(input)` | M3 唤醒目标 | 经 `ensureRunning`：Running 时加入既有执行，Idle 时新起 |
 | `deriveSubagentSessionPermission` | M4 派生子权限 | 既有函数，不改 |
+| `Worktree.create` / `remove` | M4 建/清理子 Agent 的工作树 | 既有服务（`opencode/src/worktree/index.ts`），此前只由 experimental HTTP 与 control-plane adapter 使用 |
+| `Git` 状态查询 | M6 判断 worktree 有无改动以决定是否清理 | 既有服务 |
 
 ### 2.2 需要适配
 
@@ -299,9 +301,17 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
      **不再包含对 `agent` 的 deny**（清单 §2.3）。
      - 合并时按 `(permission, pattern, action)` 三元组**去重**：`childPermission` 里已有同样规则的不重复追加
        （清单 §2.4）。
+  6.1 解析工作目录（调研 §15）：
+     - 给了 `cwd` → 直接用它，**不建 worktree**，权限不追加放行（调用方自负责该目录可写）
+     - 未给 → `Worktree.create()` 得 `info.directory`；在权限中追加
+       `{ permission: "external_directory", pattern: "<info.directory>/**", action: "allow" }`
+     - `Worktree.create` 失败 → 上抛，不建 Session。此时尚无任何副作用需要回滚
   7. `Session.create({ parentID: caller, title, agent: next.name, permission })`。
      - `title = description + " (@" + next.name + " subagent)"`，照既有约定（清单 §2.5）。roster 显示的就是它。
-  8. `resolvePromptParts(prompt)` 展开正文里的 `@file` 引用（清单 §8.2），得到 parts。
+  8. `resolvePromptParts(prompt)` 展开正文里的 `@file` 引用（清单 §8.2），得到 parts；
+     在其前面追加一段工作目录声明：该 Agent 的工作目录为 `<directory>` 的绝对路径，要求以绝对路径操作。
+     - 声明是**约定**不是强制：六个文件工具都接受绝对路径，但子 Agent 仍可用主 checkout 的绝对路径
+       操作而不被 `external_directory` 拦下（后者只防出 instance 目录）。强度边界见架构 §9 与 issue #33。
   9. M3 `deliver({ target: newSession.id, sender: caller, sender_agent, body: parts })`。
      - callee 契约：返回 `Accepted` ⇒ 初始任务已落库且执行已注册（M6 `ensure`）。新 Session 必为 idle，
        故走 `ensure` 的注册分支，产生本次执行的唯一 watcher，结局交付给新 Agent 的父（即 caller）。
@@ -408,8 +418,11 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 - **调用关系**：callers: M3 `deliver`；callees: `BackgroundJob.get`、`BackgroundJob.start`、
   M6 `runExecution`、M6 `watch`。
 - **实现思路**：
-  1. `Session.get(target)` 取标题与 agent 名，供步骤 3 的 job 元数据用。失败 → `AgentNotFound{target}`，
-     无副作用。这是本函数 `AgentNotFound` 失败通道的唯一来源。
+  1. `Session.get(target)` 取标题、agent 名与工作目录，供步骤 3 的 job 元数据用。
+     失败 → `AgentNotFound{target}`，无副作用。这是本函数 `AgentNotFound` 失败通道的唯一来源。
+  1.1 工作目录复原：目标的目录是**本 feature 自建的 worktree** 且已不存在（被步骤 5 的清理删掉过）
+     → `Worktree.create()` 重建并更新 Session 记录的目录。用户经 `cwd` 指定的目录不在此列，
+     缺失时不重建、原样让后续工具报错——那是调用方自己给的路径。
   2. `BackgroundJob.get(target)`。job id 即 SessionID（清单 §4.2 保留的身份约定）。
   3. 分支：存在且 `status === "running"` → **空操作直接返回**。既有 watcher 继续持有唯一交付权，
      本次消息进入该执行的消息序列（架构 I4）。
@@ -490,6 +503,11 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
        两者不同。既有代码恒用 `ctx.sessionID` 是因为旧路径下调用者恒等于父。
   4.1 送达确定性依赖 fork issue #32：当前 `prompt` 的唤醒在"判定—转 idle"窗口内可能空转，
       投递的消息会等到下一次外部触发才被消费。本设计不复刻投递保证，引用该修复。
+  4.2 工作树清理：目标的目录是本 feature 自建的 worktree 且 `Git` 报告其无改动
+      → `Worktree.remove({ directory })` 并清空 Session 记录的目录。有改动则保留，等人处理（对齐
+      Claude Code 的 auto-cleaned if unchanged）。清理失败只记日志，不影响结局交付。
+      - 与 CC 的差别：CC 的 subagent 是一次性的，完成即清理；本方案的 Agent **可经 `agent_send` 恢复**，
+        所以清理后若被恢复，由 `ensure` 步骤 1.1 重建一个空 worktree。无改动的树重建等价，不丢东西。
   5. 完成 `noticeDelivered.get(target)` 这个 Deferred，表示本次执行的结局通知已持久化，随后移除该表项。
      - 步骤 2 的无父分支同样要完成它——那种情况下没有通知可发，但等待方仍须被释放，否则
        `cancelAndAwaitNotice` 会永久阻塞。
@@ -630,6 +648,21 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
   未给 → 转 `agent`。旧的 `background` 参数被忽略（Agent 恒为异步，架构 §6）。不维护第二套状态、
   执行路径或测试基准（调研 §8）。
 - **正确性论证**：trivial —— 参数改名加分发，无独立逻辑。
+
+### 5.7 待定：如何持久标记「自建 worktree」
+
+`ensure` 的步骤 1.1 与 `watch` 的步骤 4.2 都需要判断「这个目录是本 feature 自建的 worktree，还是调用方
+经 `cwd` 指定的目录」。两者的清理与重建策略相反，判错会删掉用户自己的目录。
+
+`Session.Info` 目前只有 `directory` 一个字段，不含来源标记。三种可选：
+
+1. **按路径前缀推断** —— 自建的 worktree 都在 `Worktree` 服务的根下。零 schema 改动，但属推断，
+   用户把 `cwd` 指向该根下的目录就会误判
+2. **Session 增加布尔字段** —— 明确，但要动 V1 的 session schema 与迁移
+3. **记在 Session 的 metadata / 权限规则里** —— 权限里本就有那条 `external_directory` 放行，
+   其 pattern 即自建目录；无该规则即非自建。零 schema 改动且不依赖路径形状
+
+倾向 3。确认后写入 §4 数据结构节并从本节移除。
 
 ## 6. 完整性自检 checklist
 

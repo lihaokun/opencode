@@ -1,6 +1,6 @@
 # Agent 管理能力调研
 
-- 状态：调研阶段已确认（2026-09-04）；2026-09-05 三次修订，见 §12、§13、§14
+- 状态：调研阶段已确认（2026-09-04）；2026-09-05 三次修订见 §12–§14；2026-09-07 扩充范围见 §15
 - 日期：2026-08-31
 - 对应问题：[lihaokun/opencode#23](https://github.com/lihaokun/opencode/issues/23)
 - 调研范围：现有 `task`/Subagent 能力及其管理面；不涉及实现
@@ -388,3 +388,54 @@ Claude Code 以环境变量 `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` 控制嵌套�
 
 判据是**深度到限**，不是"当前没有子 Agent"——未到限但暂时无子的 Agent 必须保留 `agent_stop`，
 否则工具会随派生忽隐忽现。
+
+## 15. 扩充：subagent 的工作树隔离（2026-09-07）
+
+初版范围没有提及工作树隔离，既未包含也未排除。本次把**软隔离**纳入首版，**强制隔离**记为
+[lihaokun/opencode#33](https://github.com/lihaokun/opencode/issues/33) 待 V2 落地。
+
+### 为什么现在要谈
+
+本方案把 `subagent_depth` 默认由 1 提到 3、移除了子 Session 对 `agent` 工具的默认拒绝、并让执行恒为异步。
+三者叠加使**多个 Agent 同时在同一份工作树上改文件**从边缘情况变成默认可能。不给隔离，等于本方案自己
+制造了一个默认危险的配置。
+
+### Claude Code 的做法
+
+`isolation: worktree` 写在 subagent 定义的 frontmatter 里（也可按调用传）：subagent 得到一份从**默认分支**
+切出的 worktree，**同进程、独立文件系统作用域**（原文：runs in a separate working directory, not a separate
+process；uses the same Claude Code session but with an isolated filesystem scope）。命令层有主动检查：
+Bash 的工作目录必须解析到 worktree 内、命令不得把 git 重定向回主 checkout、worktree 消失则命令失败。
+无改动则自动清理。
+
+### OpenCode 已有的零件
+
+不需要改动文件系统解析即可拼出软隔离：
+
+- 六个文件工具都接受**绝对路径**：`read` / `write` / `edit` / `lsp` / `glob` / `grep`；后两者还接受
+  `path` 参数指定搜索根
+- `shell` 有 `cwd` 参数
+- `external_directory` 是**现成的强制点**：目标不在 instance 目录内即需过一次权限询问，`shell` 会扫描
+  命令涉及的目录逐个询问
+- `Worktree` 服务已具备 `create` / `list` / `remove` / `reset`，此前只在 experimental HTTP 与
+  control-plane adapter 中使用，没有模型可调用的入口
+
+### 首版采用：软隔离
+
+- `agent` 默认为新 Agent 创建 worktree，初始 prompt 声明其工作目录的绝对路径
+- 子 Session 权限预置 `external_directory` 对该 worktree 的放行，其余外部目录照常拦截
+- `agent` 增加 `cwd` 参数：给出则使用该目录，不建 worktree
+- 无改动则清理，对齐 Claude Code
+
+**强度边界要说清**：这是「默认在自己的工作树里干活」，不是「关得进去出不来」。子 Agent 仍可用主
+checkout 的绝对路径操作——主 checkout 在 instance 目录**之内**，`external_directory` 按设计放行；
+它防的是出界，不是串门。
+
+### 强制隔离为何不在首版
+
+强制需要「本 Session 的文件系统根是 X」在工具层可判定。V1 没有这根轴：文件工具解析路径用 instance 级
+目录，而 `InstanceState` 本身以目录为 cache key——换目录等于换到另一份 instance 分片，
+`SessionRunState` / `SessionStatus` / `BackgroundJob` 全部换一份，`agent_list` 与 `agent_stop` 随之失效。
+
+在 V1 上做强制隔离要先把「文件系统根」与「instance 状态分片键」解耦，属地基改造，且与 V2 正在建的
+Location 作用域重复。详见 #33。
