@@ -196,12 +196,18 @@ TargetNotResolved  { value }              目标名称在可寻址集合中无�
 - **调用关系**：callers: M5 `agent_send`（scope=neighbor）、M5 `agent_stop`（scope=child）；
   callees: M1 `neighborhood` / `children`。
 - **实现思路**：
-  1. `value` 形如 SessionID（前缀与长度符合 `SessionID` 的形状）→ 直接返回，**不做名称查找**。
+  1. `value` 以 SessionID 前缀 `ses` 开头 → 直接返回，**不做名称查找**。agent 类型名不以该前缀开头，
+     故二者可判定地区分，无需查表即可分流。
      - 这一分支不校验该 Session 是否存在，也不校验是否在集合内：`agent_send` 本就允许对任意存在的
        Session 直投（架构 §6），存在性由 M3 `deliver` 校验；`agent_stop` 的直接子约束由 M4 `plan`
        的 `isChild` 校验。名称解析不改变任一工具原有的寻址范围。
-  2. 否则取候选集合：`scope === "neighbor"` → `neighborhood(caller).members`；
-     `scope === "child"` → `children(caller, depth)`。
+  2. 否则取候选集合，并**排除调用者自身**：
+     - `scope === "neighbor"` → `neighborhood(caller).members` 中 `relation !== "self"` 者。
+       必须排除：邻居集合含调用者自己，不排除则调用者用自己的 agent 类型名会解析到自己，
+       随后被 `deliver` 以 `SelfDelivery` 拒绝——报错正确但归因错误，读起来像是名称查错了。
+     - `scope === "child"` → `neighborhood(caller).members` 中 `relation === "child"` 者。
+       复用同一次 `neighborhood` 调用而非另调 `children`：后者需要调用方给出 depth，
+       而本函数没有那个信息；邻居集合里的子已带 depth。
   3. 过滤 `AgentInfo.agent === value` 者：
      - 恰一个 → 返回其 session_id
      - 多个 → 返回 `time_created` 最大者（latest wins，对齐 Claude Code）

@@ -128,9 +128,10 @@
   - value: string — 调用方给出的目标标识
 
 解析规则（按序，先命中者胜）：
-  1. 形如 SessionID ⇒ 直接作为 session_id 使用，不做名称查找
+  1. 以 SessionID 前缀 `ses` 开头 ⇒ 直接作为 session_id 使用，不做名称查找
+     （agent 类型名不会以该前缀开头，故两者可判定地区分）
   2. 否则视为 agent 类型名，在调用者的**邻居集合**（`agent_send`）或**直接子集合**（`agent_stop`）中
-     匹配 `AgentInfo.agent` 相等者：
+     匹配 `AgentInfo.agent` 相等者，**候选集合排除调用者自身**：
      - 恰一个 ⇒ 取之
      - 多个 ⇒ 取 time_created 最新的一个（对齐 Claude Code 的 latest wins）
      - 零个 ⇒ 失败 `TargetNotResolved`，提示改用 session_id 并附当前 roster
@@ -281,8 +282,9 @@
 ```
 模块名称：AgentTree
 
-功能描述：解析调用者的邻居集合（父 / 子 / 兄弟）与直接子集合，并承担 `agent_stop` 的直接子判定；
-  另提供后代闭包供 M4 的停止级联使用——那是效果范围，不是寻址范围。
+功能描述：解析调用者的邻居集合（父 / 子 / 兄弟）与直接子集合，承担 `agent_stop` 的直接子判定，
+  并把调用方给出的 `TargetRef` 解析为 SessionID；另提供后代闭包供 M4 的停止级联使用——
+  那是效果范围，不是寻址范围。
 
 前置条件（Requires）：
   - 入参 session_id 对应的 Session 在 store 中存在
@@ -293,6 +295,10 @@
   - children(id) 返回 parent_id == id 的全部 Agent
   - descendants(id) 返回 id 的全部后代，不含 id 自身；仅供 M4 展开停止级联
   - isChild(caller, target) ⟺ target ∈ children(caller)
+  - resolveTarget 按 §3 `TargetRef` 的规则求值；名称只在调用者的可寻址集合内匹配，
+    因此解析结果必属于调用方本就能寻址的范围，不扩大任何工具的作用域
+  - resolveTarget 的候选集合**排除调用者自身**：邻居集合含 relation == self 的成员，
+    不排除则调用者用自己的 agent 类型名会解析到自己
 
 不变式（Invariants）：
   - 解析过程只读 Session store，不改变任何 Session 状态
@@ -516,12 +522,13 @@ transcript 留下记录，且它此刻在运行），对级联中间层而言是
 ```
 接口：M5 AgentTools → M1 AgentTree
 
-输入数据：caller: SessionID，target: SessionID | undefined
-输出数据：AgentNeighborhood（neighborhood）/ AgentInfo[]（children、descendants）/ boolean（isChild）
+输入数据：caller: SessionID，target: SessionID | undefined，TargetRef（resolveTarget）
+输出数据：AgentNeighborhood（neighborhood）/ AgentInfo[]（children、descendants）/
+  boolean（isChild）/ SessionID（resolveTarget）
 
 协议约定：
-  - 调用方责任：caller 取自工具执行上下文，不接受模型提供的值
-  - 被调用方责任：目标不存在或不是直接子时返回明确的否定结果，不抛出未分类异常
+  - 调用方责任：caller 取自工具执行上下文，不接受模型提供的值；调用 resolveTarget 时声明 scope
+  - 被调用方责任：目标不存在、不是直接子、或名称无匹配时返回明确的否定结果，不抛出未分类异常
 ```
 
 ```
