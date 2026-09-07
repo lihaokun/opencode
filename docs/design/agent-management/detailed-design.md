@@ -306,19 +306,26 @@ WorktreeUnavailable{ reason }             创建工作树失败（非 git 仓库
      - 合并时按 `(permission, pattern, action)` 三元组**去重**：`childPermission` 里已有同样规则的不重复追加
        （清单 §2.4）。
   6.1 解析工作目录（调研 §15）：
-     - 给了 `cwd` → 直接用它，**不建 worktree**，**不追加 `external_directory` 放行**。
-       - 安全理由：`cwd` 由模型提供。若自动放行，模型可用 `agent(cwd: <任意目录>)` 给自己开出
-         `external_directory` 的绕过口。该目录在 instance 目录之外时，其首次文件操作会照常触发一次
-         权限询问，由用户裁决——这是有意保留的交互，与「四个工具不弹确认」不冲突：不弹的是工具本身，
-         越界访问仍由既有机制把关。
+     - 给了 `cwd` → 直接用它，**不建 worktree**，**不追加任何权限放行**。
+       - 安全理由：`cwd` 由模型提供。若为它自动放行 `external_directory`，模型可用
+         `agent(cwd: <任意目录>)` 给自己开出绕过口。该目录在 instance 之外时，其首次文件操作照常
+         触发一次权限询问，由用户裁决——这是有意保留的交互，与「四个工具不弹确认」不冲突：
+         不弹的是工具本身，越出项目的访问仍由既有机制把关。
+       - 自建工作树不需要这条规则，因为它在项目内（见上）。
      - 未给 → `Worktree.create()` 得 `info.directory`。
-       - callee 契约：在 `Global.Path.data/worktree/<projectID>` 下
-         `git worktree add --no-checkout -b <slug>`，不给 start-point 即**从当前 HEAD 切**；
-         并调用 `project.addSandbox(projectID, directory)` 登记。嵌套时「当前 HEAD」是父 subagent
-         自己工作树的 HEAD，工作自然叠加。
-       - 权限中追加 `{ permission: "external_directory", pattern: "<directory>/**", action: "allow" }`。
-         **必须显式追加**：`containsPath` 只检查 `ctx.directory` 与 `ctx.worktree`，不查 sandbox 列表，
-         故自建工作树一定会触发 `external_directory` 询问。
+       - 根目录取**项目内**的 `<ctx.worktree>/.opencode/worktrees/<slug>`，不用 `Worktree.create`
+         现有的 `Global.Path.data/worktree/<projectID>`。`CreateInput` 需增加一个根目录参数；
+         既有调用方（experimental HTTP、control-plane adapter）不传，行为不变。
+       - **放在项目内是为了不需要权限放行**：`containsPath` 检查 `ctx.directory` 与 `ctx.worktree`，
+         项目内的路径直接为真，`external_directory` 不会触发。放在项目外则每个自建工作树都要预置
+         一条放行规则，而那条规则本身又要防着被 `cwd` 滥用。
+       - 首次使用时在 `<ctx.worktree>/.opencode/worktrees/` 写一个内容为 `*` 的 `.gitignore`——
+         **自我忽略**，不改用户的 `.gitignore`。必须忽略：ripgrep 默认尊重 gitignore
+         （`ripgrep.ts:155-165` 无 `--no-ignore`），不忽略则 `glob`/`grep` 会把每个工作树里的副本
+         都搜出来。
+       - `git worktree add --no-checkout -b <slug> <dir>`，不给 start-point 即**从当前 HEAD 切**；
+         并调用 `project.addSandbox(projectID, directory)` 登记归属。嵌套时「当前 HEAD」是父 subagent
+         自己工作树的 HEAD，其工作树根也在它自己的 `.opencode/worktrees/` 下，层层嵌套但深度有上限。
        - 复制环境文件：读项目根的 `.worktreeinclude`（gitignore 语法），对每条模式取匹配文件，
          再用 `Git` 判定其确被 gitignore，二者皆真才复制进新工作树。只复制被忽略的文件，
          已跟踪文件不重复。该文件不存在则跳过本步。

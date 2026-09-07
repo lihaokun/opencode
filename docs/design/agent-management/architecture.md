@@ -343,11 +343,12 @@ Session 当前模型之前，一条消息就会改写并持久化目标的绑定
 后置条件（Ensures）：
   - create 总是新建一个以调用者为 parentID 的子 Session，不复用既有 Session
   - create 的初始任务经 M3 投递，因而与后续消息走同一条路径
-  - 未给 cwd 时为该 Agent 创建 worktree，并在子 Session 权限中预置对该目录的
-    `external_directory` 放行；给出 cwd 时使用该目录，不建 worktree，**且不预置放行**
-  - 不为 cwd 预置放行是安全要求：`cwd` 由模型提供，自动放行等于让模型可以用
-    `agent(cwd: <任意目录>)` 给自己开出 `external_directory` 的绕过口。该目录若在 instance 目录之外，
-    其首次文件操作会照常触发一次权限询问，由用户裁决
+  - 未给 cwd 时在**项目内**（`<worktree>/.opencode/worktrees/<slug>`）创建工作树；
+    给出 cwd 时使用该目录，不建工作树
+  - **不为任何目录预置权限放行**。自建工作树在项目内，`containsPath` 直接为真，
+    `external_directory` 不触发，无需放行；`cwd` 由模型提供，为它自动放行等于让模型可以用
+    `agent(cwd: <任意目录>)` 开出绕过口——该目录若在 instance 之外，其首次文件操作照常触发一次
+    权限询问，由用户裁决
   - 初始任务的正文声明该 Agent 的工作目录绝对路径，要求以绝对路径操作
   - stop 对 ⋃ StopPlan.layers 中每个成员调用 M6 `cancelAndAwaitNotice`
   - stop 不删除任何 Session、消息或历史
@@ -572,6 +573,8 @@ transcript 留下记录，且它此刻在运行），对级联中间层而言是
 | Agent 恒为异步执行，取消 `background` 参数与实验开关 | 前台路径以 `background.wait({ id })` 阻塞等待子 Agent 结束，父 Agent 在这段时间内停在那次 tool call 里，发不出 `agent_list` / `agent_send` / `agent_stop`——管理面对前台子 Agent 完全不可用，本 feature 失去意义。Claude Code 的 `Agent` 同样没有 background 参数，其 subagent 恒为异步并经通知送达。实现须移除 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` 门与前台分支；`task` 兼容入口收到旧的 `background: false` 时忽略该参数 |
 | 默认为每个新 Agent 建 worktree | 深度提到 3、子 Agent 可再派生、执行恒为异步，三者叠加使多个 Agent 同时改同一份工作树从边缘情况变成默认可能。不隔离等于本方案自己制造一个默认危险的配置。实现不需改动文件系统解析——六个文件工具都接受绝对路径，`shell` 有 `cwd`，`external_directory` 是现成的强制点（调研 §15）|
 | worktree 从当前 HEAD 切，而非默认分支 | Claude Code 默认 `fresh`（远端默认分支）但明确指出「Use this when isolating subagents that need to operate on in-progress work」应改用 `head`——我们的场景正是后者：父 Agent 做到一半派子 Agent 改其中一部分，从默认分支切等于让子看不见父已完成的工作。opencode 的 `Worktree.create` 现状即从 HEAD 切，无需改动 |
+| 自建工作树放在项目内，而非 opencode 数据目录 | Claude Code 放在 `.claude/worktrees/` 即仓库根下。放在项目内使 `containsPath` 直接为真，`external_directory` 不触发——**整条权限放行连同它被 `cwd` 滥用的风险一并消失**。opencode 现有 `Worktree.create` 放在 `Global.Path.data/worktree/<projectID>`（项目外），故需给 `CreateInput` 增加根目录参数，既有调用方不传则行为不变 |
+| 工作树根自我忽略 | 在 `.opencode/worktrees/` 写入内容为 `*` 的 `.gitignore`，不改用户的 `.gitignore`（Claude Code 是让用户手动加，较脆）。必须忽略：ripgrep 默认尊重 gitignore，不忽略则 `glob`/`grep` 会搜出每个工作树里的文件副本 |
 | 归属标记复用 project 的 sandbox 列表 | 判断某目录是本 feature 自建还是调用方经 `cwd` 给的，两者清理策略相反，判错会删用户目录。`Worktree.create` 已调用 `project.addSandbox(projectID, directory)`，该列表记录的正是 opencode 自建的工作树——无需新增 schema，也不依赖路径形状（用户把 `cwd` 指向 worktree 根下不会被误判）|
 | 恢复时重建工作树，与 Claude Code 相反 | Claude Code 在工作树消失时清除绑定、降级为无隔离。我们只移除过**无改动**的树，重建等价、不丢东西；Claude Code 面对的是用户删除的树，可能含工作，重建会掩盖丢失。对我们而言隔离是并发编排的安全属性，静默降级会把这个 feature 要防的危险放回来 |
 | 复制 gitignored 文件进新工作树 | 新 worktree 是干净 checkout，`.env` 一类文件不存在，需要它们的项目里子 Agent 开箱跑不起来。照 Claude Code 的 `.worktreeinclude`（gitignore 语法）复制「匹配模式且确被 gitignore」的文件。这比 sweep 与加锁更影响可用性，故纳入首版 |
