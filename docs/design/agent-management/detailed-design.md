@@ -488,6 +488,8 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
      - 照既有 `inject` 的写法（清单 §6.2 标为保留）：它已经在用目标自己的 agent，正是所需。
      - **投递目标是 `target.parentID`，不是调用者**（清单 §6.3）：`agent_send` 可由兄弟发起，
        两者不同。既有代码恒用 `ctx.sessionID` 是因为旧路径下调用者恒等于父。
+  4.1 送达确定性依赖 fork issue #32：当前 `prompt` 的唤醒在"判定—转 idle"窗口内可能空转，
+      投递的消息会等到下一次外部触发才被消费。本设计不复刻投递保证，引用该修复。
   5. 完成 `noticeDelivered.get(target)` 这个 Deferred，表示本次执行的结局通知已持久化，随后移除该表项。
      - 步骤 2 的无父分支同样要完成它——那种情况下没有通知可发，但等待方仍须被释放，否则
        `cancelAndAwaitNotice` 会永久阻塞。
