@@ -7,11 +7,11 @@
 
 ## 1. 范围
 
-本细化覆盖架构 §4 的六个模块，共 22 个函数（18 个承担模块规约，4 个内部辅助）：
+本细化覆盖架构 §4 的六个模块，共 24 个函数（20 个承担模块规约，4 个内部辅助）：
 
 | 模块 | 函数 | 内部辅助 | 承接 goal |
 |---|---|---|---|
-| M1 AgentTree | `neighborhood` / `children` / `descendants` / `isChild` | `toInfo` | G1 G2 G4 G5 |
+| M1 AgentTree | `neighborhood` / `children` / `descendants` / `isChild` / `resolveTarget` / `callerDepth` | `toInfo` | G1 G2 G4 G5 |
 | M2 AgentStatusProjection | `of` | — | G1 G2 |
 | M3 AgentInbox | `deliver` | `render` | G3 G4 |
 | M4 AgentLifecycle | `create` / `plan` / `stop` | `renderTermination` | G4 G5 |
@@ -69,7 +69,7 @@
 
 ## 3. 错误处理策略
 
-**错误模型**：沿用仓库既有的 Effect typed error。本 feature 定义六个失败类型，均为可预期的调用方错误，
+**错误模型**：沿用仓库既有的 Effect typed error。本 feature 定义七个失败类型，均为可预期的调用方错误，
 不使用异常，不使用 `Effect.orDie`。
 
 ```
@@ -79,6 +79,7 @@ NotAChild          { caller, target }     agent_stop 的目标不是调用者的
 SelfDelivery       { target }             agent_send 的目标是发送者自己
 DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 WorktreeUnavailable{ reason }             创建工作树失败（非 git 仓库 / 名称生成失败 / git 命令失败）
+TargetNotResolved  { value }              目标名称在可寻址集合中无匹配
 ```
 
 **跨模块传播规则**：
@@ -94,7 +95,7 @@ WorktreeUnavailable{ reason }             创建工作树失败（非 git 仓库
 本细化不引入新的跨模块类型。架构 §3 已定义 `AgentStatus` / `AgentInfo` / `AgentNeighborhood` /
 `AgentMessage` / `Accepted` / `StopOutcome` / `StopPlan`，此处不重复。
 
-新增的六个错误类型见 §3。按 §2.4 的判定原则，它们被 M1/M3/M4/M6 产出、被 M5 消费，出现在多个模块的
+新增的七个错误类型见 §3。按 §2.4 的判定原则，它们被 M1/M3/M4/M6 产出、被 M5 消费，出现在多个模块的
 接口规约里，因此属**跨模块共享**，已同步登记进架构 §3 数据结构节。
 
 ## 5. 模块细化
@@ -188,7 +189,33 @@ WorktreeUnavailable{ reason }             创建工作树失败（非 git 仓库
   self 的 depth 需一次向上遍历取得，见 §5.5.5 `callerDepth`，其余成员的 depth 由 self 推出
   （parent = self−1，child = self+1，sibling = self）。
 
-#### 5.1.6 `callerDepth(id: SessionID) -> Effect<NonNegativeInt, AgentNotFound>`
+#### 5.1.6 `resolveTarget(caller: SessionID, value: string, scope: "neighbor" | "child") -> Effect<SessionID, TargetNotResolved | AgentNotFound>`
+
+- **功能描述**：把调用方给的 `target` 解析为 SessionID：形如 SessionID 则直用，否则按 agent 类型名
+  在指定集合内查找。
+- **调用关系**：callers: M5 `agent_send`（scope=neighbor）、M5 `agent_stop`（scope=child）；
+  callees: M1 `neighborhood` / `children`。
+- **实现思路**：
+  1. `value` 形如 SessionID（前缀与长度符合 `SessionID` 的形状）→ 直接返回，**不做名称查找**。
+     - 这一分支不校验该 Session 是否存在，也不校验是否在集合内：`agent_send` 本就允许对任意存在的
+       Session 直投（架构 §6），存在性由 M3 `deliver` 校验；`agent_stop` 的直接子约束由 M4 `plan`
+       的 `isChild` 校验。名称解析不改变任一工具原有的寻址范围。
+  2. 否则取候选集合：`scope === "neighbor"` → `neighborhood(caller).members`；
+     `scope === "child"` → `children(caller, depth)`。
+  3. 过滤 `AgentInfo.agent === value` 者：
+     - 恰一个 → 返回其 session_id
+     - 多个 → 返回 `time_created` 最大者（latest wins，对齐 Claude Code）
+     - 零个 → `TargetNotResolved{value}`，错误正文附当前候选集合的 `(session_id, agent, title)`
+       三元组，使模型无需再调一次 `agent_list` 即可改用 session_id
+- **正确性论证**：
+  - 前置：`caller` 对应的 Session 存在。
+  - 论证：步骤 1 与步骤 2-3 互斥且穷尽（形如 SessionID 与否）。步骤 3 的三分支覆盖候选集合的所有基数。
+    名称解析只在调用者自己的可寻址集合内进行，故不扩大任何工具的寻址范围——这是名称不构成
+    第二套身份的依据：它只能指向调用者本来就能指向的东西。
+  - 后置：返回的 SessionID 要么由调用方直接给出，要么来自调用者的可寻址集合。
+  - 副作用论证：只经 `neighborhood` / `children` 读取，无写入。
+
+#### 5.1.7 `callerDepth(id: SessionID) -> Effect<NonNegativeInt, AgentNotFound>`
 
 - **功能描述**：从 `id` 起沿 `parentID` 向上遍历计数，主 Agent 为 0。
 - **调用关系**：callers: M1 `neighborhood`、M4 `create`、M4 `plan`、M5 `available`；callees: `Session.get`。
@@ -622,7 +649,8 @@ WorktreeUnavailable{ reason }             创建工作树失败（非 git 仓库
   1. `neighborhood(ctx.sessionID)`。失败 → 渲染错误返回。
   2. 对每个成员调用 M2 `of(session_id)` 填 `status`。可并发，无顺序要求
      —— `of` 的功能规约声明只读且结果为即时快照。
-  3. 渲染为紧凑表：`session_id` / `relation` / `agent` / `status` / `title` / `directory`。
+  3. 渲染为紧凑表：`session_id` / `agent` / `relation` / `status` / `title` / `directory`。
+     `agent` 列同时是**可用于寻址的名称**（见 §5.1.6）；`session_id` 是歧义时的规范形式，两者都要显示。
      `directory` 不可省：各 Agent 可能在不同工作树里，缺了它无法判断谁在哪儿干活。
   4. 边界：`members` 只含自己（主 Agent 且无子）时仍返回该行，不返回空结果——空表会让模型误判为出错。
 - **正确性论证**：非平凡（跨模块调用）。论证：步骤 2 对每个成员各调一次 `of`，成员集合有限且来自
@@ -636,11 +664,13 @@ WorktreeUnavailable{ reason }             创建工作树失败（非 git 仓库
 - **实现思路**：
   1. caller 取自 `ctx.sessionID`。
   2. 取 caller 的 `agent` 名作为 `sender_agent`（仅用于前缀可读性）。
-  3. 构造 `AgentMessage{ target: params.session_id, sender: caller, sender_agent, body: params.message }`。
-  4. 调 M3 `deliver`。**不做邻居校验，不做同树校验**（架构 §6）。
-  5. 分支：`Accepted` → 渲染"已接受，未等待目标完成"；`SelfDelivery` → 渲染"不能给自己发消息"；
+  3. `resolveTarget(caller, params.target, "neighbor")` 得目标 SessionID。
+     失败 → 渲染 `TargetNotResolved` 的候选清单返回，无副作用。
+  4. 构造 `AgentMessage{ target, sender: caller, sender_agent, body: params.message }`。
+  5. 调 M3 `deliver`。**不做邻居校验，不做同树校验**（架构 §6）。
+  6. 分支：`Accepted` → 渲染"已接受，未等待目标完成"；`SelfDelivery` → 渲染"不能给自己发消息"；
      `AgentNotFound` → 渲染"目标 Session 不存在"。
-  6. 返回文本。
+  7. 返回文本。
 - **正确性论证**：非平凡（跨模块调用 + 状态变更）。论证：步骤 3 的 `sender` 取自上下文而非入参，
   故模型无法伪造发送者；`deliver` 的三种终态在步骤 5 被穷尽覆盖；失败两支均由 `deliver` 在写入前
   返回，故失败时无副作用。后置：返回文本表示"已接受"或明确的失败原因。副作用：成功路径下目标
@@ -652,13 +682,14 @@ WorktreeUnavailable{ reason }             创建工作树失败（非 git 仓库
 - **调用关系**：callees: M4 `stop`。
 - **实现思路**：
   1. caller 取自 `ctx.sessionID`。
-  2. 调 M4 `stop(caller, params.session_id)`。
-  3. 分支：成功 → 渲染 `StopOutcome` 三段：`transitioned`（本次真正停下的）、`unchanged`
+  2. `resolveTarget(caller, params.target, "child")` 得目标 SessionID；失败 → 渲染候选清单返回。
+  3. 调 M4 `stop(caller, 目标)`。
+  4. 分支：成功 → 渲染 `StopOutcome` 三段：`transitioned`（本次真正停下的）、`unchanged`
      （调用时本就空闲、未产生通知的）、`failed`（出错的，**必须**逐条列出，架构 §5 M5→M4 协议要求
      显式报告）。三段都要呈现——只报 `transitioned` 会让模型以为 `unchanged` 的成员没被处理；
      `NotAChild` → 渲染"只能停止自己直接派生的 Agent"；`AgentNotFound` → 渲染"目标不存在"。
-  4. 返回文本。
-- **正确性论证**：非平凡（跨模块调用 + 状态变更）。论证：`stop` 的三种终态在步骤 3 被穷尽覆盖；
+  5. 返回文本。
+- **正确性论证**：非平凡（跨模块调用 + 状态变更）。论证：`stop` 的三种终态在步骤 4 被穷尽覆盖；
   `failed` 非空时的渲染是协议硬要求，不得省略或折叠。后置：返回文本如实反映哪些成员被停止、
   哪些父收到通知、哪些失败。副作用：委托给 M4。
 

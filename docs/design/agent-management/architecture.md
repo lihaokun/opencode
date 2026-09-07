@@ -122,6 +122,30 @@
 ```
 
 ```
+数据结构：TargetRef
+
+字段：
+  - value: string — 调用方给出的目标标识
+
+解析规则（按序，先命中者胜）：
+  1. 形如 SessionID ⇒ 直接作为 session_id 使用，不做名称查找
+  2. 否则视为 agent 类型名，在调用者的**邻居集合**（`agent_send`）或**直接子集合**（`agent_stop`）中
+     匹配 `AgentInfo.agent` 相等者：
+     - 恰一个 ⇒ 取之
+     - 多个 ⇒ 取 time_created 最新的一个（对齐 Claude Code 的 latest wins）
+     - 零个 ⇒ 失败 `TargetNotResolved`，提示改用 session_id 并附当前 roster
+
+类型不变量：
+  - 名称解析只在调用者自己的可寻址集合内进行，不扩大寻址范围：
+    `agent_send` 仍可对任意存在的 Session 用 session_id 直投，但**名称**只解析邻居；
+    `agent_stop` 的名称只解析直接子，与其 session_id 形式的约束一致
+  - session_id 始终是规范形式，名称不构成第二套身份——它只是同一 session 的别名，
+    与调研 §5.1 否决的并行身份（标识不同事物的 run_id / agent_id）不同
+
+跨模块共享性：跨模块共享 — consumer: M5 AgentTools（解析）、M1 AgentTree（提供候选集合）
+```
+
+```
 数据结构：AgentMessage
 
 字段：
@@ -219,6 +243,7 @@
   - NotAChild         { caller, target }  agent_stop 的目标不是调用者的直接子
   - SelfDelivery      { target }          agent_send 的目标是发送者自己
   - DepthLimitReached { depth, limit }    创建时已达嵌套上限
+  - TargetNotResolved { value }          目标名称在可寻址集合中无匹配
   - WorktreeUnavailable { reason }       创建工作树失败（非 git 仓库、名称生成失败、git 命令失败等）
 
 类型不变量：
@@ -474,13 +499,16 @@ transcript 留下记录，且它此刻在运行），对级联中间层而言是
 返回：AgentNeighborhood.members，每行含 relation 与 status
 
 工具：agent_send
-  session_id:     string    — 目标，须是存在的 Session；不限于邻居
+  target:         string    — 目标：`session_id`，或调用者邻居中某个 agent 类型名
   message:        string    — 正文；系统前缀由 M3 添加，调用方不可覆盖
 返回：Accepted
 
 工具：agent_stop
-  session_id:     string    — 目标，须是调用者的直接子；停止会连带其整棵后代
+  target:         string    — 目标：`session_id`，或调用者直接子中某个 agent 类型名
 返回：StopOutcome
+
+（`target` 的解析规则见 §3 `TargetRef`。`session_id` 始终是规范形式；类型名是查表便利，
+  存在的意义是模型不必从 roster 一字不差抄一个不透明 id——那是真实的出错来源。）
 ```
 
 ## 5. 模块间接口规约
@@ -737,6 +765,7 @@ Rely-Guarantee 条件：
 | 停止范围 | `TaskStop` 按 id 停一个后台任务，文档未述子树级联 | 级联整棵子树，自底向上 | 防止停掉父之后子 Agent 变孤儿继续消耗（#37314）；备选方案见 issue #26 |
 | roster 范围 | `ListAgents` 跨 in-process subagent、teammate、本机其他会话、云端会话 | 仅调用者所在的一棵 Agent 树 | 调研 §6 明确排除跨互不相关根 Session 的通信与编排 |
 | 工作树隔离强度 | 四项检查：文件编辑不得指向主 checkout、命令 cwd 必须解析到 worktree、git 不得经 `-C`/`--git-dir`/`GIT_DIR`/`GIT_WORK_TREE`/`cd` 重定向、命令形状不可验证时拒绝 | 软隔离：默认在自己的 worktree 里，越出 instance 目录需过 `external_directory`，但不拦主 checkout | 强制需要按 Session 可判定的文件系统根，V1 无此轴；见 issue #33 |
+| 寻址标识 | 名字即地址，`ListAgents` 每行以 `name [ref]` 打头，重名时 latest wins | `session_id` 为规范形式，agent 类型名作为查表便利；roster 两者都显示 | 调研 §5.1 定 `session_id` 为唯一公开标识；名称只是别名，不构成并行身份 |
 | 工作树基准分支 | 默认远端默认分支（`fresh`），可设 `head` | 恒为当前 HEAD | 子 Agent 需在父的进行中工作上操作，此为 Claude Code 自己给的 `head` 适用场景 |
 | 运行中锁 | `git worktree lock`，防并发清理 | 无 | 首版无并发清理者：同一 Agent 至多一个执行，清理只在结算路径 |
 | 有改动工作树的回收 | 周期性 sweep，按 `cleanupPeriodDays` 且不丢工作时移除 | 无，累积待人工清理 | 见 §10 缺口 |
