@@ -84,6 +84,7 @@
   - depth: NonNegativeInt — 相对树根的深度，根为 0
   - relation: "self" | "parent" | "child" | "sibling" — 相对查询发起者的关系（调研 §14）
   - time_created: number — Session 创建时间（epoch ms）
+  - directory: string — 该 Agent 的工作目录绝对路径；自建工作树或调用方给的 cwd
 
 类型不变量：
   - depth == 0 ⟺ parent_id == undefined
@@ -218,6 +219,7 @@
   - NotAChild         { caller, target }  agent_stop 的目标不是调用者的直接子
   - SelfDelivery      { target }          agent_send 的目标是发送者自己
   - DepthLimitReached { depth, limit }    创建时已达嵌套上限
+  - WorktreeUnavailable { reason }       创建工作树失败（非 git 仓库、名称生成失败、git 命令失败等）
 
 类型不变量：
   - 五者互斥，均为可预期的调用方错误，不用于表达内部缺陷
@@ -342,9 +344,11 @@ Session 当前模型之前，一条消息就会改写并持久化目标的绑定
   - create 总是新建一个以调用者为 parentID 的子 Session，不复用既有 Session
   - create 的初始任务经 M3 投递，因而与后续消息走同一条路径
   - 未给 cwd 时为该 Agent 创建 worktree，并在子 Session 权限中预置对该目录的
-    `external_directory` 放行；给出 cwd 时使用该目录，不建 worktree
+    `external_directory` 放行；给出 cwd 时使用该目录，不建 worktree，**且不预置放行**
+  - 不为 cwd 预置放行是安全要求：`cwd` 由模型提供，自动放行等于让模型可以用
+    `agent(cwd: <任意目录>)` 给自己开出 `external_directory` 的绕过口。该目录若在 instance 目录之外，
+    其首次文件操作会照常触发一次权限询问，由用户裁决
   - 初始任务的正文声明该 Agent 的工作目录绝对路径，要求以绝对路径操作
-  - Agent 结束时若其 worktree 无改动则清理；有改动则保留待人处理
   - stop 对 ⋃ StopPlan.layers 中每个成员调用 M6 `cancelAndAwaitNotice`
   - stop 不删除任何 Session、消息或历史
   - stop 后目标仍可经 agent_send 恢复
@@ -388,6 +392,8 @@ transcript 留下记录，且它此刻在运行），对级联中间层而言是
   - watcher 在执行结算后把结局交付给**目标 Session 的 parentID 所指 Agent**，而非发起调用者
     ——`agent_send` 可由兄弟发起，两者不同
   - 目标无 parentID（主 Agent）⇒ 不交付，人在 UI 上直接看到
+  - 执行结算后：目标的工作目录若为本 feature 自建且无改动 ⇒ 清理并清空 Session 的目录绑定；
+    有改动 ⇒ 保留待人处理。清理失败不影响结局交付
   - cancelAndAwaitNotice(target)：目标有在跑的执行 ⇒ 取消它，等待其取消结局**已持久化**后返回
     `{ transitioned: true }`；目标无在跑的执行 ⇒ 不取消、不产生通知，返回 `{ transitioned: false }`
 

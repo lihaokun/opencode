@@ -69,7 +69,7 @@
 
 ## 3. 错误处理策略
 
-**错误模型**：沿用仓库既有的 Effect typed error。本 feature 定义五个失败类型，均为可预期的调用方错误，
+**错误模型**：沿用仓库既有的 Effect typed error。本 feature 定义六个失败类型，均为可预期的调用方错误，
 不使用异常，不使用 `Effect.orDie`。
 
 ```
@@ -78,6 +78,7 @@ AgentTypeNotFound  { subagent_type }      agent 创建时指定的 agent 定义�
 NotAChild          { caller, target }     agent_stop 的目标不是调用者的直接子
 SelfDelivery       { target }             agent_send 的目标是发送者自己
 DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
+WorktreeUnavailable{ reason }             创建工作树失败（非 git 仓库 / 名称生成失败 / git 命令失败）
 ```
 
 **跨模块传播规则**：
@@ -93,7 +94,7 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 本细化不引入新的跨模块类型。架构 §3 已定义 `AgentStatus` / `AgentInfo` / `AgentNeighborhood` /
 `AgentMessage` / `Accepted` / `StopOutcome` / `StopPlan`，此处不重复。
 
-新增的五个错误类型见 §3。按 §2.4 的判定原则，它们被 M1/M3/M4/M6 产出、被 M5 消费，出现在多个模块的
+新增的六个错误类型见 §3。按 §2.4 的判定原则，它们被 M1/M3/M4/M6 产出、被 M5 消费，出现在多个模块的
 接口规约里，因此属**跨模块共享**，已同步登记进架构 §3 数据结构节。
 
 ## 5. 模块细化
@@ -177,6 +178,8 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
   等价于"target ∈ children(caller)"，无需再拉子列表。
 
 #### 5.1.5 `toInfo(session, relation, depth, status) -> AgentInfo`
+
+- **字段来源**：`directory` 取 `Session.Info.directory`；其余字段同名映射。
 
 - **功能描述**：把 `Session.Info` 转成完整 `AgentInfo`。`status` 由调用方给出——`AgentInfo.status`
   是必填字段，本函数不产出不完整的值：`agent_list` 先经 M2 `of` 取状态再传入，`create` 直接传 `running`
@@ -278,7 +281,7 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 
 ### 5.4 M4 AgentLifecycle
 
-#### 5.4.1 `create(input) -> Effect<AgentInfo, DepthLimitReached | AgentTypeNotFound | AgentNotFound>`
+#### 5.4.1 `create(input) -> Effect<AgentInfo, DepthLimitReached | AgentTypeNotFound | AgentNotFound | WorktreeUnavailable>`
 
 - **功能描述**：新建一个以调用者为父的子 Agent，继承调用者当次的模型身份，并投递初始任务。
 - **调用关系**：callers: M5 `agent`；callees: `callerDepth`、`agent.get`、`MessageV2.get`、
@@ -303,7 +306,11 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
      - 合并时按 `(permission, pattern, action)` 三元组**去重**：`childPermission` 里已有同样规则的不重复追加
        （清单 §2.4）。
   6.1 解析工作目录（调研 §15）：
-     - 给了 `cwd` → 直接用它，**不建 worktree**，权限不追加放行（调用方自负责该目录可写）
+     - 给了 `cwd` → 直接用它，**不建 worktree**，**不追加 `external_directory` 放行**。
+       - 安全理由：`cwd` 由模型提供。若自动放行，模型可用 `agent(cwd: <任意目录>)` 给自己开出
+         `external_directory` 的绕过口。该目录在 instance 目录之外时，其首次文件操作会照常触发一次
+         权限询问，由用户裁决——这是有意保留的交互，与「四个工具不弹确认」不冲突：不弹的是工具本身，
+         越界访问仍由既有机制把关。
      - 未给 → `Worktree.create()` 得 `info.directory`。
        - callee 契约：在 `Global.Path.data/worktree/<projectID>` 下
          `git worktree add --no-checkout -b <slug>`，不给 start-point 即**从当前 HEAD 切**；
@@ -315,7 +322,10 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
        - 复制环境文件：读项目根的 `.worktreeinclude`（gitignore 语法），对每条模式取匹配文件，
          再用 `Git` 判定其确被 gitignore，二者皆真才复制进新工作树。只复制被忽略的文件，
          已跟踪文件不重复。该文件不存在则跳过本步。
-     - `Worktree.create` 失败 → 上抛，不建 Session。此时尚无任何副作用需要回滚
+       - 复制失败（单个文件读写错误）→ **记日志并继续**，不使创建失败：工作树本身可用，
+         缺的是便利文件；为此让整次创建失败代价更大。初始任务正文中附一行说明哪些文件未复制成功。
+     - `Worktree.create` 失败（`NotGitError` / `NameGenerationFailedError` / `CreateFailedError`）
+       → 映射为 `WorktreeUnavailable{reason}` 返回，不建 Session。此时尚无任何副作用需要回滚
   7. `Session.create({ parentID: caller, title, agent: next.name, permission })`。
      - `title = description + " (@" + next.name + " subagent)"`，照既有约定（清单 §2.5）。roster 显示的就是它。
   8. `resolvePromptParts(prompt)` 展开正文里的 `@file` 引用（清单 §8.2），得到 parts；
@@ -329,7 +339,8 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
        已分配的 id。失败原样上抛，M5 渲染时说明 Session 已建但任务未投递。
   10. 写工具元数据：`ctx.metadata({ title: description, metadata: { parentSessionId: caller, sessionId: newSession.id, model } })`
       （清单 §8.1）。TUI 的 task 卡片靠这些字段渲染，缺了卡片就是空的。
-  11. 返回 `toInfo(newSession, relation="child", depth=d+1, status=running)`。
+  11. 返回 `toInfo(newSession, relation="child", depth=d+1, status=running)`，其 `directory` 取步骤 6.1
+      解析出的工作目录——调用方需要它才能去查看子 Agent 的产出。
       状态直接给 `running`：步骤 9 已确保执行注册，无需再查一次 `SessionStatus`。
 - **正确性论证**：
   - 前置：调用者 Session 存在；`ctx.messageID` 指向调用者当次的 assistant 消息。
@@ -599,7 +610,8 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
   1. `neighborhood(ctx.sessionID)`。失败 → 渲染错误返回。
   2. 对每个成员调用 M2 `of(session_id)` 填 `status`。可并发，无顺序要求
      —— `of` 的功能规约声明只读且结果为即时快照。
-  3. 渲染为紧凑表：`session_id` / `relation` / `agent` / `status` / `title`。
+  3. 渲染为紧凑表：`session_id` / `relation` / `agent` / `status` / `title` / `directory`。
+     `directory` 不可省：各 Agent 可能在不同工作树里，缺了它无法判断谁在哪儿干活。
   4. 边界：`members` 只含自己（主 Agent 且无子）时仍返回该行，不返回空结果——空表会让模型误判为出错。
 - **正确性论证**：非平凡（跨模块调用）。论证：步骤 2 对每个成员各调一次 `of`，成员集合有限且来自
   步骤 1 的输出，故遍历必然终止；`of` 无失败通道，故本步无失败分支。后置：每行的 status 是该次调用
@@ -684,5 +696,8 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
       统一覆盖；M5 的"四个工具都不弹确认"提到模块前言，不逐函数重复
 - [x] 所有循环有终止性论证 —— `descendants`（`seen` 单调增长且有上界）、`stop`（层数有限）、
       `callerDepth`（每步上移一层，链无环有限）
+- [x] 工作树生命周期的每个分支都有归属与退出刻画 —— 创建失败映射为 `WorktreeUnavailable`；
+      环境文件复制失败记日志并继续；清理与重建的归属判定统一走 project 的 sandbox 列表；
+      清理由 M6 承担而非 M4（架构 §4.4 已相应移出）
 - [x] 所有上游事实显式列出 —— H2（parentID 链无环且深度有限）在 `neighborhood` / `descendants` /
       `callerDepth` / `plan` 的使用点各自标注；I2、I3 在 `deliver` 的论证中显式引用
