@@ -423,7 +423,8 @@ Bash 的工作目录必须解析到 worktree 内、命令不得把 git 重定向
 ### 首版采用：软隔离
 
 - `agent` 默认为新 Agent 创建 worktree，初始 prompt 声明其工作目录的绝对路径
-- 子 Session 权限预置 `external_directory` 对该 worktree 的放行，其余外部目录照常拦截
+- 工作树建在主仓根下，`containsPath` 直接为真，因此**不需要任何权限放行**；越出项目的访问仍由
+  `external_directory` 照常拦截
 - `agent` 增加 `cwd` 参数：给出则使用该目录，不建 worktree
 - 无改动则清理，对齐 Claude Code
 
@@ -435,7 +436,7 @@ checkout 的绝对路径操作——主 checkout 在 instance 目录**之内**�
 
 | 时机 | 行为 |
 |---|---|
-| 位置 | **项目内**：`<worktree>/.opencode/worktrees/<slug>`，对齐 Claude Code 的 `.claude/worktrees/`。放在项目内使 `containsPath` 为真，`external_directory` 不触发，无需权限放行；根目录写入内容为 `*` 的 `.gitignore` 自我忽略，否则 ripgrep 会搜出每个工作树里的副本 |
+| 位置 | **主仓根下平铺**：`<主 checkout>/.opencode/worktrees/<slug>`，对齐 Claude Code 的「at your repository root」。项目内使 `containsPath` 为真，无需权限放行；平铺而非嵌套，否则父清理自己的工作树时会连同嵌在其中的子工作树一并删除；根目录写入内容为 `*` 的 `.gitignore` 自我忽略，否则 ripgrep 会搜出每个工作树里的副本 |
 | 创建 | 未给 `cwd` 时建 worktree，**从当前 HEAD 切**。opencode 的 `Worktree.create` 已是此行为（`git worktree add --no-checkout -b <slug> <dir>`，不给 start-point 即 HEAD）。Claude Code 默认从远端默认分支切，但其文档指出子 Agent 需在进行中的工作上操作时应改用 `head`——我们的场景正是后者 |
 | 嵌套 | 孙 Agent 从其父 subagent 的 HEAD 切，工作自然叠加 |
 | 归属标记 | 复用 project 的 sandbox 列表：`Worktree.create` 已调用 `project.addSandbox(projectID, directory)`，记录的正是 opencode 自建的工作树。无需新增 schema，也不依赖路径形状 |

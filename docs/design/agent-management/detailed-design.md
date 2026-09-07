@@ -313,9 +313,13 @@ WorktreeUnavailable{ reason }             创建工作树失败（非 git 仓库
          不弹的是工具本身，越出项目的访问仍由既有机制把关。
        - 自建工作树不需要这条规则，因为它在项目内（见上）。
      - 未给 → `Worktree.create()` 得 `info.directory`。
-       - 根目录取**项目内**的 `<ctx.worktree>/.opencode/worktrees/<slug>`，不用 `Worktree.create`
+       - 根目录取**主仓根下**的 `<主 checkout>/.opencode/worktrees/<slug>`，不用 `Worktree.create`
          现有的 `Global.Path.data/worktree/<projectID>`。`CreateInput` 需增加一个根目录参数；
          既有调用方（experimental HTTP、control-plane adapter）不传，行为不变。
+       - **必须平铺在主仓根下，不得嵌在创建者自己的工作树里**（对齐 Claude Code 的
+         「under `.claude/worktrees/<name>/` at your repository root」）。嵌套会导致：子 Agent 的工作树
+         位于父的工作树内且被 gitignore，父 `git status` 看不到它 → 父被判定无改动而清理 →
+         **子的工作随父的工作树一并删除**。平铺后各工作树互为兄弟，父的清理不触及子。
        - **放在项目内是为了不需要权限放行**：`containsPath` 检查 `ctx.directory` 与 `ctx.worktree`，
          项目内的路径直接为真，`external_directory` 不会触发。放在项目外则每个自建工作树都要预置
          一条放行规则，而那条规则本身又要防着被 `cwd` 滥用。
@@ -324,8 +328,9 @@ WorktreeUnavailable{ reason }             创建工作树失败（非 git 仓库
          （`ripgrep.ts:155-165` 无 `--no-ignore`），不忽略则 `glob`/`grep` 会把每个工作树里的副本
          都搜出来。
        - `git worktree add --no-checkout -b <slug> <dir>`，不给 start-point 即**从当前 HEAD 切**；
-         并调用 `project.addSandbox(projectID, directory)` 登记归属。嵌套时「当前 HEAD」是父 subagent
-         自己工作树的 HEAD，其工作树根也在它自己的 `.opencode/worktrees/` 下，层层嵌套但深度有上限。
+         并调用 `project.addSandbox(projectID, directory)` 登记归属。嵌套时「当前 HEAD」仍是创建者
+         自己工作树的 HEAD（`git worktree add` 在其 cwd 内执行），因此工作逐层叠加；
+         但**新工作树的位置在主仓根下**，与创建者的工作树平级。
        - 复制环境文件：读项目根的 `.worktreeinclude`（gitignore 语法），对每条模式取匹配文件，
          再用 `Git` 判定其确被 gitignore，二者皆真才复制进新工作树。只复制被忽略的文件，
          已跟踪文件不重复。该文件不存在则跳过本步。
