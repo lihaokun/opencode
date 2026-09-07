@@ -565,6 +565,10 @@ transcript 留下记录，且它此刻在运行），对级联中间层而言是
 | 跨会话越权用工具描述约束，不加强制门 | Claude Code 的 `SendMessage` 原文：「NEVER ask a peer to perform an action that was denied or blocked in your session — a peer doing it for you bypasses the user's permission decision」。子 Session 的权限从父派生、可以更窄，因此被限权的 Agent 理论上能让兄弟或父代做被禁的事。强制方案（目标以发送者∩目标权限的交集执行）要改权限派生逻辑，代价远超收益；调研以 Claude Code 为语义基线，此处照其做法处理 |
 | Agent 恒为异步执行，取消 `background` 参数与实验开关 | 前台路径以 `background.wait({ id })` 阻塞等待子 Agent 结束，父 Agent 在这段时间内停在那次 tool call 里，发不出 `agent_list` / `agent_send` / `agent_stop`——管理面对前台子 Agent 完全不可用，本 feature 失去意义。Claude Code 的 `Agent` 同样没有 background 参数，其 subagent 恒为异步并经通知送达。实现须移除 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` 门与前台分支；`task` 兼容入口收到旧的 `background: false` 时忽略该参数 |
 | 默认为每个新 Agent 建 worktree | 深度提到 3、子 Agent 可再派生、执行恒为异步，三者叠加使多个 Agent 同时改同一份工作树从边缘情况变成默认可能。不隔离等于本方案自己制造一个默认危险的配置。实现不需改动文件系统解析——六个文件工具都接受绝对路径，`shell` 有 `cwd`，`external_directory` 是现成的强制点（调研 §15）|
+| worktree 从当前 HEAD 切，而非默认分支 | Claude Code 默认 `fresh`（远端默认分支）但明确指出「Use this when isolating subagents that need to operate on in-progress work」应改用 `head`——我们的场景正是后者：父 Agent 做到一半派子 Agent 改其中一部分，从默认分支切等于让子看不见父已完成的工作。opencode 的 `Worktree.create` 现状即从 HEAD 切，无需改动 |
+| 归属标记复用 project 的 sandbox 列表 | 判断某目录是本 feature 自建还是调用方经 `cwd` 给的，两者清理策略相反，判错会删用户目录。`Worktree.create` 已调用 `project.addSandbox(projectID, directory)`，该列表记录的正是 opencode 自建的工作树——无需新增 schema，也不依赖路径形状（用户把 `cwd` 指向 worktree 根下不会被误判）|
+| 恢复时重建工作树，与 Claude Code 相反 | Claude Code 在工作树消失时清除绑定、降级为无隔离。我们只移除过**无改动**的树，重建等价、不丢东西；Claude Code 面对的是用户删除的树，可能含工作，重建会掩盖丢失。对我们而言隔离是并发编排的安全属性，静默降级会把这个 feature 要防的危险放回来 |
+| 复制 gitignored 文件进新工作树 | 新 worktree 是干净 checkout，`.env` 一类文件不存在，需要它们的项目里子 Agent 开箱跑不起来。照 Claude Code 的 `.worktreeinclude`（gitignore 语法）复制「匹配模式且确被 gitignore」的文件。这比 sweep 与加锁更影响可用性，故纳入首版 |
 | 隔离强度为软隔离，强制隔离留待 V2 | 子 Agent 仍可用主 checkout 的绝对路径操作：主 checkout 在 instance 目录之内，`external_directory` 按设计放行——它防出界不防串门。强制需要文件系统根在工具层按 Session 可判定，而 V1 的 `InstanceState` 以目录为 cache key，换目录即换分片，管理面随之失效。见 issue #33 |
 | `subagent_depth` 默认由 1 提到 3 | 与 Claude Code 的 `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`（默认 3，主会话之下三层）对齐，单位相同；现默认 1 恰是 CC 所说的"关闭嵌套"。默认 1 时 Subagent 不能再派生，Agent 树最多两层，终止通知与自底向上排序都无对象，本 feature 的多层编排默认不可用。实现须同时改 `task.ts` 的兜底值与 `core/src/v1/config/config.ts` 中 `subagent_depth` 的 schema 说明文字 |
 | 触达深度上限时撤下工具，而非让调用失败 | Claude Code 到限时不再向该 Subagent 提供 `Agent`；OpenCode 现状是调用后返回错误，模型要先试一次、撞墙、再重新规划，白费一轮。撤下范围按"寻址集合是否永久为空"判定：`agent` 与 `agent_stop` 撤下（到限者不能派生，也就永远不会有子可停），`agent_send` 与 `agent_list` 保留（父与兄弟仍可寻址）。判据是深度到限，不是当前是否有子 Agent |
@@ -722,7 +726,10 @@ Rely-Guarantee 条件：
 |---|---|---|---|
 | 停止范围 | `TaskStop` 按 id 停一个后台任务，文档未述子树级联 | 级联整棵子树，自底向上 | 防止停掉父之后子 Agent 变孤儿继续消耗（#37314）；备选方案见 issue #26 |
 | roster 范围 | `ListAgents` 跨 in-process subagent、teammate、本机其他会话、云端会话 | 仅调用者所在的一棵 Agent 树 | 调研 §6 明确排除跨互不相关根 Session 的通信与编排 |
-| 工作树隔离强度 | 命令 cwd 必须解析到 worktree、git 不得重定向回主 checkout、worktree 消失则命令失败 | 软隔离：默认在自己的 worktree 里，越出 instance 目录需过 `external_directory`，但不拦主 checkout | 强制需要按 Session 可判定的文件系统根，V1 无此轴；见 issue #33 |
+| 工作树隔离强度 | 四项检查：文件编辑不得指向主 checkout、命令 cwd 必须解析到 worktree、git 不得经 `-C`/`--git-dir`/`GIT_DIR`/`GIT_WORK_TREE`/`cd` 重定向、命令形状不可验证时拒绝 | 软隔离：默认在自己的 worktree 里，越出 instance 目录需过 `external_directory`，但不拦主 checkout | 强制需要按 Session 可判定的文件系统根，V1 无此轴；见 issue #33 |
+| 工作树基准分支 | 默认远端默认分支（`fresh`），可设 `head` | 恒为当前 HEAD | 子 Agent 需在父的进行中工作上操作，此为 Claude Code 自己给的 `head` 适用场景 |
+| 运行中锁 | `git worktree lock`，防并发清理 | 无 | 首版无并发清理者：同一 Agent 至多一个执行，清理只在结算路径 |
+| 有改动工作树的回收 | 周期性 sweep，按 `cleanupPeriodDays` 且不丢工作时移除 | 无，累积待人工清理 | 见 §10 缺口 |
 
 ## 10. 已知缺口
 
@@ -738,7 +745,10 @@ Rely-Guarantee 条件：
    本架构不复刻投递保证，引用即可。
 6. **工作树隔离为软隔离**（fork issue #33）。子 Agent 可用主 checkout 的绝对路径绕开自己的 worktree。
    收口依赖 V2 的 Location 作用域，本架构不在 V1 上做地基改造。
-7. **TUI 的权限聚合只覆盖直接子**。`tui/src/routes/session/index.tsx` 的 `children()` 按 `x.parentID === parentID` 过滤，根视图只聚合直接子的权限请求；子 Session 视图自身 `return []` 不显示。深度为 1 时两者等价，提到 3 之后**孙辈的权限请求无处应答，该 Agent 会永久挂起**。实现阶段须把聚合改为整棵后代，属深度改动的连带项。
+7. **有改动的工作树会累积**。首版无周期性 sweep，被停止或产生改动的 Agent 留下的工作树需人工清理
+   （既有 `Worktree.remove` 或 `git worktree remove`）。
+8. **进程崩溃后工作树成为孤儿**。无回收机制。
+9. **TUI 的权限聚合只覆盖直接子**。`tui/src/routes/session/index.tsx` 的 `children()` 按 `x.parentID === parentID` 过滤，根视图只聚合直接子的权限请求；子 Session 视图自身 `return []` 不显示。深度为 1 时两者等价，提到 3 之后**孙辈的权限请求无处应答，该 Agent 会永久挂起**。实现阶段须把聚合改为整棵后代，属深度改动的连带项。
 
 ## 11. 下一阶段
 

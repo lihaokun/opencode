@@ -64,6 +64,7 @@
 | `task.ts` `notify` / `inject` | 迁入 M6：补 `cancelled` 分支、投递目标改为**目标的 parentID**、暴露通知已落库的可等待信号 | 6.1、6.3、6.4 |
 | `task.ts` `background.extend` 分支 | 移除 | 4.1 |
 | `task.ts` 三段 background 常量 | 随前台与 extend 一并移除，`agent` 的描述重写 | 8.5 |
+| `session/session.ts` `remove` | 递归删除子 Session 时一并移除其自建工作树（按 project 的 sandbox 列表判定），否则留下孤儿 | 调研 §15 |
 | `tui/src/routes/session/index.tsx` `children()` | 权限与 question 的聚合改为整棵后代，否则深度提到 3 后孙辈的权限请求无处应答 | 架构 §10 缺口 5 |
 
 ## 3. 错误处理策略
@@ -303,8 +304,17 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
        （清单 §2.4）。
   6.1 解析工作目录（调研 §15）：
      - 给了 `cwd` → 直接用它，**不建 worktree**，权限不追加放行（调用方自负责该目录可写）
-     - 未给 → `Worktree.create()` 得 `info.directory`；在权限中追加
-       `{ permission: "external_directory", pattern: "<info.directory>/**", action: "allow" }`
+     - 未给 → `Worktree.create()` 得 `info.directory`。
+       - callee 契约：在 `Global.Path.data/worktree/<projectID>` 下
+         `git worktree add --no-checkout -b <slug>`，不给 start-point 即**从当前 HEAD 切**；
+         并调用 `project.addSandbox(projectID, directory)` 登记。嵌套时「当前 HEAD」是父 subagent
+         自己工作树的 HEAD，工作自然叠加。
+       - 权限中追加 `{ permission: "external_directory", pattern: "<directory>/**", action: "allow" }`。
+         **必须显式追加**：`containsPath` 只检查 `ctx.directory` 与 `ctx.worktree`，不查 sandbox 列表，
+         故自建工作树一定会触发 `external_directory` 询问。
+       - 复制环境文件：读项目根的 `.worktreeinclude`（gitignore 语法），对每条模式取匹配文件，
+         再用 `Git` 判定其确被 gitignore，二者皆真才复制进新工作树。只复制被忽略的文件，
+         已跟踪文件不重复。该文件不存在则跳过本步。
      - `Worktree.create` 失败 → 上抛，不建 Session。此时尚无任何副作用需要回滚
   7. `Session.create({ parentID: caller, title, agent: next.name, permission })`。
      - `title = description + " (@" + next.name + " subagent)"`，照既有约定（清单 §2.5）。roster 显示的就是它。
@@ -420,9 +430,11 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
 - **实现思路**：
   1. `Session.get(target)` 取标题、agent 名与工作目录，供步骤 3 的 job 元数据用。
      失败 → `AgentNotFound{target}`，无副作用。这是本函数 `AgentNotFound` 失败通道的唯一来源。
-  1.1 工作目录复原：目标的目录是**本 feature 自建的 worktree** 且已不存在（被步骤 5 的清理删掉过）
-     → `Worktree.create()` 重建并更新 Session 记录的目录。用户经 `cwd` 指定的目录不在此列，
-     缺失时不重建、原样让后续工具报错——那是调用方自己给的路径。
+  1.1 工作目录复原：目标的目录不存在时，查 project 的 sandbox 列表判定归属——
+     - **在列表中**（本 feature 自建）→ `Worktree.create()` 重建，更新 Session 记录的目录与权限规则。
+       安全性：本设计只在**无改动**时移除工作树（`watch` 步骤 4.2），故重建等价、不丢任何东西。
+     - **不在列表中**（调用方经 `cwd` 指定）→ 不重建，原样让后续工具报错。那是调用方给的路径，
+       替它造一个空目录会掩盖问题。
   2. `BackgroundJob.get(target)`。job id 即 SessionID（清单 §4.2 保留的身份约定）。
   3. 分支：存在且 `status === "running"` → **空操作直接返回**。既有 watcher 继续持有唯一交付权，
      本次消息进入该执行的消息序列（架构 I4）。
@@ -503,11 +515,13 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
        两者不同。既有代码恒用 `ctx.sessionID` 是因为旧路径下调用者恒等于父。
   4.1 送达确定性依赖 fork issue #32：当前 `prompt` 的唤醒在"判定—转 idle"窗口内可能空转，
       投递的消息会等到下一次外部触发才被消费。本设计不复刻投递保证，引用该修复。
-  4.2 工作树清理：目标的目录是本 feature 自建的 worktree 且 `Git` 报告其无改动
-      → `Worktree.remove({ directory })` 并清空 Session 记录的目录。有改动则保留，等人处理（对齐
-      Claude Code 的 auto-cleaned if unchanged）。清理失败只记日志，不影响结局交付。
-      - 与 CC 的差别：CC 的 subagent 是一次性的，完成即清理；本方案的 Agent **可经 `agent_send` 恢复**，
-        所以清理后若被恢复，由 `ensure` 步骤 1.1 重建一个空 worktree。无改动的树重建等价，不丢东西。
+  4.2 工作树清理：目标的目录在 project 的 sandbox 列表中（本 feature 自建），且 `Git` 报告其
+      无改动、无未跟踪文件、无未推送提交 → `Worktree.remove({ directory })`（其内部 `removeSandbox`），
+      并清空 Session 记录的目录。有改动则**保留**，等人处理（对齐 Claude Code 的 auto-cleaned
+      if unchanged）。清理失败只记日志，不影响结局交付。
+      - 取消路径同此规则：取消通常留下部分改动，落入「有改动」而被保留。
+      - 与 Claude Code 的差别在恢复而非清理：CC 的工作树消失时清除绑定、降级为无隔离；本方案由
+        `ensure` 步骤 1.1 重建。理由见该步骤——我们只删过无改动的树。
   5. 完成 `noticeDelivered.get(target)` 这个 Deferred，表示本次执行的结局通知已持久化，随后移除该表项。
      - 步骤 2 的无父分支同样要完成它——那种情况下没有通知可发，但等待方仍须被释放，否则
        `cancelAndAwaitNotice` 会永久阻塞。
@@ -648,21 +662,6 @@ DepthLimitReached  { depth, limit }       agent 创建时已达嵌套上限
   未给 → 转 `agent`。旧的 `background` 参数被忽略（Agent 恒为异步，架构 §6）。不维护第二套状态、
   执行路径或测试基准（调研 §8）。
 - **正确性论证**：trivial —— 参数改名加分发，无独立逻辑。
-
-### 5.7 待定：如何持久标记「自建 worktree」
-
-`ensure` 的步骤 1.1 与 `watch` 的步骤 4.2 都需要判断「这个目录是本 feature 自建的 worktree，还是调用方
-经 `cwd` 指定的目录」。两者的清理与重建策略相反，判错会删掉用户自己的目录。
-
-`Session.Info` 目前只有 `directory` 一个字段，不含来源标记。三种可选：
-
-1. **按路径前缀推断** —— 自建的 worktree 都在 `Worktree` 服务的根下。零 schema 改动，但属推断，
-   用户把 `cwd` 指向该根下的目录就会误判
-2. **Session 增加布尔字段** —— 明确，但要动 V1 的 session schema 与迁移
-3. **记在 Session 的 metadata / 权限规则里** —— 权限里本就有那条 `external_directory` 放行，
-   其 pattern 即自建目录；无该规则即非自建。零 schema 改动且不依赖路径形状
-
-倾向 3。确认后写入 §4 数据结构节并从本节移除。
 
 ## 6. 完整性自检 checklist
 

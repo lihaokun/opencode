@@ -431,6 +431,30 @@ Bash 的工作目录必须解析到 worktree 内、命令不得把 git 重定向
 checkout 的绝对路径操作——主 checkout 在 instance 目录**之内**，`external_directory` 按设计放行；
 它防的是出界，不是串门。
 
+### 工作树生命周期
+
+| 时机 | 行为 |
+|---|---|
+| 创建 | 未给 `cwd` 时建 worktree，**从当前 HEAD 切**。opencode 的 `Worktree.create` 已是此行为（`git worktree add --no-checkout -b <slug> <dir>`，不给 start-point 即 HEAD）。Claude Code 默认从远端默认分支切，但其文档指出子 Agent 需在进行中的工作上操作时应改用 `head`——我们的场景正是后者 |
+| 嵌套 | 孙 Agent 从其父 subagent 的 HEAD 切，工作自然叠加 |
+| 归属标记 | 复用 project 的 sandbox 列表：`Worktree.create` 已调用 `project.addSandbox(projectID, directory)`，记录的正是 opencode 自建的工作树。无需新增 schema，也不依赖路径形状 |
+| 环境文件 | 新 worktree 是干净 checkout，`.env` 一类 gitignored 文件不存在。按 Claude Code 的 `.worktreeinclude`（gitignore 语法）复制「匹配模式且确被 gitignore」的文件，否则相当多真实项目里子 Agent 开箱跑不起来 |
+| 结算 | 无改动则移除并清空 Session 的目录绑定；有改动则保留 |
+| 恢复 | 目录仍在则直接用；目录不在且曾在 sandbox 列表中则**重建**；用户经 `cwd` 指定的目录不在则报错不重建 |
+| 停止 | 同结算规则。取消通常留下部分改动，落入「有改动」而保留 |
+| Session 删除 | 递归删除子 Session 时一并移除自建工作树 |
+
+**恢复时重建与 Claude Code 相反，因为情形不同**：我们只移除过**无改动**的树，重建等价、不丢任何东西；
+Claude Code 不重建面对的是**用户删除**的树，那可能含有工作，重建会掩盖丢失。
+
+### 首版不做的四项
+
+1. **周期性 sweep** —— 有改动的工作树会累积，需用户手动清理
+2. **运行中加锁** —— Claude Code 会 `git worktree lock` 防并发清理；首版没有并发清理者（同一 Agent 至多
+   一个执行），故不加
+3. **崩溃后的孤儿回收**
+4. **强制隔离**（见下节与 #33）
+
 ### 强制隔离为何不在首版
 
 强制需要「本 Session 的文件系统根是 X」在工具层可判定。V1 没有这根轴：文件工具解析路径用 instance 级
