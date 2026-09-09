@@ -391,6 +391,12 @@ Claude Code 以环境变量 `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` 控制嵌套�
 
 ## 15. 扩充：subagent 的工作树隔离（2026-09-07）
 
+> **[部分已废弃]** 本节的方向（软隔离入首版、强制隔离留 V2）成立，但落地细节有四处被 §16.10–§16.11 推翻：
+> 生命周期表的**结算 / 恢复 / 停止 / Session 删除**四行（V1 改为完全不自动清理）、**环境文件**行
+> （`.worktreeinclude` 移出首版，且它在 opencode 中并不存在）、**位置**行的忽略机制（改用 `info/exclude`
+> 而非自我忽略 `.gitignore`）、以及「默认在自己的工作树里干活」这一强度措辞（改为建议式工作目录）。
+> 「首版不做的四项」相应扩大。以 §16 为准。
+
 初版范围没有提及工作树隔离，既未包含也未排除。本次把**软隔离**纳入首版，**强制隔离**记为
 [lihaokun/opencode#33](https://github.com/lihaokun/opencode/issues/33) 待 V2 落地。
 
@@ -426,9 +432,10 @@ Bash 的工作目录必须解析到 worktree 内、命令不得把 git 重定向
 - 工作树建在主仓根下，`containsPath` 直接为真，因此**不需要任何权限放行**；越出项目的访问仍由
   `external_directory` 照常拦截
 - `agent` 增加 `cwd` 参数：给出则使用该目录，不建 worktree
-- 无改动则清理，对齐 Claude Code
+- ~~无改动则清理，对齐 Claude Code~~ **[已废弃 → §16.11]** V1 完全不自动清理
 
-**强度边界要说清**：这是「默认在自己的工作树里干活」，不是「关得进去出不来」。子 Agent 仍可用主
+**强度边界要说清**：~~这是「默认在自己的工作树里干活」~~ **[措辞已废弃 → §16.11]**——运行时默认 cwd
+并未切换，准确说法是「默认为 Agent 准备独立工作目录，并通过初始消息要求其显式在其中工作」。总之不是「关得进去出不来」。子 Agent 仍可用主
 checkout 的绝对路径操作——主 checkout 在 instance 目录**之内**，`external_directory` 按设计放行；
 它防的是出界，不是串门。
 
@@ -465,3 +472,277 @@ Claude Code 不重建面对的是**用户删除**的树，那可能含有工作�
 
 在 V1 上做强制隔离要先把「文件系统根」与「instance 状态分片键」解耦，属地基改造，且与 V2 正在建的
 Location 作用域重复。详见 #33。
+
+## 16. 修订：消息语义、实例名与工作树落地校正（2026-09-09）
+
+本节记录第二轮设计评审后的决策。与 §12–§15 冲突处以本节为准；被推翻的部分在原节就地标注。
+所有涉及代码的结论都在 `dev` 上逐条核实过，行号随文给出。
+
+### 16.1 `agent_send` 是消息，不是调用
+
+这是本轮最大的语义简化。此前设计让每条 `agent_send` 都拥有一次"最终结局"——注册 watcher、
+建 BackgroundJob、承诺一次结果投递。取消。
+
+- `agent_send` 不自动回复、不承诺返回结果、不建 BackgroundJob、不注册 watcher；
+- 调用方只收到 `accepted`；
+- 接收方自主决定是否回复，需要回复时再调一次 `agent_send`；
+- 实现直接走普通 Session 异步入口 `POST /session/{id}/prompt_async`。
+
+**只有 `agent` 的初始委托保留自动结果**：初始委托跑完后向创建者投递一次 completed/error，
+复用 `task.ts` 现有的 `runTask` 分类与 `notify`/`inject` 通道。初始执行期间收到的 `agent_send`
+只是追加消息，仍由该初始执行最终交付那一次结果。
+
+这条不对称要明说：**`agent` 自动回结果，`agent_send` 永不回**。与 Claude Code 的 `SendMessage` 也
+构成差异——CC 的云会话例外条款（"cannot message any session back yet — read its answer in its own
+transcript"）反证了常规 `SendMessage` 会带回复。两条都记入架构 §9 差异表。
+
+### 16.2 V1 的"安全 turn 边界"确实存在，就是循环头
+
+此前对这个说法有过质疑。核实后可以精确表述。`session/prompt.ts:1090-1106`：
+
+```ts
+while (true) {
+  let msgs = yield* MessageV2.filterCompactedEffect(sessionID)      // 每轮重读
+  const { user: lastUser, assistant: lastAssistant } = MessageV2.latest(msgs)
+  const lastAssistantBelongsToLatestTurn = lastAssistant !== undefined &&
+    (lastAssistant.parentID === lastUser.id || MessageV2.compareChronology(lastUser, lastAssistant) < 0)
+```
+
+新 user 消息插入后，下一轮 `lastUser` 变为它，旧 assistant 既非其子也在其之前，
+`lastAssistantBelongsToLatestTurn` 为假，退出条件全部不成立，循环继续处理新消息。
+**边界即循环头，也就是两个 provider turn 之间。**目标 running / idle 两种状态都交给
+`prompt_async` 与现有 Runner，Agent 管理层不手工判断状态来启动执行。
+
+### 16.3 发消息必须显式携带目标的 agent / model / variant
+
+`session/prompt.ts:636-690` 三层都验过：
+
+```ts
+const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
+const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
+...
+if (current.agent !== info.agent || current.model?.providerID !== info.model.providerID || ...) {
+  yield* sessions.setAgentModel({ sessionID, agent: info.agent, model: { ... } })   // 落库
+}
+```
+
+- 不传 `agent` ⇒ 切到默认 agent；
+- 只传 `agent` ⇒ agent 定义的 model 压过 session 当前 model；
+- 且结果**持久化写回 session 行**。
+
+所以不能像 FSM 给主 Session 发通知那样只传 parts，否则子 Agent 的身份会被改掉并存下来。
+`agent_send` 必须显式取目标 Session 当前的 agent / model / variant；`setAgentModel` 存的是
+`variant ?? "default"`，回传时 `"default"` 必须省略，否则来回一趟会把 variant 钉死。
+
+### 16.4 消息投递不保证送达（issue #32）
+
+`effect/runner.ts:115-119` 的 `ensureRunning` 在目标已 Running 时**丢弃新 work**，
+`finishRun`（`:70-81`）落 Idle 前**不检查这期间是否有新消息到达**。时序：
+
+```
+循环读 msgs（无新消息） → 消息落库 → ensureRunning 见 Running 丢弃 work
+  → 循环按陈旧 msgs 退出 → Idle → 消息无人处理
+```
+
+静默、无界、无人被通知。这是既有缺陷，影响 FSM 通知、普通异步消息等**所有**调用方，
+不由本方案引入，记为 [lihaokun/opencode#32](https://github.com/lihaokun/opencode/issues/32)。
+
+**本方案不为它造绕行方案**（M6 因此删除，见 16.5），也**不依赖它被修复**。
+修复与本 feature 并行推进：修法在 `effect/runner.ts` 内部加 `pendingWake` 标志位，
+参照 V2 `core/src/session/run-coordinator.ts` 的 `settle`，签名不变、文件不重叠，两边可独立落地。
+
+连带的口径修正：**取消通知与完成通知都是"投递一次，送达不保证"，不是不变量。**
+此前把"父必然收到取消通知"写成保证是不成立的。
+
+### 16.5 删除通用执行层 M6
+
+按 16.1，"每条消息都有一次执行结局"的前提不再成立，M6 AgentExecution 整体删除：
+`ensure(target)`、通用 `watch(target)`、`noticeDelivered` Map/Deferred、`cancelAndAwaitNotice`、
+"M6 是所有 Agent 执行的唯一注册者/通知生产者"这两条不变量、以及每条消息的 `ExecutionOutcome`。
+
+保留并复用的只有 `agent` 初始委托那一条：`BackgroundJob.start`、`runTask` 的完成/失败分类、
+结束后向创建者通知一次。可以留一个很小的内部 `startAgent` 供规范 `agent` 与隐藏 `task` 别名共用，
+但不重新引入通用 Session executor。
+
+### 16.6 `agent_stop` 的状态判定不能依赖 BackgroundJob
+
+被 `agent_send` 经 `prompt_async` 恢复的 Agent 可能正在运行却没有新的 BackgroundJob。
+统一改用与 `agent_list` 相同的事实来源 `SessionStatus`。
+
+必须**先读状态再取消**，因为 `session/run-state.ts:77-86`：
+
+```ts
+const cancel = (sessionID) => {
+  yield* cancelBackgroundJobs(background, sessionID)
+  const existing = data.runners.get(sessionID)
+  if (!existing) { yield* status.set(sessionID, { type: "idle" }); return }   // idle 时成功空操作
+  yield* existing.cancel
+}
+```
+
+`cancel` 分不出"本来在跑、现已取消"与"本来就 idle"。据此按层汇总
+`transitioned` / `unchanged` / `failed`，且**不给 idle / unchanged 成员发虚假的 cancelled 通知**，
+重复 stop 对 idle 成员无效果。
+
+### 16.7 可选实例名取代类型名寻址
+
+`agent` 增加可选参数 `name?: string`：
+
+- 可省略；省略时该 Agent 只能用 `session_id` 寻址；
+- 提供时在整棵 Agent 树内唯一，创建后不可修改，不得以 SessionID 前缀 `ses` 开头；
+- running / idle / cancelled / completed 都继续占用，Session 删除后才释放；
+- 重名返回 `AgentNameConflict{name}` 并**零副作用**：不建 Session、不建 workspace、不投递 prompt，
+  也不返回既有 Agent 的 session_id；
+- 存入 `Session.Info.metadata.agentName`，不动 `Session.Info.agent`（后者是 agent 类型）。
+
+三者的关系：
+
+```
+name       = auth-reviewer     可选实例名（可寻址）
+agent_type = explore           Agent 定义类型（仅供阅读）
+session_id = ses_abc123        权威身份（始终可寻址）
+```
+
+`agent_send` / `agent_stop` 的 `target` 接受 session_id 或 `agentName`，**名称只匹配 `agentName`，
+不匹配 `subagent_type`**。零匹配 → `TargetNotResolved`；多匹配意味着唯一性不变量已损坏 → 拒绝。
+
+**推翻 2026-09-08 曾采纳的"类型名 + latest wins"。**当时的依据之一"Claude Code 是 latest wins"
+是错的：CC 文档只说"Append a row's `[ref]` only when the bare name is not enough — two rows share it,
+or an error asks you to disambiguate"，即用 `[ref]` 消歧或直接报错，没有静默择一。而静默择一意味着
+**消息发给了错的 Agent 且无人知晓**。
+
+改用实例名而非"类型名 + 歧义报错"的理由：扇出是 subagent 的主用法，同类型多实例是设计目标场景，
+类型名恰好在那时不可用；且消息前缀里三个 `explore` 无法区分来源。CC 的名字即 `subagent_type`，
+是因为 CC 预期用户在 `.claude/agents/*.md` 里为具体任务定义具体类型；把它做成一等参数方向一致。
+
+**唯一性机制**：不需要 schema 迁移。范围是一棵 Agent 树（至多数十个 Session），线性扫即可；
+并发在同进程内用内存 reservation：检查与占位之间不 await 就无交错，进程重启后按需重扫重建。
+这样 §16.7 的"多匹配 = 不变量已损坏"才是真正的不可能状态，而非 best-effort 检查的正常输出。
+
+### 16.8 `task` 权限配置的一次性规范化
+
+旧 `task` 权限配置不能静默忽略——`task: deny` 升级后变成允许即是权限放宽。采用配置读取时规范化：
+
+```
+legacy task permission config → canonical agent permission config → 运行时只判 agent
+```
+
+schema 暂时同时接受 `task` 与 `agent`，`task` 标注 deprecated 并输出一次迁移 warning 不报错；
+先转换旧 `task` 规则，再覆盖显式 `agent` 规则，同 pattern 冲突时 `agent` 胜；
+隐藏的 `task` 工具别名转发同一实现并使用规范化后的 `agent` 权限，不能成为绕过。
+
+这条之所以够用，是因为 `session/tools.ts:87` 的合并顺序是
+`Permission.merge(agent.permission, session.permission ?? [])`，**用户配置进的是
+`agent.permission`，它每次运行都从 config 重新派生**，规范化一次即无陈旧副本残留。
+
+**持久化 Session 的 `task` 规则不作运行时映射。**系统生成的 `task: * deny` 与用户意图的同名规则
+形状完全相同（都是 `{task, *, deny}`）无法区分；但根 Session 的 `permission` 默认为 `undefined`，
+配置里的 deny 并不进入 session ruleset，只有经 CLI/SDK 显式设过 session 权限再派生子 Agent 才会出现。
+暴露面窄，记为已知限制一句，不为它改设计。
+
+### 16.9 `deriveSubagentSessionPermission` 必须改（此前漏记）
+
+`agent/subagent-permissions.ts` 给每个子 Session 追加：
+
+```ts
+const canTask = input.subagent.permission.some((rule) => rule.permission === "task")
+...(canTask ? [] : [{ permission: "task", pattern: "*", action: "deny" }]),
+```
+
+而 `permission/index.ts:28` 的 `evaluate` 用 **`findLast`**，合并顺序 `(agent.permission, session.permission)`，
+即**session ruleset 压过 agent 定义**。在 16.8 的"运行时只判 `agent`"下两条移植路径都是坏的：
+
+- 仍发字面 `task`：规范化后 agent 定义带的是 `agent`，`canTask` 恒为 false，每个子仍被追加
+  `task: * deny`；该规则在 `agent` 键的运行时下是死的 ⇒ 嵌套永远放行，**agent 定义级的 opt-out 静默失效**；
+- 移植成 `agent: * deny`：session 压过 agent 定义 ⇒ 每个子都被拒绝 `agent`，**深度 3 一次都跑不起来**。
+
+正确改法：**嵌套上限不再由权限系统承担，改由深度计数 + 工具可见性承担。**故
+`canTask` 改查 `agent` 键，且**不再默认追加 `agent` deny**；`todowrite` 那条不动。
+删掉默认 deny 不等于静默放行——无匹配时兜底是 `ask`（`permission/index.ts:34`），
+再由 `agent` 的默认 `*: allow` 接住。
+
+这是独立于 `task.ts` `childToolDenies` 的**第二个拒绝点**，此前两轮设计都漏了。
+
+### 16.10 工作树：三处落地校正
+
+**（一）`Worktree.create()` 返回时工作树是空的。**`worktree/index.ts:281-292`：
+
+```ts
+const createFromInfo = (info, startCommand) => {
+  yield* setup(info)                                    // git worktree add --no-checkout ← 无文件
+  yield* boot(info, startCommand).pipe(..., Effect.forkIn(scope))   // git reset --hard ← 异步
+}
+```
+
+真正的 checkout 在 `boot` 里，而 `boot` 是 fork 的。"建工作树 → 启动 Agent"会让子 Agent
+**每次都在空目录里开工**。Agent 专用入口必须满足 **ready 契约**：返回时目录存在且 tracked files
+完整可读；checkout 失败 ⇒ `WorktreeUnavailable`，不启动 Agent。
+
+**（二）位置必须在项目内，而且这是被迫的。**opencode 现有 worktree 建在
+`Global.Path.data/worktree/<projectID>`（`worktree/index.ts` `makeWorktreeInfo`），即**项目之外**。
+它之所以不需要 `external_directory`，是因为**现有 worktree 是独立 instance**——在里面开 Session 时
+`ctx.directory` 就是它。而子 Agent **不换 instance**（§16.11），于是：
+
+| worktree 位置 | 不换 instance 时 |
+|---|---|
+| 全局数据目录 | `containsPath` 假 ⇒ 每次文件访问都弹 `external_directory`，不可用 |
+| 项目内 `.opencode/worktrees/` | `containsPath` 真 ⇒ 直接可用 |
+
+`project/instance-context.ts:18-24` 的 `containsPath` 只查 `ctx.directory` 与 `ctx.worktree`，
+**不查 sandbox**，所以 `setup()` 里那句 `project.addSandbox` 帮不上忙。
+**不换 instance ⇒ 必须放项目内**，这条因果链要写进设计，同时记明这与 opencode 自身的 worktree
+位置约定不同及其原因。
+
+**（三）忽略机制改用 `info/exclude`，不写 `.gitignore`。**`snapshot/index.ts:186-193` 已有先例：
+
+```ts
+git(["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], { cwd: state.worktree })
+```
+
+`.git/info/exclude` 是仓库本地、从不提交、不出现在 `git status`；snapshot 的 `sync` 读回既有内容再追加，
+故我们写入的条目不会被冲掉；它在 common dir，`--git-path` 从任何 linked worktree 解析过去都是同一个
+文件，一条 `/.opencode/worktrees` 即可覆盖主 checkout 与全部子工作树；ripgrep 默认尊重它
+（`--no-ignore-vcs` 才关闭），满足"`glob`/`grep` 不搜出各工作树副本"的要求。
+
+此前设计的"在工作树根写内容为 `*` 的自我忽略 `.gitignore`"作废——那是往用户仓库工作树里造文件。
+（`config/config.ts:309` 的 `ensureGitignore` 证明"自我忽略目录"这一惯例存在，但其内容写死且仅在
+文件不存在时写，不能直接复用。）
+
+### 16.11 工作树隔离强度：建议式，不是强制
+
+首版不切换 per-Session `InstanceState`：`Session.Info.directory` 保持真实 instance 执行目录，
+文件工具相对路径与 shell 默认 cwd 仍按 instance directory 解析。已核实：
+`tool/read.ts:236` 是 `path.resolve(instance.directory, filepath)`，
+`tool/shell.ts:612-613` 是 `params.workdir ? resolvePath(...) : instanceCtx.directory`。
+
+因此为 Agent 准备的路径**只是建议工作目录**：初始 prompt 必须要求 Agent 使用绝对路径、shell 显式传
+`workdir`；只有 Agent 遵守约定时 workspace 才能减少并行文件冲突。**不声称 Agent 无法访问或修改主
+checkout。**真正的 per-Session 默认 cwd 与强制隔离留待 V2 Location / issue #33。
+
+此前"默认在自己的工作树里干活"的措辞作废，改为：
+> 默认为 Agent 准备独立工作目录，并通过初始消息要求 Agent 显式在其中工作；运行时默认 cwd 未切换。
+
+**`.worktreeinclude` 移出首版。**它在 opencode 中**并不存在**（全仓仅出现在本设计文档里，
+是从 Claude Code 搬来的概念），落地要从零写 gitignore 语法匹配器并逐个 `git check-ignore` 确认，
+是一个子系统而非一行分支。首版让 Agent 按需从主 checkout 用绝对路径读取——软隔离本就允许。
+
+**非 Git 项目同样是净新增**：`makeWorktreeInfo` 对非 git 直接返回 `NotGitError`、`list()` 返回 `[]`，
+现有代码完全走不到。首版在同一管理根下建普通空目录，不自动复制项目文件，初始消息同时给出
+source directory 与空 workspace directory，由 Agent 自主决定复制什么，不自动同步或合并回 source。
+
+**V1 不自动清理**：completed / error / cancelled 都不删目录，Session 删除不连带删除，
+不做无改动检测、运行锁、周期 sweep 或清理后重建。"workspace 会累积"是明确的 V1 已知限制。
+因此 V1 也不需要用 project sandbox 列表推断 Session 所有权。
+
+### 16.12 深度提到 3 的连带项：TUI 必须聚合整棵后代
+
+`tui/src/routes/session/index.tsx:208-213` 的 `children()` 按
+`x.parentID === parentID || x.id === parentID` 过滤，**只有一层**；
+`:229-235` 的 `permissions()` / `questions()` 对任何带 `parentID` 的 Session 直接 `return []`。
+
+深度为 1 时两者恰好等价。提到 3 之后，P → A → B 中 B 的 permission/question
+**在根视图看不到、在 A 的视图也不显示**，该 Agent 永久挂起。
+
+这不是"已知缺口"，是**深度改动的必要连带修改**：根 Agent 收集自身 + 全部后代，聚合 pending
+permission/question，回复按 `request.sessionID` 路由到实际后代。必须有三层回归：
+P → A → B，B 请求权限，P 的 TUI 显示，用户回复到达 B。不是新面板。
