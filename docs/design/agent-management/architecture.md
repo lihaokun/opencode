@@ -653,7 +653,7 @@ ripgrep 默认尊重它，满足"`glob`/`grep` 不搜出各工作树副本"。�
 接口：M5 AgentTools → M4 AgentLifecycle
 
 输入数据：
-  - create: { caller, name?, subagent_type, description, prompt, cwd?, model, variant }
+  - create: { caller, name?, subagent_type, description, prompt, cwd?, model, variant, callerWorkdir? }
     ——**全部为窄数据**，M4 不接触工具上下文
   - stop: caller: SessionID，target: SessionID
 输出数据：AgentInfo（create）/ StopOutcome（stop）
