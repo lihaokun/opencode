@@ -666,6 +666,18 @@ ripgrep 默认尊重它，满足"`glob`/`grep` 不搜出各工作树副本"。�
 ```
 
 ```
+接口：M4 AgentLifecycle → M2 AgentStatusProjection
+
+输入数据：session_id: SessionID
+输出数据：AgentStatus
+
+协议约定：
+  - 调用方责任：对停止集内每个成员，在**调用 cancel 之前**取一次状态；
+    不得在取消后回头判定——`SessionRunState.cancel` 对 idle 目标是成功空操作，事后无法区分
+  - 被调用方责任：与 M5→M2 相同，返回调用瞬间的快照
+```
+
+```
 接口：M4 AgentLifecycle → M3 AgentInbox（停止通知）
 
 输入数据：AgentMessage（target = 被停 Agent 的父，body = cancelled 通知正文）

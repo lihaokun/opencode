@@ -255,10 +255,10 @@ M1 不应声称构造了完整的 `AgentInfo`。
 #### 5.1.7 `reserveName(root: SessionID, name: string) -> Effect<void, AgentNameConflict>`
 
 - **功能描述**：在一棵 Agent 树内占位一个实例名。**这是 I4 的唯一维护点。**
-- **调用关系**：callers: M4 `create`；callees: `Session.get`、`Session.children`。
+- **调用关系**：callers: M4 `create`；callees: M1 `descendants`（从 `root` 展开整棵树）。
 - **实现思路**：
-  1. 从 `root`（调用者所在树的根，由 `callerDepth` 的上溯顺带得出）展开整棵树，
-     收集所有 `metadata?.agentName` 非空者，得到 `used: Set<string>`。
+  1. `descendants(root, 0)` 加 `root` 自身，得整棵树的成员；
+     收集所有 `name` 非空者，得到 `used: Set<string>`。
      - 规模论证：一棵 Agent 树的成员数受深度上限（3）与每层派生数约束，实际是数十级；
        线性扫描足够，**不需要索引，因而不需要 schema 迁移**。
   2. **在同一同步段内**（步骤 1 的结果落地后到步骤 3 之间不得有 `await` / `yield*` 让出点）
@@ -465,6 +465,9 @@ M1 不应声称构造了完整的 `AgentInfo`。
     - 步骤 1–7 的全部失败分支都在 `Session.create` 之前，故这些失败**零副作用**，
       满足架构 §3 对 `AgentNameConflict` 与 `WorktreeUnavailable` 的硬要求。
     - 步骤 3 先于步骤 7、8：名称冲突时连工作目录都不建，不留下孤儿目录。
+    - 步骤 7 先于步骤 8 是**有意的**：反过来则 `WorktreeUnavailable` 会留下一个孤儿 Session，
+      违反架构 §3 对该错误零副作用的要求。代价是 `Session.create` 本身失败（未声明的错误通道）
+      时会留下一个孤儿工作目录；V1 本就不自动清理，该目录与其它累积目录同等对待（架构 §10 缺口 7）。
     - 步骤 5 逐条复制既有规则，使新 Agent 的模型身份与既有 `task` 一致；若省略，
       新 Session 无 model，`createUserMessage` 会一路回退到 provider 默认模型而非继承调用者。
     - 步骤 6 的去重使权限集合不含重复规则；`deriveSubagentSessionPermission` 的既有语义保证
@@ -623,7 +626,7 @@ M1 不应声称构造了完整的 `AgentInfo`。
 
 - **功能描述**：自底向上取消目标子树，对**实际发生转变**的成员向其父投递一条 `cancelled` 通知。
 - **调用关系**：callers: M5 `agent_stop`；callees: M4 `plan`、M2 `of`、`SessionRunState.cancel`、
-  M3 `deliver`、M4 `renderTermination`。
+  `Session.get`、M3 `deliver`、M4 `renderTermination`。
 - **实现思路**：
   1. `plan(caller, target)`。失败原样上抛，无副作用。
   2. `transitioned = []`，`unchanged = []`，`failed = []`。
@@ -636,9 +639,12 @@ M1 不应声称构造了完整的 `AgentInfo`。
           不先读就会给本就 idle 的成员发假的 cancelled 通知，重复 stop 也会重复发。
      b. `SessionRunState.cancel(m)`。抛出未预期异常 → 记入 `failed{session_id, reason}`，
         **不中断本层其余成员，也不中断后续层**。
-     c. 成功 → 记入 `transitioned`，并向 `m` 的父投递一条通知：
-        `deliver({ target: m.parent_id, sender: m, sender_name, sender_agent,
-        body: renderTermination(m) })`。
+     c. 成功 → 记入 `transitioned`，并向 `m` 的父投递一条通知。
+        `StopPlan.layers` 只携带 `SessionID`（架构 §3），故此处 `Session.get(m)` 取回一次
+        以拿到 `parentID` 与渲染通知所需的 `name` / `agent_type` / `title`：
+        `deliver({ target: info.parentID, sender: m, sender_name, sender_agent,
+        body: renderTermination(info) })`。
+        - 只对 transitioned 成员取一次，idle 与 failed 成员不取——避免为不发通知的成员做无谓读取。
         - `m` 是 `target` 时其父即 `caller`（= `notify_boundary`）；否则其父也在停止集内，
           且位于更靠后的层。
         - 投递失败（目标不存在等）→ 记日志，**不改判**该成员的 transitioned 归属：
