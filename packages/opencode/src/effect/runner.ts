@@ -42,12 +42,18 @@ export const make = <A, E = never>(
     onIdle?: Effect.Effect<void>
     onBusy?: Effect.Effect<void>
     onInterrupt?: Effect.Effect<A, E>
+    // Consulted inside finishRun's critical section before the run transitions to
+    // Idle: when it returns true on a successful exit, the same work is started
+    // again instead. Lets consumers whose work re-reads persisted state catch up
+    // on writes that landed after the work's last read.
+    shouldReArm?: Effect.Effect<boolean>
   },
 ): Runner<A, E> => {
   const ref = SynchronizedRef.makeUnsafe<State<A, E>>({ _tag: "Idle" })
   const idle = opts?.onIdle ?? Effect.void
   const onBusy = opts?.onBusy ?? Effect.void
   const onInterrupt = opts?.onInterrupt
+  const shouldReArm = opts?.shouldReArm
   let ids = 0
 
   const state = () => SynchronizedRef.getUnsafe(ref)
@@ -67,24 +73,47 @@ export const make = <A, E = never>(
   const idleIfCurrent = () =>
     SynchronizedRef.modify(ref, (st) => [st._tag === "Idle" ? idle : Effect.void, st] as const).pipe(Effect.flatten)
 
-  const finishRun = (id: number, done: Deferred.Deferred<A, E | Cancelled>, exit: Exit.Exit<A, E>) =>
-    SynchronizedRef.modify(
+  const finishRun = (
+    id: number,
+    done: Deferred.Deferred<A, E | Cancelled>,
+    exit: Exit.Exit<A, E>,
+    work: Effect.Effect<A, E>,
+  ) =>
+    SynchronizedRef.modifyEffect(
       ref,
-      (st) =>
-        [
+      Effect.fnUntraced(function* (st) {
+        if (st._tag !== "Running" || st.run.id !== id) {
+          return [complete(done, exit), st] as const
+        }
+        // Interrupt and failure exits must not resurrect the run; success exits
+        // re-arm only if the consumer still sees unconsumed work.
+        if (shouldReArm && Exit.isSuccess(exit)) {
+          const reArm = yield* shouldReArm
+          if (reArm) {
+            const fresh = yield* Deferred.make<A, E | Cancelled>()
+            const run = yield* startRun(work, fresh)
+            return [complete(done, exit), { _tag: "Running", run }] as const
+          }
+        }
+        return [
           Effect.gen(function* () {
-            if (st._tag === "Running" && st.run.id === id) yield* idle
+            yield* idle
             yield* complete(done, exit)
           }),
-          st._tag === "Running" && st.run.id === id ? ({ _tag: "Idle" } as const) : st,
-        ] as const,
+          { _tag: "Idle" } as const,
+        ]
+      }),
     ).pipe(Effect.flatten)
 
-  const startRun = (work: Effect.Effect<A, E>, done: Deferred.Deferred<A, E | Cancelled>) =>
+  // Explicit return type breaks the finishRun ⇄ startRun inference cycle.
+  const startRun = (
+    work: Effect.Effect<A, E>,
+    done: Deferred.Deferred<A, E | Cancelled>,
+  ): Effect.Effect<RunHandle<A, E>> =>
     Effect.gen(function* () {
       const id = next()
       const fiber = yield* work.pipe(
-        Effect.onExit((exit) => finishRun(id, done, exit)),
+        Effect.onExit((exit) => finishRun(id, done, exit, work)),
         Effect.forkIn(scope),
       )
       return { id, done, fiber } satisfies RunHandle<A, E>

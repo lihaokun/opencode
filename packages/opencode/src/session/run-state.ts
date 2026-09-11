@@ -15,12 +15,14 @@ export interface Interface {
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
+    shouldReArm?: Effect.Effect<boolean>,
   ) => Effect.Effect<SessionV1.WithParts>
   readonly startShell: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
     ready?: Latch.Latch,
+    shouldReArm?: Effect.Effect<boolean>,
   ) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
 }
 
@@ -52,6 +54,7 @@ const layer = Layer.effect(
     const runner = Effect.fn("SessionRunState.runner")(function* (
       sessionID: SessionID,
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
+      shouldReArm?: Effect.Effect<boolean>,
     ) {
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
@@ -63,6 +66,7 @@ const layer = Layer.effect(
         }),
         onBusy: status.set(sessionID, { type: "busy" }),
         onInterrupt,
+        shouldReArm,
       })
       data.runners.set(sessionID, next)
       return next
@@ -89,8 +93,9 @@ const layer = Layer.effect(
       sessionID: SessionID,
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
+      shouldReArm?: Effect.Effect<boolean>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
+      return yield* (yield* runner(sessionID, onInterrupt, shouldReArm)).ensureRunning(work)
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
@@ -98,8 +103,9 @@ const layer = Layer.effect(
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
       ready?: Latch.Latch,
+      shouldReArm?: Effect.Effect<boolean>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt))
+      return yield* (yield* runner(sessionID, onInterrupt, shouldReArm))
         .startShell(work, ready)
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })

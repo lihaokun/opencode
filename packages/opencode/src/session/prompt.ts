@@ -1393,17 +1393,46 @@ const layer = Layer.effect(
       },
     )
 
+    // Re-arm predicate for the run loop: true when the latest user message is
+    // newer than the latest assistant, i.e. a turn landed after the loop's last
+    // read and would otherwise sit unconsumed once the run goes idle (#32).
+    // Read failures fall back to false — the pre-fix behavior.
+    const hasUnconsumedTurn = (sessionID: SessionID) =>
+      MessageV2.filterCompactedEffect(sessionID).pipe(
+        Effect.map((msgs) => {
+          const { user, assistant } = MessageV2.latest(msgs)
+          return Boolean(user && (!assistant || MessageV2.compareChronology(user, assistant) > 0))
+        }),
+        Effect.catch((error) =>
+          Effect.logWarning("re-arm check failed; run will go idle", { "session.id": sessionID, error }).pipe(
+            Effect.as(false),
+          ),
+        ),
+        Effect.provideService(Database.Service, database),
+      )
+
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        runLoop(input.sessionID),
+        hasUnconsumedTurn(input.sessionID),
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
       const ready = yield* Latch.make()
-      return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
+      return yield* state.startShell(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        shellImpl(input, ready),
+        ready,
+        hasUnconsumedTurn(input.sessionID),
+      )
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
