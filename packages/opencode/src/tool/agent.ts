@@ -63,29 +63,59 @@ type StopMeta = { stopped?: number; failed?: number }
 const AGENT_DESCRIPTION = [
   "Launch a new Agent to handle a complex, multi-step task.",
   "",
-  "The Agent runs asynchronously: this call returns as soon as it has started, and its result arrives as a message when it finishes. Do not sleep or poll waiting for it.",
-  "It gets its own working directory, stated in its initial instructions, so several Agents can work without fighting over the same files.",
+  "## How it runs",
   "",
-  "Use agent_list to see who is running, agent_send to give an existing Agent more work, and agent_stop to stop one you spawned.",
+  "Always asynchronous. This call returns as soon as the Agent has started, not when it finishes. Its result — completed or failed — arrives later as a message in your conversation. Do not sleep, poll, or ask it whether it is done; you will be told.",
+  "Launch several in one message when the work is genuinely independent.",
+  "",
+  "## Working directory",
+  "",
+  "Each Agent is given its own working directory and told to use it, so several Agents can work without overwriting each other. This is a convention, not a sandbox: an Agent can still reach the rest of the project by absolute path. Pass `cwd` to place it somewhere specific instead.",
+  "",
+  "## Addressing it afterwards",
+  "",
+  "The returned `session_id` always works as a target. An optional `name` is shorter to use but is not guaranteed unique — if two Agents end up sharing one, addressing by that name is refused and you must use the session_id.",
+  "",
+  "## The rest of the toolset",
+  "",
+  "`agent_list` — who exists right now and whether each is running.",
+  "`agent_send` — give an existing Agent more work, or answer one that asked you something. One-way.",
+  "`agent_stop` — stop an Agent you launched, and everything it launched in turn.",
+  "",
+  "Nesting is bounded: an Agent deep enough in the tree is not offered these tools at all.",
 ].join("\n")
 
 const LIST_DESCRIPTION = [
-  "List the Agents you can address: yourself, your parent, your direct children and your siblings.",
-  "Each row carries a session_id, which always works as a target, and may carry a name, which is shorter but only unique by convention.",
-  "Status is a snapshot taken now — it is not a promise about what happens next.",
+  "List the Agents you can address: yourself, your parent, your direct children and your siblings. Not grandchildren, and not Agents from an unrelated conversation.",
+  "",
+  "Each row carries a session_id, which always works as a target, and may carry a name, which is shorter but only unique by convention — when two rows share a name, use the session_id.",
+  "",
+  "Status is `running` or `idle`, read at this instant. It is a snapshot, not a promise: an Agent shown as running may finish immediately after. It says nothing about how an Agent finished — that arrives as a message.",
 ].join("\n")
 
 const SEND_DESCRIPTION = [
-  "Send a message to another Agent.",
+  "Send a message to another Agent. Also how you resume one that has gone idle, including one that was stopped.",
   "",
-  "This is one-way. The target does not reply automatically, this call does not wait for it, and delivery is accepted rather than guaranteed.",
-  "If you need an answer, wait for the target to send one back with agent_send of its own.",
+  "## This is a message, not a call",
+  "",
+  "The target does not reply automatically. This call does not wait for it. What comes back means the message was accepted for delivery — not that it was processed, and not that an answer is coming.",
+  "If you need an answer, say so in the message and wait; the target replies by calling agent_send itself. Do not follow up asking where the result is.",
+  "",
+  "## Who you can reach",
+  "",
+  "Your parent, your children and your siblings by name or session_id; any Agent at all by session_id. The recipient acts under its own permissions — it is not a way to have work done that you are not allowed to do yourself.",
+  "",
+  "Your identity is attached to the message automatically and cannot be set or forged from here.",
 ].join("\n")
 
 const STOP_DESCRIPTION = [
-  "Stop an Agent you spawned, along with everything it spawned in turn.",
+  "Stop an Agent you launched, along with everything it launched in turn.",
   "",
-  "Sessions and history are kept, so a stopped Agent can be resumed later with agent_send.",
+  "Only your own direct children can be named as the target; the cascade to their descendants is a consequence, not something you address.",
+  "",
+  "Nothing is deleted. The session and its history survive, so a stopped Agent can be picked up later with agent_send.",
+  "",
+  "The result reports which Agents a stop was performed on. That is not a claim that each was busy — stopping an idle Agent is harmless and reported the same way, and repeating the call is safe.",
 ].join("\n")
 
 /** Renders a typed failure as the tool's text result, keeping the metadata shape. */
