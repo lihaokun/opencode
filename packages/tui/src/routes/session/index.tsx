@@ -225,13 +225,27 @@ export function Session() {
         )
       : [],
   )
+  /**
+   * The whole subtree, not just one level.
+   *
+   * `children()` above stays one level because it drives subagent tab
+   * navigation. Permission and question requests are different: with nesting
+   * allowed, a request can come from a grandchild, and collecting only direct
+   * children would leave it unanswerable anywhere — the child's own view
+   * returns nothing, so that Agent would wait forever. Replies already route by
+   * request.sessionID, so reaching the real descendant needs nothing further.
+   */
+  const descendants = createMemo(() => {
+    const rootID = session()?.parentID ?? session()?.id
+    return rootID ? collectSubtree(sync.data.session, rootID) : []
+  })
   const permissions = createMemo(() => {
     if (session()?.parentID) return []
-    return children().flatMap((x) => sync.data.permission[x.id] ?? [])
+    return descendants().flatMap((id) => sync.data.permission[id] ?? [])
   })
   const questions = createMemo(() => {
     if (session()?.parentID) return []
-    return children().flatMap((x) => sync.data.question[x.id] ?? [])
+    return descendants().flatMap((id) => sync.data.question[id] ?? [])
   })
   const visible = createMemo(() => !session()?.parentID && permissions().length === 0 && questions().length === 0)
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
@@ -2660,6 +2674,39 @@ const toolDisplays = new Set([
  */
 export function isSubagentTool(tool: string) {
   return tool === "agent" || tool === "task"
+}
+
+/**
+ * The session and everything beneath it, by parentID.
+ *
+ * Exported so the depth behaviour can be tested without rendering: the property
+ * that matters is that a grandchild is reachable, since with nesting allowed a
+ * permission request from one would otherwise be collected nowhere.
+ */
+export function collectSubtree(sessions: { id: string; parentID?: string }[], rootID: string): string[] {
+  const byParent = new Map<string, string[]>()
+  for (const item of sessions) {
+    if (!item.parentID) continue
+    const siblings = byParent.get(item.parentID) ?? []
+    siblings.push(item.id)
+    byParent.set(item.parentID, siblings)
+  }
+  const acc: string[] = []
+  const seen = new Set<string>([rootID])
+  const frontier = [rootID]
+  // Terminates: every id pushed is newly added to `seen`, which only grows and
+  // is bounded by the number of sessions. The dedupe is defensive — a parentID
+  // chain cannot cycle.
+  while (frontier.length > 0) {
+    const id = frontier.pop()!
+    acc.push(id)
+    for (const child of byParent.get(id) ?? []) {
+      if (seen.has(child)) continue
+      seen.add(child)
+      frontier.push(child)
+    }
+  }
+  return acc
 }
 
 export function toolDisplay(tool: string) {
