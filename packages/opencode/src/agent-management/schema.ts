@@ -1,4 +1,6 @@
-import { Schema } from "effect"
+import { Effect, Schema } from "effect"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
+import type { SessionPrompt } from "../session/prompt"
 import { SessionID } from "../session/schema"
 
 /**
@@ -148,6 +150,49 @@ export class WorktreeUnavailable extends Schema.TaggedErrorClass<WorktreeUnavail
     const left = this.paths.length > 0 ? ` Possible leftovers: ${this.paths.join(", ")}.` : ""
     return `Could not prepare a working directory: ${this.reason}.${left}`
   }
+}
+
+/**
+ * The slice of SessionPrompt this feature needs, injected by the tool layer the
+ * way the task tool already receives it. Keeps the mechanism modules from
+ * importing SessionPrompt at runtime.
+ */
+export interface AgentPromptOps {
+  cancel(sessionID: SessionID): Effect.Effect<void>
+  resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
+  prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+}
+
+/**
+ * A message from one Agent to another. Only ever carries agent_send traffic and
+ * the single cancellation notice; a new Agent's initial task keeps its parts
+ * structure and does not come through here.
+ */
+export interface AgentMessage {
+  target: SessionID
+  sender: SessionID
+  sender_name: string | undefined
+  sender_agent: string | undefined
+  body: string
+}
+
+/**
+ * As strong as the existing HTTP 204: the asynchronous request was accepted and
+ * scheduled. Not that the message is persisted, was handled, will be handled, or
+ * was answered.
+ */
+export interface Accepted {
+  target: SessionID
+}
+
+export interface StopOutcome {
+  /**
+   * Members a stop was performed on. Not "transitioned from running": cancel on
+   * an idle session is a silent success, and reading status first does not help
+   * because the target can finish in between.
+   */
+  stopped: SessionID[]
+  failed: { session_id: SessionID; reason: string }[]
 }
 
 export * as AgentManagement from "./schema"

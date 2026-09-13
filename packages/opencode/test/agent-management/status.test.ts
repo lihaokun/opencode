@@ -59,7 +59,7 @@ describe("AgentStatusProjection", () => {
       const sessions = yield* Session.Service
       const session = yield* sessions.create({ title: "root" })
 
-      yield* status.set(session.id, { type: "retry", attempt: 1, max: 3, next: Date.now() + 1000 })
+      yield* status.set(session.id, { type: "retry", attempt: 1, message: "rate limited", next: Date.now() + 1000 })
       expect(yield* projection.of(session.id)).toBe("running")
     }))
 
