@@ -456,8 +456,8 @@ no patterns worth writing.
 
 `task` was this key's old name. Config still accepts it and rewrites it to
 `agent` on read, so an existing `task: deny` keeps working — silently ignoring
-it would widen permissions on upgrade. There is no `task` tool any more; use
-`agent` in new config.
+it would widen permissions on upgrade. Use `agent` in new config; `task` is
+deprecated and the rewrite is the only thing keeping it alive.
 
 An agent whose ruleset starts with `{"*": "deny"}` must name these tools
 explicitly to keep them — a wildcard deny removes them along with everything

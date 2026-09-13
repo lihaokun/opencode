@@ -181,7 +181,13 @@ const layer = Layer.effect(
           const parent = yield* sessions.get(input.caller)
           yield* input.ops.prompt({
             sessionID: input.caller,
-            agent: parent.agent ?? input.agent,
+            // Never fall back to the child's agent type. Doing so switches the
+            // parent to the subagent's definition and persists it — including
+            // that definition's model, which is how a subagent pinned to a
+            // broken model used to take its parent down. Omitting it lets
+            // createUserMessage pick the default agent, which is the right
+            // answer for a session that never bound one.
+            agent: parent.agent,
             model: parent.model
               ? { providerID: parent.model.providerID, modelID: parent.model.id }
               : undefined,

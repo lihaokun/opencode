@@ -298,3 +298,110 @@ describe("AgentLifecycle.stop", () => {
       expect(still.title).toBe("a")
     }))
 })
+
+describe("AgentLifecycle delegation notice", () => {
+  it.instance("never switches the parent to the child's agent when notifying it", () =>
+    Effect.gen(function* () {
+      const lifecycle = yield* AgentLifecycle.Service
+      const sessions = yield* Session.Service
+      // A parent that has not bound an agent yet. The notice must not fill that
+      // in with the child's type: doing so adopts the subagent definition's
+      // model as well and persists it, so a subagent pinned to a model the
+      // parent cannot use would drag the parent onto it.
+      const root = yield* sessions.create({ title: "root" })
+      const { ops, seen } = stubOps()
+
+      yield* lifecycle.create(baseCreate(root.id, ops))
+      yield* awaitWithTimeout(
+        Effect.gen(function* () {
+          while (!seen.some((input) => input.sessionID === root.id)) yield* Effect.sleep("10 millis")
+        }),
+        "the creator was never notified",
+      )
+
+      const notice = seen.find((input) => input.sessionID === root.id)!
+      expect(notice.agent).toBeUndefined()
+      const parent = yield* sessions.get(root.id)
+      expect(parent.agent).toBeUndefined()
+    }))
+
+  it.instance("re-reads the parent's identity at delivery time", () =>
+    Effect.gen(function* () {
+      const lifecycle = yield* AgentLifecycle.Service
+      const sessions = yield* Session.Service
+      const root = yield* sessions.create({
+        title: "root",
+        agent: "build",
+        model: { id: ModelV2.ID.make("m1"), providerID: ProviderV2.ID.make("p") },
+      })
+      // Hold the child inside its delegation so the parent can switch model
+      // while it is still running; otherwise the notice goes out first and the
+      // test proves nothing.
+      const gate = yield* Deferred.make<void>()
+      const seen: SessionPrompt.PromptInput[] = []
+      const ops: AgentManagement.AgentPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            seen.push(input)
+            if (input.sessionID !== root.id) yield* Deferred.await(gate)
+            return {
+              info: {
+                role: "assistant",
+                id: "msg",
+                sessionID: input.sessionID,
+                finish: "stop",
+                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              },
+              parts: [{ type: "text", text: "done" }],
+            } as unknown as SessionV1.WithParts
+          }),
+      }
+
+      yield* lifecycle.create(baseCreate(root.id, ops))
+      // The parent switches model while the child runs. The notice has to carry
+      // the new one, not the one captured when the child was created.
+      yield* sessions.setAgentModel({
+        sessionID: root.id,
+        agent: "build",
+        model: { id: ModelV2.ID.make("m2"), providerID: ProviderV2.ID.make("p"), variant: "default" },
+        time: Date.now(),
+      })
+      yield* Deferred.succeed(gate, undefined)
+      yield* awaitWithTimeout(
+        Effect.gen(function* () {
+          while (!seen.some((input) => input.sessionID === root.id)) yield* Effect.sleep("10 millis")
+        }),
+        "the creator was never notified",
+      )
+
+      const notice = seen.find((input) => input.sessionID === root.id)!
+      expect(notice.model?.modelID).toBe(ModelV2.ID.make("m2"))
+      expect(notice.variant).toBeUndefined()
+    }))
+})
+
+describe("AgentLifecycle workspaces", () => {
+  it.instance("prepares an empty workspace inside the project when there is no cwd and no git", () =>
+    Effect.gen(function* () {
+      const lifecycle = yield* AgentLifecycle.Service
+      const sessions = yield* Session.Service
+      const root = yield* sessions.create({ title: "root" })
+      const { ops } = stubOps()
+
+      const result = yield* lifecycle.create({
+        caller: root.id,
+        subagent_type: "explore",
+        description: "look around",
+        prompt: "find the thing",
+        model: ref,
+        variant: undefined,
+        ops,
+      })
+
+      expect(result.workdir.source).toBe("generated_empty_workspace")
+      expect(result.workdir.path).toContain(".opencode/worktrees")
+      expect(result.workdir.enforced).toBe(false)
+    }))
+})
