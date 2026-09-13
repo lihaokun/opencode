@@ -54,6 +54,8 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
+import { AgentTree } from "@/agent-management/tree"
+import { AgentStatusProjection } from "@/agent-management/status"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
 
@@ -115,6 +117,8 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const status = yield* SessionStatus.Service
     const sessions = yield* Session.Service
+    const agentTree = yield* AgentTree.Service
+    const agentStatus = yield* AgentStatusProjection.Service
     const agents = yield* Agent.Service
     const provider = yield* Provider.Service
     const processor = yield* SessionProcessor.Service
@@ -1197,6 +1201,11 @@ const layer = Layer.effect(
             Effect.provideService(FSUtil.Service, fsys),
             Effect.provideService(Session.Service, sessions),
           )
+          msgs = yield* SessionReminders.applyAgentRoster({ messages: msgs, session }).pipe(
+            Effect.provideService(Session.Service, sessions),
+            Effect.provideService(AgentTree.Service, agentTree),
+            Effect.provideService(AgentStatusProjection.Service, agentStatus),
+          )
 
           const msg: SessionV1.Assistant = {
             id: MessageID.ascending(),
@@ -1655,6 +1664,8 @@ export const node = LayerNode.make({
     SessionStatus.node,
     Session.node,
     Agent.node,
+    AgentTree.node,
+    AgentStatusProjection.node,
     Provider.node,
     SessionProcessor.node,
     SessionCompaction.node,

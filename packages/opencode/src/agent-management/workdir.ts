@@ -1,4 +1,4 @@
-import { Cause, Effect, Exit, Path } from "effect"
+import { Cause, Effect, Exit, Option, Path } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { AppProcess } from "@opencode-ai/core/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -61,7 +61,17 @@ export const prepareWorkdir = Effect.fn("AgentWorkdir.prepare")(function* (input
     })
   }
 
-  const worktree = yield* Worktree.Service
+  // Looked up rather than depended on. Making it a layer dependency would drag
+  // the project store and its bootstrap into every layer that can reach the
+  // Agent tools, which is most of them. Absent, the git branch simply reports
+  // that it could not prepare a worktree.
+  const worktree = Option.getOrUndefined(yield* Effect.serviceOption(Worktree.Service))
+  if (!worktree) {
+    return yield* new AgentManagement.WorktreeUnavailable({
+      reason: "the worktree service is not available in this context",
+      paths: [],
+    })
+  }
   const created = yield* worktree
     .createForAgent({ destinationRoot, baseCommit: head.text.trim() })
     .pipe(Effect.exit)

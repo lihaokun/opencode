@@ -13,7 +13,6 @@ import { Session } from "../session/session"
 import { SessionRunState } from "../session/run-state"
 import { SessionID, MessageID } from "../session/schema"
 import { Truncate } from "../tool/truncate"
-import { Worktree } from "../worktree"
 import { AgentDelegation } from "./delegation"
 import { AgentInbox } from "./inbox"
 import { AgentTree } from "./tree"
@@ -84,7 +83,6 @@ const layer = Layer.effect(
     const pathSvc = yield* Path.Path
     const fs = yield* FSUtil.Service
     const appProcess = yield* AppProcess.Service
-    const worktree = yield* Worktree.Service
 
     /**
      * Unlocked, best-effort. Two concurrent creations can both pass and produce
@@ -251,7 +249,6 @@ const layer = Layer.effect(
         Effect.provideService(Path.Path, pathSvc),
         Effect.provideService(FSUtil.Service, fs),
         Effect.provideService(AppProcess.Service, appProcess),
-        Effect.provideService(Worktree.Service, worktree),
       )
 
       const childPermission = deriveSubagentSessionPermission({
@@ -396,7 +393,6 @@ export const node = LayerNode.make({
     BackgroundJob.node,
     SessionRunState.node,
     Truncate.node,
-    Worktree.node,
     FSUtil.node,
     AppProcess.node,
     path,

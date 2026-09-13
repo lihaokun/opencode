@@ -15,6 +15,9 @@ import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
 import { Truncate } from "./truncate"
+import { AgentLifecycle } from "@/agent-management/lifecycle"
+
+const DEFAULT_SUBAGENT_DEPTH = AgentLifecycle.DEFAULT_SUBAGENT_DEPTH
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -241,10 +244,10 @@ export const TaskTool = Tool.define(
         depth++
         current = yield* sessions.get(current.parentID)
       }
-      if (depth >= (cfg.subagent_depth ?? 1)) {
+      if (depth >= (cfg.subagent_depth ?? DEFAULT_SUBAGENT_DEPTH)) {
         return yield* Effect.fail(
           new Error(
-            `Subagent depth limit reached (${cfg.subagent_depth ?? 1}). Increase "subagent_depth" to allow nested subagents.`,
+            `Subagent depth limit reached (${cfg.subagent_depth ?? DEFAULT_SUBAGENT_DEPTH}). Increase "subagent_depth" to allow nested subagents.`,
           ),
         )
       }
@@ -277,9 +280,10 @@ export const TaskTool = Tool.define(
         ...(next.permission.some((rule) => rule.permission === "todowrite")
           ? []
           : [{ permission: "todowrite" as const, pattern: "*" as const, action: "deny" as const }]),
-        ...(next.permission.some((rule) => rule.permission === id)
-          ? []
-          : [{ permission: id, pattern: "*" as const, action: "deny" as const }]),
+        // No default deny on spawning any more. Nesting is bounded by the depth
+        // counter and by which tools the model is offered; a rule here would win
+        // over the agent definition's own, since evaluate takes the last match
+        // and the session ruleset is merged last.
         ...(cfg.experimental?.primary_tools?.map((permission) => ({
           permission,
           pattern: "*" as const,

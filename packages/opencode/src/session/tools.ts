@@ -93,6 +93,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     modelID: ModelV2.ID.make(input.model.api.id),
     providerID: input.model.providerID,
     agent: input.agent,
+    // The tool list is the only place Agent tool visibility can be decided:
+    // Tool.Context does not exist yet, and the schema is about to be sent.
+    sessionID: input.session.id,
     permission: input.session.permission,
   })) {
     const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
