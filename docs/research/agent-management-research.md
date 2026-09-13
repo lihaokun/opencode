@@ -187,6 +187,10 @@ agent_stop
 
 ## 8. `task` 兼容别名
 
+> **[已废弃 → §17.3]** `task` **工具本身删除**，不保留隐藏可执行别名。仅保留两件事：
+> 旧权限配置键 `task` 在读取时规范化为 `agent`（§16.8），以及历史 transcript 中的 `task` tool part
+> 在**展示层**可读。本节其余关于可执行别名的论述作废。
+
 新接口以 `agent` 为唯一规范名称，但可以保留现有 `task` 作为隐藏兼容别名：
 
 - 模型工具列表只展示 `agent`，不同时展示语义重复的 `task`；
@@ -480,6 +484,10 @@ Location 作用域重复。详见 #33。
 
 ### 16.1 `agent_send` 是消息，不是调用
 
+> **[部分已废弃 → §17.1]** 「是消息不是调用」成立。但本节写的「直接走 `prompt_async`」被实现成了
+> 直接 await `SessionPrompt.prompt()`，那会阻塞到目标整轮结束。必须照 HTTP handler 那样 **fork**；
+> 且 `Accepted` 的强度随之降到 HTTP 204 —— 不保证已持久化。
+
 这是本轮最大的语义简化。此前设计让每条 `agent_send` 都拥有一次"最终结局"——注册 watcher、
 建 BackgroundJob、承诺一次结果投递。取消。
 
@@ -536,6 +544,9 @@ if (current.agent !== info.agent || current.model?.providerID !== info.model.pro
 
 ### 16.4 消息投递不保证送达（issue #32）
 
+> **[已更新 → §17.6]** 结论不变。补充：子 Agent 列表 reminder 使「通知被 #32 吞掉」从无声挂起
+> 降级为一轮延迟——父下一轮即可从 roster 看出子已 idle。
+
 `effect/runner.ts:115-119` 的 `ensureRunning` 在目标已 Running 时**丢弃新 work**，
 `finishRun`（`:70-81`）落 Idle 前**不检查这期间是否有新消息到达**。时序：
 
@@ -566,6 +577,10 @@ if (current.agent !== info.agent || current.model?.providerID !== info.model.pro
 
 ### 16.6 `agent_stop` 的状态判定不能依赖 BackgroundJob
 
+> **[部分已废弃 → §17.5]** 「不能依赖 `BackgroundJob`」成立且仍然有效（`agent_list` 的状态来源仍是
+> `SessionStatus`）。但 `agent_stop` 的**状态审计整体删除**：不预读状态、不区分
+> transitioned/unchanged，无条件调 `cancel`。本节下文的分类论述作废。
+
 被 `agent_send` 经 `prompt_async` 恢复的 Agent 可能正在运行却没有新的 BackgroundJob。
 统一改用与 `agent_list` 相同的事实来源 `SessionStatus`。
 
@@ -585,6 +600,10 @@ const cancel = (sessionID) => {
 重复 stop 对 idle 成员无效果。
 
 ### 16.7 可选实例名取代类型名寻址
+
+> **[部分已废弃 → §17.4]** 「可选实例名取代类型名」这一方向成立，但**强唯一性作废**：
+> 删除 reservation 机制、假设 H3 与不变量 I4，允许并发产生重名，多匹配是正常可达分支且一律拒绝。
+> 本节下文关于「树内扫描 + 同进程占位」「多匹配 = 不变量已损坏」的论述以 §17.4 为准。
 
 `agent` 增加可选参数 `name?: string`：
 
@@ -746,3 +765,280 @@ source directory 与空 workspace directory，由 Agent 自主决定复制什么
 这不是"已知缺口"，是**深度改动的必要连带修改**：根 Agent 收集自身 + 全部后代，聚合 pending
 permission/question，回复按 `request.sessionID` 路由到实际后代。必须有三层回归：
 P → A → B，B 请求权限，P 的 TUI 显示，用户回复到达 B。不是新面板。
+
+## 17. 修订：最终审核后的契约收敛（2026-09-14）
+
+本节记录第三轮（最终）评审后的决策。与 §1–§16 冲突处以本节为准。所有涉及代码的结论都在
+`dev` 上逐条核实过，行号随文给出。**本节生效后设计进入实现前的最后一次对照审核。**
+
+### 17.1 `agent_send` 必须 fork，不能等 `prompt()`
+
+§16.2 说"直接复用 `prompt_async`"，但把它写成了直接调用并等待 `SessionPrompt.prompt()`。**这是错的。**
+
+```ts
+// session/prompt.ts:1069-1070
+if (input.noReply === true) return message
+return yield* loop({ sessionID: input.sessionID })     // ← 阻塞到整轮跑完
+```
+
+```ts
+// server/routes/instance/httpapi/handlers/session.ts:316-329
+yield* promptSvc.prompt({ ...ctx.payload, sessionID }).pipe(
+  Effect.catchCause((cause) => /* logError + publish Session.Event.Error */),
+  Effect.forkIn(scope, { startImmediately: true }),    // ← 异步语义在这里
+)
+return HttpApiSchema.NoContent.make()
+```
+
+**异步性来自外层的 fork，不在 `prompt()` 里。**直接 await 会让 `agent_send` 阻塞到目标整轮结束，
+把"单向消息"变成它自己声明不是的那个 RPC。`noReply: true` 也不是解法——那只落库不跑 loop，
+idle 的目标永远不会启动。必须照 handler 那样 fork 并在 fork 内 catch。
+
+连带后果：**`Accepted` 的强度降到与 HTTP 204 一致**——异步请求已被接受/调度，
+**不保证**返回前消息已持久化、已处理、将被处理或已回复。原 I2「Accepted ⇒ 已持久化」删除，
+以及一切依赖它的论证（停止排序的 happens-before、防复活）一并删除。
+fork 内的失败只发 `Session.Event.Error`，调用方那边已经返回 accepted，**模型拿不到投递失败反馈**，
+记为已知限制。
+
+### 17.2 不存在按 Session 的 workspace 路由（对评审的一处修正）
+
+评审要求"复用完整 prompt_async **包括目标 Session 的 workspace/location routing**"。核实后：
+
+```ts
+const requireSession = Effect.fn(...)(function* (sessionID) {
+  return yield* SessionError.mapStorageNotFound(session.get(sessionID))
+})
+```
+
+`promptAsync` 这一层**没有任何按目标 Session 选 instance 的机制**——instance 由 HTTP 请求自己
+路由到，不是按 session 选的。所以"不能丢掉外层路由语义"描述的是 V1 不存在的能力。
+
+采纳的是 fork 那一半（17.1）。**跨 workspace 的 `agent_send` 在 V1 做不到**，如实记为已知限制；
+不记为"已由 prompt_async 解决"。同一 project 内的 Agent 树共享 instance，本 feature 的目标场景不受影响。
+
+### 17.3 `task` 工具删除，不保留隐藏可执行别名
+
+推翻 §8 与 §16 采纳的"隐藏兼容入口"。
+
+- `task` **工具本身废弃并删除**，运行时 tool ID 只剩 `agent`；
+- 可以提取、改造 `task.ts` 的初始委托代码，但**不复制第二套**；
+- 旧权限配置键 `task` 仍被 schema 接受并在读取时一次性规范化为 `agent`（§16.8 不变）；
+- 历史 transcript 里已存在的 `task` tool part 继续在**展示层**可读，这不等于保留可执行工具；
+- 旧插件继续发起新的 `task` tool call 按已废弃/未知工具处理，不做执行兼容。
+
+**连带的运行时消费者必须一并迁移**（此前完全漏记）：
+
+```
+tool/registry.ts:268   Permission.evaluate("task", item.name, agent.permission)   ← subagent type 过滤
+agent/agent.ts         内置受限 Agent 的 allowlist（见 17.7）
+session/prompt.ts      agent part 的权限判断与「call the task tool」模型提示
+```
+
+**UI 消费者同样必须迁移**，否则功能静默消失：
+
+```
+tui/routes/session/index.tsx:221/1511/1522/1767/2648
+tui/routes/session/permission.tsx:286
+app/pages/session/timeline/message-timeline.tsx:95
+cli/cmd/run/subagent-data.ts:334      if (part.tool !== "task") return
+cli/cmd/run/tool.ts:578/1436
+cli/cmd/agent.ts:26
+```
+
+纯展示层可同时识别历史 `task` part 以保证旧 transcript 可读。禁止全局盲替换：
+历史展示、普通英文 "task" 含义、legacy 配置入口要逐项分类。
+
+### 17.4 实例名降为弱别名，允许并发重名
+
+推翻 §16.7 的强唯一不变量与 reservation 机制。
+
+- 创建时**无锁**扫描当前 Agent 树；已看见同名则失败返回 `AgentNameConflict{name}`；
+- 不返回既有 Agent 的 `session_id`，不把创建静默改成复用；
+- **两个并发创建可能同时通过检查并产生同名 Agent，此结果被明确允许**；
+- 不引入 reservation Map、锁、数据库唯一约束或阻塞机制。
+
+删除 `reserveName`、外部假设 H3（同进程串行创建）、不变量 I4（名称强唯一）、
+以及"多匹配表示存储损坏"的论证。**多匹配是正常可达分支。**
+
+名称解析三分支：0 个 → 未找到；1 个 → 成功；**多个 → 不发送、不停止、不 latest-wins、不广播，
+返回全部同名候选的 `session_id`，要求调用方改用 `session_id`**。
+
+错误类型相应带上候选：
+
+```ts
+TargetNotResolved { value: string, matches: SessionID[] }
+```
+
+`matches.length === 0` 表示未找到，`> 1` 表示歧义。原 `{ value }` 承载不了候选，
+而设计正文却说"错误正文附候选清单"，属签名与论证不一致。
+
+**重名是永久状态，不是暂时的**：那两个 Agent 从此永远无法用名字寻址，只能用 `session_id`。
+这是接受弱别名的代价，要写清楚。
+
+### 17.5 `agent_stop` 删除状态审计，且只发一条向上通知
+
+**删除状态审计**（推翻 §16.6 的 transitioned/unchanged 分类）：
+
+- 对停止范围内每个 Session **无条件**调 `SessionRunState.cancel(session_id)`；
+- 有 run 则停止，没有则由既有 cancel 自然 no-op；
+- **不预读 `SessionStatus`**、不区分 transitioned / unchanged、不审计是否由本次调用造成状态转换；
+- 不引入锁、run generation 或 `run_id`。
+
+理由：那个分类本来就不可靠——读到 running 之后、cancel 之前目标可能自行结束（曾记为缺口 11）。
+删掉审计等于承认这件事测不准，而不是假装测得准。结果只报告哪些 Session 的 stop 操作完成、
+哪些失败；"完成"不表示本次一定从 running 转成 cancelled。
+
+**通知只发一条，给停止发起者**（对评审 §2.6 的修正）：
+
+评审要求给每个被停成员的父都发通知，并接受"迟到通知可能唤醒已被取消的父"。不接受。
+该复活不是极窄调度——投递是 fork 的，外层不等它就去 cancel 父，落在前后是掷硬币。
+
+改为：
+
+```
+停止集 = target + 它的全部后代
+集合内每个成员的父都在集合内 —— 除了 target，它的父是 caller
+⇒ 只有 target 发一条 cancelled 通知，发给 caller
+```
+
+`caller` 恒在停止集外（`StopPlan` 不变量：target 必是 caller 的直接子），且正在执行本次
+`agent_stop`，**全程醒着**。于是唯一被通知的对象不可能被"唤醒"——复活路径彻底不存在，
+不需要排序、屏障或 happens-before 论证。原 I1 删除；自底向上保留但**只作为发起顺序**，
+不再承担正确性。
+
+递归取消的后代不发任何通知。它们的父自己也在被停，不存在仍在等待的主体——
+这正是 §7 G4 论证里早就写着的事实。丢掉的"父不知道子被停过"由 17.6 的 roster 补上。
+
+### 17.6 子 Agent 列表作为落盘 reminder 注入
+
+新增机制，补 17.5 不通知后代所丢的信息，并顺带削弱对 issue #32 的暴露。
+
+复用既有 `SessionReminders`（`session/reminders.ts`，在 `session/prompt.ts:1195` 由 `runLoop`
+每轮调用）。该模块有两种写法，语义不同：
+
+```ts
+// :28  纯内存 push —— 每轮重建，不落库
+userMessage.parts.push({ id: PartID.ascending(), ..., synthetic: true })
+
+// :56  updatePart —— 落库，永久留在 transcript
+const part = yield* sessions.updatePart({ ..., synthetic: true })
+userMessage.parts.push(part)
+```
+
+**必须用落库那种。**非落库每轮重建会**改写一条已经发出去的消息**：reminder 挂在最后一条 user
+message 上，同一轮多个 step 里那条消息不变，step 1 发的是 `userMsg + roster_v1`，step 2 重建成
+`roster_v2`，前缀对不上，**从那条 user message 往后的缓存全部失效**，包括 step 1 产生的全部
+assistant 与 tool 消息。落库的 part 有稳定 id、内容不再变，字节级稳定。
+
+落库之后"只出现一次"即成立：它留在历史里，不需要每轮重复。
+
+**发射规则**（判据基于**已过滤**的可见历史）：
+
+```
+1. 取调用者的直接子，渲染成一行
+2. 在 input.messages 里倒找最近一条 roster part（按固定前缀行识别）
+3. 没有       → 落盘发一条     ← 首次派生 / 压缩之后
+   有且相同   → 跳过           ← 稳态，零开销
+   有但不同   → 落盘发一条     ← 子的状态翻转
+4. 没有子     → 什么都不做
+```
+
+**压缩不需要特判。**`message-v2.ts:526-582` 的 `filterCompacted` 把边界前的消息重排为
+`[compaction-user, summary, ...retained tail..., continue-user]`，边界前的 roster part 不再进请求；
+而 `runLoop` 给 `SessionReminders.apply` 的本来就是 `filterCompactedEffect` 之后的视图
+（`prompt.ts:1093` → `:1195`）。于是压缩后"倒找不到" → 自动重发。
+首次派生、状态翻转、压缩之后三种情况走同一条规则。
+
+范围与渲染：**只列直接子**（父与兄弟与本 Agent 的决策关系不大，`agent_list` 随时可查）；
+一行而非一项一行；只在有子时注入。
+
+已知代价：若某个子在一轮**中途**翻转状态，该 step 会给已发出的 user message 追加 part，
+触发一次缓存失效。只在子真的翻转时发生，不是每轮，有界，且那恰是这条信息最值钱的时刻。
+
+副产品：完成/失败通知若被 issue #32 的窗口吞掉，父下一轮就能从 roster 看出子已 idle，
+**无声挂起因此降级为一轮延迟**。
+
+### 17.7 内置受限 Agent 必须显式放行新工具
+
+`agent/agent.ts:196-211` 的 `explore` 是 `"*": "deny"` 加白名单：
+
+```ts
+Permission.fromConfig({ "*": "deny", grep: "allow", glob: "allow", list: "allow",
+  bash: "allow", webfetch: "allow", websearch: "allow", read: "allow", ... })
+```
+
+不显式 allow 就意味着**四个 Agent 管理工具全部被权限过滤掉**。内置受限 Agent 的 allowlist 必须更新；
+深度上限仍由工具列表过滤承担。用户自定义 Agent 的显式 deny 继续被尊重，不由本 feature 强制覆盖。
+
+### 17.8 工具可见性在工具列表生成期计算，不在执行期
+
+`SessionTools.resolve` 的入参是：
+
+```ts
+{ agent: Agent.Info, model: Provider.Model, session: Session.Info, processor, bypassAgentCheck, messages, promptOps }
+```
+
+**有 `session.id`，没有 `Tool.Context`。**`Tool.Context`（`ctx.sessionID` / `ctx.messageID`）
+只在工具真正执行时才存在，而模型看到的工具 schema 在那之前就已确定。
+因此深度过滤必须在 `SessionTools.resolve` 或等价的工具列表生成点、用 `input.session.id` 计算；
+`agent` 内部的深度检查保留为第二道防线，防插件或直接入口绕过。
+
+### 17.9 其余契约校正
+
+**工作目录失败不再承诺零文件系统副作用。**`WorktreeUnavailable` 只保证：不创建 Session、
+不投递初始 prompt、不启动 Agent。已经产生的 `info/exclude` 修改、目录、分支或半成品 worktree
+**可以残留**，并在错误中给出原因与相关路径供人工处理。V1 本就不自动清理。
+
+**创建结果不携带实时 status。**此前 `create` 在 BackgroundJob 启动后直接返回 `status: "running"`，
+与"status 唯一来自 `SessionStatus`"冲突。创建只表达"已创建并启动"；完整 `AgentInfo.status`
+只在 `agent_list` 中装配。
+
+**删除虚构的同步启动失败分支。**此前称 `startDelegation` 会把"Session 已建但任务未起"原样抛给 M5，
+但函数签名、`BackgroundJob.start` 与 M5 分支都没有该错误。执行失败走 BackgroundJob 的异步 error
+结算与既有通知路径；内部 defect 不伪装成可恢复的模型错误。
+
+**`AgentSkeleton` 是跨模块共享类型，不是模块私有。**`AgentNeighborhood.members` 必须是
+`AgentSkeleton[]`，M5 查询 M2 后产生 `AgentInfo[]`。它出现在 M1→M5 的接口上，按 §2.4 的判定
+就属跨模块共享。
+
+**M4 必须取真实父 Session。**此前 `create` 入参的 `caller` 只是 SessionID 却直接读
+`caller.permission`。改为 `create` 开始时 `Session.get(caller)` 一次，使用
+`parent.permission` 与 `parent.metadata.agentWorkdir`；删除重复的 `callerWorkdir` 参数。
+model/variant 仍由 M5 从调用者当次 assistant message 读出后传入。
+
+**身份保持规则覆盖三处**，不止 `agent_send`：
+
+1. `agent_send`：显式传目标当前 agent/model/variant；
+2. 初始委托 completed/error 的 `inject`：投递时**重新读取**父 Session 当前的 agent/model/variant，
+   不能省略 model，也不能用创建子 Agent 时捕获的旧 variant——父可能在子运行期间换过模型；
+3. 新建子 Session：在 `Session.create` 时就持久化已解析身份
+   （`CreateInput` 有 `model` 与 `metadata`，`session.ts:348-357`），不能等首个异步 prompt 才绑定。
+
+**通知保证降为一次尝试。**可保证：一个初始委托只注册一个 watcher，completed/error 时**至多**
+发起一次异步通知。不可保证：父恰好收到、消息必落库、必被消费。删除"创建者收到恰一条"这类强保证。
+cancelled 通知同强度。
+
+**`DelegationOutcome.text` 允许为空。**`lastVisibleText` 是
+`parts.findLast((p) => p.type === "text")?.text ?? ""`，纯工具调用完成时合法返回空串。
+设计既然复用既有分类，就必须允许 `{kind:"completed", text:""}`，不虚构 fallback。
+
+**初始委托代码只有一份。**`runTask`（`task.ts:333`）、`inject`（`:369`）、`notify`（`:398`）
+都是 `TaskTool.execute` 内的**闭包**，不是可直接调用的公开 helper。必须最小提取为共享内部实现、
+显式传窄数据。此前把它们列为"直接复用，不包装"是错的。
+
+**tool metadata 记录子 Agent 实际解析后的 model**，而不是无条件记录父调用消息的继承候选，
+否则 TUI 元数据会显示错误模型。
+
+### 17.10 深层 permission/question 的函数级流程
+
+§16.12 只说了"TUI 聚合整棵后代"，没给流程。补：
+
+```
+根 Session
+→ 按 parentID 求自身 + 全部后代闭包
+→ 聚合这些 session_id 的 pending permissions/questions
+→ 现有 UI 显示第一项
+→ 按 request.sessionID 把回复送到真实后代
+```
+
+必须有 `P → A → B` 三层回归用例。
