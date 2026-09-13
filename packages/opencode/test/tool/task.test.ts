@@ -607,11 +607,16 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("prevents subagents from launching subagents by default", () =>
+  // The default depth is 3 now, counted from the main session at 0, so a
+  // subagent may nest. What is asserted here is that the gate still holds once
+  // the limit is actually reached.
+  it.instance("prevents launching subagents once the default depth is reached", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
-      const child = yield* sessions.create({ parentID: chat.id, title: "child" })
+      let child = yield* sessions.create({ parentID: chat.id, title: "depth-1" })
+      child = yield* sessions.create({ parentID: child.id, title: "depth-2" })
+      child = yield* sessions.create({ parentID: child.id, title: "depth-3" })
       const nestedAssistant = yield* sessions.updateMessage({
         ...assistant,
         id: MessageID.ascending(),

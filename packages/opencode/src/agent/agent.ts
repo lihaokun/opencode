@@ -162,7 +162,7 @@ const layer = Layer.effect(
               Permission.fromConfig({
                 question: "allow",
                 plan_exit: "allow",
-                task: {
+                agent: {
                   general: "deny",
                 },
                 external_directory: {
@@ -206,6 +206,13 @@ const layer = Layer.effect(
                 webfetch: "allow",
                 websearch: "allow",
                 read: "allow",
+                // The wildcard deny above would otherwise hide the Agent
+                // management tools entirely. Depth still decides which of them
+                // are offered.
+                agent: "allow",
+                agent_list: "allow",
+                agent_send: "allow",
+                agent_stop: "allow",
                 external_directory: readonlyExternalDirectory,
               }),
               user,
