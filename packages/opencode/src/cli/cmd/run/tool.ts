@@ -99,6 +99,7 @@ type ToolDefs = {
   apply_patch: typeof ApplyPatchTool
   batch: Tool.Info
   task: typeof TaskTool
+  agent: typeof TaskTool
   todowrite: typeof TodoWriteTool
   question: typeof QuestionTool
   read: typeof ReadTool
@@ -761,14 +762,14 @@ function taskResult(output: string): string | undefined {
     return undefined
   }
 
-  const match = output.match(/<task_result>\s*([\s\S]*?)\s*<\/task_result>/)
+  const match = output.match(/<(?:agent|task)_result>\s*([\s\S]*?)\s*<\/(?:agent|task)_result>/)
   if (match) {
     return match[1].trim() || undefined
   }
 
   const next = output
     .split("\n")
-    .filter((line) => !line.startsWith("task_id:"))
+    .filter((line) => !line.startsWith("task_id:") && !line.startsWith("session_id:"))
     .join("\n")
     .trim()
   return next || undefined
@@ -1092,6 +1093,22 @@ const TOOL_RULES = {
     },
   },
   task: {
+    view: {
+      output: false,
+      final: true,
+      snap: "structured",
+    },
+    run: runTask,
+    snap: snapTask,
+    scroll: {
+      start: scrollTaskStart,
+      final: scrollTaskFinal,
+    },
+    permission: permTask,
+  },
+  // Same rendering under the live name. The `task` entry above stays so older
+  // transcripts still display; only `agent` is produced now.
+  agent: {
     view: {
       output: false,
       final: true,
@@ -1433,7 +1450,7 @@ export function toolEntryBody(commit: StreamCommit, raw: string): RunEntryBody |
   const ctx = toolFrame(commit, raw)
   const view = toolView(ctx.name)
 
-  if (ctx.name === "task") {
+  if (ctx.name === "agent" || ctx.name === "task") {
     if (commit.phase === "start") {
       return undefined
     }

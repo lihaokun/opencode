@@ -218,7 +218,7 @@ export function Session() {
           (sync.data.part[message.id] ?? []).filter(
             (part): part is ToolPart =>
               part.type === "tool" &&
-              part.tool === "task" &&
+              isSubagentTool(part.tool) &&
               part.state.status === "running" &&
               part.state.metadata?.background !== true,
           ),
@@ -1508,7 +1508,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
           )
         }}
       </For>
-      <Show when={props.parts.some((x) => x.type === "tool" && x.tool === "task")}>
+      <Show when={props.parts.some((x) => x.type === "tool" && isSubagentTool(x.tool))}>
         <box paddingTop={1} paddingLeft={3}>
           <text fg={theme.text}>
             {childShortcut()}
@@ -1519,7 +1519,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
                 props.parts.some(
                   (x) =>
                     x.type === "tool" &&
-                    x.tool === "task" &&
+                    isSubagentTool(x.tool) &&
                     x.state.status === "running" &&
                     x.state.metadata?.background !== true,
                 )
@@ -2653,7 +2653,17 @@ const toolDisplays = new Set([
   "execute",
 ])
 
+/**
+ * Subagent parts are `agent` now. Historical transcripts still carry `task`
+ * parts and stay readable — recognising the old name here is display only and
+ * does not bring the old tool back.
+ */
+export function isSubagentTool(tool: string) {
+  return tool === "agent" || tool === "task"
+}
+
 export function toolDisplay(tool: string) {
+  if (isSubagentTool(tool)) return "task"
   return toolDisplays.has(tool) ? tool : "generic"
 }
 

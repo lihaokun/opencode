@@ -2602,7 +2602,10 @@ it.instance("subtask child inherits parent session external_directory allow", ()
       expect.arrayContaining([{ permission: "external_directory", pattern: "/tmp/allowed/*", action: "allow" }]),
     )
     expect(Permission.evaluate("external_directory", "/tmp/allowed/file", rules).action).toBe("allow")
-    expect(Permission.evaluate("task", "anything", rules).action).toBe("deny")
+    // No default deny on spawning any more: nesting is bounded by depth and by
+    // which tools are offered, not by a rule on the child's session that would
+    // outrank the agent definition's own.
+    expect(Permission.evaluate("agent", "anything", rules).action).not.toBe("deny")
   }),
 )
 
