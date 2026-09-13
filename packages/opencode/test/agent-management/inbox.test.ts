@@ -149,7 +149,7 @@ describe("AgentInbox", () => {
       )
 
       expect(seen[0].agent).toBe("explore")
-      expect(seen[0].model).toEqual({ providerID: "p", modelID: "m" })
+      expect(seen[0].model).toEqual({ providerID: ProviderV2.ID.make("p"), modelID: ModelV2.ID.make("m") })
       expect(seen[0].variant).toBe("xhigh")
     }))
 
