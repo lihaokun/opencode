@@ -997,6 +997,10 @@ Rely-Guarantee 条件：
    roster（§4.5）把后果从无声挂起降级为一轮延迟。
 6. **工作目录隔离为建议式**（fork issue #33）。运行时默认 cwd 并未切换。
 7. **工作目录会累积**。完全不自动清理，需人工处理。`WorktreeUnavailable` 还可能留下半成品。
+   实现阶段实测到一个连带后果：**跑在某个 git 项目里就会在那个项目里建工作树**，
+   包括把 opencode 自己的仓库当项目跑的测试——一次实现过程中就在本仓留下 11 个 worktree 与同名分支。
+   本仓已把 `.opencode/worktrees/` 加进 `.gitignore`（产品侧写的是 `info/exclude`，那是 per-clone 的，
+   挡不住别的 clone 和 CI）。测试若要触发 git 分支，必须跑在 tmpdir instance 里。
 8. **进程崩溃后工作目录成为孤儿**。无回收机制。
 9. **非 Git 项目的工作目录是空的**。不自动复制项目文件；Agent 若整目录复制须排除
    `.opencode/worktrees` 以免递归复制自身。
