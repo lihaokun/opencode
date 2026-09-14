@@ -697,11 +697,55 @@ export const RunCommand = effectCmd({
         async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
           const toggles = new Map<string, boolean>()
           const sessions = new Set([sessionID])
+          // Which of them are working right now. A one-shot run must not leave
+          // while an agent it started is still going: agents are asynchronous,
+          // so their result comes back as a message that wakes this session
+          // again, and that reply is part of this run's output.
+          const working = new Set<string>()
           let error: string | undefined
+          let ceiling: ReturnType<typeof setTimeout> | undefined
+          let abandoned = false
+
+          // A stuck agent must not hold the process open forever. The clock
+          // measures continuous idleness, so it restarts whenever anything
+          // picks up work again.
+          const ceilingMs = (() => {
+            const raw = process.env["OPENCODE_RUN_AGENT_WAIT_MS"]
+            if (raw === undefined) return 10 * 60 * 1000
+            const parsed = Number(raw)
+            return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10 * 60 * 1000
+          })()
+
+          const stopWaiting = () => {
+            if (ceiling === undefined) return
+            clearTimeout(ceiling)
+            ceiling = undefined
+          }
+
+          const startWaiting = () => {
+            stopWaiting()
+            if (ceilingMs === 0) return
+            ceiling = setTimeout(() => {
+              abandoned = true
+              // Stop what is still running and take the partial result rather
+              // than hanging. Aborting the root cascades to the agents it
+              // started.
+              void client.session.abort({ sessionID }).catch(() => {})
+            }, ceilingMs)
+          }
 
           for await (const event of events.stream) {
             if (event.type === "session.created" && event.properties.info.parentID) {
-              if (sessions.has(event.properties.info.parentID)) sessions.add(event.properties.info.id)
+              if (sessions.has(event.properties.info.parentID)) {
+                sessions.add(event.properties.info.id)
+                // Counted as working from the moment it exists, not from its
+                // first busy event. The session is created during the parent's
+                // tool call, but its first status can arrive after the parent
+                // has already gone idle — and then the run would leave believing
+                // nothing was left to do.
+                working.add(event.properties.info.id)
+                stopWaiting()
+              }
             }
 
             if (
@@ -733,7 +777,7 @@ export const RunCommand = effectCmd({
 
               if (
                 part.type === "tool" &&
-                part.tool === "task" &&
+                (part.tool === "agent" || part.tool === "task") &&
                 part.state.status === "running" &&
                 args.format !== "json"
               ) {
@@ -790,12 +834,20 @@ export const RunCommand = effectCmd({
               UI.error(err)
             }
 
-            if (
-              event.type === "session.status" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.status.type === "idle"
-            ) {
-              break
+            if (event.type === "session.status" && sessions.has(event.properties.sessionID)) {
+              const id = event.properties.sessionID
+              if (event.properties.status.type === "idle") working.delete(id)
+              else working.add(id)
+
+              if (working.size > 0) stopWaiting()
+
+              if (id === sessionID && event.properties.status.type === "idle") {
+                if (working.size === 0 || abandoned) {
+                  stopWaiting()
+                  break
+                }
+                startWaiting()
+              }
             }
 
             if (event.type === "permission.asked") {
@@ -819,6 +871,12 @@ export const RunCommand = effectCmd({
                 })
               }
             }
+          }
+          stopWaiting()
+          if (abandoned) {
+            const message = `Gave up waiting for agents still running after ${Math.round(ceilingMs / 1000)}s; their work was stopped and any partial result dropped.`
+            error = error ? error + EOL + message : message
+            if (!emit("error", { error: { name: "AgentWaitCeiling", data: { message } } })) UI.error(message)
           }
           return error
         }
@@ -895,7 +953,6 @@ export const RunCommand = effectCmd({
             initialInput,
             createSession: createFreshSession,
             thinking,
-            backgroundSubagents: flags.experimentalBackgroundSubagents,
             demo: args.demo,
           })
         } catch (error) {
@@ -932,7 +989,6 @@ export const RunCommand = effectCmd({
             files,
             initialInput,
             thinking,
-            backgroundSubagents: flags.experimentalBackgroundSubagents,
             demo: args.demo,
           })
         } catch (error) {

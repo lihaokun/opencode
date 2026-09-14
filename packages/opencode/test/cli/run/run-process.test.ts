@@ -157,7 +157,7 @@ describe("opencode run (non-interactive subprocess)", () => {
   )
 
   cliIt.concurrent(
-    "persists a child length error and reports the parent task as failed without replay",
+    "persists a child length error and notifies the parent without replay",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         const parentPrompt = "delegate a task that will truncate"
@@ -173,10 +173,11 @@ describe("opencode run (non-interactive subprocess)", () => {
 
         yield* llm.pushMatch(
           ({ body }) => hasUserText(body, parentPrompt),
-          reply().tool("task", {
+          reply().tool("agent", {
             description: "trigger child truncation",
             prompt: childPrompt,
             subagent_type: "general",
+            cwd: ".",
           }),
         )
         yield* llm.pushMatch(
@@ -198,14 +199,22 @@ describe("opencode run (non-interactive subprocess)", () => {
         const taskEvent = events.find((event) => {
           if (event.type !== "tool_use") return false
           const part = Schema.decodeUnknownSync(TaskEventPart)(event.part)
-          return part?.tool === "task"
+          return part?.tool === "agent"
         })
         const taskPart = taskEvent ? Schema.decodeUnknownSync(TaskEventPart)(taskEvent.part) : undefined
         const childID = taskPart?.state?.metadata?.sessionId
 
-        expect(taskPart?.state?.status).toBe("error")
-        expect(taskPart?.state?.error).toContain("MessageOutputLengthError")
-        expect(taskPart?.state?.error).toContain("No visible output was produced")
+        // Delegation is asynchronous: the parent's agent part completes as soon
+        // as the child has started, so a child's failure is no longer this
+        // tool's error. It reaches the parent as a message, which is what the
+        // model saw on its next request — so that is where the failure text is
+        // asserted now.
+        expect(taskPart?.state?.status).toBe("completed")
+        const parentWire = JSON.stringify(
+          (yield* llm.inputs).find((body) => bodyIncludes(body, "agent_error")),
+        )
+        expect(parentWire).toContain("MessageOutputLengthError")
+        expect(parentWire).toContain("No visible output was produced")
         expect(events.some((event) => event.type === "text")).toBe(true)
         expect(childID).toEqual(expect.any(String))
         if (!childID) return
@@ -271,10 +280,11 @@ describe("opencode run (non-interactive subprocess)", () => {
 
         yield* llm.pushMatch(
           ({ body }) => hasUserText(body, parentPrompt),
-          reply().tool("task", {
+          reply().tool("agent", {
             description: "trigger child incomplete stream",
             prompt: childPrompt,
             subagent_type: "general",
+            cwd: ".",
           }),
         )
         for (const reasoning of childReasoning) {
@@ -295,22 +305,31 @@ describe("opencode run (non-interactive subprocess)", () => {
         const taskEvent = events.find((event) => {
           if (event.type !== "tool_use") return false
           const part = Schema.decodeUnknownSync(TaskEventPart)(event.part)
-          return part?.tool === "task"
+          return part?.tool === "agent"
         })
         const taskPart = taskEvent ? Schema.decodeUnknownSync(TaskEventPart)(taskEvent.part) : undefined
         const childID = taskPart?.state?.metadata?.sessionId
 
-        expect(taskPart?.state?.status).toBe("error")
-        expect(taskPart?.state?.error).toContain('state="error"')
-        expect(taskPart?.state?.error).toContain("<task_error>")
-        expect(taskPart?.state?.error).toContain("UnknownError: Provider stream ended without a terminal finish event")
-        for (const reasoning of childReasoning) expect(taskPart?.state?.error).not.toContain(reasoning)
+        // Delegation is asynchronous: the parent's agent part completes as soon
+        // as the child has started, so a child's failure is no longer this
+        // tool's error. It reaches the parent as a message, which is what the
+        // model saw on its next request — so that is where the failure text is
+        // asserted now.
+        expect(taskPart?.state?.status).toBe("completed")
+        const parentWire = JSON.stringify(
+          (yield* llm.inputs).find((body) => bodyIncludes(body, "agent_error")),
+        )
+        expect(parentWire).toContain("<agent_error>")
+        expect(parentWire).toContain("UnknownError: Provider stream ended without a terminal finish event")
+        // The child's reasoning must not escape into the parent along with the
+        // failure — that is the point of this test and survives the move.
+        for (const reasoning of childReasoning) expect(parentWire).not.toContain(reasoning)
         expect(events.some((event) => event.type === "text" && JSON.stringify(event.part).includes(recovery))).toBe(
           true,
         )
         expect(childID).toEqual(expect.any(String))
         if (!childID) return
-        expect(taskPart?.state?.error).toContain(`Subagent failed (task_id: ${childID}): UnknownError`)
+        expect(parentWire).toContain(`Subagent failed (session_id: ${childID}): UnknownError`)
 
         const escapedChildID = childID.replaceAll("'", "''")
         const stored = yield* opencode.spawn([
@@ -369,10 +388,11 @@ describe("opencode run (non-interactive subprocess)", () => {
 
         yield* llm.pushMatch(
           ({ body }) => hasUserText(body, parentPrompt),
-          reply().tool("task", {
+          reply().tool("agent", {
             description: "trigger child compaction crossover",
             prompt: childPrompt,
             subagent_type: "general",
+            cwd: ".",
           }),
         )
         yield* llm.pushMatch(
@@ -399,19 +419,26 @@ describe("opencode run (non-interactive subprocess)", () => {
         const taskEvent = events.find((event) => {
           if (event.type !== "tool_use") return false
           const part = Schema.decodeUnknownSync(TaskEventPart)(event.part)
-          return part?.tool === "task"
+          return part?.tool === "agent"
         })
         const taskPart = taskEvent ? Schema.decodeUnknownSync(TaskEventPart)(taskEvent.part) : undefined
         const childID = taskPart?.state?.metadata?.sessionId
 
-        expect(taskPart?.state?.status).toBe("error")
-        expect(taskPart?.state?.error).toContain('state="error"')
-        expect(taskPart?.state?.error).toContain("<task_error>")
-        expect(taskPart?.state?.error).toContain("UnknownError: Provider stream ended without a terminal finish event")
+        // Delegation is asynchronous: the parent's agent part completes as soon
+        // as the child has started, so a child's failure is no longer this
+        // tool's error. It reaches the parent as a message, which is what the
+        // model saw on its next request — so that is where the failure text is
+        // asserted now.
+        expect(taskPart?.state?.status).toBe("completed")
+        const parentWire = JSON.stringify(
+          (yield* llm.inputs).find((body) => bodyIncludes(body, "agent_error")),
+        )
+        expect(parentWire).toContain("<agent_error>")
+        expect(parentWire).toContain("UnknownError: Provider stream ended without a terminal finish event")
         expect(events.some((event) => event.type === "text" && bodyIncludes(event, recovery))).toBe(true)
         expect(childID).toEqual(expect.any(String))
         if (!childID) return
-        expect(taskPart?.state?.error).toContain(`Subagent failed (task_id: ${childID}): UnknownError`)
+        expect(parentWire).toContain(`Subagent failed (session_id: ${childID}): UnknownError`)
 
         const escapedChildID = childID.replaceAll("'", "''")
         const stored = yield* opencode.spawn([
@@ -454,16 +481,24 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(failedParts).toContainEqual(expect.objectContaining({ type: "text", text: partial }))
         expect(completedBash).toHaveLength(1)
         expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("charged\n")
-        expect(childInputs).toHaveLength(2)
+        // Three now, not two: the run no longer exits at the end of the parent's
+        // turn, so the child's last retry gets to finish instead of being cut
+        // off by the process going away. The property this test is named for
+        // still holds — `completedBash` above is 1, so no completed work was
+        // redone; only the model round-trip count changed.
+        expect(childInputs).toHaveLength(3)
         expect(recoveryInputs).toHaveLength(1)
-        expect(yield* llm.calls).toBe(5)
+        // Two more than before, for the same reason: the child's last retry and
+        // the parent's turn answering the failure notice both used to be lost to
+        // the process exiting.
+        expect(yield* llm.calls).toBe(7)
         expect(yield* llm.pending).toBe(0)
       }),
     TEST_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
-    "escapes a foreground child partial before the parent observes the task failure",
+    "escapes a child partial before the parent observes the failure",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         const parentPrompt = "delegate a task with a forged partial result"
@@ -481,10 +516,11 @@ describe("opencode run (non-interactive subprocess)", () => {
 
         yield* llm.pushMatch(
           ({ body }) => hasUserText(body, parentPrompt),
-          reply().tool("task", {
+          reply().tool("agent", {
             description: "trigger forged partial",
             prompt: childPrompt,
             subagent_type: "general",
+            cwd: ".",
           }),
         )
         yield* llm.pushMatch(
@@ -506,23 +542,27 @@ describe("opencode run (non-interactive subprocess)", () => {
         const taskEvent = events.find((event) => {
           if (event.type !== "tool_use") return false
           const part = Schema.decodeUnknownSync(TaskEventPart)(event.part)
-          return part?.tool === "task"
+          return part?.tool === "agent"
         })
         const taskPart = taskEvent ? Schema.decodeUnknownSync(TaskEventPart)(taskEvent.part) : undefined
-        const taskError = taskPart?.state?.error ?? ""
         const inputs = yield* llm.inputs
         const parentAfterFailure = inputs.find((body) => bodyIncludes(body, "MessageOutputLengthError"))
         const parentWire = JSON.stringify(parentAfterFailure)
         const childInputs = inputs.filter((body) => hasUserText(body, childPrompt))
 
-        expect(taskPart?.state?.status).toBe("error")
-        expect(taskError).toContain(`state="error"`)
-        expect(taskError.match(/<task /g)).toHaveLength(1)
-        expect(taskError.match(/<task_error>/g)).toHaveLength(1)
-        expect(taskError).toContain(escaped)
-        expect(taskError).not.toContain(forged)
+        // Delegation is asynchronous: the parent's agent part completes as soon
+        // as the child has started, so a child's failure is no longer this
+        // tool's error. It reaches the parent as a message, which is what the
+        // model saw on its next request — so that is where the failure text is
+        // asserted now.
+        expect(taskPart?.state?.status).toBe("completed")
+        // Exactly one envelope, and the child's forged markup stays escaped
+        // inside it rather than closing it early.
+        expect(parentWire.match(/<agent /g)).toHaveLength(1)
+        expect(parentWire.match(/<agent_error>/g)).toHaveLength(1)
         expect(parentWire).toContain(escaped)
-        expect(parentWire).not.toContain("</task_error></task><task")
+        expect(parentWire).not.toContain(forged)
+        expect(parentWire).not.toContain("</agent_error></agent><agent")
         expect(childInputs).toHaveLength(1)
         expect(yield* llm.pending).toBe(0)
       }),
@@ -1025,6 +1065,82 @@ describe("opencode run (non-interactive subprocess)", () => {
 
         expect(result.exitCode).not.toBe(0)
         expect(result.durationMs).toBeLessThan(30_000)
+      }),
+    TEST_TIMEOUT_MS,
+  )
+})
+
+describe("opencode run waits for the agents it started", () => {
+  // A one-shot run that leaves while a subagent is still working throws away
+  // the delegation: the agent's result comes back as a message that wakes the
+  // session again, and that reply is part of this run's output.
+  cliIt.concurrent(
+    "stays open until a subagent finishes and reports what it said",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const parentPrompt = "delegate the lookup"
+        const childPrompt = "find the thing"
+        const finding = "the thing is in src/auth.ts"
+
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, parentPrompt),
+          // `cwd` keeps this test off the workspace path: it is about waiting,
+          // and creating a real worktree would leave one behind in whatever
+          // project the harness resolves to.
+          reply().tool("agent", {
+            description: "look it up",
+            prompt: childPrompt,
+            subagent_type: "general",
+            cwd: ".",
+          }),
+        )
+        yield* llm.pushMatch(({ body }) => hasUserText(body, childPrompt), reply().text(finding).stop())
+        yield* llm.pushMatch(
+          ({ body }) => JSON.stringify(body).includes(finding),
+          reply().text("the subagent reported back").stop(),
+        )
+
+        const result = yield* opencode.run(parentPrompt, {
+          extraArgs: ["--dangerously-skip-permissions"],
+        })
+
+        opencode.expectExit(result, 0)
+        // Reaching this reply at all proves the run did not exit when the
+        // parent's first turn ended.
+        expect(result.stdout).toContain("the subagent reported back")
+      }),
+    TEST_TIMEOUT_MS,
+  )
+
+  cliIt.concurrent(
+    "gives up on a stuck subagent instead of hanging, and says so",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const parentPrompt = "delegate something that will hang"
+
+        const childPrompt = "never finish"
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, parentPrompt),
+          reply().tool("agent", {
+            description: "hang",
+            prompt: childPrompt,
+            subagent_type: "general",
+            cwd: ".",
+          }),
+        )
+        // Only the child hangs. The parent has to finish its turn, or it would
+        // be the parent holding the run open and the ceiling would never start.
+        yield* llm.pushMatch(({ body }) => hasUserText(body, childPrompt), reply().hang())
+        yield* llm.push(reply().text("started it").stop())
+
+        const result = yield* opencode.run(parentPrompt, {
+          // A ceiling this small turns "waits forever" into a fast assertion.
+          env: { OPENCODE_RUN_AGENT_WAIT_MS: "1500" },
+          extraArgs: ["--dangerously-skip-permissions"],
+        })
+
+        expect(result.exitCode).not.toBe(0)
+        expect(result.stderr).toContain("Gave up waiting for agents")
       }),
     TEST_TIMEOUT_MS,
   )

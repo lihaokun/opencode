@@ -84,9 +84,9 @@ it.instance("plan agent denies the general subagent by default", () =>
   Effect.gen(function* () {
     const plan = yield* load((svc) => svc.get("plan"))
     expect(plan).toBeDefined()
-    expect(Permission.evaluate("task", "general", plan!.permission).action).toBe("deny")
-    expect(Permission.evaluate("task", "explore", plan!.permission).action).toBe("allow")
-    expect(Permission.evaluate("task", "custom", plan!.permission).action).toBe("allow")
+    expect(Permission.evaluate("agent", "general", plan!.permission).action).toBe("deny")
+    expect(Permission.evaluate("agent", "explore", plan!.permission).action).toBe("allow")
+    expect(Permission.evaluate("agent", "custom", plan!.permission).action).toBe("allow")
   }),
 )
 
@@ -96,7 +96,7 @@ it.instance(
     Effect.gen(function* () {
       const plan = yield* load((svc) => svc.get("plan"))
       expect(plan).toBeDefined()
-      expect(Permission.evaluate("task", "general", plan!.permission).action).toBe("allow")
+      expect(Permission.evaluate("agent", "general", plan!.permission).action).toBe("allow")
     }),
   {
     config: {

@@ -331,7 +331,9 @@ function taskSessionID(part: ToolPart) {
 }
 
 function syncTaskTab(data: SubagentData, part: ToolPart, children?: Set<string>) {
-  if (part.tool !== "task") {
+  // `agent` is the live tool; `task` stays recognised so older transcripts keep
+  // rendering their subagent tabs.
+  if (part.tool !== "agent" && part.tool !== "task") {
     return false
   }
 

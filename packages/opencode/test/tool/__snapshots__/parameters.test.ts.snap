@@ -464,3 +464,37 @@ exports[`tool parameters JSON Schema (wire shape) write 1`] = `
   "type": "object",
 }
 `;
+
+exports[`tool parameters JSON Schema (wire shape) agent 1`] = `
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "cwd": {
+      "description": "Working directory for this Agent. When omitted a separate working directory is prepared for it automatically.",
+      "type": "string",
+    },
+    "description": {
+      "description": "A short (3-5 word) description of the task",
+      "type": "string",
+    },
+    "name": {
+      "description": "Optional short name for this Agent, used to address it later with agent_send or agent_stop. Must not start with 'ses'. Names are a convenience: they are not guaranteed unique, and an ambiguous name is refused rather than guessed.",
+      "type": "string",
+    },
+    "prompt": {
+      "description": "The task for the agent to perform",
+      "type": "string",
+    },
+    "subagent_type": {
+      "description": "The type of specialized agent to use for this task",
+      "type": "string",
+    },
+  },
+  "required": [
+    "description",
+    "prompt",
+    "subagent_type",
+  ],
+  "type": "object",
+}
+`;

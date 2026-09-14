@@ -44,7 +44,8 @@ import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { TaskTool, type TaskPromptOps } from "@/tool/task"
+import { AGENT_TOOL_ID } from "@/tool/agent"
+import { AgentManagement } from "@/agent-management/schema"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -54,6 +55,8 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
+import { AgentTree } from "@/agent-management/tree"
+import { AgentStatusProjection } from "@/agent-management/status"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
 
@@ -115,6 +118,8 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const status = yield* SessionStatus.Service
     const sessions = yield* Session.Service
+    const agentTree = yield* AgentTree.Service
+    const agentStatus = yield* AgentStatusProjection.Service
     const agents = yield* Agent.Service
     const provider = yield* Provider.Service
     const processor = yield* SessionProcessor.Service
@@ -146,7 +151,7 @@ const layer = Layer.effect(
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
-      } satisfies TaskPromptOps
+      } satisfies AgentManagement.AgentPromptOps
     })
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
@@ -263,7 +268,7 @@ const layer = Layer.effect(
       const { task, model, lastUser, sessionID, session, msgs } = input
       const ctx = yield* InstanceState.context
       const promptOps = yield* ops()
-      const { task: taskTool } = yield* registry.named()
+      const { agent: agentTool } = yield* registry.named()
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
       const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
         id: MessageID.ascending(),
@@ -286,7 +291,7 @@ const layer = Layer.effect(
         sessionID: assistantMessage.sessionID,
         type: "tool",
         callID: ulid(),
-        tool: TaskTool.id,
+        tool: AGENT_TOOL_ID,
         state: {
           status: "running",
           input: {
@@ -298,15 +303,16 @@ const layer = Layer.effect(
           time: { start: Date.now() },
         },
       })
+      // `command` is display-only and stays in the part's recorded input; the
+      // tool itself has no such parameter.
       const taskArgs = {
         prompt: task.prompt,
         description: task.description,
         subagent_type: task.agent,
-        command: task.command,
       }
       yield* plugin.trigger(
         "tool.execute.before",
-        { tool: TaskTool.id, sessionID, callID: part.id },
+        { tool: AGENT_TOOL_ID, sessionID, callID: part.id },
         { args: taskArgs },
       )
 
@@ -321,7 +327,7 @@ const layer = Layer.effect(
 
       let error: Error | undefined
       const taskAbort = new AbortController()
-      const result = yield* taskTool
+      const result = yield* agentTool
         .execute(taskArgs, {
           agent: task.agent,
           messageID: assistantMessage.id,
@@ -388,7 +394,7 @@ const layer = Layer.effect(
 
       yield* plugin.trigger(
         "tool.execute.after",
-        { tool: TaskTool.id, sessionID, callID: part.id, args: taskArgs },
+        { tool: AGENT_TOOL_ID, sessionID, callID: part.id, args: taskArgs },
         result,
       )
 
@@ -972,7 +978,7 @@ const layer = Layer.effect(
         }
 
         if (part.type === "agent") {
-          const perm = Permission.evaluate("task", part.name, ag.permission)
+          const perm = Permission.evaluate(AGENT_TOOL_ID, part.name, ag.permission)
           const hint = perm.action === "deny" ? " . Invoked by user; guaranteed to exist." : ""
           return [
             { ...part, messageID: info.id, sessionID: input.sessionID },
@@ -1196,6 +1202,11 @@ const layer = Layer.effect(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(FSUtil.Service, fsys),
             Effect.provideService(Session.Service, sessions),
+          )
+          msgs = yield* SessionReminders.applyAgentRoster({ messages: msgs, session }).pipe(
+            Effect.provideService(Session.Service, sessions),
+            Effect.provideService(AgentTree.Service, agentTree),
+            Effect.provideService(AgentStatusProjection.Service, agentStatus),
           )
 
           const msg: SessionV1.Assistant = {
@@ -1655,6 +1666,8 @@ export const node = LayerNode.make({
     SessionStatus.node,
     Session.node,
     Agent.node,
+    AgentTree.node,
+    AgentStatusProjection.node,
     Provider.node,
     SessionProcessor.node,
     SessionCompaction.node,

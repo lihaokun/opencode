@@ -183,16 +183,43 @@ function expand(pattern: string): string {
   return pattern
 }
 
+/** The key the `task` tool's permissions were configured under before it became `agent`. */
+export const LEGACY_AGENT_PERMISSION_KEY = "task"
+export const AGENT_PERMISSION_KEY = "agent"
+
+function rulesFor(permission: string, value: ConfigPermissionV1.Info[string]): PermissionV1.Rule[] {
+  if (typeof value === "string") return [{ permission, action: value, pattern: "*" }]
+  return Object.entries(value).map(([pattern, action]) => ({ permission, pattern: expand(pattern), action }))
+}
+
+/**
+ * Config rules become a ruleset, with one normalisation: the legacy `task` key
+ * is rewritten to `agent`.
+ *
+ * Silently ignoring it would widen permissions — someone who wrote `task: deny`
+ * to keep subagents off would find them allowed after an upgrade. The rewritten
+ * rules are placed immediately ahead of any explicit `agent` rules so that on a
+ * shared pattern the explicit one wins, since evaluate takes the last match.
+ * Everything else keeps its original position.
+ *
+ * Doing it here covers every caller, and because a user's config is re-derived
+ * into agent.permission on each run there is no stale copy to migrate.
+ */
 export function fromConfig(permission: ConfigPermissionV1.Info) {
+  const legacy = permission[LEGACY_AGENT_PERMISSION_KEY]
+  const converted = legacy ? rulesFor(AGENT_PERMISSION_KEY, legacy) : []
+  const hasCanonical = AGENT_PERMISSION_KEY in permission
+
   const ruleset: PermissionV1.Rule[] = []
   for (const [key, value] of Object.entries(permission)) {
-    if (typeof value === "string") {
-      ruleset.push({ permission: key, action: value, pattern: "*" })
+    if (key === LEGACY_AGENT_PERMISSION_KEY) {
+      // Held back when an explicit `agent` key exists, so it lands just before
+      // it rather than after.
+      if (!hasCanonical) ruleset.push(...converted)
       continue
     }
-    ruleset.push(
-      ...Object.entries(value).map(([pattern, action]) => ({ permission: key, pattern: expand(pattern), action })),
-    )
+    if (key === AGENT_PERMISSION_KEY) ruleset.push(...converted)
+    ruleset.push(...rulesFor(key, value))
   }
   return ruleset
 }
