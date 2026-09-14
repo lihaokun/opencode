@@ -736,7 +736,16 @@ export const RunCommand = effectCmd({
 
           for await (const event of events.stream) {
             if (event.type === "session.created" && event.properties.info.parentID) {
-              if (sessions.has(event.properties.info.parentID)) sessions.add(event.properties.info.id)
+              if (sessions.has(event.properties.info.parentID)) {
+                sessions.add(event.properties.info.id)
+                // Counted as working from the moment it exists, not from its
+                // first busy event. The session is created during the parent's
+                // tool call, but its first status can arrive after the parent
+                // has already gone idle — and then the run would leave believing
+                // nothing was left to do.
+                working.add(event.properties.info.id)
+                stopWaiting()
+              }
             }
 
             if (
@@ -768,7 +777,7 @@ export const RunCommand = effectCmd({
 
               if (
                 part.type === "tool" &&
-                part.tool === "task" &&
+                (part.tool === "agent" || part.tool === "task") &&
                 part.state.status === "running" &&
                 args.format !== "json"
               ) {

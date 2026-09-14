@@ -9,7 +9,6 @@ import { EditTool } from "./edit"
 import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
-import { TaskTool } from "./task"
 import {
   AgentTool,
   AgentListTool,
@@ -78,20 +77,20 @@ export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false
   )
 }
 
-type TaskDef = Tool.InferDef<typeof TaskTool>
+type AgentDef = Tool.InferDef<typeof AgentTool>
 type ReadDef = Tool.InferDef<typeof ReadTool>
 
 type State = {
   custom: Tool.Def[]
   builtin: Tool.Def[]
-  task: TaskDef
+  agent: AgentDef
   read: ReadDef
 }
 
 export interface Interface {
   readonly ids: () => Effect.Effect<string[]>
   readonly all: () => Effect.Effect<Tool.Def[]>
-  readonly named: () => Effect.Effect<{ task: TaskDef; read: ReadDef }>
+  readonly named: () => Effect.Effect<{ agent: AgentDef; read: ReadDef }>
   readonly tools: (model: {
     providerID: ProviderV2.ID
     modelID: ModelV2.ID
@@ -120,7 +119,6 @@ const layer = Layer.effect(
     const mcp = yield* MCP.Service
 
     const invalid = yield* InvalidTool
-    const task = yield* TaskTool
     const agentTool = yield* AgentTool
     const agentListTool = yield* AgentListTool
     const agentSendTool = yield* AgentSendTool
@@ -240,7 +238,6 @@ const layer = Layer.effect(
           grep: Tool.init(greptool),
           edit: Tool.init(edit),
           write: Tool.init(writetool),
-          task: Tool.init(task),
           agent: Tool.init(agentTool),
           agentList: Tool.init(agentListTool),
           agentSend: Tool.init(agentSendTool),
@@ -267,7 +264,6 @@ const layer = Layer.effect(
             tool.grep,
             tool.edit,
             tool.write,
-            tool.task,
             tool.agent,
             tool.agentList,
             tool.agentSend,
@@ -281,7 +277,7 @@ const layer = Layer.effect(
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
           ],
-          task: tool.task,
+          agent: tool.agent,
           read: tool.read,
         }
       }),
@@ -296,7 +292,7 @@ const layer = Layer.effect(
       return (yield* all()).map((tool) => tool.id)
     })
 
-    const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
+    const describeAgents = Effect.fn("ToolRegistry.describeAgents")(function* (agent: Agent.Info) {
       const items = (yield* agents.list()).filter((item) => item.mode !== "primary")
       // Canonical key. Legacy `task` rules are normalised to `agent` when config
       // is read, so evaluating the old name here would consult a key nothing
@@ -374,7 +370,7 @@ const layer = Layer.effect(
             id: tool.id,
             description: [
               output.description,
-              tool.id === TaskTool.id || tool.id === AGENT_TOOL_ID ? yield* describeTask(input.agent) : undefined,
+              tool.id === AGENT_TOOL_ID ? yield* describeAgents(input.agent) : undefined,
               tool.id === "execute" ? codeModeDescription : undefined,
             ]
               .filter(Boolean)
@@ -391,7 +387,7 @@ const layer = Layer.effect(
 
     const named: Interface["named"] = Effect.fn("ToolRegistry.named")(function* () {
       const s = yield* InstanceState.get(state)
-      return { task: s.task, read: s.read }
+      return { agent: s.agent, read: s.read }
     })
 
     return Service.of({ ids, all, named, tools })

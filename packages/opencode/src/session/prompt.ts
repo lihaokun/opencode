@@ -44,7 +44,8 @@ import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { TaskTool, type TaskPromptOps } from "@/tool/task"
+import { AGENT_TOOL_ID } from "@/tool/agent"
+import { AgentManagement } from "@/agent-management/schema"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -150,7 +151,7 @@ const layer = Layer.effect(
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
-      } satisfies TaskPromptOps
+      } satisfies AgentManagement.AgentPromptOps
     })
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
@@ -267,7 +268,7 @@ const layer = Layer.effect(
       const { task, model, lastUser, sessionID, session, msgs } = input
       const ctx = yield* InstanceState.context
       const promptOps = yield* ops()
-      const { task: taskTool } = yield* registry.named()
+      const { agent: agentTool } = yield* registry.named()
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
       const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
         id: MessageID.ascending(),
@@ -290,7 +291,7 @@ const layer = Layer.effect(
         sessionID: assistantMessage.sessionID,
         type: "tool",
         callID: ulid(),
-        tool: TaskTool.id,
+        tool: AGENT_TOOL_ID,
         state: {
           status: "running",
           input: {
@@ -302,15 +303,16 @@ const layer = Layer.effect(
           time: { start: Date.now() },
         },
       })
+      // `command` is display-only and stays in the part's recorded input; the
+      // tool itself has no such parameter.
       const taskArgs = {
         prompt: task.prompt,
         description: task.description,
         subagent_type: task.agent,
-        command: task.command,
       }
       yield* plugin.trigger(
         "tool.execute.before",
-        { tool: TaskTool.id, sessionID, callID: part.id },
+        { tool: AGENT_TOOL_ID, sessionID, callID: part.id },
         { args: taskArgs },
       )
 
@@ -325,7 +327,7 @@ const layer = Layer.effect(
 
       let error: Error | undefined
       const taskAbort = new AbortController()
-      const result = yield* taskTool
+      const result = yield* agentTool
         .execute(taskArgs, {
           agent: task.agent,
           messageID: assistantMessage.id,
@@ -392,7 +394,7 @@ const layer = Layer.effect(
 
       yield* plugin.trigger(
         "tool.execute.after",
-        { tool: TaskTool.id, sessionID, callID: part.id, args: taskArgs },
+        { tool: AGENT_TOOL_ID, sessionID, callID: part.id, args: taskArgs },
         result,
       )
 
@@ -976,7 +978,7 @@ const layer = Layer.effect(
         }
 
         if (part.type === "agent") {
-          const perm = Permission.evaluate("task", part.name, ag.permission)
+          const perm = Permission.evaluate(AGENT_TOOL_ID, part.name, ag.permission)
           const hint = perm.action === "deny" ? " . Invoked by user; guaranteed to exist." : ""
           return [
             { ...part, messageID: info.id, sessionID: input.sessionID },

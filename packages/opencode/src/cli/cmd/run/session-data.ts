@@ -395,7 +395,8 @@ function syncQuestion(data: SessionData, part: ToolPart): FooterOutput | undefin
 }
 
 function toolStatus(part: ToolPart): string {
-  if (part.tool !== "task") {
+  // `task` stays recognised so older transcripts still render.
+  if (part.tool !== "agent" && part.tool !== "task") {
     return `running ${part.tool}`
   }
 
