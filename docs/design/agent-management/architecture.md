@@ -1000,8 +1000,13 @@ Rely-Guarantee 条件：
 7. **工作目录会累积**。完全不自动清理，需人工处理。`WorktreeUnavailable` 还可能留下半成品。
    实现阶段实测到一个连带后果：**跑在某个 git 项目里就会在那个项目里建工作树**，
    包括把 opencode 自己的仓库当项目跑的测试——一次实现过程中就在本仓留下 11 个 worktree 与同名分支。
-   本仓已把 `.opencode/worktrees/` 加进 `.gitignore`（产品侧写的是 `info/exclude`，那是 per-clone 的，
-   挡不住别的 clone 和 CI）。测试若要触发 git 分支，必须跑在 tmpdir instance 里。
+   本仓已把 `**/.opencode/worktrees/` 加进 `.gitignore`（产品侧写的是 `info/exclude`，那是 per-clone 的，
+   挡不住别的 clone 和 CI；注意模式要用 `**/` 前缀，中间带斜杠的模式会被锚定到仓库根，
+   挡不住 `packages/*/.opencode/`）。测试若要触发 git 分支，必须确保 instance 真在 tmpdir 里。
+   **一处待查**：`test/lib/cli-process.ts` 的 harness 以 `cwd: <tmpdir>` spawn 子进程，但 `opencode run`
+   在里面建出的是**本仓的** git worktree（落在 `packages/opencode/.opencode/worktrees/`）——
+   说明 project 解析没跟着 spawn 的 cwd 走。只有证据没有定论，凡是往项目相对路径写东西的测试都可能受影响，
+   值得单独查一次。
 8. **进程崩溃后工作目录成为孤儿**。无回收机制。
 9. **非 Git 项目的工作目录是空的**。不自动复制项目文件；Agent 若整目录复制须排除
    `.opencode/worktrees` 以免递归复制自身。

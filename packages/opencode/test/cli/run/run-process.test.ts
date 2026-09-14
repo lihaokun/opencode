@@ -1044,10 +1044,14 @@ describe("opencode run waits for the agents it started", () => {
 
         yield* llm.pushMatch(
           ({ body }) => hasUserText(body, parentPrompt),
+          // `cwd` keeps this test off the workspace path: it is about waiting,
+          // and creating a real worktree would leave one behind in whatever
+          // project the harness resolves to.
           reply().tool("agent", {
             description: "look it up",
             prompt: childPrompt,
             subagent_type: "general",
+            cwd: ".",
           }),
         )
         yield* llm.pushMatch(({ body }) => hasUserText(body, childPrompt), reply().text(finding).stop())
@@ -1081,6 +1085,7 @@ describe("opencode run waits for the agents it started", () => {
             description: "hang",
             prompt: childPrompt,
             subagent_type: "general",
+            cwd: ".",
           }),
         )
         // Only the child hangs. The parent has to finish its turn, or it would
