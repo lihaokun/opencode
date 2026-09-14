@@ -63,7 +63,7 @@ Session 并按 fallback 链改写它。细化 §5.4.1 步骤 8。
 | 4.2 | `background.start({ id: 子SessionID, ..., onPromote, run })` | `:426-439` | **修改** | 保留"job id 即子 SessionID"；`onPromote` 随前台废弃而移除。细化 §5.4.4 步骤 1 |
 | 4.3 | `run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(子SessionID)))` | `:439` | **保留** | 细化 §5.4.4 步骤 2 |
 | 4.4 | 前台分支：abort 监听、`raceFirst`、按结果渲染 | `:463-506` | **废弃** | 恒为异步 |
-| 4.5 | `onPromote` / `waitForPromotion` / `background.promote` | `:431`、`:478` | **废弃** | 前台没了，死代码一并清理 |
+| 4.5 | `onPromote` / `waitForPromotion` / `background.promote` | `:431`、`:478` | **废弃** | 前台没了，死代码一并清理。**实际范围比这行原本写的大**：除 `BackgroundJob` 那三个成员外，还有 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` 开关、`/experimental/session/:sessionID/background` 端点及其 capability 字段、以及 `backgroundSubagents` 从 `run.ts` 一路穿到 `footer.view.tsx` 的整条 UI 链。其中 TUI 那处**不只是死代码**——它按 `metadata.background !== true` 筛运行中的 subagent，而新实现根本不写该字段，于是每个 Agent 都被算作「前台」，footer 给出一个已无实现的「转后台」按键。它被默认关闭的实验开关挡着，所以没人撞见——这正是它能活下来的原因 |
 
 ## 5. 结果判定与失败分类
 
