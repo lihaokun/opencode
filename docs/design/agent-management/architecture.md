@@ -1016,6 +1016,23 @@ Rely-Guarantee 条件：
     `requireSession` 只是一次查找。同一 project 内的 Agent 树共享 instance，目标场景不受影响；
     拿到别的 workspace 的 session_id 时行为未定义，实现阶段应显式拒绝而非静默跑错 instance。
 
+### 实现阶段未自动化覆盖的三项
+
+以下三条按设计成立，但**没有自动化测试**，只靠代码审读保证。列出来是为了让它们可见，
+而不是留一个"全绿"的错觉。每条都附了为什么不写测试。
+
+1. **`cwd` 不获得自动权限放行**。`prepareWorkdir` 的 `provided_cwd` 分支只记录路径，
+   不建目录也不加任何权限规则（`agent-management/workdir.ts:29-33`）。若为模型给的路径自动放行
+   `external_directory`，模型就能用 `agent(cwd: <任意目录>)` 把一个本该由用户裁决的决定
+   变成自己能下的决定。现有测试只能断言"返回 provided_cwd 且没创建目录"；
+   要证明"没有放行"得跑起子 Agent 去访问越界目录并断言权限被问，需要串起权限系统、
+   工具执行与 instance 边界，成本远超这三行无写入代码的价值。
+2. **任一结局都不自动删除工作目录**。V1 根本没有清理代码路径，没有可测的行为——
+   能测的只有"某个不存在的东西没被调用"。累积本身已记为缺口 7。
+3. **三层 permission/question 的回复路由端到端**。闭包计算有 `collectSubtree` 的五条测试钉着
+   （含"数据成环也必然终止"），但"用户的回复真的到达 B"需要跑起 TUI。
+   路由本身走既有的 `request.sessionID`，本 feature 未改动它。
+
 ## 11. 下一阶段
 
 架构确认后进入 §4.3 细化阶段，更新 `detailed-design.md`，需满足 §4.3.1 完整性 6 条与
