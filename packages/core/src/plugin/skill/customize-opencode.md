@@ -305,6 +305,13 @@ The default is 3. Set it to 0 to stop agents launching agents at all. At the
 limit the launching and stopping tools are simply not offered, rather than
 offered and then refused.
 
+`opencode run` is one-shot, and it waits: once the main turn ends it stays open
+while any subagent it launched is still working, because that subagent's result
+comes back as a message the session still has to answer. The wait is capped at
+10 minutes of continuous idleness so a stuck subagent cannot hold the process
+open; on timeout the run stops what is still running, reports it, and exits
+non-zero. `OPENCODE_RUN_AGENT_WAIT_MS` changes the cap, and `0` removes it.
+
 Each subagent is given its own working directory — a real git worktree in a git
 project — and told to work in it, which is what lets several run at once without
 overwriting each other. It is a convention rather than a sandbox: a subagent can

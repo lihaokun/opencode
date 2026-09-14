@@ -35,4 +35,4 @@ tsconfig.tsbuildinfo
 
 # Agent workspaces. The product registers these in .git/info/exclude, which is
 # per-clone; this repo's own tests exercise the feature, so track the ignore too.
-.opencode/worktrees/
+**/.opencode/worktrees/

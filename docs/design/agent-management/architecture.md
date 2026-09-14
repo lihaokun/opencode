@@ -792,6 +792,7 @@ return yield* loop({ sessionID: input.sessionID })
 | **TUI 权限聚合改为整棵后代** | `tui/src/routes/session/index.tsx:208-213` 的 `children()` 只有一层，`:229-235` 对任何带 `parentID` 的 Session 直接 `return []`。深度 1 时二者等价；提到 3 之后 P → A → B 中 B 的 permission/question 在根视图看不到、在 A 的视图也不显示，**该 Agent 永久挂起**。必要连带项，不是可选项 |
 | 不设 `agent_get` | CC 只有 `ListAgents` 且每行自带 busy/idle；`TaskOutput` 已废弃 |
 | 一个 Agent 任一时刻至多一个活动执行 | 这是 `session_id` 足以作唯一标识的前提。机制由 I3 维护 |
+| **一次性运行在退出前排空自己启动的 Agent** | `opencode run` 跑完一个回合就退出，而委托的结果是**以通知形式回到父的对话里、父再据此回应**的——回合结束就走，等于委托白做，还留下半截工作树和跑了一半的子 Agent。老的前台路径靠阻塞天然避开了这件事。Claude Code 对 `claude -p` 的处理与此一致且更细：后台 **Bash** 任务在最终结果返回约 5 秒后被终止（dev server 不该吊住进程），而后台 **subagent 或 workflow** 则「stays open until that work completes, because its result is part of the final output」；等待以**连续空闲**计时，默认 10 分钟封顶，超时则停掉仍在跑的并丢弃部分结果，`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` 可调、设 0 不设限。本方案照此：根 Session 转 idle 时若树内仍有成员在跑则不退出，任何成员重新开工则重置计时；上限 `OPENCODE_RUN_AGENT_WAIT_MS`（默认 10 分钟，0 = 不设限），超时中止并以非零退出码如实报告。**放在 CLI 而非 `runLoop`**：放 loop 会让父在子跑着时一直 busy，交互模式下那是错的——你要父空闲好让用户继续打字，那正是异步委托的意义 |
 | 不引入 correlation ID、per-message output 槽或 `run_id` | `agent_send` 根本不产生结局，自然无需为消息编号 |
 
 ## 7. 架构正确性论证

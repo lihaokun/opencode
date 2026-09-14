@@ -1029,3 +1029,74 @@ describe("opencode run (non-interactive subprocess)", () => {
     TEST_TIMEOUT_MS,
   )
 })
+
+describe("opencode run waits for the agents it started", () => {
+  // A one-shot run that leaves while a subagent is still working throws away
+  // the delegation: the agent's result comes back as a message that wakes the
+  // session again, and that reply is part of this run's output.
+  cliIt.concurrent(
+    "stays open until a subagent finishes and reports what it said",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const parentPrompt = "delegate the lookup"
+        const childPrompt = "find the thing"
+        const finding = "the thing is in src/auth.ts"
+
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, parentPrompt),
+          reply().tool("agent", {
+            description: "look it up",
+            prompt: childPrompt,
+            subagent_type: "general",
+          }),
+        )
+        yield* llm.pushMatch(({ body }) => hasUserText(body, childPrompt), reply().text(finding).stop())
+        yield* llm.pushMatch(
+          ({ body }) => JSON.stringify(body).includes(finding),
+          reply().text("the subagent reported back").stop(),
+        )
+
+        const result = yield* opencode.run(parentPrompt, {
+          extraArgs: ["--dangerously-skip-permissions"],
+        })
+
+        opencode.expectExit(result, 0)
+        // Reaching this reply at all proves the run did not exit when the
+        // parent's first turn ended.
+        expect(result.stdout).toContain("the subagent reported back")
+      }),
+    TEST_TIMEOUT_MS,
+  )
+
+  cliIt.concurrent(
+    "gives up on a stuck subagent instead of hanging, and says so",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const parentPrompt = "delegate something that will hang"
+
+        const childPrompt = "never finish"
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, parentPrompt),
+          reply().tool("agent", {
+            description: "hang",
+            prompt: childPrompt,
+            subagent_type: "general",
+          }),
+        )
+        // Only the child hangs. The parent has to finish its turn, or it would
+        // be the parent holding the run open and the ceiling would never start.
+        yield* llm.pushMatch(({ body }) => hasUserText(body, childPrompt), reply().hang())
+        yield* llm.push(reply().text("started it").stop())
+
+        const result = yield* opencode.run(parentPrompt, {
+          // A ceiling this small turns "waits forever" into a fast assertion.
+          env: { OPENCODE_RUN_AGENT_WAIT_MS: "1500" },
+          extraArgs: ["--dangerously-skip-permissions"],
+        })
+
+        expect(result.exitCode).not.toBe(0)
+        expect(result.stderr).toContain("Gave up waiting for agents")
+      }),
+    TEST_TIMEOUT_MS,
+  )
+})
