@@ -1001,10 +1001,13 @@ Rely-Guarantee 条件：
    本仓已把 `**/.opencode/worktrees/` 加进 `.gitignore`（产品侧写的是 `info/exclude`，那是 per-clone 的，
    挡不住别的 clone 和 CI；注意模式要用 `**/` 前缀，中间带斜杠的模式会被锚定到仓库根，
    挡不住 `packages/*/.opencode/`）。测试若要触发 git 分支，必须确保 instance 真在 tmpdir 里。
-   **一处待查**：`test/lib/cli-process.ts` 的 harness 以 `cwd: <tmpdir>` spawn 子进程，但 `opencode run`
-   在里面建出的是**本仓的** git worktree（落在 `packages/opencode/.opencode/worktrees/`）——
-   说明 project 解析没跟着 spawn 的 cwd 走。只有证据没有定论，凡是往项目相对路径写东西的测试都可能受影响，
-   值得单独查一次。
+   **已查明并修复**：`test/lib/cli-process.ts` 的 harness 以 `cwd: <tmpdir>` spawn，但
+   `cli/cmd/run.ts:333` 解析项目用的是 `process.env.PWD ?? process.cwd()`——`PWD` 优先，
+   而 harness 只设了 `HOME` / `XDG_*` / `OPENCODE_TEST_HOME`，`PWD` 整个从父测试进程继承，
+   指向 `packages/opencode`。于是子进程实际 cwd 在 tmpdir、认的项目却是本仓，
+   凡是往项目相对路径写的东西（工作树、`.opencode/`、plan、snapshot）都落进仓库。
+   与隔离强弱无关：即使隔离是强制的，认错项目照样会写进仓库。
+   修法是让 `PWD` 跟着每个 spawn 的 `cwd` 走。
 8. **进程崩溃后工作目录成为孤儿**。无回收机制。
 9. **非 Git 项目的工作目录是空的**。不自动复制项目文件；Agent 若整目录复制须排除
    `.opencode/worktrees` 以免递归复制自身。
