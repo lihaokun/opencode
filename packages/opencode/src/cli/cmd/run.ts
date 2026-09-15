@@ -723,15 +723,6 @@ export const RunCommand = effectCmd({
             ceiling = undefined
           }
 
-          // Restarts the clock, and is called on every sign of life from a
-          // tracked session — that is what "continuous idleness" means. Note
-          // that being busy is *not* a reason to stop it: a child stuck in busy
-          // produces no events at all, so stopping the clock while anything was
-          // busy is precisely what let it hold the process open forever.
-          const noteActivity = () => {
-            if (rootIdle) startWaiting()
-          }
-
           const startWaiting = () => {
             stopWaiting()
             if (ceilingMs === 0) return
@@ -742,6 +733,15 @@ export const RunCommand = effectCmd({
               // started.
               void client.session.abort({ sessionID }).catch(() => {})
             }, ceilingMs)
+          }
+
+          // Restarts the clock, and is called on every sign of life from a
+          // tracked session — that is what "continuous idleness" means. Note
+          // that being busy is *not* a reason to stop it: a child stuck in busy
+          // produces no events at all, so stopping the clock while anything was
+          // busy is precisely what let it hold the process open forever.
+          const noteActivity = () => {
+            if (rootIdle) startWaiting()
           }
 
           for await (const event of events.stream) {
