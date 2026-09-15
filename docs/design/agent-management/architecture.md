@@ -1,9 +1,13 @@
 # 架构设计 — agent-management
 
-- 状态：架构阶段，**等待再次确认**。2026-09-14 最终评审后第三次实质修订：`agent_send` 改为 fork 投递
+- 状态：架构阶段，**已确认**。2026-09-14 最终评审后第三次实质修订：`agent_send` 改为 fork 投递
   且 `Accepted` 降为 HTTP 204 强度（删除 I2）；`task` 工具删除而非隐藏；实例名降为弱别名
   （删除 I4、H3）；`agent_stop` 删除状态审计且只发一条向上通知（删除 I1）；
   新增子 Agent 列表 reminder；工具可见性移到工具列表生成期。
+- 2026-09-16 第四次实质修订（依据 `docs/fixes/agent-management-fix-pr35-review.md`，经五轮复审）：
+  跨 directory 投递**可路由**（原"做不到"的判断有误，缺口 12 删除）；legacy `task` 权限改为
+  **原地改名**；roster 改为**边沿触发、回合边界投递**并如实记录其增长；新增**兄弟快照**；
+  `startDelegation` 增内部 `notify`；`AgentPromptOps` 增 `deliverAsync`。
 - 工具表面：四个（调研 §12 撤销 `agent_get`；§13 把恢复统一交给 `agent_send`）
 - 日期：2026-09-04，末次修订 2026-09-14
 - 对应问题：[lihaokun/opencode#23](https://github.com/lihaokun/opencode/issues/23)
@@ -61,8 +65,14 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
 `SessionRunState.cancel`——不预读状态、不分类。**只有 `target` 发一条 `cancelled` 通知给 `caller`**；
 递归取消的后代不发任何通知（它们的父都在停止集内，自己也在被停，没有在等的主体）。
 
-**上下文注入**：每轮比较当前直接子列表与可见历史中最近一条 roster，**变化时落盘一条**。
-它补上"后代被停但父没被通知"所丢的信息，并使被 issue #32 吞掉的完成通知降级为一轮延迟。
+**上下文注入**：两条独立机制。
+
+- **roster（面向父）**：在**回合边界**（`idle→running`，或刚压缩过）渲染当前直接子列表，
+  与可见历史中最近一条比较，**不同才落盘一条**——边沿触发、回合边界投递。
+  它补上"后代被停但父没被通知"所丢的信息，并使被 issue #32 吞掉的完成通知降级为一轮延迟。
+- **兄弟快照（面向子）**：新建子 D 时在其初始 prompt 中一次性列出 `{C} ∪ (children(C) \ {D})`
+  （C 为调用者），只含 `session_id` 与 name、**不含状态**，明写是启动时快照。
+  没有它，新建的子连自己有父都不知道，想回话必须先调 `agent_list`。
 
 ## 3. 核心数据结构
 
@@ -230,7 +240,13 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
 
     sender_name 缺省时省略该段；**回复说明恒用 session_id，不用 name**——
     session_id 在任何解析范围下都可用、且不会歧义，而 name 是弱别名
-  - 调用方无法覆盖或伪造前缀（调研 §5.3）
+  - **调用方无法覆盖或伪造前缀，对前缀内的每一个插值字段都成立**（调研 §5.3）。
+    `sender_name` / `sender_agent` 由模型提供，是不可信输入：渲染时对全部插值字段做
+    **编码式转义**——先编码 `\`，再编码 `\r` `\n` `\t` 与 `[` `]`。
+    先编码反斜杠是单射性的前提：否则真实换行编码成 `\n` 后会与字面输入 `\n` 碰撞，
+    两个不同的 Agent 名字从此不可区分。**编码而非剥离**，剥离会让 `a<换行>b` 与 `ab` 同形。
+    后置条件：首行不含 CR/LF。**不对 body 的内容作任何限制**——body 允许包含
+    形如 `[Agent message from …` 的文本，边界由"前缀字段不可终结首行"保证，而非由全文扫描保证
   - 本结构**只服务 `agent_send` 与停止通知**：新 Agent 的初始任务不经它（见 §4.4）
 
 生命周期：创建于 M3 deliver；不可变；随 Session 历史存续
@@ -368,6 +384,8 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
   - 每项含 session_id、name（若有）、agent_type、status
   - 无直接子时不产出本结构（不注入任何内容）
   - 带一个固定前缀行作为识别标记，使下一轮能在历史中定位最近一条
+  - 首行措辞明示为**时点快照**（`Your subagents at this point:`）：历史中会留下若干条过期的
+    roster，权威来源始终是 `agent_list`。这与 transcript 中其他随时间失效的事实同性质
 
 跨模块共享性：跨模块共享 — producer: M5 AgentTools；consumer: 既有 SessionReminders 注入点
 ```
@@ -449,7 +467,11 @@ Claude Code 的 `ListAgents` 同样只给 busy / idle。本模块**不读 `Backg
 后置条件（Ensures）：
   - 消息携带的 agent / model / variant **显式取自目标 Session 当前持久化的值**，不取自调用者，
     也不省略（理由见下）
-  - 投递调用被 **fork** 出去，本模块不等待它完成
+  - 投递经 `AgentPromptOps.deliverAsync(input: SessionPrompt.PromptInput)` —— **含目标 Session
+    路由的完整异步投递入口**，与 HTTP `prompt_async` handler 共用同一实现。
+    本模块**不自建** fork：只取 `prompt()` 而自己 fork 会丢掉路由那一半，
+    导致目标在**发送方的 Instance** 里执行（见 §10 的跨 directory 条目）
+  - 投递调用被 **fork** 出去（由 `deliverAsync` 负责），本模块不等待它完成
   - 返回 Accepted —— 其强度见 §3：已接受 / 已调度，**不保证已持久化或将被处理**
   - 目标的 running / idle 由现有异步入口与 Session Runner 处理，
     **本模块不判断目标状态，也不手工启动执行**
@@ -540,6 +562,17 @@ return yield* loop({ sessionID: input.sessionID })
 
 **后代不通知丢的信息由 roster 补**：父被唤回时，下一轮 §4.5 的 roster 就显示子已 idle。
 
+**内部契约 `notify`（不对模型暴露）**：`startDelegation` 取一个**显式**参数 `notify: boolean`，
+默认 `true`。`false` 时不注册 completed/error watcher，由调用方自行 `background.wait` 同一个 job。
+唯一使用者是 command-subtask（`/review` 一类）：它需要子的最终结果才能继续，
+经 `Tool.Context.extra` 按调用传入，作用域恰好是那一次 `execute`。
+
+**必须是显式参数，不能是 Effect Context 值**：`BackgroundJob` 用 `Effect.forkIn` 起 job fiber，
+forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子的执行 fiber 传遍整棵子树——
+子再建孙时孙也读到 `false`，**孙完成后不通知子**。一个只该管本次委托的开关不得有子树作用域。
+
+**模型可见的 `agent` 工具恒为异步**，不因此获得任何等待语义或 `background` 参数（调研 §12 已否决）。
+
 **为什么不预读状态**：`session/run-state.ts:77-86` 的 `cancel` 对无 runner 的 Session 是
 成功空操作，事后分不出"本来在跑、现已取消"与"本来就 idle"。而**先读再取消同样测不准**——
 读到 running 之后、cancel 之前目标可能自行结束。与其假装测得准，不如不报告这个维度。
@@ -622,8 +655,13 @@ return yield* loop({ sessionID: input.sessionID })
   - `agent` 经 `ctx.ask({ permission: "agent", patterns: [subagent_type], always: ["*"] })` 求值；
     默认 `*: allow` 使其不弹窗，但 deny 与显式 ask 仍生效
   - agent_list / agent_send / agent_stop 不新增逐次确认
-  - **roster 注入**：每轮渲染当前直接子列表，与可见历史中最近一条 roster 比较，
-    不同或不存在则**落盘**一条；无直接子则不注入
+  - **roster 注入（面向父）**：在**回合边界**求值——命中"最后一条 user message 之后尚无
+    assistant message"（即 `idle→running`）或"可见历史含 compaction part 且其后无 roster"；
+    命中后渲染当前直接子列表，与可见历史中最近一条比较，不同或不存在则**落盘**一条。
+    无直接子不注入；调用者 `agent_list` 为 deny 不注入
+  - **兄弟快照注入（面向子）**：`M4.create` 组装初始 prompt 时一次性插入，
+    集合为 `{C} ∪ (children(C) \ {D})`（C 为调用者、D 为新子），只含 `session_id` 与 name、
+    **不含状态**，明写为启动时快照。受 **D 自己的** `agent_list` 权限约束
 
 不变式（Invariants）：
   - 权限判定先于任何副作用；判定失败的调用不写入任何消息、不中断任何执行
@@ -752,12 +790,12 @@ return yield* loop({ sessionID: input.sessionID })
 | `agent_send` 是消息，不是调用 | 不自动回复、不承诺结果、不建 BackgroundJob、不注册 watcher，调用方只收 `accepted`。一条消息的"结局"在语义上不存在——接收方可能只是把它读进上下文继续原任务 |
 | **投递必须 fork，不能 await `prompt()`** | `prompt.ts:1069-1070` 在 `noReply !== true` 时 `return yield* loop(...)`，直接 await 会阻塞到目标整轮结束，把单向消息变成 RPC。`noReply: true` 也不行——只落库不跑 loop，idle 目标永不启动。照 HTTP handler：`prompt(...).pipe(catchCause(...), forkIn(scope, {startImmediately: true}))`，**且必须在 fork 内 catch** |
 | **`Accepted` 只有 HTTP 204 的强度** | 承上：异步性在 fork 里，调用方返回时消息未必已落库。原 I2「Accepted ⇒ 已持久化」及一切依赖它的论证删除。代价：fork 内失败只发 `Session.Event.Error`，模型拿不到投递失败反馈（§10 缺口 5） |
-| **V1 没有按 Session 的 workspace 路由** | `requireSession` 只有 `session.get(sessionID)`，instance 由 HTTP 请求自己路由，不是按目标 session 选的。跨 workspace 的 `agent_send` 在 V1 **做不到**，如实记为限制（§10 缺口 12），不记为"已由 prompt_async 解决"。同一 project 内的 Agent 树共享 instance，目标场景不受影响 |
+| **投递必须经含路由的完整入口** | 前一版据 `requireSession` 断言"V1 没有按 Session 的 workspace 路由"，**该判断是错的**：路由在 `middleware/workspace-routing.ts:222-232` —— 先按 URL 中的 sessionID 查出 Session，再由 `planRequest` 用 `session.workspaceID` / `session.directory` 规划目标 Instance。一个 handler 内的函数不能证明一整层不存在。故本 server 内的**跨 directory 投递做得到**，做法是 `AgentPromptOps.deliverAsync` 取完整 `PromptInput`，由它与 HTTP handler 共用同一实现。**寻址范围是当前 server 的 Session 命名空间**：`Session.get` 是本机 DB 的主键查询，其他 server 的 Session 本就不在表内，查不到即 `AgentNotFound`，不为此新增分支或错误类型 |
 | 只有 `agent` 的初始委托保留自动结局 | 初始委托是创建者交出去的一项任务，有明确完成含义。产生一处**不对称并需明说**：`agent` 自动回结果，`agent_send` 永不回 |
 | **通知强度只到"至多发起一次"** | 可保证：一个初始委托只注册一个 watcher，completed/error 时至多发起一次异步通知。不可保证：父恰好收到、消息必落库、必被消费。cancelled 同强度 |
 | 消息身份取自目标 Session 且必须显式传 | `createUserMessage` 的优先级是 `input.model ?? agent 定义 model ?? Session 当前 model`，不传 `agent` 回落默认 agent，且结果经 `setAgentModel` 落库。**同一规则覆盖三处**：`agent_send`、初始委托 completed/error 的 `inject`（投递时**重新读**父的当前身份，父可能在子运行期间换过模型）、以及新建子 Session 时就持久化已解析身份 |
 | **`task` 工具删除，不保留隐藏别名** | 推翻调研 §8。运行时 tool ID 只剩 `agent`；配置键迁移与历史展示兼容保留。代价是连带迁移：`registry.ts:268` 的 subagent type 过滤、内置 Agent allowlist、prompt 里的 agent part 判断与模型提示，以及 TUI/app/CLI 中约十余处按 `part.tool === "task"` 分支的渲染器——不迁移则 subagent 显示静默消失 |
-| 旧 `task` 权限配置读取时一次性规范化为 `agent` | 不能静默忽略：`task: deny` 升级后变成允许即是权限放宽。先转换旧 `task`、再覆盖显式 `agent`，同 pattern 冲突时 `agent` 胜；运行时只判 `agent`。够用的依据：`session/tools.ts:87` 合并的是 `merge(agent.permission, session.permission)`，用户配置进的是 `agent.permission` 而它**每次运行都从 config 重新派生** |
+| 旧 `task` 权限配置读取时**原地改名**为 `agent` | 不能静默忽略：`task: deny` 升级后变成允许即是权限放宽。**必须原地改名，不能"先转换再覆盖"**——`Permission.evaluate` 用 `findLast`，规则集是**有序**结构，位置即语义；把 legacy 规则移到显式 `agent` 规则之前，会同时改变它与**通配规则**的相对位置。实测反例：`{task:"allow", "*":"deny", agent:{reviewer:"allow"}}` 迁移后 `evaluate("agent","someone")` 由 **deny 变 allow**。原地改名使**规则集的序逐位不变**，迁移退化为纯 key 重命名，"不扩大权限"由此成为结构性质而非需论证的结论；仅当存在**完全相同 pattern** 的显式 `agent` 规则时抑制该条 legacy 规则。够用的依据：`session/tools.ts:87` 合并的是 `merge(agent.permission, session.permission)`，用户配置进的是 `agent.permission` 而它**每次运行都从 config 重新派生** |
 | 持久化 Session 的 `task` 规则不作运行时映射 | 系统生成的与用户意图的同名规则形状完全相同，无法区分；而根 Session 的 `permission` 默认 `undefined`，配置里的 deny 并不进入 session ruleset。暴露面窄，记为 §10 缺口 10 |
 | **`deriveSubagentSessionPermission` 必须改：不再默认拒绝嵌套** | `permission/index.ts:28` 的 `evaluate` 用 `findLast`，合并顺序使 **session ruleset 压过 agent 定义**；而 `subagent-permissions.ts` 给每个子追加 `task: * deny`。仍发字面 `task` ⇒ 规则变死码、agent 定义级 opt-out 静默失效；移植成 `agent: * deny` ⇒ **每个子都被拒绝 `agent`，深度 3 一次都跑不起来**。正确改法：嵌套上限改由深度计数 + 工具可见性承担，`canTask` 改查 `agent` 键且不再默认追加 deny |
 | 移除 `childToolDenies` 对 `agent` 的默认拒绝 | 与上一条相互独立的第一道闸，须同改 |
@@ -770,6 +808,8 @@ return yield* loop({ sessionID: input.sessionID })
 | **子 Agent 列表作为落盘 reminder 注入** | 补上"后代被停但父没被通知"所丢的信息，并使被 #32 吞掉的完成通知从无声挂起降级为一轮延迟 |
 | **roster 必须落盘，不能每轮内存重建** | 非落盘那种会**改写一条已经发出去的消息**：reminder 挂在最后一条 user message 上，同轮多个 step 里那条消息不变，step 1 发 `userMsg + roster_v1`、step 2 重建成 `roster_v2`，前缀对不上 ⇒ **从那条消息往后的缓存全部失效**，包括 step 1 产生的全部 assistant 与 tool 消息。落盘的 part 有稳定 id、字节级稳定；落盘之后"只出现一次"即成立 |
 | roster 的判据基于**已过滤**的可见历史 | `filterCompacted` 把边界前的消息换成 summary，边界前的 roster 不再进请求；而 reminder 阶段拿到的本就是过滤后的视图。于是压缩后"倒找不到" ⇒ 自动重发。**首次派生、状态翻转、压缩之后三种情况走同一条规则，无需特判** |
+| **roster 边沿触发、回合边界投递** | 判据是 `idle→running`（最后一条 user 之后尚无 assistant）或刚压缩过。**它比"只在异常恢复时注入"宽**——普通新回合同样命中，这是明确的取舍而非疏漏：收敛靠内容去重，实际语义为"子的整体状态自上次告知以来变化时，在下一个回合边界告知一次"。好处是覆盖更广（子悄悄转 idle 而通知未达也会被纠正）且**无需枚举失效原因**——任何导致父停止又恢复的原因，其恢复动作必然表现为一次 `idle→running`。代价如实记录：**注入次数与被观察到的状态变化数线性相关，Session 生命周期内无固定上界**（同一子可经 `agent_send` 反复 resume），旧快照靠压缩折叠。不删旧表——那要改写历史消息，会从该点起废掉整段缓存 |
+| **兄弟快照面向子、启动时一次、不含状态** | 新建的子不知道自己有父，想回话必须先调 `agent_list`。集合是 `{C} ∪ (children(C) \ {D})`，即**新子视角下的父与兄弟**（不是调用者的父与兄弟——那是新子的祖父与叔伯）。权限判据取**接收方**：`agent_list` 被 deny 的用意就是"这个子不该知道别的 Agent 存在"，换条投递路径绕过去等于在权限表面开后门。CC 的同名机制亦按接收方决定——其文档载明 roster "appears only when the subagent's tools include `SendMessage`" |
 | roster 只列直接子、只在有子时注入、渲染成一行 | 父与兄弟与本 Agent 的决策关系不大，`agent_list` 随时可查；绝大多数 subagent 没有子，一个字都不加 |
 | 停止级联到整棵子树 | 避免"停了父、子变孤儿继续消耗"；是否改为只停目标本身列为 follow-up（issue #26） |
 | **创建不返回实时 status** | 在 BackgroundJob 启动后硬编码 `running` 与"status 唯一来自 `SessionStatus`"冲突。创建只表达"已创建并启动"；完整 `AgentInfo.status` 只在 `agent_list` 装配 |
@@ -792,7 +832,7 @@ return yield* loop({ sessionID: input.sessionID })
 | **TUI 权限聚合改为整棵后代** | `tui/src/routes/session/index.tsx:208-213` 的 `children()` 只有一层，`:229-235` 对任何带 `parentID` 的 Session 直接 `return []`。深度 1 时二者等价；提到 3 之后 P → A → B 中 B 的 permission/question 在根视图看不到、在 A 的视图也不显示，**该 Agent 永久挂起**。必要连带项，不是可选项 |
 | 不设 `agent_get` | CC 只有 `ListAgents` 且每行自带 busy/idle；`TaskOutput` 已废弃 |
 | 一个 Agent 任一时刻至多一个活动执行 | 这是 `session_id` 足以作唯一标识的前提。机制由 I3 维护 |
-| **一次性运行在退出前排空自己启动的 Agent** | `opencode run` 跑完一个回合就退出，而委托的结果是**以通知形式回到父的对话里、父再据此回应**的——回合结束就走，等于委托白做，还留下半截工作树和跑了一半的子 Agent。老的前台路径靠阻塞天然避开了这件事。Claude Code 对 `claude -p` 的处理与此一致且更细：后台 **Bash** 任务在最终结果返回约 5 秒后被终止（dev server 不该吊住进程），而后台 **subagent 或 workflow** 则「stays open until that work completes, because its result is part of the final output」；等待以**连续空闲**计时，默认 10 分钟封顶，超时则停掉仍在跑的并丢弃部分结果，`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` 可调、设 0 不设限。本方案照此：根 Session 转 idle 时若树内仍有成员在跑则不退出，任何成员重新开工则重置计时；上限 `OPENCODE_RUN_AGENT_WAIT_MS`（默认 10 分钟，0 = 不设限），超时中止并以非零退出码如实报告。**放在 CLI 而非 `runLoop`**：放 loop 会让父在子跑着时一直 busy，交互模式下那是错的——你要父空闲好让用户继续打字，那正是异步委托的意义 |
+| **一次性运行在退出前排空自己启动的 Agent** | `opencode run` 跑完一个回合就退出，而委托的结果是**以通知形式回到父的对话里、父再据此回应**的——回合结束就走，等于委托白做，还留下半截工作树和跑了一半的子 Agent。老的前台路径靠阻塞天然避开了这件事。Claude Code 对 `claude -p` 的处理与此一致且更细：后台 **Bash** 任务在最终结果返回约 5 秒后被终止（dev server 不该吊住进程），而后台 **subagent 或 workflow** 则「stays open until that work completes, because its result is part of the final output」；等待以**连续空闲**计时，默认 10 分钟封顶，超时则停掉仍在跑的并丢弃部分结果，`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` 可调、设 0 不设限。本方案照此：根 Session 转 idle 时若树内仍有成员在跑则不退出，任何成员重新开工则重置计时；上限 `OPENCODE_RUN_AGENT_WAIT_MS`（默认 10 分钟，0 = 不设限），超时中止并以非零退出码如实报告。**计入"活动"的事件**为被跟踪 Session 的 `session.created` / `session.status` / `message.updated` / `message.part.updated`——"重置"而非"清除"：忙碌本身不是停表的理由，只有活动才重新计时，否则卡死在 busy 的子恰好豁免上限。**正常退出只由 root 自己的 idle 事件驱动**：结算顺序是 child Runner 先发 idle（`effect/runner.ts` 的 `finishRun` 里 `yield* idle` 排在 `complete(done, exit)` 之前）、prompt 才返回、job 才 settle、watcher 才投递，故 child idle 到达时结果尚在路上，据其退出必然丢结果；通知丢失的情形由上限兜底，不由提前退出兜底。**放在 CLI 而非 `runLoop`**：放 loop 会让父在子跑着时一直 busy，交互模式下那是错的——你要父空闲好让用户继续打字，那正是异步委托的意义 |
 | 不引入 correlation ID、per-message output 槽或 `run_id` | `agent_send` 根本不产生结局，自然无需为消息编号 |
 
 ## 7. 架构正确性论证
@@ -969,8 +1009,9 @@ Rely-Guarantee 条件：
 | 模型选择 | `Agent` 有 `model` 参数 | 无，继承创建者当次的 model 与 variant | 首版不做 |
 | 停止范围与通知 | `TaskStop` 按 id 停一个后台任务，文档未述子树级联 | 级联整棵子树，**但只向发起者发一条通知** | 防止孤儿继续消耗；只通知集外的发起者使复活路径不存在。备选见 issue #26 |
 | roster 范围 | `ListAgents` 跨 in-process subagent、teammate、本机其他会话、云端会话 | 仅调用者所在的一棵 Agent 树，且只到邻居 | 调研 §6 明确排除跨互不相关根 Session 的编排 |
-| **跨 workspace 通信** | `ListAgents` 可寻址本机其他会话与云端会话 | **做不到** | V1 的 HTTP 层没有按目标 Session 选 instance 的路由（§10 缺口 12） |
-| **子列表注入上下文** | 未述 | 有，落盘 reminder，变化时发一条 | 补"后代被停不通知"所丢的信息，并缓解 #32 |
+| **跨 directory 通信** | `ListAgents` 可寻址本机其他会话与云端会话 | **本 server 内跨 directory 支持**；不跨 server | 寻址范围是当前 server 的 Session 命名空间；投递经 `deliverAsync` 切到目标 Instance。其他 server 的 Session 不在本机 DB 内，查不到即 `AgentNotFound` |
+| **子列表注入上下文（面向父）** | **没有**：三方证据显示 CC 不持续注入运行中列表——文档中唯一的 roster 面向子、不含状态；逆向分析枚举的五类 system reminder 无 subagent 状态类 | 有，落盘 reminder，边沿触发、回合边界投递 | CC 的父一路醒着、transcript 始终可靠；我们多出一条 CC 不存在的路径——父被单方面取消后又被唤回，此时 transcript 给出**错误**结论而非仅仅"不知道"。这是有意增强 |
+| **兄弟快照（面向子）** | 有：启动时快照，只列 named agent，不含状态，且仅在子自己具备 `SendMessage` 时出现 | 同形：启动时一次、`{C} ∪ (children(C) \ {D})`、不含状态、受接收方 `agent_list` 约束 | 照搬 CC 语义，含"按接收方能力决定是否给"这一条 |
 | 工作目录隔离强度 | 四项主动检查 | 建议式：准备目录并在初始消息中要求使用，但运行时默认 cwd 未切换 | 强制需要按 Session 可判定的文件系统根，V1 无此轴；见 issue #33 |
 | 工作树基准 | 默认远端默认分支，可设 `head` | 恒为父建议工作目录的 HEAD | 子 Agent 需在父的进行中工作上操作，此为 CC 自己给的 `head` 适用场景 |
 | gitignored 文件带入 | `.worktreeinclude` | 首版不做 | 该机制在 opencode 中不存在 |
@@ -1015,10 +1056,6 @@ Rely-Guarantee 条件：
     再派生子 Agent 的情形。
 11. **重名不可恢复**。两个并发创建产生同名后，二者从此只能用 `session_id` 寻址；
     本 feature 不提供改名。
-12. **跨 workspace 的 `agent_send` 做不到**。V1 的 HTTP 层没有按目标 Session 选 instance 的路由，
-    `requireSession` 只是一次查找。同一 project 内的 Agent 树共享 instance，目标场景不受影响；
-    拿到别的 workspace 的 session_id 时行为未定义，实现阶段应显式拒绝而非静默跑错 instance。
-
 ### 实现阶段未自动化覆盖的三项
 
 以下三条按设计成立，但**没有自动化测试**，只靠代码审读保证。列出来是为了让它们可见，

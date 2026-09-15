@@ -1,9 +1,9 @@
 # 细化设计 — agent-management
 
-- 状态：细化阶段，**等待确认**。2026-09-14 随架构第三次重写：投递改 fork、停止删审计只发一条、
+- 状态：细化阶段，**已确认**。2026-09-16 随架构第四次修订同步（见 `docs/fixes/agent-management-fix-pr35-review.md`）。2026-09-14 随架构第三次重写：投递改 fork、停止删审计只发一条、
   名称降弱别名、`task` 工具删除、新增 roster 注入、工具可见性移到工具列表生成期。
 - 日期：2026-09-06，末次修订 2026-09-14
-- 上游依据：`docs/design/agent-management/architecture.md`（**等待再次确认**，本细化随其一同过闸）
+- 上游依据：`docs/design/agent-management/architecture.md`（**已确认**）
 - 代码基线：`dev` @ `a4293ca229`
 
 ## 1. 范围
@@ -274,14 +274,41 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   - `name` 缺省时把括号内折叠为 `<agent_type>` 一种形态。
   - **回复说明恒用 `sender` 的 session_id，不用 name**：name 是弱别名，可能重名或不存在；
     session_id 在任何解析范围下都可用且唯一。
-  - 各字段由 M5 从调用上下文填入，不取自模型入参，故无伪造路径。
-- **正确性论证**：trivial —— 纯拼接，唯一分支是 `name` 是否存在，两支均已刻画。
+  - **转义（安全关键，非 trivial）**：`name` 与 `agent_type` 虽由 M5 从调用上下文填入，
+    但其**值本身源自模型**（创建时的 `name` / `subagent_type`），是不可信输入。
+    渲染时对**全部插值字段**做编码式转义，顺序固定：
+
+    ```
+    1. \  → \\        ← 必须第一步
+    2. \r → \r
+    3. \n → \n
+    4. \t → \t
+    5. [  → \[      ]  → \]
+    ```
+
+    **先编码反斜杠是单射性的前提**：否则真实换行编码成 `\n` 后与字面输入 `\n` 碰撞，
+    `[` 与字面 `\[` 同理，两个不同的名字渲染成同一个串。
+    **编码而非剥离**：剥离让 `a<换行>b` 与 `ab` 同形，同样丢失单射性。
+  - **回复说明恒用 `sender` 的 session_id**（见上），故该字段不是模型可控的。
+- **正确性论证**：
+  - 分支：`name` 是否存在（两支已刻画）× 各字段是否含需转义字符。
+  - 单射性：转义表是前缀无歧义的，且反斜杠先行，故 `escape` 是单射 ⇒
+    两个不同的 `name` 不可能渲染出同一首行。
+  - 后置条件（可直接断言）：**首行不含 CR/LF**，即首行不可被终结、不可被伪造出第二个消息头。
+  - **不对 `body` 作任何断言**：body 允许包含形如 `[Agent message from …` 的文本
+    （既有测试正是故意如此）。边界由"前缀字段不可终结首行"保证，不由全文扫描保证——
+    后者会把合法的 body 判为违规。
 
 #### 5.3.2 `deliver(message: AgentMessage) -> Effect<Accepted, AgentNotFound | SelfDelivery>`
 
 - **功能描述**：以目标 Session 自身的身份**fork 进**普通异步消息入口。
 - **调用关系**：callers: M5 `agent_send`、M4 `stop`（一条取消通知）；
-  callees: `Session.get`、`SessionPrompt.prompt`。
+  callees: `Session.get`、`AgentPromptOps.deliverAsync`。
+- **依赖方向（必须保持无环）**：现有链是
+  `SessionPrompt → ToolRegistry → tool/agent.ts → AgentInbox`。本模块**不 import `SessionPrompt`**，
+  它通过注入的 `AgentPromptOps` 取得投递能力——**那个间接层存在的理由就是打断这个环**。
+  因此 `deliverAsync` 加在 `AgentPromptOps`（定义于 `agent-management/schema.ts`）上、
+  由 `prompt.ts` 实现，**不能**让本模块直接调一个位于或依赖 `SessionPrompt` 的入口。
 - **实现思路**：
   1. 校验 `sender !== target`，否则 `SelfDelivery{target}`，无副作用。
   2. `Session.get(target)`。失败 → `AgentNotFound{target}`，无副作用。得 `target`。
@@ -297,22 +324,22 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
      - `variant = target.model?.variant`；**其值为 `"default"` 时不传**。
        `setAgentModel` 存的是 `variant ?? "default"`，原样回传会把"未指定"变成"显式 default"，
        来回一趟即钉死。
-  4. **fork 投递**：
+  4. **经完整入口投递**：
 
      ```
-     prompt({ sessionID: target.id, agent, model, variant,
-              parts: [{ type: "text", text: render(message) }] })
-       .pipe(
-         catchCause(记日志 + 发 Session.Event.Error),      ← 必须在 fork 内 catch
-         forkIn(scope, { startImmediately: true }),
-       )
+     ops.deliverAsync({ sessionID: target.id, agent, model, variant,
+                        parts: [{ type: "text", text: render(message) }] })
      ```
 
-     - **必须 fork**：`prompt.ts:1069-1070` 在 `noReply !== true` 时 `return yield* loop(...)`，
-       直接 await 会阻塞到目标整轮结束，把单向消息变成 RPC。
+     - **不自建 fork**。`deliverAsync` 同时承担**目标 Instance 路由**与 fork 两件事；
+       只调 `prompt()` 再自己 `forkIn` 只取了 `prompt_async` 语义的一半，
+       结果是目标在**发送方的 Instance** 里执行，用发送方的 directory、配置与权限
+       （架构 §6「投递必须经含路由的完整入口」）。
+     - **必须 fork**（由 `deliverAsync` 负责）：`prompt.ts:1069-1070` 在 `noReply !== true` 时
+       `return yield* loop(...)`，直接 await 会阻塞到目标整轮结束，把单向消息变成 RPC。
      - **不能用 `noReply: true`**：它只落库不跑 loop，idle 的目标永远不会启动。
-     - **必须在 fork 内 catch**：否则失败逃逸成 defect。照 HTTP handler 的做法
-       （`handlers/session.ts:316-329`）记日志并发 `Session.Event.Error`。
+     - **必须在 fork 内 catch**（由 `deliverAsync` 负责）：否则失败逃逸成 defect。
+       照既有 handler 的做法记日志并发 `Session.Event.Error`。
      - **不判断目标 running / idle**：running 时现有 loop 在下一个 provider turn 边界重读历史
        读到它（`prompt.ts:1093` 每轮重读，新 user message 使 `lastAssistantBelongsToLatestTurn`
        为假故退出条件不成立）；idle 时自然起新 run。
@@ -391,6 +418,8 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
      - **必须保持 parts 形态**：压成字符串会丢附件。初始任务**不经 `AgentMessage`**——
        那个结构的 `body` 是 string，只服务 `agent_send` 与停止通知。
+  9b. **兄弟快照**：在工作目录声明之后再插入一个 text part（详见 §5.5.7）。
+      新子对 `agent_list` 为 deny 时跳过本步。
      - 声明是**约定不是强制**：运行时默认 cwd 未切换（`tool/read.ts:236`、`tool/shell.ts:612`）。
   10. `startDelegation({ session: newSession, agent: next.name, model: resolvedModel,
       variant: resolvedVariant, parts, caller })`（§5.4.4）。
@@ -417,8 +446,11 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 #### 5.4.2 `prepareWorkdir({ cwd?, parentWorkdir? }) -> Effect<{ path, source }, WorktreeUnavailable>`
 
 - **实现思路**：
-  1. **给了 `cwd`** → 返回 `{ path: cwd, source: "provided_cwd" }`。不创建任何东西，
+  1. **给了 `cwd`** → 相对**目标 Session 的 directory** 解析并规范化为**绝对路径**后
+     返回 `{ path: <absolute>, source: "provided_cwd" }`。不创建任何东西，
      **不追加任何权限放行**。
+     - 必须绝对化：存进 Session metadata 的值会被后续读取，存相对路径则其含义随读取时的
+       process cwd 变化，同一个 workdir 在不同时刻解析到不同目录。
      - 安全理由：`cwd` 由模型提供。为它自动放行 `external_directory` 等于让模型用
        `agent(cwd: <任意目录>)` 开出绕过口。该目录在 instance 之外时，其首次文件操作照常触发
        一次权限询问，由用户裁决。
@@ -427,7 +459,21 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
         **平铺**（嵌套时父清理会删掉子的工作）；**在项目内**（`containsPath`
         只查 `ctx.directory` 与 `ctx.worktree`、不查 sandbox，放项目外会每次文件访问都弹权限）。
      b. 登记忽略：`git rev-parse --path-format=absolute --git-path info/exclude` 定位，
-        读回既有内容，`/.opencode/worktrees` 已在其中则跳过，否则追加后写回。
+        读回既有内容，pattern 已在其中则跳过，否则追加后写回。
+        - **pattern 必须按 repo 相对计算**，不能写死 `/.opencode/worktrees`：
+          `info/exclude` 与 `.gitignore` 同语义——**中间带斜杠的 pattern 相对文件所在目录
+          （即 repo 根）解析**。从 `packages/opencode` 这样的子目录启动时，
+          `destinationRoot` 是 `<repo>/packages/opencode/.opencode/worktrees`，
+          而写死的 pattern 指向 `<repo>/.opencode/worktrees`，两者不匹配，工作目录照样进 `git status`。
+          正确做法是以 `ctx.worktree` 为基准算 `destinationRoot` 的相对路径。
+        - **越界前置条件**：若 `path.relative(ctx.worktree, destinationRoot)` 以 `..` 开头
+          或为绝对路径，则 `destinationRoot` 不在 repo 内，**返回错误而不写入**——
+          exclude pattern 只能表达 repo 内的路径，此时写什么都是错的。
+        - **分隔符规范化为 `/`**：`\` 在 gitignore pattern 中是转义符而非分隔符，
+          Windows 下直写 `path.relative` 的结果会得到一个无效 pattern。
+        - **转义 gitignore 元字符**：对 `\` `*` `?` `[` `]` 逐字符加 `\` 前缀；
+          **行首**的 `#` 与 `!` 同样加前缀（否则被解释为注释与取反）；**行尾空格**加反斜杠保留。
+          目录名来自用户的项目路径，不能假设其中没有这些字符。
         - **不调 Snapshot 的 `sync`**：它会连带重写 Snapshot 自己的 block 列表（§2.2）。
         - 必要性：ripgrep 默认尊重 `info/exclude`，不登记则 `glob`/`grep` 会搜出每个工作目录的副本。
      c. `baseDirectory = parentWorkdir?.path ?? ctx.directory`；
@@ -444,12 +490,23 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
      e. 返回 `{ path: destination, source: "generated_git_worktree" }`。
   3. **未给 `cwd`，且非 git 项目**：在同一 `destinationRoot` 下建普通空目录，
      **不复制任何项目文件**，返回 `{ path, source: "generated_empty_workspace" }`。
+     - **目录名用 `Identifier.create("agent", "ascending")`**（单调且唯一）。
+       **不用时间戳**：同毫秒内并发创建两个会撞到同一个目录。
+       **也不用 `Slug.create()`**：其组合空间为 29 形容词 × 31 名词 = **899**
+       （`packages/core/src/util/slug.ts`），生日问题下约 **35 个目录即有 50% 碰撞概率**——
+       它是给人看的展示名，不是标识符。
+       注意**不能写 `Identifier.ascending("agent")`**：`ascending` 的入参是
+       `keyof typeof prefixes`（`core/src/id/id.ts:3-17`，只有 job/event/session/… 几个固定值），
+       没有合适的前缀；`create` 才接受任意字符串前缀。
      - 既有 `makeWorktreeInfo` 对非 git 直接返回 `NotGitError`、`list()` 返回 `[]`，
        现有代码完全走不到，故本分支是**净新增**，不复用工作树逻辑。
      - 不登记 `info/exclude`（非 git 没有它）；该目录初始为空，对 ripgrep 可见可接受。
   4. `.worktreeinclude` **首版不做**：该机制在 opencode 中不存在，落地需要 gitignore 语法匹配器
      加逐个 `git check-ignore`。
 - **正确性论证**：三分支由 `(cwd 是否给出, 是否 git)` 判定，互斥且穷尽。
+  分支 1 的绝对化是纯函数变换，不引入副作用；分支 3 的唯一性由 `Identifier` 的单调序保证，
+  不依赖时钟分辨率；分支 2b 的 pattern 与实际目录在**任意启动位置**下都匹配，
+  因为二者以同一个 `ctx.worktree` 为基准计算。
   分支 2 的 a–e 顺序满足"位置确定 → 忽略登记 → 基线确定 → checkout ready"；
   步骤 2b 的"已存在则跳过"使其幂等，重复创建不让 `info/exclude` 累积重复行。
   后置：返回的 `path` 存在且（git 分支下）tracked files 完整可读。
@@ -474,10 +531,13 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
     （多进程即失效），要么要数据库唯一约束（schema 迁移）。而失败模式已被安全地兜住。
   - 副作用论证：只读 Session store。
 
-#### 5.4.4 `startDelegation({ session, agent, model, variant, parts, caller }) -> Effect<void>`
+#### 5.4.4 `startDelegation({ session, agent, model, variant, parts, caller, notify = true }) -> Effect<void>`
 
 - **功能描述**：起初始委托的后台执行，并在结束后向**创建者**至多发起一次结局通知。
   **这是本 feature 中唯一产生自动结局的地方。**
+- **内部参数 `notify`（不对模型暴露）**：`true`（默认）时注册结局 watcher；`false` 时**不注册**，
+  由调用方自行 `background.wait({ id: session.id })` 取同一个 job 的结果。
+  唯一使用者是 command-subtask（§5.4.9）。
 - **调用关系**：callers: M4 `create`；callees: `BackgroundJob.start`、`SessionPrompt.prompt`、
   M4 `classify`、提取后的 `notify` / `inject`。
 - **实现思路**：
@@ -494,7 +554,8 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
         `cancelled` → `Effect.interrupt`。
         - **必须映射到三种不同的 Effect 出口**：BackgroundJob 的结算状态由 run 体的 exit 推出，
           统一成功返回一个带 kind 的值会让每个 job 都结算成 `completed`。
-  4. 注册 `notify(jobID)`：`background.wait` → `completed` 注入完成、`error` 注入失败、
+  4. **`notify === false` 时跳过本步**（不注册任何 watcher，直接结束）。否则注册
+     `notify(jobID)`：`background.wait` → `completed` 注入完成、`error` 注入失败、
      **其余（含 `cancelled`）静默**。
      - 投递经提取后的 `inject`，目标是 `caller`。初始委托的调用者**就是**父，故既有的
        "恒向调用者投递"写法正确，无需改成从 parentID 解析。
@@ -506,8 +567,13 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
        连带取消了子的 job），则无人通知——此时父自己也已被取消，不存在仍在等待的主体。
   5. 只在 `start` 时注册一次 `notify`。
 - **正确性论证**：
+  - **`notify` 必须是显式参数，不能是 Effect Context 值**：`BackgroundJob` 用 `Effect.forkIn`
+    起 job fiber，forked fiber 继承 `currentContext`。若 `notify` 走上下文，它会随子的执行 fiber
+    传遍整棵子树——**子再建孙时孙也读到 `false`，孙完成后不通知子**。
+    一个只该管本次委托的开关不得获得子树作用域。显式参数的作用域恰好是这一次调用。
   - **单一 watcher、至多一次通知**：`notify` 只在步骤 5 注册一次，`background.wait` 对一个 job
-    只结算一次，故初始委托**至多发起一次**结局通知。初始执行期间经 `agent_send` 追加的消息
+    只结算一次，故初始委托**至多发起一次**结局通知。
+    `notify === false` 时改由调用方等待同一个 job，**总数仍是一条**面向父的消息，不是两条。初始执行期间经 `agent_send` 追加的消息
     进入同一个 loop 的消息序列，由这同一次执行消费，不产生第二个结局。
   - **不保证送达**：`inject` 走 fork 且失败被吞（既有行为），且受 issue #32 影响。
     可保证的是"至多发起一次"，不是"恰好收到一次"（架构 §6）。
@@ -607,7 +673,50 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   - 副作用论证：(1) 中断子树中原本在跑的成员的执行；(2) 不删除任何 Session、消息、历史或工作目录，
     故被停成员完整存续、`deliver` 对其仍可投递并起新执行；(3) 向 caller 写入**一条**通知。
 
-#### 5.4.8 `renderTermination(info: Session.Info) -> string`
+#### 5.4.9 `awaitDelegation(childSessionID) -> Effect<JobOutcome>`（command-subtask 专用）
+
+- **功能描述**：给**内部**的 command-subtask 路径（`/review` 一类）取初始委托的最终结果。
+  模型可见的 `agent` 工具**不获得**任何等待语义。
+- **为什么需要**：`/review` 要总结的是子 Agent 的**结论**，而 `agent` 恒为异步、
+  立即返回一句 "Started …"。总结一句启动确认没有意义。
+  参考实现同此分界：Claude Code 的 `Agent` 工具有 `run_in_background`，
+  官方说明为 *"Claude sets `run_in_background: false` when it needs the result before continuing"*
+  ——**同一套委托机制同时支持等待与不等待，由调用点决定**。差别只在于我们不把这个开关暴露给模型。
+- **为什么不是"等通知到达后再触发 summary"**：那要求父跨轮次保持一个待续的 summary 意图，
+  而通知不保证送达（架构 §10 缺口 5），该状态可能永远不被消费。
+  等待发生在一次命令调用**之内**，不跨轮次、无挂起状态。
+- **数据流**：
+  1. `handleSubtask` 在调 `agent` 工具时，于 `Tool.Context.extra` 增加 `notifyOnFinish: false`
+     （该处已在传 `bypassAgentCheck` / `promptOps`，本条只是多一个键）。
+     **必须走 `extra` 而不是 Effect Context**，理由见 §5.4.4。
+  2. `agent` 工具读出它，**显式**传给 `create` → `startDelegation`，后者因此不注册结局 watcher。
+  3. **先判 `result.metadata?.sessionId` 是否存在**：
+     - **不存在** ⇒ 创建本身失败（worktree 不可用 / agent 类型不存在 / 校验不过），
+       此时既无子 Session 也无 BackgroundJob。直接把工具的失败结果写成 tool part error，
+       **不等待、不建 summary**，返回。
+     - 直接 `background.wait({ id: undefined })` 的后果不是报错而是**静默**：
+       `wait` 对未知 id 返回 `{ timedOut: false }` 且不带 `info`，三个结果分支全部落空。
+     - 存在 ⇒ 进入步骤 4。job id 恒等于子 SessionID（§5.4.4 步骤 1），
+       故等的就是同一个 job，**不存在第二条 delegation 路径**。
+  4. `background.wait({ id: childSessionID })`，按结果三分支写回 tool part：
+     - `completed` → tool part `completed`，output 用与自动通知**同一个** `renderOutput` 渲染；
+     - `error` → tool part `error`，取 job 的 error；
+     - `cancelled` → tool part `error`，文案用 `cancelled`。
+  5. **只有 `completed` 才创建 summary user message**。error / cancelled 时父已从 tool part
+     拿到全部信息，再插一条"总结上面的输出"会让它去总结一个不存在的结果。
+  6. **父中断时取消子**：等待侧挂 `Effect.onInterrupt(() => background.cancel(childSessionID))`。
+     `background.cancel` 置 cancelled 并关闭 job scope ⇒ 中断其 fiber ⇒ 触发 §5.4.4 步骤 2
+     已有的 `Effect.onInterrupt(() => ops.cancel(session.id))` ⇒ child prompt 取消。
+     注意那个 `onInterrupt` 绑的是 **BackgroundJob 自己的 fiber**，只有走 `background.cancel`
+     才会触发；父 fiber 被中断本身不会波及它。
+- **正确性论证**：
+  - **父只收到一条消息**：`notifyOnFinish: false` 与 summary 构成互斥二选一，
+    watcher 未注册故不会有自动通知；这是本函数唯一的逻辑分支，须直接断言，
+    不能只由"端到端输出正确"间接证明。
+  - **不改变公开契约**：等待只存在于这条内部路径上，`agent` 工具仍恒为异步、立即返回。
+  - **不新增挂起状态**：等待在一次命令调用之内完成。
+
+#### 5.4.10 `renderTermination(info: Session.Info) -> string`
 
 - **功能描述**：渲染那条 `cancelled` 通知的正文。
 - **入参是 `Session.Info`**，不是 `AgentSkeleton` —— §5.4.7 步骤 4 拿到的就是它，
@@ -616,7 +725,10 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 - **实现思路**：状态词统一用 `cancelled`（不引入 `stopped`）；正文含被停 Agent 的 `session_id`、
   `name`（若有）、`agent_type`、`title`，并说明它可经 `agent_send` 恢复、
   其后代也已一并停止。长度受 `Truncate.limits()` 约束。
-- **正确性论证**：trivial —— 纯拼接。
+  **`name` / `agent_type` / `title` 走与 §5.3.1 同一个转义函数**——它们同样源自模型，
+  同样被插进一条系统生成的首行。
+- **正确性论证**：非 trivial 的部分只有转义，论证同 §5.3.1（先编码反斜杠 ⇒ 单射 ⇒ 首行不可伪造）。
+  其余为纯拼接。
 
 ### 5.5 M5 AgentTools
 
@@ -737,19 +849,38 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
     不为它加"当前是否有子"的判据——那会让工具忽隐忽现。
   - 副作用论证：只读 Session。
 
-#### 5.5.6 `rosterReminder(messages, session) -> Effect<void>`
+#### 5.5.6 `rosterReminder(messages, session) -> Effect<void>`  *（面向父）*
 
-- **功能描述**：把当前直接子列表作为**落盘** reminder 注入上下文。变化时发一条。
-- **调用点**：既有 `SessionReminders.apply`（由 `runLoop` 在 `prompt.ts:1195` 每轮调用），
-  新增一个分支。
+- **功能描述**：把当前直接子列表作为**落盘** reminder 注入上下文。
+  **边沿触发（状态变化）、回合边界投递**。
+- **调用点**：既有 reminder 阶段（`prompt.ts:1206`）。注意该点位于 `runLoop` 的
+  `while (true)` **step 循环内**（`:1096`），故本函数**必须自己判定回合边界**，
+  否则会每个 step 求值一次。
 - **实现思路**：
+  0. **回合边界判定**（命中其一才继续，否则直接返回）：
+     - **A. 本轮起点**：`messages` 中最后一条 user message 之后**尚无** assistant message。
+       reminder 在本 step 的 assistant message 创建**之前**求值，故 step 0 时成立、
+       step > 0 时不成立——**一行判断，无状态**。
+     - **B. 刚压缩过**：可见历史含 `type === "compaction"` 的 part，且其后无 roster。
+     - A 覆盖全部失效路径：取消 / API 异常 / 用户中断 / 进程重启后恢复，任一情形下
+       父重新开工都是一次 `idle→running`，必然落在 A 内，**无需枚举原因**。
+       由"起来的一方观察"而非"将死的一方记标记"——后者在崩溃路径上根本不执行。
+     - **A 比意图宽**：它同样命中每个普通新回合。这是明确的取舍，收敛靠步骤 3 的内容去重。
   1. `children(session.id, depth)` 得直接子。**为空 → 直接返回，不注入任何内容。**
      绝大多数 subagent 属于这一类，一个字都不加。
+  1b. 求值调用者的 `agent_list` 权限；为 `deny` → **不注入**。
+     roster 与 `agent_list` 暴露同一类信息，换条投递路径就绕过去等于在权限表面开后门。
   2. 对每个子调 M2 `of` 取 status，渲染成**一行**：
 
      ```
-     <SENTINEL> Your subagents: ses_abc123 (reviewer, idle) · ses_def456 (explore, running)
+     <SENTINEL>
+     Your subagents at this point:
+       ses_abc123  reviewer (explore)   idle
+       ses_def456  (explore)            running
      ```
+
+     - 首行措辞明示为**时点快照**：历史中会留下若干条过期的 roster，
+       权威来源始终是 `agent_list`。
 
      - `<SENTINEL>` 是固定前缀行，供步骤 3 在历史中定位。
      - `name` 缺省时只显示 `(agent_type, status)`。
@@ -776,10 +907,48 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   - **它补什么**：`agent_stop` 不给递归取消的后代发通知（§5.4.7），父被唤回时靠这里知道子已 idle；
     完成通知若被 issue #32 吞掉，父下一轮也能从这里看出子已 idle——
     **无声挂起因此降级为一轮延迟**。是缓解不是保证。
-  - **已知代价**：若某个子在一轮**中途**翻转状态，该 step 会给已发出的 user message 追加 part，
-    触发一次缓存失效。只在子真的翻转时发生，不是每轮，**有界**，且那恰是这条信息最值钱的时刻。
+  - **缓存中性**（步骤 0 的收益所在）：注入点恒为本回合**刚创建、尚未发给 provider** 的
+    user message；压缩后则是 `filterCompacted` 重排出的 continue-user。
+    追加 part 因此不废任何缓存。上一版在**每个 step** 上求值、追加到一条**已发送**的消息，
+    那才是缺陷——收益来自"每回合一次"，而不是"注入得少"。
+  - **增长如实记录**：注入次数与**被观察到的状态变化数**线性相关，
+    **Session 生命周期内没有固定上界**——同一个子可经 `agent_send` 反复唤起，
+    `idle → running → idle → …`，每次变化都可能落盘一条。旧快照靠压缩折叠。
+    **不删旧表**：那要改写历史消息，会从该点起废掉整段缓存，与上一条自相矛盾。
   - **幂等性**：重复写一条相同的 roster 是浪费不是错误；步骤 3 的相同判定使稳态下不写。
   - 副作用论证：至多写入一条 synthetic text part。
+
+#### 5.5.7 `siblingSnapshot(caller, child) -> Effect<string | undefined>`  *（面向子）*
+
+- **功能描述**：新建子 D 时，在其初始 prompt 中一次性列出它能向谁发消息。
+  **启动时快照，之后不更新。**
+- **调用点**：M4 `create` 步骤 9b。
+- **为什么需要**：新建的子**连自己有父都不知道**——它要回话必须先调 `agent_list` 猜出父是谁。
+  这是 CC 的 sibling roster 解决的同一个问题。
+- **集合的准确定义**：设调用者为 C、新建的子为 D，
+
+  ```
+  snapshot = {C} ∪ (children(C) \ {D})
+  ```
+
+  即 **D 的父与 D 的兄弟**。
+  **不是"调用者的父与兄弟"**——那是 D 的**祖父与叔伯**，与 D 能向谁发消息无关。
+- **内容**：每项 `session_id` + `name`（若有），**不含状态**。
+  并明写这是**启动时快照，之后新建的 Agent 不在其中**——照 CC 语义：
+  *"It is a snapshot taken when the subagent starts, so agents named later don't appear."*
+  含状态会立刻过期且与 roster 的职责重叠。
+- **权限**：受 **D 自己的** `agent_list` 权限约束；D 为 `deny` 时返回 `undefined`（不注入）。
+  判据取**接收方**而非调用者：`agent_list` 被 deny 的用意就是"这个子不该知道别的 Agent 存在"，
+  换一种投递方式就绕过去，等于在权限表面开后门。
+  CC 亦按接收方能力决定——其文档载明 roster
+  *"appears only when the subagent's tools include `SendMessage`"*。
+- **与 roster 的分工**：roster **给父讲子的状态**（动态、边沿触发）；
+  快照**给子讲能向谁发消息**（静态、一次性、不含状态）。两者不重叠。
+- **正确性论证**：
+  - 集合定义中 `\ {D}` 是必要的：D 此刻已在 `children(C)` 内（步骤 8 已建 Session），
+    不剔除会让它在自己的邻居表里看到自己。
+  - 不含状态 ⇒ 不会过期成错误信息，只会过期成不完整信息，而不完整由"明写是快照"承担。
+  - 副作用：只读；返回值由 `create` 写入初始 prompt。
 
 ## 6. 完整性自检 checklist
 
