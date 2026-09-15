@@ -988,7 +988,7 @@ CLI 会当场退出，**父永远没机会处理子的结果**——正是这套
 | `test/server/session-actions.test.ts` | `:93` | 删/改打已删端点的用例 | ✅ |
 | `src/acp/tool.ts` | `:65` | `case "task"` → 识别 `agent`；`task` 仅保留为历史展示分支 | ✅ |
 | `packages/web/src/content/docs/agents.mdx` + 全部 locale 副本 | Task tool / `permission.task` 文案 | 改为 `agent` 工具与新权限键；保留 legacy `task` 的迁移说明 | ✅ |
-| `packages/app/src/i18n/*.ts` | `settings.permissions.tool.task.*` | 新增 `…tool.agent.*` 四键文案；`task` 条目按 legacy 处理 | ✅ |
+| `packages/app/src/i18n/*.ts` | `settings.permissions.tool.task.*` | **原键改名**为 `…tool.agent.*`，62 个 locale 沿用既有译文（不新造 40 种语言的翻译，parity 测试通过）。`agent_list` / `agent_send` / `agent_stop` **暂无**描述串——dock 对缺失 key 降级为空描述（`session-permission-dock.tsx:16`），三者默认 allow，极少弹窗；留给一次翻译流程 | ✅（附例外） |
 | 生成物：SDK | —— | 执行 `./packages/sdk/js/script/build.ts` | ✅ |
 | 生成物：client | —— | 在 `packages/client` 执行 `bun run generate` | ✅ |
 | `packages/sdk/openapi.json`、`codemode` fixture | —— | 由上两条重新生成后一并提交 | ✅ |
@@ -1027,4 +1027,4 @@ CLI 会当场退出，**父永远没机会处理子的结果**——正是这套
 | `task-inventory.md` | 补 consumer 行：`session-ui`、`web/share`、**`acp/tool.ts`**、**`web/src/content/docs/**/agents.mdx`（全 locale）**、**`app/src/i18n/*.ts`**；补生成物行：`packages/sdk/js/script/build.ts`、`packages/client` 的 `bun run generate` | 实现 | ✅ |
 | `docs/research/agent-management-research.md` | §17.2 更正：V1 **有**按 Session 的路由；原结论作废 | 实现 | ✅ |
 | `packages/core/src/plugin/skill/customize-opencode.md` | 权限键补四个新键；说明 legacy `task` 的迁移与 deprecation | 实现 | ✅ |
-| PR #35 描述 | 删除"跨 workspace 做不到"的限制条目——本 server 内跨 directory 支持，且不新增 remote 契约 | 实现 | ✅ |
+| PR #35 描述 | 删除"跨 workspace 做不到"的限制条目——本 server 内跨 directory 支持，且不新增 remote 契约 | 实现 | **待办**：改 PR 描述属远端操作，须先经用户同意 |
