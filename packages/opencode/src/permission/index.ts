@@ -194,31 +194,42 @@ function rulesFor(permission: string, value: ConfigPermissionV1.Info[string]): P
 
 /**
  * Config rules become a ruleset, with one normalisation: the legacy `task` key
- * is rewritten to `agent`.
+ * is renamed to `agent` in place.
  *
  * Silently ignoring it would widen permissions — someone who wrote `task: deny`
- * to keep subagents off would find them allowed after an upgrade. The rewritten
- * rules are placed immediately ahead of any explicit `agent` rules so that on a
- * shared pattern the explicit one wins, since evaluate takes the last match.
- * Everything else keeps its original position.
+ * to keep subagents off would find them allowed after an upgrade.
+ *
+ * In place is the whole point. evaluate takes the last match, so a ruleset's
+ * order is its meaning, and moving the converted rules to sit ahead of an
+ * explicit `agent` key also moves them past anything in between — a wildcard
+ * included, and a wildcard is relevant to every key. `{task: "allow", "*":
+ * "deny", agent: {reviewer: "allow"}}` used to migrate to a ruleset where
+ * `agent:someone` evaluated to allow, having been deny before. Renaming without
+ * moving leaves the sequence identical position for position, so the migration
+ * is a rename and nothing else, and "permissions do not widen" follows from the
+ * shape rather than from an argument.
+ *
+ * An explicit `agent` rule still wins over a legacy one on the same pattern,
+ * which is what suppressing the duplicate achieves: the suppressed rule was
+ * shadowed by the explicit one anyway, so dropping it changes no outcome.
  *
  * Doing it here covers every caller, and because a user's config is re-derived
  * into agent.permission on each run there is no stale copy to migrate.
  */
 export function fromConfig(permission: ConfigPermissionV1.Info) {
-  const legacy = permission[LEGACY_AGENT_PERMISSION_KEY]
-  const converted = legacy ? rulesFor(AGENT_PERMISSION_KEY, legacy) : []
-  const hasCanonical = AGENT_PERMISSION_KEY in permission
+  const canonical = permission[AGENT_PERMISSION_KEY]
+  const explicitPatterns = new Set(
+    canonical === undefined ? [] : rulesFor(AGENT_PERMISSION_KEY, canonical).map((rule) => rule.pattern),
+  )
 
   const ruleset: PermissionV1.Rule[] = []
   for (const [key, value] of Object.entries(permission)) {
     if (key === LEGACY_AGENT_PERMISSION_KEY) {
-      // Held back when an explicit `agent` key exists, so it lands just before
-      // it rather than after.
-      if (!hasCanonical) ruleset.push(...converted)
+      ruleset.push(
+        ...rulesFor(AGENT_PERMISSION_KEY, value).filter((rule) => !explicitPatterns.has(rule.pattern)),
+      )
       continue
     }
-    if (key === AGENT_PERMISSION_KEY) ruleset.push(...converted)
     ruleset.push(...rulesFor(key, value))
   }
   return ruleset

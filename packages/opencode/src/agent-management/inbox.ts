@@ -19,14 +19,43 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/AgentInbox") {}
 
 /**
+ * Makes a model-supplied string safe to interpolate into a system-written line.
+ *
+ * A name and an agent type both come from the model, and both land inside the
+ * first line of a message. Left alone, a name containing `]` and a newline ends
+ * that line early and starts whatever it likes on the next one — a second
+ * message header, for instance.
+ *
+ * Encoding, not stripping: stripping renders `a\nb` and `ab` the same, so two
+ * different agents become indistinguishable. And the backslash has to go first,
+ * or a real newline encodes to `\n` and collides with a name that literally
+ * contained those two characters, which loses the same property by a longer
+ * route.
+ *
+ * What this guarantees is about the header's fields, not about the whole
+ * message: a body is free to contain anything, `[Agent message from …`
+ * included, because the boundary is the first line and the first line is built
+ * entirely from encoded fields.
+ */
+export function escapeField(value: string) {
+  return value
+    .replaceAll("\\", "\\\\")
+    .replaceAll("\r", "\\r")
+    .replaceAll("\n", "\\n")
+    .replaceAll("\t", "\\t")
+    .replaceAll("[", "\\[")
+    .replaceAll("]", "\\]")
+}
+
+/**
  * The system-written prefix. The reply instruction always names the sender's
  * session_id rather than its name: a name is a weak alias that may be missing or
  * ambiguous, while a session_id works from anywhere.
  */
 export function render(message: AgentManagement.AgentMessage) {
-  const who = message.sender_name
-    ? `${message.sender_name} (${message.sender_agent ?? "agent"}, ${message.sender})`
-    : `${message.sender_agent ?? "agent"} (${message.sender})`
+  const name = message.sender_name === undefined ? undefined : escapeField(message.sender_name)
+  const agent = escapeField(message.sender_agent ?? "agent")
+  const who = name ? `${name} (${agent}, ${message.sender})` : `${agent} (${message.sender})`
   return [
     `[Agent message from ${who}]`,
     `To reply, use agent_send(target="${message.sender}", message="<your reply>").`,
@@ -73,33 +102,22 @@ const layer = Layer.effect(
       // trip.
       const variant = target.model?.variant === "default" ? undefined : target.model?.variant
 
-      yield* input.ops
-        .prompt({
-          sessionID: target.id,
-          agent,
-          model,
-          variant,
-          parts: [{ type: "text", text: render(message) }],
-        })
-        .pipe(
-          // Must be caught inside the fork, or the failure escapes as a defect.
-          // Mirrors what the prompt_async handler does.
-          Effect.catchCause((cause) =>
-            Effect.gen(function* () {
-              yield* Effect.logError("agent message delivery failed", { sessionID: target.id, cause })
-              yield* events.publish(Session.Event.Error, {
-                sessionID: target.id,
-                error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
-              })
-            }),
-          ),
-          // Must fork. prompt returns `loop(...)` unless noReply is set, so
-          // awaiting it blocks until the target finishes its whole turn, which
-          // would make a one-way message a synchronous call. noReply is not an
-          // escape either: it persists the message without ever running the
-          // loop, so an idle target would never start.
-          Effect.forkIn(scope, { startImmediately: true }),
-        )
+      // deliverAsync, not prompt: it does the fork *and* the switch to the
+      // target's instance. Doing the fork here instead left the target running
+      // inside the sender's instance, against the sender's directory, config
+      // and permissions.
+      //
+      // Forking is still required for the reason it always was — prompt returns
+      // `loop(...)` unless noReply is set, so awaiting it blocks until the
+      // target finishes its whole turn, and noReply is no escape either since it
+      // persists the message without ever running the loop.
+      yield* input.ops.deliverAsync({
+        sessionID: target.id,
+        agent,
+        model,
+        variant,
+        parts: [{ type: "text", text: render(message) }],
+      })
 
       return { target: target.id }
     })

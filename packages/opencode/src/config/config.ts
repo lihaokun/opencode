@@ -25,6 +25,7 @@ import { containsPath, type InstanceContext } from "../project/instance-context"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { RemoteAuthError } from "@opencode-ai/core/v1/config/error"
 import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
+import { Permission } from "@/permission"
 import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
 import { ConfigAgent } from "./agent"
 import { ConfigCommand } from "./command"
@@ -575,6 +576,12 @@ const layer = Layer.effect(
             perms[tool] = action
           }
           result.permission = mergeDeep(perms, result.permission ?? {})
+        }
+
+        if (result.permission && Permission.LEGACY_AGENT_PERMISSION_KEY in result.permission) {
+          yield* Effect.logWarning(
+            `permission.${Permission.LEGACY_AGENT_PERMISSION_KEY} is deprecated; rename it to permission.${Permission.AGENT_PERMISSION_KEY}. It still applies, renamed in place, and keeps its position among your other rules.`,
+          )
         }
 
         if (!result.username) {

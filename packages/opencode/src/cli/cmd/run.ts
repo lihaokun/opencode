@@ -705,6 +705,7 @@ export const RunCommand = effectCmd({
           let error: string | undefined
           let ceiling: ReturnType<typeof setTimeout> | undefined
           let abandoned = false
+          let rootIdle = false
 
           // A stuck agent must not hold the process open forever. The clock
           // measures continuous idleness, so it restarts whenever anything
@@ -720,6 +721,15 @@ export const RunCommand = effectCmd({
             if (ceiling === undefined) return
             clearTimeout(ceiling)
             ceiling = undefined
+          }
+
+          // Restarts the clock, and is called on every sign of life from a
+          // tracked session — that is what "continuous idleness" means. Note
+          // that being busy is *not* a reason to stop it: a child stuck in busy
+          // produces no events at all, so stopping the clock while anything was
+          // busy is precisely what let it hold the process open forever.
+          const noteActivity = () => {
+            if (rootIdle) startWaiting()
           }
 
           const startWaiting = () => {
@@ -744,9 +754,11 @@ export const RunCommand = effectCmd({
                 // has already gone idle — and then the run would leave believing
                 // nothing was left to do.
                 working.add(event.properties.info.id)
-                stopWaiting()
+                noteActivity()
               }
             }
+
+            if (event.type === "message.updated" && sessions.has(event.properties.sessionID)) noteActivity()
 
             if (
               event.type === "message.updated" &&
@@ -763,6 +775,7 @@ export const RunCommand = effectCmd({
 
             if (event.type === "message.part.updated") {
               const part = event.properties.part
+              if (sessions.has(part.sessionID)) noteActivity()
               if (part.sessionID !== sessionID) continue
 
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
@@ -836,18 +849,27 @@ export const RunCommand = effectCmd({
 
             if (event.type === "session.status" && sessions.has(event.properties.sessionID)) {
               const id = event.properties.sessionID
-              if (event.properties.status.type === "idle") working.delete(id)
+              const idle = event.properties.status.type === "idle"
+              if (idle) working.delete(id)
               else working.add(id)
+              if (id === sessionID) rootIdle = idle
 
-              if (working.size > 0) stopWaiting()
-
-              if (id === sessionID && event.properties.status.type === "idle") {
-                if (working.size === 0 || abandoned) {
-                  stopWaiting()
-                  break
-                }
-                startWaiting()
+              // Only the root's own idle ends the run, and a child's idle never
+              // does. A child publishes idle *before* its prompt returns — see
+              // Runner.finishRun, where `idle` runs ahead of completing the
+              // deferred the prompt awaits — so the job has not settled and the
+              // watcher has not delivered the result to the parent yet. At that
+              // moment the root is idle and nothing is working, and leaving on
+              // that would drop the very result this wait exists to collect.
+              // A notification that never arrives is the ceiling's problem, not
+              // this branch's.
+              if (id === sessionID && idle && (working.size === 0 || abandoned)) {
+                stopWaiting()
+                break
               }
+
+              if (rootIdle) startWaiting()
+              else stopWaiting()
             }
 
             if (event.type === "permission.asked") {

@@ -77,6 +77,7 @@ function stubOps() {
           parts: [{ type: "text", text: "done" }],
         } as unknown as SessionV1.WithParts
       }),
+    deliverAsync: (input) => Effect.forkDetach(ops.prompt(input)).pipe(Effect.asVoid),
   }
   return { seen, ops }
 }

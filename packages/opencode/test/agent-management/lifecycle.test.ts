@@ -76,6 +76,7 @@ function stubOps(opts?: { block?: Deferred.Deferred<void>; text?: string }) {
           parts: [{ type: "text", text: opts?.text ?? "done" }],
         } as unknown as SessionV1.WithParts
       }),
+    deliverAsync: (input) => Effect.forkDetach(ops.prompt(input)).pipe(Effect.asVoid),
   }
   return { seen, ops }
 }
@@ -357,6 +358,7 @@ describe("AgentLifecycle delegation notice", () => {
               parts: [{ type: "text", text: "done" }],
             } as unknown as SessionV1.WithParts
           }),
+        deliverAsync: (input) => Effect.forkDetach(ops.prompt(input)).pipe(Effect.asVoid),
       }
 
       yield* lifecycle.create(baseCreate(root.id, ops))

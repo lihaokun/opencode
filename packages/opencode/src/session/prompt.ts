@@ -30,6 +30,7 @@ import { Config } from "@/config/config"
 import { ConfigMarkdown } from "@/config/markdown"
 import { SessionSummary } from "./summary"
 import { NamedError } from "@opencode-ai/core/util/error"
+import { InstanceStore } from "@/project/instance-store"
 import { SessionProcessor } from "./processor"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
@@ -105,6 +106,18 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  /**
+   * Send a message to a session and return without waiting for it — the whole
+   * of what `prompt_async` means, routing included.
+   *
+   * There are two halves to that: the fork, so a one-way message does not block
+   * on the target's turn, and the switch to the target session's own instance,
+   * so it runs with its own directory, config, agents and permissions. Taking
+   * only the fork leaves the target executing inside the sender's instance,
+   * reading and writing in the wrong project. Both callers — the HTTP handler
+   * and agent_send — go through here so neither can take half again.
+   */
+  readonly deliverAsync: (input: PromptInput) => Effect.Effect<void>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -151,12 +164,57 @@ const layer = Layer.effect(
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        deliverAsync: (input: PromptInput) => deliverAsync(input),
       } satisfies AgentManagement.AgentPromptOps
     })
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
       yield* state.cancel(sessionID)
+    })
+
+    const deliverAsync = Effect.fn("SessionPrompt.deliverAsync")(function* (input: PromptInput) {
+      const target = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      const here = yield* InstanceState.context
+
+      // Caught inside the fork, or the failure escapes as a defect. The caller
+      // is already gone by then, so the only report left is the event.
+      const run = prompt(input).pipe(
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            yield* Effect.logError("async delivery failed", { sessionID: input.sessionID, cause })
+            yield* events.publish(Session.Event.Error, {
+              sessionID: input.sessionID,
+              error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
+            })
+          }),
+        ),
+      )
+
+      // Same directory means this instance already is the target's, and loading
+      // it again would be a detour to the same place.
+      if (target.directory === here.directory) {
+        yield* run.pipe(Effect.forkIn(scope, { startImmediately: true }))
+        return
+      }
+
+      // Swapping InstanceRef is what routing is: every per-instance service
+      // reads its state through it, so the whole run lands in the target's
+      // instance. Same mechanism the control plane uses for a local workspace.
+      const store = yield* Effect.serviceOption(InstanceStore.Service)
+      if (store._tag === "None") {
+        // Refuse rather than quietly run it here. Running a session against
+        // another directory's files is worse than not delivering, and silence
+        // is how this went unnoticed the first time.
+        return yield* Effect.die(
+          new Error(
+            `cannot deliver to session ${input.sessionID}: it belongs to ${target.directory}, this instance is ${here.directory}, and no InstanceStore is available to switch`,
+          ),
+        )
+      }
+      yield* store.value
+        .provide({ directory: target.directory }, run)
+        .pipe(Effect.forkIn(scope, { startImmediately: true }))
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -1547,6 +1605,7 @@ const layer = Layer.effect(
     return Service.of({
       cancel,
       prompt,
+      deliverAsync,
       loop,
       shell,
       command,

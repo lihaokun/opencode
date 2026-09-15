@@ -375,13 +375,21 @@ const layer = Layer.effect(
   }),
 )
 
+// `cancelled`, not `stopped`: one word for the state everywhere, matching the
+// job status and what agent_list reports.
+//
+// Name, agent type and title all originate with the model, and all three land
+// in a system-written line, so they go through the same escaping as a message
+// header — see AgentInbox.escapeField.
 function renderTermination(info: Session.Info, descendants: number) {
-  const name = info.metadata?.[AgentManagement.METADATA_AGENT_NAME]
-  const who = name ? `${name} (${info.agent ?? "agent"})` : (info.agent ?? "agent")
+  const raw = info.metadata?.[AgentManagement.METADATA_AGENT_NAME]
+  const name = raw === undefined ? undefined : AgentInbox.escapeField(raw)
+  const agent = AgentInbox.escapeField(info.agent ?? "agent")
+  const who = name ? `${name} (${agent})` : agent
   return [
-    `Agent stopped: ${who}`,
+    `Agent cancelled: ${who}`,
     `session_id: ${info.id}`,
-    `title: ${info.title}`,
+    `title: ${AgentInbox.escapeField(info.title)}`,
     ...(descendants > 0 ? [`Its ${descendants} descendant Agent(s) were stopped as well.`] : []),
     "Its session and history are intact; it can be resumed with agent_send.",
   ].join("\n")

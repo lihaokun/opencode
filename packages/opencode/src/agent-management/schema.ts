@@ -161,6 +161,14 @@ export interface AgentPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+  /**
+   * Asynchronous delivery, routing included — see SessionPrompt.Interface.
+   *
+   * It lives on this injected interface rather than being imported, because
+   * SessionPrompt reaches AgentInbox through the tool registry. Importing back
+   * would close the cycle; this indirection is what keeps the graph acyclic.
+   */
+  deliverAsync(input: SessionPrompt.PromptInput): Effect.Effect<void>
 }
 
 /**
