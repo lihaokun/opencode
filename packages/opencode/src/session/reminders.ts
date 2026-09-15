@@ -14,6 +14,7 @@ import PLAN_MODE from "./prompt/plan-mode.txt"
 import { Permission } from "@/permission"
 import { AGENT_LIST_TOOL_ID } from "@/tool/agent"
 import { AgentTree } from "@/agent-management/tree"
+import { AgentInbox } from "@/agent-management/inbox"
 import { AgentStatusProjection } from "@/agent-management/status"
 
 /** Marks a roster part so a later turn can find the most recent one. */
@@ -54,6 +55,7 @@ export const AGENT_ROSTER_SENTINEL = "<!-- opencode:subagents -->"
 export const applyAgentRoster = Effect.fn("SessionReminders.applyAgentRoster")(function* (input: {
   messages: SessionV1.WithParts[]
   session: Session.Info
+  agent?: Agent.Info
 }) {
   const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
   if (!userMessage) return input.messages
@@ -87,17 +89,19 @@ export const applyAgentRoster = Effect.fn("SessionReminders.applyAgentRoster")(f
   if (children.length === 0) return input.messages
 
   // A roster and agent_list expose the same thing, so a session denied the tool
-  // is not handed the list by another route.
-  if (Permission.evaluate(AGENT_LIST_TOOL_ID, "*", input.session.permission ?? []).action === "deny") {
-    return input.messages
-  }
+  // is not handed the list by another route. Merged the way tools.ts merges it,
+  // since a user writes the rule on the agent while the session carries what was
+  // derived for this run.
+  const ruleset = Permission.merge(input.agent?.permission ?? [], input.session.permission ?? [])
+  if (Permission.evaluate(AGENT_LIST_TOOL_ID, "*", ruleset).action === "deny") return input.messages
 
   const rows = yield* Effect.forEach(children, (child) =>
     projection.of(child.session_id).pipe(
       Effect.map((status) => {
-        const label = child.name
-          ? `${child.name} (${child.agent_type ?? "agent"})`
-          : `(${child.agent_type ?? "agent"})`
+        // Escaped for the same reason a message header is: a name comes from
+        // the model, and a newline in one would forge a row of its own.
+        const type = AgentInbox.escapeField(child.agent_type ?? "agent")
+        const label = child.name ? `${AgentInbox.escapeField(child.name)} (${type})` : `(${type})`
         return `  ${child.session_id}  ${label}  ${status}`
       }),
     ),

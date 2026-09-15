@@ -1319,7 +1319,7 @@ const layer = Layer.effect(
             Effect.provideService(FSUtil.Service, fsys),
             Effect.provideService(Session.Service, sessions),
           )
-          msgs = yield* SessionReminders.applyAgentRoster({ messages: msgs, session }).pipe(
+          msgs = yield* SessionReminders.applyAgentRoster({ messages: msgs, session, agent }).pipe(
             Effect.provideService(Session.Service, sessions),
             Effect.provideService(AgentTree.Service, agentTree),
             Effect.provideService(AgentStatusProjection.Service, agentStatus),
