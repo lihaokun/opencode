@@ -201,15 +201,6 @@ export function RunFooterView(props: RunFooterViewProps) {
         props.tuiConfig,
       ) ?? "",
   )
-  const backgroundShortcut = useKeymapSelector(
-    (keymap: OpenTuiKeymap) =>
-      formatKeySequence(
-        keymap
-          .getCommandBindings({ visibility: "registered", commands: ["session.background"] })
-          .get("session.background")?.[0]?.sequence,
-        props.tuiConfig,
-      ) ?? "",
-  )
   const interrupt = useKeymapSelector(
     (keymap: OpenTuiKeymap) =>
       formatKeySequence(

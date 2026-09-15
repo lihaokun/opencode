@@ -155,6 +155,12 @@ export const AgentTool = Tool.define(
           model: { providerID: message.info.providerID, modelID: message.info.modelID },
           variant: message.info.variant,
           ops,
+          // Passed per call through ctx.extra, alongside promptOps and
+          // bypassAgentCheck, which is why it cannot reach the tool's schema or
+          // leak into the child's execution. Set by the command-subtask path,
+          // which waits on the job itself and would otherwise get both the
+          // automatic notice and its own summary.
+          notify: ctx.extra?.notifyOnFinish !== false,
         })
         .pipe(Effect.catch((error) => Effect.succeed(error)))
 

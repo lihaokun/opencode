@@ -11,26 +11,45 @@ import { Session } from "./session"
 import PROMPT_PLAN from "./prompt/plan.txt"
 import BUILD_SWITCH from "./prompt/build-switch.txt"
 import PLAN_MODE from "./prompt/plan-mode.txt"
+import { Permission } from "@/permission"
+import { AGENT_LIST_TOOL_ID } from "@/tool/agent"
 import { AgentTree } from "@/agent-management/tree"
 import { AgentStatusProjection } from "@/agent-management/status"
 
-/** Marks a roster part so the next turn can find the most recent one. */
+/** Marks a roster part so a later turn can find the most recent one. */
 export const AGENT_ROSTER_SENTINEL = "<!-- opencode:subagents -->"
 
 /**
- * Keeps an Agent aware of its direct children.
+ * Tells an Agent what its direct children are doing.
  *
- * Written to the transcript rather than rebuilt each turn. A non-persisted
- * reminder hangs off the last user message, which does not change across the
- * steps of one turn — so regenerating it rewrites a message that has already
- * been sent and invalidates the cache from that point on, including everything
- * the earlier steps produced. Persisted, it is byte-stable, and appearing once
- * is enough because it stays in history.
+ * Edge-triggered, delivered at a turn boundary. The trigger is either the start
+ * of a turn — the last user message has no assistant message after it yet — or a
+ * compaction with no roster after it. Anything that stops a parent and later
+ * brings it back, a cancellation, an API failure, an interrupt, a restart,
+ * shows up as one of those, so there is no list of causes to keep complete, and
+ * the judgement is made by the side that wakes up rather than recorded by the
+ * side that is about to die. A flag written on the way out is not written at all
+ * when the process is killed.
  *
- * Emitted only when it differs from the most recent one still visible. The
- * comparison runs against the post-compaction view the loop passes in, so
- * compaction re-emits it without a special case — same rule as a first spawn or
- * a status change.
+ * The criterion is deliberately wider than that intent: an ordinary new turn
+ * matches it too. What narrows it down is the comparison below — a roster is
+ * written only when it differs from the most recent one still visible — so the
+ * effective rule is "say something when the children's collective state has
+ * changed since the last time we said anything".
+ *
+ * Written to the transcript rather than rebuilt per step, and evaluated once per
+ * turn rather than once per step, which is the same point from two sides: the
+ * part is appended to a user message that has not been sent to the provider yet,
+ * so it costs no cache. Rebuilding it on a later step of the same turn would
+ * rewrite a message already sent and invalidate everything after it.
+ *
+ * The count of these grows with the number of observed state changes, and over
+ * a long session there is no bound on it — a child can be woken through
+ * agent_send again and again. Old entries are left where they are: removing one
+ * would mean rewriting history, which is the cache cost this design exists to
+ * avoid. They leave the visible context through compaction, and the heading says
+ * "at this point" because agent_list is the authority, not a line from four
+ * turns ago.
  */
 export const applyAgentRoster = Effect.fn("SessionReminders.applyAgentRoster")(function* (input: {
   messages: SessionV1.WithParts[]
@@ -38,6 +57,18 @@ export const applyAgentRoster = Effect.fn("SessionReminders.applyAgentRoster")(f
 }) {
   const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
   if (!userMessage) return input.messages
+
+  // Evaluated before this step's assistant message exists, so "nothing after
+  // the last user message" is true on the first step of a turn and false on
+  // every later one. After a compaction, filterCompacted puts a continue-user
+  // message last, so that counts as a turn boundary too — and a fresh one,
+  // since the earlier roster is no longer in the visible history to compare
+  // against.
+  const turnStart = input.messages.every(
+    (msg) => msg.info.role !== "assistant" || msg.info.time.created < userMessage.info.time.created,
+  )
+  const compacted = input.messages.some((msg) => msg.parts.some((part) => part.type === "compaction"))
+  if (!turnStart && !compacted) return input.messages
 
   const tree = yield* AgentTree.Service
   const projection = yield* AgentStatusProjection.Service
@@ -48,15 +79,23 @@ export const applyAgentRoster = Effect.fn("SessionReminders.applyAgentRoster")(f
   // Most subagents have none, and they get nothing at all.
   if (children.length === 0) return input.messages
 
-  const rendered = yield* Effect.forEach(children, (child) =>
+  // A roster and agent_list expose the same thing, so a session denied the tool
+  // is not handed the list by another route.
+  if (Permission.evaluate(AGENT_LIST_TOOL_ID, "*", input.session.permission ?? []).action === "deny") {
+    return input.messages
+  }
+
+  const rows = yield* Effect.forEach(children, (child) =>
     projection.of(child.session_id).pipe(
       Effect.map((status) => {
-        const label = child.name ? `${child.name} (${child.agent_type ?? "agent"}, ${status})` : `${child.agent_type ?? "agent"} (${status})`
-        return `${child.session_id} ${label}`
+        const label = child.name
+          ? `${child.name} (${child.agent_type ?? "agent"})`
+          : `(${child.agent_type ?? "agent"})`
+        return `  ${child.session_id}  ${label}  ${status}`
       }),
     ),
   )
-  const text = [AGENT_ROSTER_SENTINEL, `Your subagents: ${rendered.join(" · ")}`].join("\n")
+  const text = [AGENT_ROSTER_SENTINEL, "Your subagents at this point:", ...rows].join("\n")
 
   const previous = input.messages
     .flatMap((msg) => msg.parts)

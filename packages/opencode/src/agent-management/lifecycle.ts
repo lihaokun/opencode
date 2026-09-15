@@ -9,6 +9,9 @@ import { BackgroundJob } from "@/background/job"
 import { Config } from "@/config/config"
 import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
+import { Permission } from "@/permission"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { AGENT_LIST_TOOL_ID } from "@/tool/agent"
 import { Session } from "../session/session"
 import { SessionRunState } from "../session/run-state"
 import { SessionID, MessageID } from "../session/schema"
@@ -31,6 +34,19 @@ export interface CreateInput {
   model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
   variant: string | undefined
   ops: AgentManagement.AgentPromptOps
+  /**
+   * Whether the delegation reports its own outcome back to the caller. Internal
+   * — no tool exposes it, and the `agent` tool stays asynchronous either way.
+   *
+   * `false` is for a caller that needs the result before it can continue, and
+   * so waits on the job itself: a command subtask such as /review, which has to
+   * summarise what the subagent concluded rather than the confirmation that it
+   * started. Leaving the watcher registered as well would give the parent two
+   * messages for one delegation, and the automatic one would wake it a second
+   * time. Claude Code draws the same line with run_in_background — one
+   * delegation mechanism, the call site decides whether it waits.
+   */
+  notify?: boolean
 }
 
 export interface CreateResult {
@@ -106,6 +122,54 @@ const layer = Layer.effect(
       }
     })
 
+    /**
+     * Tells a new Agent who it can talk to.
+     *
+     * Without it a subagent does not know it has a parent at all, and has to
+     * call agent_list to guess before it can answer anything. Claude Code hands
+     * a subagent the same thing for the same reason.
+     *
+     * The set is the child's own parent and siblings — the caller, plus the
+     * caller's other children. Not the caller's parent and siblings, which from
+     * the new child's seat would be its grandparent and its uncles, and have
+     * nothing to do with who it can reach.
+     *
+     * A snapshot, with no statuses. Status would be stale immediately and is
+     * the roster's job; this answers a question that does not change. Saying
+     * outright that it is a snapshot is what makes it honest when it is
+     * incomplete — an Agent named later is not in it.
+     *
+     * Gated on the recipient's own agent_list permission, not the caller's:
+     * denying a subagent agent_list means it should not know about other
+     * Agents, and handing it the list by a different route would be a hole in
+     * that rather than a nuance of it. Claude Code gates its equivalent the
+     * same way, on whether the subagent's own tools include the messaging one.
+     */
+    const siblingSnapshot = Effect.fn("AgentLifecycle.siblingSnapshot")(function* (input: {
+      caller: Session.Info
+      child: SessionID
+      permission: PermissionV1.Ruleset
+    }) {
+      if (Permission.evaluate(AGENT_LIST_TOOL_ID, "*", input.permission).action === "deny") return undefined
+
+      const depth = yield* tree.callerDepth(input.caller.id).pipe(Effect.orElseSucceed(() => 0))
+      const siblings = (yield* tree.children(input.caller.id, depth + 1)).filter(
+        (item) => item.session_id !== input.child,
+      )
+
+      const callerName = input.caller.metadata?.[AgentManagement.METADATA_AGENT_NAME]
+      const rows = [
+        `  ${input.caller.id}  ${callerName ? `${callerName} (your parent)` : "your parent"}`,
+        ...siblings.map((item) => `  ${item.session_id}  ${item.name ?? `(${item.agent_type ?? "agent"})`}`),
+      ]
+      return [
+        "Agents you can message with agent_send:",
+        ...rows,
+        "",
+        "This is a snapshot taken when you started; Agents created later are not in it. Use agent_list for the current picture.",
+      ].join("\n")
+    })
+
     const workdirInstruction = (workdir: AgentManagement.AgentWorkdir, sourceDirectory: string) =>
       workdir.source === "generated_empty_workspace"
         ? [
@@ -135,6 +199,7 @@ const layer = Layer.effect(
         : Parameters<AgentManagement.AgentPromptOps["prompt"]>[0]["parts"]
       description: string
       ops: AgentManagement.AgentPromptOps
+      notify: boolean
     }) {
       const limits = yield* truncate.limits()
 
@@ -159,8 +224,18 @@ const layer = Layer.effect(
         run,
       })
 
-      // Registered once. Silent on cancelled, because a cancellation notice comes
-      // from stop; adding one here would produce two for a single agent_stop.
+      // Registered once, and only when this delegation reports for itself.
+      // Silent on cancelled, because a cancellation notice comes from stop;
+      // adding one here would produce two for a single agent_stop.
+      //
+      // Note that `notify` is a parameter rather than something read from the
+      // Effect context. A forked fiber inherits the context, and the job's fiber
+      // is forked from here, so a contextual flag would travel through the
+      // child's whole execution: when that child spawned one of its own, the
+      // grandchild would read `false` too and never report back to it. The scope
+      // of this switch has to be exactly one delegation.
+      if (!input.notify) return
+
       yield* background
         .wait({ id: input.session.id })
         .pipe(
@@ -277,11 +352,14 @@ const layer = Layer.effect(
         },
       })
 
+      const neighbours = yield* siblingSnapshot({ caller: parent, child: session.id, permission: childPermission })
+
       // Keeps the parts structure: resolvePromptParts expands @file references
       // into attachment parts, and flattening to a string drops them.
       const resolved = yield* input.ops.resolvePromptParts(input.prompt)
       const parts = [
         { type: "text" as const, text: workdirInstruction(workdir, parent.directory) },
+        ...(neighbours ? [{ type: "text" as const, text: neighbours }] : []),
         ...resolved,
       ]
 
@@ -294,6 +372,7 @@ const layer = Layer.effect(
         parts,
         description: input.description,
         ops: input.ops,
+        notify: input.notify ?? true,
       })
 
       // No live status: the job may not have started yet, and status has exactly

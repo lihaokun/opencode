@@ -1,4 +1,5 @@
-import { afterEach, describe, expect } from "bun:test"
+import path from "path"
+import { afterEach, describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -16,6 +17,7 @@ import { Session } from "@/session/session"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { Truncate } from "@/tool/truncate"
+import { AgentWorkdir } from "@/agent-management/workdir"
 import { AgentLifecycle } from "@/agent-management/lifecycle"
 import { AgentManagement } from "@/agent-management/schema"
 import type { SessionPrompt } from "@/session/prompt"
@@ -403,7 +405,70 @@ describe("AgentLifecycle workspaces", () => {
       })
 
       expect(result.workdir.source).toBe("generated_empty_workspace")
-      expect(result.workdir.path).toContain(".opencode/worktrees")
+      // Built with join rather than written with a slash, so the assertion
+      // holds on Windows too.
+      expect(result.workdir.path).toContain(path.join(".opencode", "worktrees"))
       expect(result.workdir.enforced).toBe(false)
     }))
+
+  // A timestamp was the directory name before this. Two workspaces created
+  // inside the same millisecond took the same one.
+  it.instance("gives concurrent non-git workspaces different directories", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const lifecycle = yield* AgentLifecycle.Service
+      const caller = yield* sessions.create({ title: "root" })
+      const { ops } = stubOps()
+
+      const made = yield* Effect.all(
+        [0, 1].map(() =>
+          lifecycle.create({
+            caller: caller.id,
+            subagent_type: "explore",
+            description: "look around",
+            prompt: "find the thing",
+            model: ref,
+            variant: undefined,
+            ops,
+          }),
+        ),
+        { concurrency: "unbounded" },
+      )
+
+      expect(made[0].workdir.path).not.toBe(made[1].workdir.path)
+    }))
+})
+
+// The pattern has to name the destination relative to the repository root,
+// because that is what info/exclude anchors a mid-path slash to. It also has to
+// survive whatever characters a user's own directory names contain.
+describe("AgentWorkdir.escapeIgnorePattern", () => {
+  test("normalises Windows separators", () => {
+    // A backslash is gitignore's escape character, not a separator, so writing
+    // one produces a pattern that matches nothing like the intended path.
+    expect(AgentWorkdir.escapeIgnorePattern("packages\\opencode\\.opencode/worktrees")).toBe(
+      "packages/opencode/.opencode/worktrees",
+    )
+  })
+
+  test.each([
+    ["a glob", "a*b/.opencode/worktrees", "a\\*b/.opencode/worktrees"],
+    ["a single-char glob", "a?b/.opencode/worktrees", "a\\?b/.opencode/worktrees"],
+    ["a character class", "a[0]b/.opencode/worktrees", "a\\[0\\]b/.opencode/worktrees"],
+  ])("escapes %s", (_label, input, expected) => {
+    expect(AgentWorkdir.escapeIgnorePattern(input)).toBe(expected)
+  })
+
+  test.each([
+    ["a comment marker", "#notes/.opencode/worktrees", "\\#notes/.opencode/worktrees"],
+    ["a negation marker", "!notes/.opencode/worktrees", "\\!notes/.opencode/worktrees"],
+  ])("escapes %s at the start of the pattern", (_label, input, expected) => {
+    expect(AgentWorkdir.escapeIgnorePattern(input)).toBe(expected)
+  })
+
+  test("keeps a trailing space", () => {
+    // Trailing whitespace is stripped from a gitignore line unless escaped.
+    expect(AgentWorkdir.escapeIgnorePattern("notes /x")).toBe("notes /x")
+    expect(AgentWorkdir.escapeIgnorePattern("notes ")).toBe("notes\\ ")
+  })
 })
