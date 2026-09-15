@@ -179,24 +179,30 @@ const layer = Layer.effect(
       const target = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       const here = yield* InstanceState.context
 
-      // Caught inside the fork, or the failure escapes as a defect. The caller
-      // is already gone by then, so the only report left is the event.
-      const run = prompt(input).pipe(
-        Effect.catchCause((cause) =>
-          Effect.gen(function* () {
-            yield* Effect.logError("async delivery failed", { sessionID: input.sessionID, cause })
-            yield* events.publish(Session.Event.Error, {
-              sessionID: input.sessionID,
-              error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
-            })
-          }),
-        ),
-      )
+      // Everything the fork does is reported this way, or the failure escapes
+      // as a defect. The caller is already gone by then, so the event is the
+      // only report left. Note that this wraps the instance switch as well as
+      // the run: loading the target's instance can fail too, and a failure
+      // there is just as invisible.
+      const report = (effect: Effect.Effect<unknown, unknown>) =>
+        effect.pipe(
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              yield* Effect.logError("async delivery failed", { sessionID: input.sessionID, cause })
+              yield* events.publish(Session.Event.Error, {
+                sessionID: input.sessionID,
+                error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
+              })
+            }),
+          ),
+          Effect.forkIn(scope, { startImmediately: true }),
+          Effect.asVoid,
+        )
 
       // Same directory means this instance already is the target's, and loading
       // it again would be a detour to the same place.
       if (target.directory === here.directory) {
-        yield* run.pipe(Effect.forkIn(scope, { startImmediately: true }))
+        yield* report(prompt(input))
         return
       }
 
@@ -207,16 +213,16 @@ const layer = Layer.effect(
       if (store._tag === "None") {
         // Refuse rather than quietly run it here. Running a session against
         // another directory's files is worse than not delivering, and silence
-        // is how this went unnoticed the first time.
+        // is how this went unnoticed the first time. Every entry point that
+        // builds SessionPrompt has the store, so this is a guard against a
+        // layer assembled without it rather than a path a user can reach.
         return yield* Effect.die(
           new Error(
             `cannot deliver to session ${input.sessionID}: it belongs to ${target.directory}, this instance is ${here.directory}, and no InstanceStore is available to switch`,
           ),
         )
       }
-      yield* store.value
-        .provide({ directory: target.directory }, run)
-        .pipe(Effect.forkIn(scope, { startImmediately: true }))
+      yield* report(store.value.provide({ directory: target.directory }, prompt(input)))
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
