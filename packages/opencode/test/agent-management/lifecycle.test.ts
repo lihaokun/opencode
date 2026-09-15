@@ -439,6 +439,88 @@ describe("AgentLifecycle workspaces", () => {
     }))
 })
 
+// Without this a subagent does not know it has a parent, and has to call
+// agent_list to work out who asked before it can answer.
+describe("AgentLifecycle sibling snapshot", () => {
+  const snapshotOf = (seen: SessionPrompt.PromptInput[]) => {
+    const initial = seen.find((input) => input.parts.some((p) => p.type === "text"))
+    return initial?.parts
+      .map((p) => (p.type === "text" ? p.text : ""))
+      .find((text) => text.includes("Agents you can message"))
+  }
+
+  it.instance("tells a new subagent about its parent", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const lifecycle = yield* AgentLifecycle.Service
+      const caller = yield* sessions.create({ title: "root" })
+      const { ops, seen } = stubOps()
+
+      yield* lifecycle.create(baseCreate(caller.id, ops))
+
+      const snapshot = snapshotOf(seen)
+      expect(snapshot).toContain(caller.id)
+      // A snapshot, and it says so — an Agent named later is not in it.
+      expect(snapshot).toContain("snapshot")
+      // Status belongs to the roster; here it would be stale on arrival.
+      expect(snapshot).not.toContain("running")
+      expect(snapshot).not.toContain("idle")
+    }),
+  )
+
+  // The caller's other children, which from the new child's seat are its
+  // siblings. Not the caller's own siblings, which would be its uncles.
+  it.instance("lists the caller's other children and not the caller's siblings", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const lifecycle = yield* AgentLifecycle.Service
+      const grandparent = yield* sessions.create({ title: "grandparent" })
+      const caller = yield* sessions.create({ parentID: grandparent.id, title: "caller" })
+      const uncle = yield* sessions.create({ parentID: grandparent.id, title: "uncle" })
+      const { ops, seen } = stubOps()
+
+      const sibling = yield* lifecycle.create(baseCreate(caller.id, ops))
+      seen.length = 0
+      yield* lifecycle.create(baseCreate(caller.id, ops))
+
+      const snapshot = snapshotOf(seen)
+      expect(snapshot).toContain(caller.id)
+      expect(snapshot).toContain(sibling.session_id)
+      expect(snapshot).not.toContain(grandparent.id)
+      expect(snapshot).not.toContain(uncle.id)
+    }),
+  )
+
+  it.instance("leaves the new subagent out of its own neighbour list", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const lifecycle = yield* AgentLifecycle.Service
+      const caller = yield* sessions.create({ title: "root" })
+      const { ops, seen } = stubOps()
+
+      const made = yield* lifecycle.create(baseCreate(caller.id, ops))
+      expect(snapshotOf(seen)).not.toContain(made.session_id)
+    }),
+  )
+
+  // Denying a subagent agent_list means it should not know about other Agents.
+  // Handing it the list another way would be a hole in that, not a nuance of it.
+  it.instance("says nothing to a subagent denied agent_list", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const lifecycle = yield* AgentLifecycle.Service
+      const caller = yield* sessions.create({
+        title: "root",
+        permission: [{ permission: "agent_list", pattern: "*", action: "deny" }],
+      })
+      const { ops, seen } = stubOps()
+
+      yield* lifecycle.create(baseCreate(caller.id, ops))
+      expect(snapshotOf(seen)).toBeUndefined()
+    }),
+  )
+})
+
 // The pattern has to name the destination relative to the repository root,
 // because that is what info/exclude anchors a mid-path slash to. It also has to
 // survive whatever characters a user's own directory names contain.

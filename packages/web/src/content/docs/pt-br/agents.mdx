@@ -573,7 +573,7 @@ Aplica-se apenas a agentes `mode: subagent`.
 
 ### Permissões de tarefa
 
-Controle quais subagentes um agente pode invocar através da ferramenta Task com `permission.task`. Usa padrões globais para correspondência flexível.
+Controle quais subagentes um agente pode invocar através da ferramenta Task com `permission.agent`. Usa padrões globais para correspondência flexível.
 
 ```json title="opencode.json"
 {
@@ -581,7 +581,7 @@ Controle quais subagentes um agente pode invocar através da ferramenta Task com
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

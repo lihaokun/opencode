@@ -161,6 +161,10 @@ Session 并按 fallback 链改写它。细化 §5.4.1 步骤 8。
 | `cli/cmd/run/subagent-data.ts:334` | `if (part.tool !== "task") return` |
 | `cli/cmd/run/tool.ts:578`、`:1436` | kind 与 name 分支 |
 | `cli/cmd/agent.ts:26` | 工具名清单 |
+| `acp/tool.ts:65` | `case "task"` 的 kind 分类（**PR #35 复审补记**） |
+| `session-ui/components/message-part.tsx` | 卡片分支、三个 memo 判据、`ToolRegistry` 注册名（**补记**） |
+| `session-ui/components/tool-error-card.tsx` | 工具名 → i18n key 映射（**补记**） |
+| `web/components/share/part.tsx` | 分享页的图标与卡片分支（**补记**） |
 
 **纯展示层可同时识别历史 `task` part**，保证旧 transcript 可读——这不恢复执行能力。
 前台转后台相关 UI 随前台模式一并删除。
@@ -177,3 +181,13 @@ Session 并按 fallback 链改写它。细化 §5.4.1 步骤 8。
 | `session/reminders.ts` | 增加 roster 分支，用**落盘**那种写法（`:56`），不用内存 push（`:28`） | 细化 §5.5.6 |
 | `worktree/index.ts` | 新增 Agent 专用内部入口（ready 契约）；**不给公开 `CreateInput` 加 `root`** | 细化 §5.4.2 |
 | `tui/routes/session/index.tsx:208-213`、`:229-235` | 权限/question 聚合改为整棵后代，回复按 `request.sessionID` 路由 | 架构 §6，深度改动的必要连带项 |
+
+### 10.5 文档与生成物（PR #35 复审补记）
+
+| 位置 | 改动 |
+|---|---|
+| `web/src/content/docs/agents.mdx` | 权限键表补四个新键；`permission.task` 段改名并说明 in-place 迁移 |
+| `web/src/content/docs/*/agents.mdx`（17 个 locale） | **只替换代码标识符**（`permission.task` → `permission.agent`、示例中的 `"task":`），译文散文留给翻译流程；`docs-locale-sync` 工作流当前为 `if: false` |
+| `app/src/i18n/*.ts`（62 个） | `settings.permissions.tool.task.*` **原键改名**为 `…tool.agent.*`，沿用既有译文——不新造 40 种语言的翻译。`agent_list` / `agent_send` / `agent_stop` **暂无**描述串：dock 对缺失 key 降级为空描述（`session-permission-dock.tsx:16`），三者默认 allow，极少弹窗 |
+| `core/src/plugin/skill/customize-opencode.md` | legacy 迁移改述为「原地改名、保持位置」 |
+| 生成物 | `bun ./packages/sdk/js/script/build.ts`；`packages/client` 下 `bun run generate` |

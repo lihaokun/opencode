@@ -571,7 +571,7 @@ Only analyze code and suggest changes.
 
 ### タスクの権限
 
-`permission.task` を使用して、エージェントがタスクツール経由でどのサブエージェントを呼び出すことができるかを制御します。柔軟なマッチングのためにグロブパターンを使用します。
+`permission.agent` を使用して、エージェントがタスクツール経由でどのサブエージェントを呼び出すことができるかを制御します。柔軟なマッチングのためにグロブパターンを使用します。
 
 ```json title="opencode.json"
 {
@@ -579,7 +579,7 @@ Only analyze code and suggest changes.
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

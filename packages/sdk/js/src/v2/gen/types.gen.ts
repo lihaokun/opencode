@@ -1674,6 +1674,10 @@ export type PermissionConfig =
       list?: PermissionRuleConfig
       bash?: PermissionRuleConfig
       task?: PermissionRuleConfig
+      agent?: PermissionRuleConfig
+      agent_list?: PermissionRuleConfig
+      agent_send?: PermissionRuleConfig
+      agent_stop?: PermissionRuleConfig
       external_directory?: PermissionRuleConfig
       todowrite?: PermissionActionConfig
       question?: PermissionActionConfig

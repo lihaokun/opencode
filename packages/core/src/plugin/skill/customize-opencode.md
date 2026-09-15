@@ -461,10 +461,13 @@ type except `general`. It defaults to allow, so launching a subagent does not
 prompt. `agent_list`, `agent_send` and `agent_stop` are ordinary tool keys with
 no patterns worth writing.
 
-`task` was this key's old name. Config still accepts it and rewrites it to
+`task` was this key's old name. Config still accepts it and renames it to
 `agent` on read, so an existing `task: deny` keeps working — silently ignoring
-it would widen permissions on upgrade. Use `agent` in new config; `task` is
-deprecated and the rewrite is the only thing keeping it alive.
+it would widen permissions on upgrade. The rename happens **in place**: the rule
+keeps its position among the others, which matters because the last matching
+rule wins, so a legacy rule goes on being overridden by exactly what overrode it
+before. When both keys name the same pattern, the explicit `agent` one wins. Use
+`agent` in new config; `task` is deprecated and warns once on load.
 
 An agent whose ruleset starts with `{"*": "deny"}` must name these tools
 explicitly to keep them — a wildcard deny removes them along with everything

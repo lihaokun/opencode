@@ -568,7 +568,7 @@ Only analyze code and suggest changes.
 
 ### Task Permissions (สิทธิ์งาน)
 
-กำหนดว่า subagent ใดที่เอเจนต์นี้สามารถเรียกใช้ได้ผ่านเครื่องมือ task ด้วย `permission.task`
+กำหนดว่า subagent ใดที่เอเจนต์นี้สามารถเรียกใช้ได้ผ่านเครื่องมือ task ด้วย `permission.agent`
 
 ```json title="opencode.json"
 {
@@ -576,7 +576,7 @@ Only analyze code and suggest changes.
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

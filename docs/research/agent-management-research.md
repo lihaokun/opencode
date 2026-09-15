@@ -800,9 +800,12 @@ idle 的目标永远不会启动。必须照 handler 那样 fork 并在 fork 内
 fork 内的失败只发 `Session.Event.Error`，调用方那边已经返回 accepted，**模型拿不到投递失败反馈**，
 记为已知限制。
 
-### 17.2 不存在按 Session 的 workspace 路由（对评审的一处修正）
+### 17.2 ~~不存在按 Session 的 workspace 路由~~ —— **本节结论作废**（2026-09-16）
 
-评审要求"复用完整 prompt_async **包括目标 Session 的 workspace/location routing**"。核实后：
+**本节原先的结论是错的，已由 PR #35 复审推翻。保留原文与更正，以免同一错误被再次推导出来。**
+
+原结论：评审要求"复用完整 prompt_async **包括目标 Session 的 workspace/location routing**"，
+我据下面这段断言该能力不存在——
 
 ```ts
 const requireSession = Effect.fn(...)(function* (sessionID) {
@@ -810,11 +813,19 @@ const requireSession = Effect.fn(...)(function* (sessionID) {
 })
 ```
 
-`promptAsync` 这一层**没有任何按目标 Session 选 instance 的机制**——instance 由 HTTP 请求自己
-路由到，不是按 session 选的。所以"不能丢掉外层路由语义"描述的是 V1 不存在的能力。
+**错在哪**：`requireSession` 是 handler **内部**的一个查找，而路由在**它外面的中间件**里。
+`server/routes/instance/httpapi/middleware/workspace-routing.ts:222-232` 先按 URL 中的 sessionID
+查出 Session，再由 `planRequest`（`:160-186`）用 `session.workspaceID` / `session.directory`
+规划目标 Instance。**一个函数不能证明一整层不存在**——这是方法上的错误，不只是结论上的。
 
-采纳的是 fork 那一半（17.1）。**跨 workspace 的 `agent_send` 在 V1 做不到**，如实记为已知限制；
-不记为"已由 prompt_async 解决"。同一 project 内的 Agent 树共享 instance，本 feature 的目标场景不受影响。
+**更正后的结论**：`prompt_async` 的语义是**两半**——异步性在 handler 的 fork，路由在中间件。
+只取 fork 那一半，就会让目标 Session 在**发送方的 Instance** 里执行。本 server 内的跨 directory
+投递**做得到**，做法是把两半封装成单一入口（`AgentPromptOps.deliverAsync`），由 `agent_send`
+与 HTTP handler 共用。
+
+**寻址范围**：`session_id` 限于当前 OpenCode server 的 Session 命名空间。`Session.get` 是本机
+DB 的一次主键查询，别的 server 的 Session 本就不在表内，查不到即 `AgentNotFound`——
+不为此新增分支或错误类型。
 
 ### 17.3 `task` 工具删除，不保留隐藏可执行别名
 

@@ -947,42 +947,42 @@ CLI 会当场退出，**父永远没机会处理子的结果**——正是这套
 
 | 文件 | 函数 / 行号 | 改动概述 | 状态 |
 |---|---|---|---|
-| `src/permission/index.ts` | `fromConfig` `:185-224` | legacy `task` 原地改名；仅同 pattern 显式规则时抑制 | 待改 |
-| `packages/core/src/v1/config/permission.ts` | `:17-35` | 补四个新键；`task` 标 deprecated | 待改 |
-| `src/config/config.ts` | 读取路径 | legacy `task` 出现时输出一次迁移 warning | 待改 |
-| `src/agent-management/schema.ts` | `AgentPromptOps` `:160-164` | 接口加 `deliverAsync(input: SessionPrompt.PromptInput): Effect<void>` | 待改 |
-| `src/session/prompt.ts` | `Interface` `:107-112` / `ops()` `:149-155` | 实现并透出 `deliverAsync`：按目标 Session 路由 + fork + 失败上报 | 待改 |
-| `.../httpapi/handlers/session.ts` | `promptAsync` `:311-329` | 改调 `deliverAsync`，删自己的 `catchCause + forkIn`（与 `agent_send` 共用一份实现） | 待改 |
-| `src/agent-management/lifecycle.ts` | `create` / `startDelegation` | 增**显式**参数 `notify`（默认 `true`）；`false` 时不注册完成 watcher | 待改 |
-| `src/tool/agent.ts` | `:105` 附近 | 读 `ctx.extra?.notifyOnFinish`，显式透传给 `lifecycle.create` | 待改 |
-| `src/session/prompt.ts` | `handleSubtask` `:337` | `extra` 加 `notifyOnFinish: false`；**先判 `metadata.sessionId` 是否存在**（不存在则直接写 tool error 并返回）；否则 `background.wait` 同一个 job；三分支写回 tool part；仅 completed 建 summary；`onInterrupt` 调 `background.cancel` | 待改 |
-| `src/agent-management/inbox.ts` | `deliver` `:88-101` | 改调完整入口，删自建 fork | 待改 |
-| `src/agent-management/inbox.ts` | `render` `:26-35` | 转义 `name` / `agent_type` | 待改 |
-| `src/agent-management/lifecycle.ts` | `renderTermination` `:382` | 用词改 `cancelled` | 待改 |
-| `src/agent-management/lifecycle.ts` | `create` | 初始 prompt 插入兄弟快照 part | 待改 |
-| `src/agent-management/workdir.ts` | `:32-34` | `cwd` 绝对化 | 待改 |
-| `src/agent-management/workdir.ts` | `:42` | 非 Git 目录名改抗碰撞 ID | 待改 |
-| `src/agent-management/workdir.ts` | `registerIgnore` `:100-114` | exclude pattern 按 repo 相对计算 | 待改 |
-| `src/session/reminders.ts` | `applyAgentRoster` `:17-76` | 重写为两触发点 + 权限检查 | 待改 |
-| `src/session/prompt.ts` | `handleSubtask` `:260-454` | 不再总结启动确认；文案去 task | 待改 |
-| `src/session/prompt.ts` | `:991` | attachment 提示改 `agent` | 待改 |
-| `src/agent/generate.txt` | `:44,51` | 示例改 agent 工具 | 待改 |
-| `src/session/prompt/meta.txt` | `:42` | 标题改 agent | 待改 |
-| `src/cli/cmd/run.ts` | `:700-850` | `rootIdle` 状态化；上限改测"连续无活动"（活动重置而非忙碌清除）；事件流与 timeout 竞争 | 待改 |
-| `packages/session-ui/src/components/message-part.tsx` | `:512,1551-1560,1979` | 识别 `agent`；`task` 仅历史展示 | 待改 |
-| `packages/session-ui/src/components/tool-error-card.tsx` | `:52` | 同上 | 待改 |
-| `packages/web/src/components/share/part.tsx` | `:117,267` | 同上 | 待改 |
-| `packages/tui/src/config/keybind.ts` | `:98,305` | 删 `session_background` | 待改 |
-| `src/cli/cmd/run/footer.view.tsx` | `:204-212` | 删无用 shortcut | 待改 |
-| `.../handlers/experimental.ts` | imports | 删未使用 service / import | 待改 |
-| `test/server/session-actions.test.ts` | `:93` | 删/改打已删端点的用例 | 待改 |
-| `src/acp/tool.ts` | `:65` | `case "task"` → 识别 `agent`；`task` 仅保留为历史展示分支 | 待改 |
-| `packages/web/src/content/docs/agents.mdx` + 全部 locale 副本 | Task tool / `permission.task` 文案 | 改为 `agent` 工具与新权限键；保留 legacy `task` 的迁移说明 | 待改 |
-| `packages/app/src/i18n/*.ts` | `settings.permissions.tool.task.*` | 新增 `…tool.agent.*` 四键文案；`task` 条目按 legacy 处理 | 待改 |
-| 生成物：SDK | —— | 执行 `./packages/sdk/js/script/build.ts` | 待改 |
-| 生成物：client | —— | 在 `packages/client` 执行 `bun run generate` | 待改 |
-| `packages/sdk/openapi.json`、`codemode` fixture | —— | 由上两条重新生成后一并提交 | 待改 |
-| `test/agent-management/lifecycle.test.ts` | `:404` | 路径断言用 `path.join` | 待改 |
+| `src/permission/index.ts` | `fromConfig` `:185-224` | legacy `task` 原地改名；仅同 pattern 显式规则时抑制 | ✅ |
+| `packages/core/src/v1/config/permission.ts` | `:17-35` | 补四个新键；`task` 标 deprecated | ✅ |
+| `src/config/config.ts` | 读取路径 | legacy `task` 出现时输出一次迁移 warning | ✅ |
+| `src/agent-management/schema.ts` | `AgentPromptOps` `:160-164` | 接口加 `deliverAsync(input: SessionPrompt.PromptInput): Effect<void>` | ✅ |
+| `src/session/prompt.ts` | `Interface` `:107-112` / `ops()` `:149-155` | 实现并透出 `deliverAsync`：按目标 Session 路由 + fork + 失败上报 | ✅ |
+| `.../httpapi/handlers/session.ts` | `promptAsync` `:311-329` | 改调 `deliverAsync`，删自己的 `catchCause + forkIn`（与 `agent_send` 共用一份实现） | ✅ |
+| `src/agent-management/lifecycle.ts` | `create` / `startDelegation` | 增**显式**参数 `notify`（默认 `true`）；`false` 时不注册完成 watcher | ✅ |
+| `src/tool/agent.ts` | `:105` 附近 | 读 `ctx.extra?.notifyOnFinish`，显式透传给 `lifecycle.create` | ✅ |
+| `src/session/prompt.ts` | `handleSubtask` `:337` | `extra` 加 `notifyOnFinish: false`；**先判 `metadata.sessionId` 是否存在**（不存在则直接写 tool error 并返回）；否则 `background.wait` 同一个 job；三分支写回 tool part；仅 completed 建 summary；`onInterrupt` 调 `background.cancel` | ✅ |
+| `src/agent-management/inbox.ts` | `deliver` `:88-101` | 改调完整入口，删自建 fork | ✅ |
+| `src/agent-management/inbox.ts` | `render` `:26-35` | 转义 `name` / `agent_type` | ✅ |
+| `src/agent-management/lifecycle.ts` | `renderTermination` `:382` | 用词改 `cancelled` | ✅ |
+| `src/agent-management/lifecycle.ts` | `create` | 初始 prompt 插入兄弟快照 part | ✅ |
+| `src/agent-management/workdir.ts` | `:32-34` | `cwd` 绝对化 | ✅ |
+| `src/agent-management/workdir.ts` | `:42` | 非 Git 目录名改抗碰撞 ID | ✅ |
+| `src/agent-management/workdir.ts` | `registerIgnore` `:100-114` | exclude pattern 按 repo 相对计算 | ✅ |
+| `src/session/reminders.ts` | `applyAgentRoster` `:17-76` | 重写为两触发点 + 权限检查 | ✅ |
+| `src/session/prompt.ts` | `handleSubtask` `:260-454` | 不再总结启动确认；文案去 task | ✅ |
+| `src/session/prompt.ts` | `:991` | attachment 提示改 `agent` | ✅ |
+| `src/agent/generate.txt` | `:44,51` | 示例改 agent 工具 | ✅ |
+| `src/session/prompt/meta.txt` | `:42` | 标题改 agent | ✅ |
+| `src/cli/cmd/run.ts` | `:700-850` | `rootIdle` 状态化；上限改测"连续无活动"（活动重置而非忙碌清除）；事件流与 timeout 竞争 | ✅ |
+| `packages/session-ui/src/components/message-part.tsx` | `:512,1551-1560,1979` | 识别 `agent`；`task` 仅历史展示 | ✅ |
+| `packages/session-ui/src/components/tool-error-card.tsx` | `:52` | 同上 | ✅ |
+| `packages/web/src/components/share/part.tsx` | `:117,267` | 同上 | ✅ |
+| `packages/tui/src/config/keybind.ts` | `:98,305` | 删 `session_background` | ✅ |
+| `src/cli/cmd/run/footer.view.tsx` | `:204-212` | 删无用 shortcut | ✅ |
+| `.../handlers/experimental.ts` | imports | 删未使用 service / import | ✅ |
+| `test/server/session-actions.test.ts` | `:93` | 删/改打已删端点的用例 | ✅ |
+| `src/acp/tool.ts` | `:65` | `case "task"` → 识别 `agent`；`task` 仅保留为历史展示分支 | ✅ |
+| `packages/web/src/content/docs/agents.mdx` + 全部 locale 副本 | Task tool / `permission.task` 文案 | 改为 `agent` 工具与新权限键；保留 legacy `task` 的迁移说明 | ✅ |
+| `packages/app/src/i18n/*.ts` | `settings.permissions.tool.task.*` | 新增 `…tool.agent.*` 四键文案；`task` 条目按 legacy 处理 | ✅ |
+| 生成物：SDK | —— | 执行 `./packages/sdk/js/script/build.ts` | ✅ |
+| 生成物：client | —— | 在 `packages/client` 执行 `bun run generate` | ✅ |
+| `packages/sdk/openapi.json`、`codemode` fixture | —— | 由上两条重新生成后一并提交 | ✅ |
+| `test/agent-management/lifecycle.test.ts` | `:404` | 路径断言用 `path.join` | ✅ |
 
 ---
 
@@ -996,25 +996,25 @@ CLI 会当场退出，**父永远没机会处理子的结果**——正是这套
 
 | 文档路径 | 要改什么 | 类别 | 状态 |
 |---|---|---|---|
-| `architecture.md` | §6 决策行 `:755`「V1 没有按 Session 的 workspace 路由」**整行作废**——`requireSession` 不能证明路由不存在，路由在 `workspace-routing.ts:222-232`。改为：本地跨 directory **可路由**，共享 use case 取显式目标描述符 | **设计** | 待改 |
-| `architecture.md` | §10 **缺口 12 整条删除**：其理由（V1 无按 Session 路由）是错的，而结论（跨 workspace 做不到）对本 server 内的跨 directory 也不成立。**不补 remote 缺口**——`session_id` 的地址空间就是本 server，remote Session 本就不在其中，查不到走既有 `AgentNotFound` | **设计** | 待改 |
-| `architecture.md` | §9 CC 差异表 `:972`「跨 workspace 通信 = 做不到」改为「本 server 内跨 directory 支持」，并写明地址空间限于本 server | **设计** | 待改 |
-| `architecture.md` | §6 决策行 `:760`「先转换旧 `task`、再覆盖显式 `agent`」**是 P0-2 的错误源头**——"先转换再覆盖"即移动位置。改为**原地改名 + 同 pattern 时抑制**，并写明理由（`findLast` 下位置即语义） | **设计** | 待改 |
-| `architecture.md` | §6 状态表决策行改为「**边沿触发、回合边界投递**」：`idle→running` 或刚压缩时求值，与历史中最近一条不同才落盘。**明写判据比意图宽**（普通新回合也命中）及接受该取舍的理由 | **设计** | 待改 |
-| `architecture.md` | §9 CC 差异表 `:973` 改写：CC **不**持续注入运行中列表（三方证据见 §3），我们的注入是有意增强，且已收敛为边沿触发 | **设计** | 待改 |
-| `architecture.md` | §6 新增决策行：**兄弟快照**——面向子、启动时一次、不含状态，集合为 `{C} ∪ (children(C) \ {D})`，受 **D 自己的** `agent_list` 权限约束 | **设计** | 待改 |
-| `architecture.md` | §4.4 M4 新增内部契约：`startDelegation` 的 `notify` 参数；command-subtask 复用同一次 delegation 并自行等待，父只收一条消息；父中断时取消子 | **设计** | 待改 |
-| `architecture.md` | §6 决策行 `:795`（run 排空）**保留原语义不改**——"连续空闲""重置计时"是对的，实现背离了它。补两句：**什么算"活动"**（被跟踪 Session 的 created / status / message / part 事件），以及**正常退出只由 root 自己的 idle 驱动**（后代 idle 早于结果投递，据其退出会丢结果） | 实现 | 待改 |
-| `architecture.md` | §4.3 M3 后置条件改为"经含路由的完整投递入口" | 实现 | 待改 |
-| `architecture.md` | §3 `AgentMessage` 类型不变量：前缀不可伪造扩展到**全部**插值字段 | 实现 | 待改 |
-| `architecture.md` | 闭合"等待再次确认"状态（P2-7） | 实现 | 待改 |
-| `detailed-design.md` | §5.3.2 `deliver` 改为调完整入口（取显式描述符）；§5.3.1 `render` 写明**编码而非剥离**的转义规则与其单射性论证 | **设计** | 待改 |
-| `detailed-design.md` | `applyAgentRoster` 函数级设计按新触发规则重写 + 正确性论证；**新增**兄弟快照的函数级设计（集合定义、权限判据、快照语义） | **设计** | 待改 |
-| `detailed-design.md` | 新增 `startDelegation` 的 `notify` 参数与 command-subtask 等待路径的函数级设计 | **设计** | 待改 |
-| `detailed-design.md` | §5.4.2 `prepareWorkdir`：`cwd` 绝对化；唯一 ID 明确为 `Identifier.create("agent", "ascending")`（附 `Slug.create()` 899 组合与 `Identifier.ascending` 前缀集受限两条否决理由）；exclude pattern 的基准、分隔符规范化与元字符转义规则 | **设计** | 待改 |
-| `detailed-design.md` | §5.4.8 停止通知用词 `cancelled`；渲染同样走转义 | 实现 | 待改 |
-| `detailed-design.md` | 闭合"等待确认"状态 | 实现 | 待改 |
-| `task-inventory.md` | 补 consumer 行：`session-ui`、`web/share`、**`acp/tool.ts`**、**`web/src/content/docs/**/agents.mdx`（全 locale）**、**`app/src/i18n/*.ts`**；补生成物行：`packages/sdk/js/script/build.ts`、`packages/client` 的 `bun run generate` | 实现 | 待改 |
-| `docs/research/agent-management-research.md` | §17.2 更正：V1 **有**按 Session 的路由；原结论作废 | 实现 | 待改 |
-| `packages/core/src/plugin/skill/customize-opencode.md` | 权限键补四个新键；说明 legacy `task` 的迁移与 deprecation | 实现 | 待改 |
-| PR #35 描述 | 删除"跨 workspace 做不到"的限制条目——本 server 内跨 directory 支持，且不新增 remote 契约 | 实现 | 待改 |
+| `architecture.md` | §6 决策行 `:755`「V1 没有按 Session 的 workspace 路由」**整行作废**——`requireSession` 不能证明路由不存在，路由在 `workspace-routing.ts:222-232`。改为：本地跨 directory **可路由**，共享 use case 取显式目标描述符 | **设计** | ✅ |
+| `architecture.md` | §10 **缺口 12 整条删除**：其理由（V1 无按 Session 路由）是错的，而结论（跨 workspace 做不到）对本 server 内的跨 directory 也不成立。**不补 remote 缺口**——`session_id` 的地址空间就是本 server，remote Session 本就不在其中，查不到走既有 `AgentNotFound` | **设计** | ✅ |
+| `architecture.md` | §9 CC 差异表 `:972`「跨 workspace 通信 = 做不到」改为「本 server 内跨 directory 支持」，并写明地址空间限于本 server | **设计** | ✅ |
+| `architecture.md` | §6 决策行 `:760`「先转换旧 `task`、再覆盖显式 `agent`」**是 P0-2 的错误源头**——"先转换再覆盖"即移动位置。改为**原地改名 + 同 pattern 时抑制**，并写明理由（`findLast` 下位置即语义） | **设计** | ✅ |
+| `architecture.md` | §6 状态表决策行改为「**边沿触发、回合边界投递**」：`idle→running` 或刚压缩时求值，与历史中最近一条不同才落盘。**明写判据比意图宽**（普通新回合也命中）及接受该取舍的理由 | **设计** | ✅ |
+| `architecture.md` | §9 CC 差异表 `:973` 改写：CC **不**持续注入运行中列表（三方证据见 §3），我们的注入是有意增强，且已收敛为边沿触发 | **设计** | ✅ |
+| `architecture.md` | §6 新增决策行：**兄弟快照**——面向子、启动时一次、不含状态，集合为 `{C} ∪ (children(C) \ {D})`，受 **D 自己的** `agent_list` 权限约束 | **设计** | ✅ |
+| `architecture.md` | §4.4 M4 新增内部契约：`startDelegation` 的 `notify` 参数；command-subtask 复用同一次 delegation 并自行等待，父只收一条消息；父中断时取消子 | **设计** | ✅ |
+| `architecture.md` | §6 决策行 `:795`（run 排空）**保留原语义不改**——"连续空闲""重置计时"是对的，实现背离了它。补两句：**什么算"活动"**（被跟踪 Session 的 created / status / message / part 事件），以及**正常退出只由 root 自己的 idle 驱动**（后代 idle 早于结果投递，据其退出会丢结果） | 实现 | ✅ |
+| `architecture.md` | §4.3 M3 后置条件改为"经含路由的完整投递入口" | 实现 | ✅ |
+| `architecture.md` | §3 `AgentMessage` 类型不变量：前缀不可伪造扩展到**全部**插值字段 | 实现 | ✅ |
+| `architecture.md` | 闭合"等待再次确认"状态（P2-7） | 实现 | ✅ |
+| `detailed-design.md` | §5.3.2 `deliver` 改为调完整入口（取显式描述符）；§5.3.1 `render` 写明**编码而非剥离**的转义规则与其单射性论证 | **设计** | ✅ |
+| `detailed-design.md` | `applyAgentRoster` 函数级设计按新触发规则重写 + 正确性论证；**新增**兄弟快照的函数级设计（集合定义、权限判据、快照语义） | **设计** | ✅ |
+| `detailed-design.md` | 新增 `startDelegation` 的 `notify` 参数与 command-subtask 等待路径的函数级设计 | **设计** | ✅ |
+| `detailed-design.md` | §5.4.2 `prepareWorkdir`：`cwd` 绝对化；唯一 ID 明确为 `Identifier.create("agent", "ascending")`（附 `Slug.create()` 899 组合与 `Identifier.ascending` 前缀集受限两条否决理由）；exclude pattern 的基准、分隔符规范化与元字符转义规则 | **设计** | ✅ |
+| `detailed-design.md` | §5.4.8 停止通知用词 `cancelled`；渲染同样走转义 | 实现 | ✅ |
+| `detailed-design.md` | 闭合"等待确认"状态 | 实现 | ✅ |
+| `task-inventory.md` | 补 consumer 行：`session-ui`、`web/share`、**`acp/tool.ts`**、**`web/src/content/docs/**/agents.mdx`（全 locale）**、**`app/src/i18n/*.ts`**；补生成物行：`packages/sdk/js/script/build.ts`、`packages/client` 的 `bun run generate` | 实现 | ✅ |
+| `docs/research/agent-management-research.md` | §17.2 更正：V1 **有**按 Session 的路由；原结论作废 | 实现 | ✅ |
+| `packages/core/src/plugin/skill/customize-opencode.md` | 权限键补四个新键；说明 legacy `task` 的迁移与 deprecation | 实现 | ✅ |
+| PR #35 描述 | 删除"跨 workspace 做不到"的限制条目——本 server 内跨 directory 支持，且不新增 remote 契约 | 实现 | ✅ |

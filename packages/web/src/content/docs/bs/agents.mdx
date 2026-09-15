@@ -572,7 +572,7 @@ Odnosi se samo na `mode: subagent` agente.
 
 ### Dozvole zadataka
 
-Kontrolirajte koje podagente agent može pozvati preko Task alata sa `permission.task`. Koristi glob uzorke za fleksibilno uparivanje.
+Kontrolirajte koje podagente agent može pozvati preko Task alata sa `permission.agent`. Koristi glob uzorke za fleksibilno uparivanje.
 
 ```json title="opencode.json"
 {
@@ -580,7 +580,7 @@ Kontrolirajte koje podagente agent može pozvati preko Task alata sa `permission
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"
