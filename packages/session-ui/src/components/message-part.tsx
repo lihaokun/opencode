@@ -65,6 +65,7 @@ import { partDefaultOpen } from "./part-default-open"
 import { animate } from "motion"
 import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
+import { isAgentTool, resolveToolName } from "./tool-alias"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
 
 async function writeClipboard(text: string): Promise<boolean> {
@@ -1489,13 +1490,8 @@ export function registerTool(input: { name: string; render?: ToolComponent }) {
   return input
 }
 
-// The aliases map a tool's other names onto the component registered for it.
-// `task` is what the agent tool was called before, and sessions recorded then
-// still have parts under that name.
-const TOOL_ALIASES: Record<string, string> = { apply_patch: "patch", bash: "shell", task: "agent" }
-
 export function getTool(name: string) {
-  return state[TOOL_ALIASES[name] ?? name]?.render
+  return state[resolveToolName(name)]?.render
 }
 
 export const ToolRegistry = {
@@ -1555,18 +1551,18 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
   const input = () => part().state?.input ?? emptyInput
   // @ts-expect-error
   const partMetadata = () => part().state?.metadata ?? emptyMetadata
-  const isAgentTool = () => part().tool === "agent" || part().tool === "task"
+  const isAgent = () => isAgentTool(part().tool)
   const taskId = createMemo(() => {
-    if (!isAgentTool()) return
+    if (!isAgent()) return
     const value = partMetadata().sessionId
     if (typeof value === "string" && value) return value
   })
   const taskHref = createMemo(() => {
-    if (!isAgentTool()) return
+    if (!isAgent()) return
     return sessionLink(taskId(), data.sessionHref)
   })
   const taskSubtitle = createMemo(() => {
-    if (!isAgentTool()) return undefined
+    if (!isAgent()) return undefined
     const value = input().description
     if (typeof value === "string" && value) return value
     return taskId()

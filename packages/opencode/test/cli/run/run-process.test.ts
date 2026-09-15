@@ -1112,6 +1112,61 @@ describe("opencode run waits for the agents it started", () => {
     TEST_TIMEOUT_MS,
   )
 
+  // The ceiling measures how long nothing has happened, not how long the run has
+  // taken. A subagent that keeps working past the ceiling — here by running a
+  // command that sleeps, several times over — resets it each time and must be
+  // allowed to finish. Get this wrong in the other direction and a long but
+  // productive agent is killed mid-task.
+  //
+  // The scenario is real rather than accidentally fast: drop the ceiling to
+  // 200ms and this same run does give up, which is what makes the 700ms result
+  // mean something. What resets the clock here is the child's own busy/idle
+  // transitions, one per provider turn — the message and part events feed the
+  // same reset and carry a child that stays inside a single long turn.
+  cliIt.concurrent(
+    "does not give up on a subagent that is still doing things",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const parentPrompt = "delegate something slow"
+        const childPrompt = "take your time"
+        const finding = "took a while but here it is"
+
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, parentPrompt),
+          reply().tool("agent", {
+            description: "slow work",
+            prompt: childPrompt,
+            subagent_type: "general",
+            cwd: ".",
+          }),
+        )
+        // Four sleeps of 400ms. Each gap is under the 700ms ceiling, the total
+        // is comfortably over it, and every tool round trip is an event.
+        for (let i = 0; i < 4; i++) {
+          yield* llm.pushMatch(
+            ({ body }) => hasUserText(body, childPrompt),
+            reply().tool("bash", { command: "sleep 0.4", description: "wait" }),
+          )
+        }
+        yield* llm.pushMatch(({ body }) => hasUserText(body, childPrompt), reply().text(finding).stop())
+        yield* llm.push(reply().text("started it").stop())
+        yield* llm.push(reply().text(`the subagent said: ${finding}`).stop())
+
+        const result = yield* opencode.run(parentPrompt, {
+          env: { OPENCODE_RUN_AGENT_WAIT_MS: "700" },
+          extraArgs: ["--dangerously-skip-permissions"],
+        })
+
+        // Proof the child really worked past the ceiling: without that this
+        // asserts nothing about resetting.
+        expect(result.durationMs).toBeGreaterThan(1_600)
+        expect(result.stderr).not.toContain("Gave up waiting for agents")
+        expect(result.stdout).toContain(finding)
+        expect(result.exitCode).toBe(0)
+      }),
+    TEST_TIMEOUT_MS,
+  )
+
   cliIt.concurrent(
     "gives up on a stuck subagent instead of hanging, and says so",
     ({ llm, opencode }) =>
