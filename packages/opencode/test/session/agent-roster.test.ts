@@ -167,6 +167,37 @@ describe("SessionReminders.applyAgentRoster", () => {
     }),
   )
 
+  // A child can be woken through agent_send again and again, so the count of
+  // these tracks observed state changes with no bound over a session's life.
+  // That is the cost of the design, and it is recorded rather than denied.
+  it.instance("writes another each time a child's state changes", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const session = yield* sessions.create({ title: "root" })
+      const child = yield* sessions.create({ parentID: session.id, title: "child" })
+
+      let messages: SessionV1.WithParts[] = []
+      const turn = Effect.fn("RosterTest.turn")(function* () {
+        messages = yield* applyAgentRoster({ messages: [...messages, yield* userMessage(session.id)], session })
+        return rosterParts(messages).length
+      })
+
+      yield* status.set(child.id, { type: "busy" })
+      expect(yield* turn()).toBe(1)
+
+      yield* status.set(child.id, { type: "idle" })
+      expect(yield* turn()).toBe(2)
+
+      // Woken again through agent_send, and again after that.
+      yield* status.set(child.id, { type: "busy" })
+      expect(yield* turn()).toBe(3)
+
+      yield* status.set(child.id, { type: "idle" })
+      expect(yield* turn()).toBe(4)
+    }),
+  )
+
   // A roster and agent_list expose the same thing, so a session denied the tool
   // is not handed the list by a different route.
   it.instance("says nothing when the session is denied agent_list", () =>

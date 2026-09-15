@@ -266,6 +266,39 @@ describe("AgentInbox", () => {
     })
   })
 
+  // The routing and the fork are two halves of what prompt_async means. Calling
+  // prompt and forking here took only the second, which left the target running
+  // inside the sender's instance — its directory, its config, its permissions.
+  it.instance("delivers through the routed entry point, not by forking prompt itself", () =>
+    Effect.gen(function* () {
+      const inbox = yield* AgentInbox.Service
+      const sessions = yield* Session.Service
+      const sender = yield* sessions.create({ title: "sender" })
+      const target = yield* sessions.create({ title: "target" })
+
+      const routed: SessionPrompt.PromptInput[] = []
+      const ops: AgentManagement.AgentPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: () => Effect.die(new Error("deliver must not call prompt directly")),
+        deliverAsync: (input) => Effect.sync(() => void routed.push(input)),
+      }
+
+      yield* inbox.deliver({
+        message: {
+          target: target.id,
+          sender: sender.id,
+          sender_name: "reviewer",
+          sender_agent: "explore",
+          body: "hello",
+        },
+        ops,
+      })
+
+      expect(routed).toHaveLength(1)
+      expect(routed[0].sessionID).toBe(target.id)
+    }))
+
   it.instance("still reports accepted when delivery fails inside the fork", () =>
     Effect.gen(function* () {
       const inbox = yield* AgentInbox.Service
