@@ -237,4 +237,38 @@ describe("SessionReminders.applyAgentRoster", () => {
       expect(rosterParts(out)).toHaveLength(1)
     }),
   )
+
+  // Only until one comes back. Otherwise every step for the rest of the session
+  // would qualify, which is the per-step evaluation this design exists to leave
+  // behind.
+  it.instance("stops treating a compaction as a trigger once a roster follows it", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "root" })
+      const child = yield* sessions.create({ parentID: session.id, title: "child" })
+
+      const user = yield* userMessage(session.id)
+      const compaction = yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: user.info.id,
+        sessionID: session.id,
+        type: "compaction",
+        auto: true,
+      } satisfies SessionV1.CompactionPart)
+      user.parts.push(compaction)
+
+      const withRoster = yield* applyAgentRoster({ messages: [user, yield* assistantAfter(user)], session })
+      expect(rosterParts(withRoster)).toHaveLength(1)
+
+      // A second child changes the roster's content, so only the trigger can be
+      // what keeps this step quiet.
+      yield* sessions.create({ parentID: session.id, title: "another" })
+      void child
+      const later = yield* applyAgentRoster({
+        messages: [...withRoster, yield* assistantAfter(user)],
+        session,
+      })
+      expect(rosterParts(later)).toHaveLength(1)
+    }),
+  )
 })

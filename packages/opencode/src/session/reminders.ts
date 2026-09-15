@@ -58,16 +58,23 @@ export const applyAgentRoster = Effect.fn("SessionReminders.applyAgentRoster")(f
   const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
   if (!userMessage) return input.messages
 
-  // Evaluated before this step's assistant message exists, so "nothing after
-  // the last user message" is true on the first step of a turn and false on
-  // every later one. After a compaction, filterCompacted puts a continue-user
-  // message last, so that counts as a turn boundary too — and a fresh one,
-  // since the earlier roster is no longer in the visible history to compare
-  // against.
-  const turnStart = input.messages.every(
-    (msg) => msg.info.role !== "assistant" || msg.info.time.created < userMessage.info.time.created,
-  )
-  const compacted = input.messages.some((msg) => msg.parts.some((part) => part.type === "compaction"))
+  // Evaluated before this step's assistant message exists, so "nothing after the
+  // last user message" is true on the first step of a turn and false on every
+  // later one. By position rather than by timestamp, which two messages can
+  // share. After a compaction filterCompacted puts a continue-user message
+  // last, so that reads as a turn boundary here too.
+  const lastUser = input.messages.lastIndexOf(userMessage)
+  const turnStart = !input.messages.slice(lastUser + 1).some((msg) => msg.info.role === "assistant")
+
+  // Compaction replaces the start notice and the completion notice with a
+  // summary, so the roster has to come back even mid-turn. Only until one does:
+  // otherwise every step for the rest of the session would qualify, which is
+  // the per-step evaluation this exists to get away from.
+  const flat = input.messages.flatMap((msg) => msg.parts)
+  const compaction = flat.findLastIndex((part) => part.type === "compaction")
+  const roster = flat.findLastIndex((part) => part.type === "text" && part.text.startsWith(AGENT_ROSTER_SENTINEL))
+  const compacted = compaction >= 0 && roster < compaction
+
   if (!turnStart && !compacted) return input.messages
 
   const tree = yield* AgentTree.Service
