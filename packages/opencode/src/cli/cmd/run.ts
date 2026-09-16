@@ -703,9 +703,10 @@ export const RunCommand = effectCmd({
           // again, and that reply is part of this run's output.
           const working = new Set<string>()
           let error: string | undefined
-          let ceiling: ReturnType<typeof setTimeout> | undefined
+          let timer: ReturnType<typeof setTimeout> | undefined
           let abandoned = false
           let rootIdle = false
+          let finished: (() => void) | undefined
 
           // A stuck agent must not hold the process open forever. The clock
           // measures continuous idleness, so it restarts whenever anything
@@ -717,34 +718,97 @@ export const RunCommand = effectCmd({
             return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10 * 60 * 1000
           })()
 
+          // How long to wait, once the whole tree has gone quiet, for a result
+          // that is still in transit.
+          //
+          // A child publishes idle before its prompt returns — Runner.finishRun
+          // runs `idle` ahead of completing the deferred — so the job has not
+          // settled and the notice has not reached its parent yet. Everything
+          // between those two points is in-process: settle the deferred, fork,
+          // start the parent's turn. Milliseconds. A second is three orders of
+          // magnitude of headroom, paid once per run that used subagents, and
+          // the cost of being too eager is losing the result the run exists to
+          // report.
+          const settleMs = 1000
+
           const stopWaiting = () => {
-            if (ceiling === undefined) return
-            clearTimeout(ceiling)
-            ceiling = undefined
+            if (timer === undefined) return
+            clearTimeout(timer)
+            timer = undefined
           }
 
-          const startWaiting = () => {
+          /**
+           * Decides what this run is waiting for, and how long it is prepared
+           * to wait. Called after every event from a tracked session, so any
+           * sign of life restarts whichever clock applies — that is what
+           * "continuous idleness" means, and being busy is not a reason to stop
+           * the clock, since an agent stuck in busy produces no events at all.
+           *
+           * Three states:
+           *
+           * - The root is producing. Nothing to bound; it is the run's own
+           *   output.
+           * - Something is busy but silent. The long ceiling applies, and
+           *   running out of it means work is being dropped, so it aborts and
+           *   says so. The root is idle whenever that fires, by construction,
+           *   so the abort is never landing on a root in the middle of reading
+           *   a result.
+           * - Everything is quiet. Either the tree is finished or a result is
+           *   between the child that produced it and the parent that will read
+           *   it. The short settle tells those apart, and reaching the end of
+           *   it is a clean finish, not an abandonment.
+           *
+           * Deliberately not anchored on the root's own idle. At depth one the
+           * root is always last to go quiet, because every child reports to it;
+           * deeper than that it is not, since a grandchild reports to its own
+           * parent and the root is never told. Waiting for a root idle that
+           * cannot come is how a finished nested tree used to hang forever.
+           */
+          const reconsider = () => {
             stopWaiting()
-            if (ceilingMs === 0) return
-            ceiling = setTimeout(() => {
-              abandoned = true
-              // Stop what is still running and take the partial result rather
-              // than hanging. Aborting the root cascades to the agents it
-              // started.
-              void client.session.abort({ sessionID }).catch(() => {})
-            }, ceilingMs)
+            if (!rootIdle) return
+            if (working.size > 0) {
+              // Already gave up once. Re-arming would abort again and again if
+              // the abort is not getting through; the settle ends the run
+              // instead, with the report the first attempt earned.
+              if (abandoned) {
+                timer = setTimeout(() => finished?.(), settleMs)
+                return
+              }
+              if (ceilingMs === 0) return
+              timer = setTimeout(() => {
+                abandoned = true
+                // Stop what is still running and take the partial result rather
+                // than hanging. Aborting the root cascades to the agents it
+                // started.
+                void client.session.abort({ sessionID }).catch(() => {})
+              }, ceilingMs)
+              return
+            }
+            // Nothing can be in transit when no child session was ever
+            // created, so a run that used no subagents ends the moment the root
+            // goes idle, exactly as it did before any of this existed.
+            if (sessions.size === 1) {
+              finished?.()
+              return
+            }
+            timer = setTimeout(() => finished?.(), settleMs)
           }
 
-          // Restarts the clock, and is called on every sign of life from a
-          // tracked session — that is what "continuous idleness" means. Note
-          // that being busy is *not* a reason to stop it: a child stuck in busy
-          // produces no events at all, so stopping the clock while anything was
-          // busy is precisely what let it hold the process open forever.
-          const noteActivity = () => {
-            if (rootIdle) startWaiting()
-          }
+          // Raced against the stream so the settle timer can end the run:
+          // `for await` has no way out except an event, and the whole point of
+          // the settle is that no further event is coming.
+          const iterator = events.stream[Symbol.asyncIterator]()
+          const done = new Promise<"done">((resolve) => {
+            finished = () => resolve("done")
+          })
 
-          for await (const event of events.stream) {
+          while (true) {
+            const next = await Promise.race([iterator.next(), done])
+            if (next === "done") break
+            if (next.done) break
+            const event = next.value
+
             if (event.type === "session.created" && event.properties.info.parentID) {
               if (sessions.has(event.properties.info.parentID)) {
                 sessions.add(event.properties.info.id)
@@ -754,11 +818,11 @@ export const RunCommand = effectCmd({
                 // has already gone idle — and then the run would leave believing
                 // nothing was left to do.
                 working.add(event.properties.info.id)
-                noteActivity()
+                reconsider()
               }
             }
 
-            if (event.type === "message.updated" && sessions.has(event.properties.sessionID)) noteActivity()
+            if (event.type === "message.updated" && sessions.has(event.properties.sessionID)) reconsider()
 
             if (
               event.type === "message.updated" &&
@@ -775,7 +839,7 @@ export const RunCommand = effectCmd({
 
             if (event.type === "message.part.updated") {
               const part = event.properties.part
-              if (sessions.has(part.sessionID)) noteActivity()
+              if (sessions.has(part.sessionID)) reconsider()
               if (part.sessionID !== sessionID) continue
 
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
@@ -854,22 +918,14 @@ export const RunCommand = effectCmd({
               else working.add(id)
               if (id === sessionID) rootIdle = idle
 
-              // Only the root's own idle ends the run, and a child's idle never
-              // does. A child publishes idle *before* its prompt returns — see
-              // Runner.finishRun, where `idle` runs ahead of completing the
-              // deferred the prompt awaits — so the job has not settled and the
-              // watcher has not delivered the result to the parent yet. At that
-              // moment the root is idle and nothing is working, and leaving on
-              // that would drop the very result this wait exists to collect.
-              // A notification that never arrives is the ceiling's problem, not
-              // this branch's.
-              if (id === sessionID && idle && (working.size === 0 || abandoned)) {
+              // Giving up ends the run at the root's next idle, without waiting
+              // out a settle nobody is going to fill.
+              if (abandoned && id === sessionID && idle) {
                 stopWaiting()
                 break
               }
 
-              if (rootIdle) startWaiting()
-              else stopWaiting()
+              reconsider()
             }
 
             if (event.type === "permission.asked") {

@@ -1112,6 +1112,97 @@ describe("opencode run waits for the agents it started", () => {
     TEST_TIMEOUT_MS,
   )
 
+  // Reported on PR #35: a finished tree deeper than one level used to hang
+  // forever. Every child reports to its own parent, so at depth one the root is
+  // always last to go quiet and "root is idle" reads as "the tree is done". One
+  // level deeper it does not: B reports to A, A finishes, and nobody tells the
+  // root — which had its last idle turns earlier. The run waited for an event
+  // that could not come.
+  //
+  // Runs under the shipping ceiling on purpose. With a short one this passes for
+  // the wrong reason, by timing out rather than by converging.
+  cliIt.concurrent(
+    "finishes when a nested tree finishes, without waiting on the root",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const rootPrompt = "start the chain"
+        const midPrompt = "middle task: delegate downward"
+        const leafPrompt = "leaf task"
+
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, rootPrompt),
+          reply().tool("agent", { description: "middle agent", prompt: midPrompt, subagent_type: "general", cwd: "." }),
+        )
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, midPrompt),
+          reply().tool("agent", { description: "leaf agent", prompt: leafPrompt, subagent_type: "general", cwd: "." }),
+        )
+        yield* llm.pushMatch(({ body }) => hasUserText(body, leafPrompt), reply().text("leaf finding").stop())
+        // A's second run, woken by B's result. It goes idle last, and it is not
+        // the root.
+        yield* llm.pushMatch(
+          ({ body }) => JSON.stringify(body).includes("leaf finding"),
+          reply().text("middle done").stop(),
+        )
+        yield* llm.pushMatch(
+          ({ body }) => JSON.stringify(body).includes("Agent completed"),
+          reply().text("root done").stop(),
+        )
+
+        const result = yield* opencode.run(rootPrompt, {
+          timeoutMs: 25_000,
+          extraArgs: ["--dangerously-skip-permissions"],
+        })
+
+        expect(result.exitCode).toBe(0)
+        // Not "Gave up": nothing was abandoned, the tree simply finished.
+        expect(result.stderr).not.toContain("Gave up waiting")
+        expect(result.stdout).toContain("root done")
+      }),
+    TEST_TIMEOUT_MS,
+  )
+
+  // Also from PR #35, and the reason the case above could not be caught by the
+  // existing tests: the ceiling was cleared by any member going busy and only
+  // ever re-armed on a root idle, which in the waiting phase happens once. A
+  // subagent that does real work before hanging — which is what a tool-using
+  // agent looks like — disarmed the protection and nothing put it back. The
+  // existing "stuck subagent" test misses it only because that child hangs on
+  // its very first call and never emits a second status.
+  cliIt.concurrent(
+    "still gives up on a subagent that hangs after doing some work",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const parentPrompt = "delegate something that will hang on its second step"
+        const childPrompt = "two steps then hang"
+
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, parentPrompt),
+          reply().tool("agent", {
+            description: "hang on step two",
+            prompt: childPrompt,
+            subagent_type: "general",
+            cwd: ".",
+          }),
+        )
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, childPrompt),
+          reply().tool("bash", { command: "sleep 1", description: "wait" }),
+        )
+        yield* llm.pushMatch(({ body }) => JSON.stringify(body).includes("sleep 1"), reply().hang())
+
+        const result = yield* opencode.run(parentPrompt, {
+          timeoutMs: 25_000,
+          env: { OPENCODE_RUN_AGENT_WAIT_MS: "1500" },
+          extraArgs: ["--dangerously-skip-permissions"],
+        })
+
+        expect(result.exitCode).not.toBe(0)
+        expect(result.stderr).toContain("Gave up waiting for agents")
+      }),
+    TEST_TIMEOUT_MS,
+  )
+
   // The ceiling measures how long nothing has happened, not how long the run has
   // taken. A subagent that keeps working past the ceiling — here by running a
   // command that sleeps, several times over — resets it each time and must be
