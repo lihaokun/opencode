@@ -2414,6 +2414,61 @@ it.instance("static loop consumes queued replies across turns", () =>
   }),
 )
 
+it.instance("message written while the loop is finishing is consumed, not dropped", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Idle race",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+
+    // Hold the first response mid-stream and end it with an in-iteration break
+    // (content-filter), so the loop exits without re-reading messages. The
+    // injected message lands after that iteration's read and inside the window
+    // between it and the idle transition (#32) — a normal stop would not do:
+    // the loop would take another iteration and re-read it.
+    const release = defer<void>()
+    yield* llm.push(reply().wait(release.promise).text("partial").contentFilter().item())
+    yield* llm.text("second")
+
+    const loop = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "first provider request never arrived")
+    const injected = yield* user(session.id, "injected while finishing")
+    release.resolve()
+
+    // The loop fiber settles with the first run's result; the re-armed run must
+    // pick up the injected message with a second provider request.
+    yield* awaitWithTimeout(Fiber.await(loop), "first run never finished", "10 seconds")
+    yield* awaitWithTimeout(llm.wait(2), "injected message was never consumed", "10 seconds")
+
+    // Settled: the re-armed turn finished and no spurious extra round remains.
+    const status = yield* SessionStatus.Service
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const s = yield* status.get(session.id)
+        return s.type === "idle" ? (true as const) : undefined
+      }),
+      "session never went idle",
+      "10 seconds",
+    )
+    expect(yield* llm.calls).toBe(2)
+    expect(yield* llm.pending).toBe(0)
+
+    const msgs = yield* sessions.messages({ sessionID: session.id })
+    const picked = msgs.findLast((m) => m.info.role === "assistant" && m.info.parentID === injected.id)
+    expect(picked?.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
+  }),
+)
+
 it.instance("loop continues when finish is tool-calls", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

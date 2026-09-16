@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Fiber, Latch, Ref, Scope } from "effect"
 import { Runner } from "@/effect/runner"
-import { it } from "../lib/effect"
+import { it, pollWithTimeout } from "../lib/effect"
 
 const waitForState = <A, E>(runner: Runner.Runner<A, E>, tag: Runner.State<A, E>["_tag"]) =>
   Effect.gen(function* () {
@@ -509,6 +509,128 @@ describe("Runner", () => {
       yield* Deferred.succeed(gate, undefined)
       yield* Fiber.await(fiber)
       expect(runner.busy).toBe(false)
+    }),
+  )
+
+  // --- shouldReArm (re-arm on finish) ---
+
+  it.live(
+    "re-arms finished work when shouldReArm is true",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const ran = yield* Ref.make(0)
+      // True exactly once: the first finish re-arms, the second goes idle.
+      const flag = yield* Ref.make(true)
+      const runner = Runner.make<string>(s, { shouldReArm: Ref.getAndSet(flag, false) })
+      const work = Effect.gen(function* () {
+        yield* Ref.update(ran, (n) => n + 1)
+        return "ok"
+      })
+
+      const result = yield* runner.ensureRunning(work)
+
+      expect(result).toBe("ok")
+      // The re-armed execution is forked inside finishRun's critical section,
+      // so it may not have run yet when ensureRunning returns.
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const ran2 = yield* Ref.get(ran)
+          return ran2 === 2 ? (true as const) : undefined
+        }),
+        "re-armed execution never ran",
+        "1 second",
+      )
+      expect(runner.state._tag).toBe("Idle")
+    }),
+  )
+
+  it.live(
+    "re-armed run keeps joiner on the first result",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const ran = yield* Ref.make(0)
+      const gate = yield* Deferred.make<void>()
+      const flag = yield* Ref.make(true)
+      const runner = Runner.make<string>(s, { shouldReArm: Ref.getAndSet(flag, false) })
+      const work = Effect.gen(function* () {
+        yield* Ref.update(ran, (n) => n + 1)
+        yield* Deferred.await(gate)
+        return "first-result"
+      })
+
+      const first = yield* runner.ensureRunning(work).pipe(Effect.forkChild)
+      const joiner = yield* runner.ensureRunning(Effect.succeed("second")).pipe(Effect.forkChild)
+
+      yield* Deferred.succeed(gate, undefined)
+      // Fiber.await resolves to the Exit as a value in this Effect version.
+      const joinExit = yield* Fiber.await(joiner)
+      const firstExit = yield* Fiber.await(first)
+      expect(Exit.isSuccess(joinExit) && joinExit.value).toBe("first-result")
+      expect(Exit.isSuccess(firstExit) && firstExit.value).toBe("first-result")
+      yield* waitForState(runner, "Idle")
+      expect(yield* Ref.get(ran)).toBe(2)
+    }),
+  )
+
+  it.live(
+    "does not re-arm when shouldReArm is false",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const ran = yield* Ref.make(0)
+      const runner = Runner.make<string>(s, { shouldReArm: Effect.succeed(false) })
+      const work = Effect.gen(function* () {
+        yield* Ref.update(ran, (n) => n + 1)
+        return "ok"
+      })
+
+      expect(yield* runner.ensureRunning(work)).toBe("ok")
+      expect(yield* Ref.get(ran)).toBe(1)
+      expect(runner.state._tag).toBe("Idle")
+    }),
+  )
+
+  it.live(
+    "does not re-arm after a failed exit",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const ran = yield* Ref.make(0)
+      const runner = Runner.make<string, string>(s, { shouldReArm: Effect.succeed(true) })
+      const work = Effect.gen(function* () {
+        yield* Ref.update(ran, (n) => n + 1)
+        return yield* Effect.fail("boom")
+      })
+
+      const exit = yield* runner.ensureRunning(work).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      yield* waitForState(runner, "Idle")
+      expect(yield* Ref.get(ran)).toBe(1)
+    }),
+  )
+
+  it.live(
+    "does not re-arm after cancel",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const ran = yield* Ref.make(0)
+      const started = yield* Deferred.make<void>()
+      const runner = Runner.make<string>(s, { shouldReArm: Effect.succeed(true) })
+      const fiber = yield* runner
+        .ensureRunning(
+          Effect.gen(function* () {
+            yield* Ref.update(ran, (n) => n + 1)
+            yield* Deferred.succeed(started, void 0)
+            return yield* Effect.never.pipe(Effect.as("never"))
+          }),
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Deferred.await(started)
+      yield* runner.cancel
+      yield* Fiber.await(fiber)
+      // Give a would-be re-arm time to start before asserting it never does.
+      yield* Effect.sleep("50 millis")
+      expect(runner.state._tag).toBe("Idle")
+      expect(yield* Ref.get(ran)).toBe(1)
     }),
   )
 })
