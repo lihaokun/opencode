@@ -1185,15 +1185,19 @@ describe("opencode run waits for the agents it started", () => {
             cwd: ".",
           }),
         )
+        // bun rather than sleep: the shell behind the bash tool provides its own
+        // builtins, and sleep is not among them, so on Windows the command fails
+        // and the delay this test is built on never happens.
+        //
         // Long enough that the child's second turn — and the busy it publishes
         // for it — lands after the root has gone idle, which is the whole point;
         // short enough that the ceiling is measuring the hang rather than
         // racing the sleep when the suite runs everything at once.
         yield* llm.pushMatch(
           ({ body }) => hasUserText(body, childPrompt),
-          reply().tool("bash", { command: "sleep 0.3", description: "wait" }),
+          reply().tool("bash", { command: `bun -e "await Bun.sleep(300)"`, description: "wait" }),
         )
-        yield* llm.pushMatch(({ body }) => JSON.stringify(body).includes("sleep 0.3"), reply().hang())
+        yield* llm.pushMatch(({ body }) => JSON.stringify(body).includes("Bun.sleep(300)"), reply().hang())
         // The root has to finish its own turn and go idle, or it is the root
         // holding the run open and the ceiling never arms at all.
         yield* llm.push(reply().text("started it").stop())
@@ -1271,12 +1275,14 @@ describe("opencode run waits for the agents it started", () => {
             cwd: ".",
           }),
         )
-        // Four sleeps of 400ms. Each gap is under the 700ms ceiling, the total
-        // is comfortably over it, and every tool round trip is an event.
+        // Four waits of 400ms — bun rather than sleep, which the shell behind the
+        // bash tool does not provide on every platform. Each gap is under the
+        // 700ms ceiling, the total is comfortably over it, and every tool round
+        // trip is an event.
         for (let i = 0; i < 4; i++) {
           yield* llm.pushMatch(
             ({ body }) => hasUserText(body, childPrompt),
-            reply().tool("bash", { command: "sleep 0.4", description: "wait" }),
+            reply().tool("bash", { command: `bun -e "await Bun.sleep(400)"`, description: "wait" }),
           )
         }
         yield* llm.pushMatch(({ body }) => hasUserText(body, childPrompt), reply().text(finding).stop())

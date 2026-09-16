@@ -76,8 +76,20 @@ describe("agent working directory", () => {
 
   it.instance("records a provided cwd without creating anything", () =>
     Effect.gen(function* () {
-      const result = yield* AgentWorkdir.prepareWorkdir({ cwd: "/tmp/somewhere" })
-      expect(result).toEqual({ path: "/tmp/somewhere", source: "provided_cwd" })
+      const instance = yield* TestInstance
+      const absolute = path.join(instance.directory, "somewhere")
+      const result = yield* AgentWorkdir.prepareWorkdir({ cwd: absolute })
+      expect(result).toEqual({ path: absolute, source: "provided_cwd" })
+    }))
+
+  // The value is stored on the session and read back later, so a relative one
+  // would mean whatever the reader's process directory happened to be — the
+  // same workspace landing somewhere else on a later read.
+  it.instance("resolves a relative cwd against the session's own directory", () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const result = yield* AgentWorkdir.prepareWorkdir({ cwd: "./somewhere" })
+      expect(result).toEqual({ path: path.join(instance.directory, "somewhere"), source: "provided_cwd" })
     }))
 })
 
