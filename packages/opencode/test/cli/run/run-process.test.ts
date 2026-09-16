@@ -1185,11 +1185,18 @@ describe("opencode run waits for the agents it started", () => {
             cwd: ".",
           }),
         )
+        // Long enough that the child's second turn — and the busy it publishes
+        // for it — lands after the root has gone idle, which is the whole point;
+        // short enough that the ceiling is measuring the hang rather than
+        // racing the sleep when the suite runs everything at once.
         yield* llm.pushMatch(
           ({ body }) => hasUserText(body, childPrompt),
-          reply().tool("bash", { command: "sleep 1", description: "wait" }),
+          reply().tool("bash", { command: "sleep 0.3", description: "wait" }),
         )
-        yield* llm.pushMatch(({ body }) => JSON.stringify(body).includes("sleep 1"), reply().hang())
+        yield* llm.pushMatch(({ body }) => JSON.stringify(body).includes("sleep 0.3"), reply().hang())
+        // The root has to finish its own turn and go idle, or it is the root
+        // holding the run open and the ceiling never arms at all.
+        yield* llm.push(reply().text("started it").stop())
 
         const result = yield* opencode.run(parentPrompt, {
           timeoutMs: 25_000,
