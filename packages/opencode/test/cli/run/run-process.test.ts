@@ -1203,6 +1203,39 @@ describe("opencode run waits for the agents it started", () => {
     TEST_TIMEOUT_MS,
   )
 
+  // Setting the ceiling to 0 means "wait without one", and the reviewer noted
+  // the path had no coverage. It turns off giving up, not leaving: a tree that
+  // finishes still ends the run, because that exit is reached by everything
+  // going quiet rather than by any clock running out.
+  cliIt.concurrent(
+    "still exits with the ceiling disabled, once the work is done",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const parentPrompt = "delegate the lookup"
+        const childPrompt = "find the thing"
+        const finding = "found in src/auth.ts"
+
+        yield* llm.pushMatch(
+          ({ body }) => hasUserText(body, parentPrompt),
+          reply().tool("agent", { description: "look", prompt: childPrompt, subagent_type: "general", cwd: "." }),
+        )
+        yield* llm.pushMatch(({ body }) => hasUserText(body, childPrompt), reply().text(finding).stop())
+        yield* llm.push(reply().text("started it").stop())
+        yield* llm.push(reply().text(`the subagent said: ${finding}`).stop())
+
+        const result = yield* opencode.run(parentPrompt, {
+          timeoutMs: 25_000,
+          env: { OPENCODE_RUN_AGENT_WAIT_MS: "0" },
+          extraArgs: ["--dangerously-skip-permissions"],
+        })
+
+        expect(result.exitCode).toBe(0)
+        expect(result.stderr).not.toContain("Gave up waiting")
+        expect(result.stdout).toContain(finding)
+      }),
+    TEST_TIMEOUT_MS,
+  )
+
   // The ceiling measures how long nothing has happened, not how long the run has
   // taken. A subagent that keeps working past the ceiling — here by running a
   // command that sleeps, several times over — resets it each time and must be

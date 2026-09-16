@@ -117,6 +117,13 @@
 |---|---|
 | 嵌套树跑完即退出（**用出厂默认 ceiling**,短 ceiling 会让它因超时而"通过") | exit 0、无 "Gave up"、stdout 含 root 的最终回复 |
 | 子先干活再挂起 → ceiling 仍触发 | 非零退出 + "Gave up waiting" |
+| `OPENCODE_RUN_AGENT_WAIT_MS=0`（评审点名的零覆盖路径） | 树跑完仍 exit 0 —— 0 关掉的是"放弃",不是"离开" |
+
+**与评审建议的一处有意偏离**：它建议"在任意成员的 idle 上判 `working.size === 0` **即退出**"。
+诊断照收,机制改了一处——那样退出正好命中 §0.2 B1 指出的"结果尚在投递途中"窗口。
+改为**解锚 + 短 settle**：解锚解决 P0-1,settle 保住 B1。
+评审第 3 点（abort 目标排除 root）则用结构解决而非改目标：ceiling 只在 `rootIdle` 为真时武装,
+abort 不可能落在正在消费结果的 root 上;abort root 本身仍是让取消级联到子的方式,错的是时机不是目标。
 
 ### 0.4 五次复审（2026-09-16）
 
