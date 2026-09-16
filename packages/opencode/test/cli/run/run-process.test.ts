@@ -61,6 +61,10 @@ const StoredPart = Schema.Struct({
 })
 
 const crossoverUsage = { input: 100, output: 1 } satisfies Usage
+// Wall-clock tests only. See the one use below for why the Windows runner
+// cannot hold the timing window these need.
+const posixOnly = process.platform === "win32" ? cliIt.skip : cliIt.concurrent
+
 const TEST_TIMEOUT_MS = 120_000
 
 function missingFinishWithUsage(input: { text: string; usage: Usage }) {
@@ -1248,17 +1252,24 @@ describe("opencode run waits for the agents it started", () => {
   )
 
   // The ceiling measures how long nothing has happened, not how long the run has
-  // taken. A subagent that keeps working past the ceiling — here by running a
-  // command that sleeps, several times over — resets it each time and must be
-  // allowed to finish. Get this wrong in the other direction and a long but
-  // productive agent is killed mid-task.
+  // taken. A subagent that keeps working past the ceiling — here by waiting,
+  // several times over — resets it each time and must be allowed to finish. Get
+  // this wrong in the other direction and a long but productive agent is killed
+  // mid-task.
   //
   // The scenario is real rather than accidentally fast: drop the ceiling to
   // 200ms and this same run does give up, which is what makes the 700ms result
   // mean something. What resets the clock here is the child's own busy/idle
   // transitions, one per provider turn — the message and part events feed the
   // same reset and carry a child that stays inside a single long turn.
-  cliIt.concurrent(
+  //
+  // POSIX only. The property is a wall-clock one and needs each gap to stay
+  // under the ceiling while the total goes past it. On the Windows runner a
+  // single subprocess launch can take longer than the whole ceiling, so that
+  // window closes and the run gives up for reasons that have nothing to do with
+  // what is being tested. Widening it far enough to be safe there would make the
+  // ceiling so long that the test no longer distinguishes reset from never-armed.
+  posixOnly(
     "does not give up on a subagent that is still doing things",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
