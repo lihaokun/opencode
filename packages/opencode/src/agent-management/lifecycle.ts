@@ -148,19 +148,36 @@ const layer = Layer.effect(
     const siblingSnapshot = Effect.fn("AgentLifecycle.siblingSnapshot")(function* (input: {
       caller: Session.Info
       child: SessionID
+      subagent: Agent.Info
       permission: PermissionV1.Ruleset
     }) {
-      if (Permission.evaluate(AGENT_LIST_TOOL_ID, "*", input.permission).action === "deny") return undefined
+      // Both halves, the way session/tools.ts merges them. The session ruleset
+      // carries what was derived for this run; a rule a user wrote lives on the
+      // agent definition and is not in there — deriveSubagentSessionPermission
+      // deliberately leaves the subagent's own permissions to the subagent.
+      // Checking only the session half missed exactly the case worth catching.
+      const ruleset = Permission.merge(input.subagent.permission, input.permission)
+      if (Permission.evaluate(AGENT_LIST_TOOL_ID, "*", ruleset).action === "deny") return undefined
 
       const depth = yield* tree.callerDepth(input.caller.id).pipe(Effect.orElseSucceed(() => 0))
       const siblings = (yield* tree.children(input.caller.id, depth + 1)).filter(
         (item) => item.session_id !== input.child,
       )
 
-      const callerName = input.caller.metadata?.[AgentManagement.METADATA_AGENT_NAME]
+      // Names and types come from the model and go into lines this writes, so
+      // they are encoded the same way a message header's fields are — a newline
+      // in one would otherwise add a row of its own to a list the reader is
+      // meant to trust.
+      const raw = input.caller.metadata?.[AgentManagement.METADATA_AGENT_NAME]
+      const callerName = raw === undefined ? undefined : AgentInbox.escapeField(raw)
       const rows = [
         `  ${input.caller.id}  ${callerName ? `${callerName} (your parent)` : "your parent"}`,
-        ...siblings.map((item) => `  ${item.session_id}  ${item.name ?? `(${item.agent_type ?? "agent"})`}`),
+        ...siblings.map((item) => {
+          const label = item.name
+            ? AgentInbox.escapeField(item.name)
+            : `(${AgentInbox.escapeField(item.agent_type ?? "agent")})`
+          return `  ${item.session_id}  ${label}`
+        }),
       ]
       return [
         "Agents you can message with agent_send:",
@@ -352,7 +369,12 @@ const layer = Layer.effect(
         },
       })
 
-      const neighbours = yield* siblingSnapshot({ caller: parent, child: session.id, permission: childPermission })
+      const neighbours = yield* siblingSnapshot({
+        caller: parent,
+        child: session.id,
+        subagent: next,
+        permission: childPermission,
+      })
 
       // Keeps the parts structure: resolvePromptParts expands @file references
       // into attachment parts, and flattening to a string drops them.

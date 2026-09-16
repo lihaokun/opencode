@@ -706,6 +706,13 @@ export const RunCommand = effectCmd({
           let timer: ReturnType<typeof setTimeout> | undefined
           let abandoned = false
           let rootIdle = false
+          // Whether a result may be between the child that produced it and the
+          // parent that will read it. Set when a child goes idle, cleared as
+          // soon as anything picks up work, because that is the handoff
+          // landing. Without it the grace period below would be paid on every
+          // run that used a subagent, including the ordinary case where the
+          // root has already consumed the result and is the last to go quiet.
+          let handoff = false
           let finished: (() => void) | undefined
 
           // A stuck agent must not hold the process open forever. The clock
@@ -723,13 +730,22 @@ export const RunCommand = effectCmd({
           //
           // A child publishes idle before its prompt returns — Runner.finishRun
           // runs `idle` ahead of completing the deferred — so the job has not
-          // settled and the notice has not reached its parent yet. Everything
-          // between those two points is in-process: settle the deferred, fork,
-          // start the parent's turn. Milliseconds. A second is three orders of
-          // magnitude of headroom, paid once per run that used subagents, and
-          // the cost of being too eager is losing the result the run exists to
-          // report.
-          const settleMs = 1000
+          // settled and the notice has not reached its parent yet. Nothing in
+          // the event stream says whether one is coming: a cancelled child sends
+          // none, and the two look identical from here. So this is a grace
+          // period, and no fixed value can be proven right.
+          //
+          // What makes a generous one affordable is that it is only spent when
+          // `handoff` says a child has just gone quiet with nobody having picked
+          // the work up yet. The ordinary case — child finishes, parent consumes
+          // the result, parent goes quiet last — does not pay it at all.
+          // OPENCODE_RUN_AGENT_SETTLE_MS overrides it.
+          const settleMs = (() => {
+            const raw = process.env["OPENCODE_RUN_AGENT_SETTLE_MS"]
+            if (raw === undefined) return 5000
+            const parsed = Number(raw)
+            return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5000
+          })()
 
           const stopWaiting = () => {
             if (timer === undefined) return
@@ -782,13 +798,19 @@ export const RunCommand = effectCmd({
                 // than hanging. Aborting the root cascades to the agents it
                 // started.
                 void client.session.abort({ sessionID }).catch(() => {})
+                // And decide again straight away rather than waiting for an
+                // event to do it. An abort that fails, or that reaches a session
+                // already gone, produces nothing at all — and this used to be
+                // the one path where nothing was left to end the run.
+                reconsider()
               }, ceilingMs)
               return
             }
-            // Nothing can be in transit when no child session was ever
-            // created, so a run that used no subagents ends the moment the root
-            // goes idle, exactly as it did before any of this existed.
-            if (sessions.size === 1) {
+            // Nothing can be in transit when no child ever existed, or when the
+            // last thing to happen was somebody picking work up rather than a
+            // child going quiet. Those runs end the moment the root goes idle,
+            // exactly as they did before any of this existed.
+            if (sessions.size === 1 || !handoff) {
               finished?.()
               return
             }
@@ -917,6 +939,10 @@ export const RunCommand = effectCmd({
               if (idle) working.delete(id)
               else working.add(id)
               if (id === sessionID) rootIdle = idle
+              // A child going quiet may have a result on its way to its parent;
+              // anything picking work up is that result landing.
+              if (!idle) handoff = false
+              else if (id !== sessionID) handoff = true
 
               // Giving up ends the run at the root's next idle, without waiting
               // out a settle nobody is going to fill.
