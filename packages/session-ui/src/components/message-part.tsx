@@ -65,6 +65,7 @@ import { partDefaultOpen } from "./part-default-open"
 import { animate } from "motion"
 import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
+import { isAgentTool, resolveToolName } from "./tool-alias"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
 
 async function writeClipboard(text: string): Promise<boolean> {
@@ -509,6 +510,9 @@ export function getToolInfo(
         title: webSearchProviderLabel(metadata?.provider, i18n),
         subtitle: input.query,
       }
+    // `task` is the name this tool had before; history recorded then still has
+    // parts under it, so both render the same card.
+    case "agent":
     case "task": {
       const type =
         typeof input.subagent_type === "string" && input.subagent_type
@@ -1487,7 +1491,7 @@ export function registerTool(input: { name: string; render?: ToolComponent }) {
 }
 
 export function getTool(name: string) {
-  return state[name === "apply_patch" ? "patch" : name === "bash" ? "shell" : name]?.render
+  return state[resolveToolName(name)]?.render
 }
 
 export const ToolRegistry = {
@@ -1547,17 +1551,18 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
   const input = () => part().state?.input ?? emptyInput
   // @ts-expect-error
   const partMetadata = () => part().state?.metadata ?? emptyMetadata
+  const isAgent = () => isAgentTool(part().tool)
   const taskId = createMemo(() => {
-    if (part().tool !== "task") return
+    if (!isAgent()) return
     const value = partMetadata().sessionId
     if (typeof value === "string" && value) return value
   })
   const taskHref = createMemo(() => {
-    if (part().tool !== "task") return
+    if (!isAgent()) return
     return sessionLink(taskId(), data.sessionHref)
   })
   const taskSubtitle = createMemo(() => {
-    if (part().tool !== "task") return undefined
+    if (!isAgent()) return undefined
     const value = input().description
     if (typeof value === "string" && value) return value
     return taskId()
@@ -1976,7 +1981,7 @@ ToolRegistry.register({
 })
 
 ToolRegistry.register({
-  name: "task",
+  name: "agent",
   render(props) {
     const data = useData()
     const i18n = useI18n()

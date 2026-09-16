@@ -1674,6 +1674,10 @@ export type PermissionConfig =
       list?: PermissionRuleConfig
       bash?: PermissionRuleConfig
       task?: PermissionRuleConfig
+      agent?: PermissionRuleConfig
+      agent_list?: PermissionRuleConfig
+      agent_send?: PermissionRuleConfig
+      agent_stop?: PermissionRuleConfig
       external_directory?: PermissionRuleConfig
       todowrite?: PermissionActionConfig
       question?: PermissionActionConfig
@@ -2133,7 +2137,7 @@ export type Provider = {
 }
 
 export type ExperimentalCapabilities = {
-  backgroundSubagents: boolean
+  [key: string]: unknown
 }
 
 export type ConsoleState = {
@@ -7833,38 +7837,6 @@ export type ExperimentalSessionListResponses = {
 }
 
 export type ExperimentalSessionListResponse = ExperimentalSessionListResponses[keyof ExperimentalSessionListResponses]
-
-export type ExperimentalSessionBackgroundData = {
-  body?: never
-  path: {
-    sessionID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/experimental/session/{sessionID}/background"
-}
-
-export type ExperimentalSessionBackgroundErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-}
-
-export type ExperimentalSessionBackgroundError =
-  ExperimentalSessionBackgroundErrors[keyof ExperimentalSessionBackgroundErrors]
-
-export type ExperimentalSessionBackgroundResponses = {
-  /**
-   * Backgrounded subagents
-   */
-  200: boolean
-}
-
-export type ExperimentalSessionBackgroundResponse =
-  ExperimentalSessionBackgroundResponses[keyof ExperimentalSessionBackgroundResponses]
 
 export type ExperimentalResourceListData = {
   body?: never

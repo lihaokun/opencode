@@ -35,6 +35,7 @@ import { SessionSummary } from "../../src/session/summary"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
+import { AGENT_ROSTER_SENTINEL } from "../../src/session/reminders"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -50,7 +51,7 @@ import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
-import { TestInstance } from "../fixture/fixture"
+import { provideInstance, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer, type Usage } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -556,7 +557,7 @@ const seed = Effect.fn("test.seed")(function* (
   return { user: msg, assistant }
 })
 
-const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
+const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref, command?: string) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
     yield* session.updatePart({
@@ -568,6 +569,7 @@ const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
       description: "inspect bug",
       agent: "general",
       model,
+      ...(command ? { command } : {}),
     })
   })
 
@@ -2603,7 +2605,7 @@ it.instance("failed subtask preserves metadata on error tool state", () =>
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
     const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.tool("task", {
+    yield* llm.tool("agent", {
       description: "inspect bug",
       prompt: "look into the cache key path",
       subagent_type: "general",
@@ -2612,25 +2614,257 @@ it.instance("failed subtask preserves metadata on error tool state", () =>
     const msg = yield* user(chat.id, "hello")
     yield* addSubtask(chat.id, msg.id)
 
-    const result = yield* prompt.loop({ sessionID: chat.id })
+    // A subagent pinned to a model that does not exist must not take the parent
+    // down with it. Its failure belongs in its own session and reaches the
+    // parent as a message.
+    const exit = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
+    expect(Exit.isSuccess(exit)).toBe(true)
+    if (!Exit.isSuccess(exit)) return
+    const result = exit.value
     expect(result.info.role).toBe("assistant")
-    expect(yield* llm.calls).toBe(2)
 
     const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
     const taskMsg = msgs.find((item) => item.info.role === "assistant" && item.info.agent === "general")
     expect(taskMsg?.info.role).toBe("assistant")
     if (!taskMsg || taskMsg.info.role !== "assistant") return
 
-    const tool = errorTool(taskMsg.parts)
+    // The agent tool no longer surfaces a child's failure as its own error —
+    // delegation is asynchronous, so it returns once the child has started and
+    // the failure arrives later as a message. What must still hold is that the
+    // metadata the UI renders from names the child and the model the child was
+    // actually resolved to, which here is the broken one the agent pins.
+    const tool = taskMsg.parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
     if (!tool) return
 
-    expect(tool.state.error).toContain("Tool execution failed")
-    expect(tool.state.metadata).toBeDefined()
-    expect(tool.state.metadata?.sessionId).toBeDefined()
-    expect(tool.state.metadata?.model).toEqual({
+    const state = tool.state as { metadata?: { sessionId?: string; model?: unknown } }
+    expect(state.metadata).toBeDefined()
+    expect(state.metadata?.sessionId).toBeDefined()
+    expect(state.metadata?.model).toEqual({
       providerID: ProviderV2.ID.make("test"),
       modelID: ModelV2.ID.make("missing-model"),
     })
+  }),
+)
+
+// agent_send finds a session anywhere on this server — Session.get is a
+// primary-key lookup — but running it is the other half. Forking prompt here
+// without switching instance left the target executing against the sender's
+// directory, config and permissions.
+it.instance("delivers into the target session's own instance", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const elsewhere = yield* tmpdirScoped({ git: true, config: () => providerCfg(llm.url) })
+
+    // Session.create takes its directory from the current instance, so the
+    // target has to be created inside the other one. Passing a workspace id
+    // would not have moved it.
+    const target = yield* Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      return yield* sessions.create({ title: "target" })
+    }).pipe(provideInstance(elsewhere))
+    expect(target.directory).toBe(elsewhere)
+
+    yield* llm.text("ran")
+
+    const prompt = yield* SessionPrompt.Service
+    yield* prompt.deliverAsync({
+      sessionID: target.id,
+      agent: "build",
+      parts: [{ type: "text", text: "run" }],
+    })
+
+    // prompt.ts records the directory the run actually used on the assistant
+    // message, which is what makes the routing observable.
+    const executed = yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const msgs = yield* MessageV2.filterCompactedEffect(target.id)
+        return msgs.find((item) => item.info.role === "assistant")
+      }),
+      "target session never ran",
+      "5 seconds",
+    )
+    expect(executed.info.role === "assistant" && executed.info.path.cwd).toBe(elsewhere)
+  }),
+)
+
+// A slash command has to summarise what the subagent concluded, and the agent
+// tool returns as soon as the delegation is registered — its output is
+// "Started …". So this one internal caller waits on the same delegation. What
+// must not happen is the parent hearing about it twice.
+it.instance("a command subtask carries the subagent's result, in one message", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.text("the cache key is built from the wrong fields")
+    yield* llm.text("summarised")
+    const msg = yield* user(chat.id, "hello")
+    yield* addSubtask(chat.id, msg.id, ref, "review")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+    const taskMsg = msgs.find((item) => item.info.role === "assistant" && item.info.agent === "general")
+    const tool = taskMsg ? toolPart(taskMsg.parts) : undefined
+    expect(tool?.state.status).toBe("completed")
+    const output = tool && tool.state.status === "completed" ? tool.state.output : ""
+    expect(output).toContain("the cache key is built from the wrong fields")
+    expect(output).not.toContain("Started")
+
+    // One message about the delegation reaches the parent — the summary. The
+    // automatic completion notice is not registered for this path, and if it
+    // were it would also wake the parent a second time. The subagent roster is
+    // a separate mechanism and is filtered out here rather than counted.
+    const synthetic = msgs
+      .filter((item) => item.info.role === "user")
+      .flatMap((item) => item.parts)
+      .filter(
+        (part): part is SessionV1.TextPart =>
+          part.type === "text" && part.synthetic === true && !part.text.startsWith(AGENT_ROSTER_SENTINEL),
+      )
+    expect(synthetic).toHaveLength(1)
+    expect(synthetic[0].text).toContain("Summarize the agent result")
+  }),
+)
+
+// A command subtask has no purpose once the command is cancelled, and the
+// parent's own interruption does not reach the job on its own — the onInterrupt
+// startDelegation installs is on the job's fiber, so something has to cancel
+// the job for it to fire.
+it.instance(
+  "cancelling a command subtask stops the subagent with it",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.hang
+      const msg = yield* user(chat.id, "hello")
+      yield* addSubtask(chat.id, msg.id, ref, "review")
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* llm.wait(1)
+
+      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+      const taskMsg = msgs.find((item) => item.info.role === "assistant" && item.info.agent === "general")
+      const tool = taskMsg ? toolPart(taskMsg.parts) : undefined
+      const sessionID =
+        tool && "metadata" in tool.state
+          ? (tool.state.metadata as { sessionId?: string } | undefined)?.sessionId
+          : undefined
+      if (typeof sessionID !== "string") throw new Error("missing child session id")
+      const childID = SessionID.make(sessionID)
+      expect((yield* status.get(childID)).type).toBe("busy")
+
+      yield* prompt.cancel(chat.id)
+      expect(Exit.isSuccess(yield* Fiber.await(fiber))).toBe(true)
+
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const state = yield* status.get(childID)
+          return state.type === "idle" ? (true as const) : undefined
+        }),
+        "the subagent kept running after its command was cancelled",
+        "5 seconds",
+      )
+    }),
+  15_000,
+)
+
+function hasUserText(body: Record<string, unknown>, value: string) {
+  if (!Array.isArray(body.messages)) return false
+  return body.messages.some((message) => {
+    if (!message || typeof message !== "object" || !("role" in message) || message.role !== "user") return false
+    return JSON.stringify("content" in message ? message.content : undefined).includes(value)
+  })
+}
+
+// notify is passed per call, not carried on the Effect context. A forked job
+// fiber inherits the context, so a contextual flag would travel through the
+// child's whole execution and silence the grandchildren's notices too.
+it.instance("a command subtask's own subagent still reports back to it", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    const grandchildPrompt = "look at the cache key"
+    // The command's subagent delegates once more, then finishes.
+    yield* llm.tool("agent", {
+      description: "dig deeper",
+      prompt: grandchildPrompt,
+      subagent_type: "general",
+    })
+    yield* llm.pushMatch(({ body }) => hasUserText(body, grandchildPrompt), reply().text("found it").stop())
+    yield* llm.text("child done")
+    yield* llm.text("summarised")
+
+    const msg = yield* user(chat.id, "hello")
+    yield* addSubtask(chat.id, msg.id, ref, "review")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+    const child = msgs.find((item) => item.info.role === "assistant" && item.info.agent === "general")
+    const tool = child ? toolPart(child.parts) : undefined
+    const childID = tool && "metadata" in tool.state
+      ? (tool.state.metadata as { sessionId?: string } | undefined)?.sessionId
+      : undefined
+    if (typeof childID !== "string") throw new Error("missing child session id")
+
+    // The grandchild's completion notice has to land in the child's session.
+    const notices = yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const inner = yield* MessageV2.filterCompactedEffect(SessionID.make(childID))
+        const found = inner
+          .filter((item) => item.info.role === "user")
+          .flatMap((item) => item.parts)
+          .filter(
+            (part): part is SessionV1.TextPart =>
+              part.type === "text" && part.synthetic === true && part.text.includes("Agent completed"),
+          )
+        return found.length > 0 ? found : undefined
+      }),
+      "the grandchild never reported back to its own parent",
+      "5 seconds",
+    )
+    expect(notices.length).toBeGreaterThan(0)
+  }),
+  15_000,
+)
+
+// Creation can fail before there is a child session or a job — an unavailable
+// worktree, a depth limit, a rejected name. Waiting on an id that was never
+// started returns no info rather than an error, so an unguarded wait turns a
+// clear failure into a hang.
+it.instance("a command subtask whose agent never started reports the failure", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig((url) => ({ ...providerCfg(url), subagent_depth: 0 }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const msg = yield* user(chat.id, "hello")
+    yield* addSubtask(chat.id, msg.id, ref, "review")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+    const taskMsg = msgs.find((item) => item.info.role === "assistant" && item.info.agent === "general")
+    const tool = taskMsg ? toolPart(taskMsg.parts) : undefined
+    expect(tool?.state.status).toBe("error")
+
+    // Nothing to summarise, so nothing asks for a summary.
+    const synthetic = msgs
+      .filter((item) => item.info.role === "user")
+      .flatMap((item) => item.parts)
+      .filter(
+        (part): part is SessionV1.TextPart =>
+          part.type === "text" && part.synthetic === true && !part.text.startsWith(AGENT_ROSTER_SENTINEL),
+      )
+    expect(synthetic).toHaveLength(0)
   }),
 )
 
@@ -2657,7 +2891,10 @@ it.instance("subtask child inherits parent session external_directory allow", ()
       expect.arrayContaining([{ permission: "external_directory", pattern: "/tmp/allowed/*", action: "allow" }]),
     )
     expect(Permission.evaluate("external_directory", "/tmp/allowed/file", rules).action).toBe("allow")
-    expect(Permission.evaluate("task", "anything", rules).action).toBe("deny")
+    // No default deny on spawning any more: nesting is bounded by depth and by
+    // which tools are offered, not by a rule on the child's session that would
+    // outrank the agent definition's own.
+    expect(Permission.evaluate("agent", "anything", rules).action).not.toBe("deny")
   }),
 )
 
@@ -2707,15 +2944,18 @@ it.instance(
           const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
           const taskMsg = msgs.find((item) => item.info.role === "assistant" && item.info.agent === "general")
           const tool = taskMsg?.parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
-          if (tool?.state.status === "running" && tool.state.metadata?.sessionId) return tool
+          if (tool && "metadata" in tool.state && tool.state.metadata?.sessionId) return tool
         }),
-        "timed out waiting for running subtask metadata",
+        "timed out waiting for subtask metadata",
       )
 
-      if (tool.state.status !== "running") return
-      expect(typeof tool.state.metadata?.sessionId).toBe("string")
-      expect(tool.state.title).toBeDefined()
-      expect(tool.state.metadata?.model).toBeDefined()
+      // The agent tool returns once the delegation is registered, so the part no
+      // longer sits in `running` while the child works. The metadata the UI
+      // renders from still has to be there, which is what this checks.
+      const state = tool.state as { metadata?: { sessionId?: string; model?: unknown }; title?: string }
+      expect(typeof state.metadata?.sessionId).toBe("string")
+      expect(state.title).toBeDefined()
+      expect(state.metadata?.model).toBeDefined()
 
       yield* prompt.cancel(chat.id)
       yield* Fiber.await(fiber)
@@ -2724,7 +2964,7 @@ it.instance(
 )
 
 it.instance(
-  "running task tool preserves metadata after tool-call transition",
+  "running agent tool preserves metadata after tool-call transition",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -2734,7 +2974,7 @@ it.instance(
         title: "Pinned",
         permission: [{ permission: "*", pattern: "*", action: "allow" }],
       })
-      yield* llm.tool("task", {
+      yield* llm.tool("agent", {
         description: "inspect bug",
         prompt: "look into the cache key path",
         subagent_type: "general",
@@ -2747,19 +2987,24 @@ it.instance(
       const tool = yield* pollWithTimeout(
         Effect.gen(function* () {
           const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
-          const assistant = msgs.findLast((item) => item.info.role === "assistant" && item.info.agent === "build")
-          const tool = assistant?.parts.find(
-            (part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task",
-          )
-          if (tool?.state.status === "running" && tool.state.metadata?.sessionId) return tool
+          // Not findLast: the agent tool completes in its own turn, and the
+          // assistant that follows carries only text.
+          const tool = msgs
+            .filter((item) => item.info.role === "assistant" && item.info.agent === "build")
+            .flatMap((item) => item.parts)
+            .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "agent")
+          if (tool && "metadata" in tool.state && tool.state.metadata?.sessionId) return tool
         }),
-        "timed out waiting for running task metadata",
+        "timed out waiting for agent tool metadata",
       )
 
-      if (tool.state.status !== "running") return
-      expect(typeof tool.state.metadata?.sessionId).toBe("string")
-      expect(tool.state.title).toBe("inspect bug")
-      expect(tool.state.metadata?.model).toBeDefined()
+      // The agent tool returns once the delegation is registered, so the part no
+      // longer sits in `running` while the child works. The metadata the UI
+      // renders from still has to be there, which is what this checks.
+      const state = tool.state as { metadata?: { sessionId?: string; model?: unknown }; title?: string }
+      expect(typeof state.metadata?.sessionId).toBe("string")
+      expect(state.title).toBe("inspect bug")
+      expect(state.metadata?.model).toBeDefined()
 
       yield* prompt.cancel(chat.id)
       yield* Fiber.await(fiber)
@@ -2937,16 +3182,16 @@ noLLMServer.instance(
       const ready = yield* Deferred.make<void>()
       const aborted = yield* Deferred.make<void>()
       const registry = yield* ToolRegistry.Service
-      const { task } = yield* registry.named()
-      const original = task.execute
-      task.execute = (_args, ctx) =>
+      const { agent } = yield* registry.named()
+      const original = agent.execute
+      agent.execute = (_args: unknown, ctx: { abort: AbortSignal }) =>
         Effect.callback<never>((_resume) => {
           ctx.abort.addEventListener("abort", () => succeedVoid(aborted), { once: true })
           if (ctx.abort.aborted) succeedVoid(aborted)
           succeedVoid(ready)
           return Effect.sync(() => succeedVoid(aborted))
         })
-      yield* Effect.addFinalizer(() => Effect.sync(() => void (task.execute = original)))
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (agent.execute = original)))
 
       const { prompt, chat } = yield* boot()
       const msg = yield* user(chat.id, "hello")
@@ -2996,7 +3241,12 @@ it.instance(
       const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
       const taskMsg = msgs.find((item) => item.info.role === "assistant" && item.info.agent === "general")
       const tool = taskMsg ? toolPart(taskMsg.parts) : undefined
-      const sessionID = tool?.state.status === "running" ? tool.state.metadata?.sessionId : undefined
+      // Read regardless of status: the agent part completes as soon as the
+      // delegation starts, while the child keeps running behind it.
+      const sessionID =
+        tool && "metadata" in tool.state
+          ? (tool.state.metadata as { sessionId?: string } | undefined)?.sessionId
+          : undefined
       expect(typeof sessionID).toBe("string")
       if (typeof sessionID !== "string") throw new Error("missing child session id")
       const childID = SessionID.make(sessionID)

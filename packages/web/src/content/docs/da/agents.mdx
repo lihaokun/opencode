@@ -571,9 +571,9 @@ Gælder kun for `mode: subagent`-agent.
 
 ---
 
-### Opgavetilladelser (`permission.task`)
+### Opgavetilladelser (`permission.agent`)
 
-Kontroller, hvilke subagenter en agent kan påkalde via opgaveværktøjet med `permission.task`. Bruger glob-mønstre til fleksibel matchning.
+Kontroller, hvilke subagenter en agent kan påkalde via opgaveværktøjet med `permission.agent`. Bruger glob-mønstre til fleksibel matchning.
 
 ```json title="opencode.json"
 {
@@ -581,7 +581,7 @@ Kontroller, hvilke subagenter en agent kan påkalde via opgaveværktøjet med `p
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

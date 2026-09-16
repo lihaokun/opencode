@@ -280,6 +280,45 @@ opencode ships with `build`, `plan`, `general`, `explore`. Hidden internal agent
 `compaction`, `title`, `summary`. To override a built-in's fields, define the
 same key in `agent: { <name>: { ... } }`.
 
+### How subagents behave at runtime
+
+Worth knowing before configuring them, because several settings only make sense
+against this.
+
+A model launches one with the `agent` tool and manages it with `agent_list`,
+`agent_send` and `agent_stop`. Launching is **always asynchronous**: the tool
+returns once the subagent has started, and the result arrives later as a message
+in the parent's conversation. There is no foreground mode and nothing to poll.
+
+`agent_send` is a one-way message, not a request-response. It can also resume a
+subagent that has gone idle, including one that was stopped — `agent_stop` ends
+an execution but deletes nothing.
+
+Subagents can launch subagents. `subagent_depth` bounds how deep, counting the
+main session as 0:
+
+```json
+{ "subagent_depth": 3 }
+```
+
+The default is 3. Set it to 0 to stop agents launching agents at all. At the
+limit the launching and stopping tools are simply not offered, rather than
+offered and then refused.
+
+`opencode run` is one-shot, and it waits: once the main turn ends it stays open
+while any subagent it launched is still working, because that subagent's result
+comes back as a message the session still has to answer. The wait is capped at
+10 minutes of continuous idleness so a stuck subagent cannot hold the process
+open; on timeout the run stops what is still running, reports it, and exits
+non-zero. `OPENCODE_RUN_AGENT_WAIT_MS` changes the cap, and `0` removes it.
+
+Each subagent is given its own working directory — a real git worktree in a git
+project — and told to work in it, which is what lets several run at once without
+overwriting each other. It is a convention rather than a sandbox: a subagent can
+still reach the rest of the project by absolute path. These directories live
+under `.opencode/worktrees/` inside the project and are **not** cleaned up
+automatically, so they accumulate until removed by hand.
+
 ## Commands
 
 opencode's command loader scans for `**/*.md` inside command directories. The
@@ -410,11 +449,29 @@ rules last.
 `permission: "allow"` (a string at the top level) is shorthand for "allow
 everything" and is rarely what the user wants.
 
-Known permission keys: `read, edit, glob, grep, list, bash, task,
-external_directory, todowrite, question, webfetch, websearch, lsp, doom_loop,
-skill`. Some of these (`todowrite,
+Known permission keys: `read, edit, glob, grep, list, bash, agent, agent_list,
+agent_send, agent_stop, external_directory, todowrite, question, webfetch,
+websearch, lsp, doom_loop, skill`. Some of these (`todowrite,
 question, webfetch, websearch, doom_loop`) only accept a flat
 action, not a per-pattern object.
+
+`agent` gates launching a subagent, and its patterns are **subagent type
+names**, not paths: `{"agent": {"*": "allow", "general": "deny"}}` allows every
+type except `general`. It defaults to allow, so launching a subagent does not
+prompt. `agent_list`, `agent_send` and `agent_stop` are ordinary tool keys with
+no patterns worth writing.
+
+`task` was this key's old name. Config still accepts it and renames it to
+`agent` on read, so an existing `task: deny` keeps working — silently ignoring
+it would widen permissions on upgrade. The rename happens **in place**: the rule
+keeps its position among the others, which matters because the last matching
+rule wins, so a legacy rule goes on being overridden by exactly what overrode it
+before. When both keys name the same pattern, the explicit `agent` one wins. Use
+`agent` in new config; `task` is deprecated and warns once on load.
+
+An agent whose ruleset starts with `{"*": "deny"}` must name these tools
+explicitly to keep them — a wildcard deny removes them along with everything
+else.
 
 `external_directory` patterns are filesystem paths (use `~/`, absolute paths,
 or globs like `~/projects/**`).

@@ -22,7 +22,12 @@ const InputObject = Schema.StructWithRest(
     grep: Schema.optional(Rule),
     list: Schema.optional(Rule),
     bash: Schema.optional(Rule),
+    /** @deprecated renamed to `agent`; still read, and renamed in place on load. */
     task: Schema.optional(Rule),
+    agent: Schema.optional(Rule),
+    agent_list: Schema.optional(Rule),
+    agent_send: Schema.optional(Rule),
+    agent_stop: Schema.optional(Rule),
     external_directory: Schema.optional(Rule),
     todowrite: Schema.optional(Action),
     question: Schema.optional(Action),

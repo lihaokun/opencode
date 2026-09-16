@@ -30,6 +30,8 @@ import { Config } from "@/config/config"
 import { ConfigMarkdown } from "@/config/markdown"
 import { SessionSummary } from "./summary"
 import { NamedError } from "@opencode-ai/core/util/error"
+import { InstanceStore } from "@/project/instance-store"
+import { BackgroundJob } from "@/background/job"
 import { SessionProcessor } from "./processor"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
@@ -44,7 +46,8 @@ import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { TaskTool, type TaskPromptOps } from "@/tool/task"
+import { AGENT_TOOL_ID } from "@/tool/agent"
+import { AgentManagement } from "@/agent-management/schema"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -54,6 +57,8 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
+import { AgentTree } from "@/agent-management/tree"
+import { AgentStatusProjection } from "@/agent-management/status"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
 
@@ -102,6 +107,18 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  /**
+   * Send a message to a session and return without waiting for it — the whole
+   * of what `prompt_async` means, routing included.
+   *
+   * There are two halves to that: the fork, so a one-way message does not block
+   * on the target's turn, and the switch to the target session's own instance,
+   * so it runs with its own directory, config, agents and permissions. Taking
+   * only the fork leaves the target executing inside the sender's instance,
+   * reading and writing in the wrong project. Both callers — the HTTP handler
+   * and agent_send — go through here so neither can take half again.
+   */
+  readonly deliverAsync: (input: PromptInput) => Effect.Effect<void>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -115,6 +132,8 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const status = yield* SessionStatus.Service
     const sessions = yield* Session.Service
+    const agentTree = yield* AgentTree.Service
+    const agentStatus = yield* AgentStatusProjection.Service
     const agents = yield* Agent.Service
     const provider = yield* Provider.Service
     const processor = yield* SessionProcessor.Service
@@ -140,18 +159,70 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const background = yield* BackgroundJob.Service
     const { db } = database
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
-      } satisfies TaskPromptOps
+        deliverAsync: (input: PromptInput) => deliverAsync(input),
+      } satisfies AgentManagement.AgentPromptOps
     })
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
       yield* state.cancel(sessionID)
+    })
+
+    const deliverAsync = Effect.fn("SessionPrompt.deliverAsync")(function* (input: PromptInput) {
+      const target = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      const here = yield* InstanceState.context
+
+      // Everything the fork does is reported this way, or the failure escapes
+      // as a defect. The caller is already gone by then, so the event is the
+      // only report left. Note that this wraps the instance switch as well as
+      // the run: loading the target's instance can fail too, and a failure
+      // there is just as invisible.
+      const report = (effect: Effect.Effect<unknown, unknown>) =>
+        effect.pipe(
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              yield* Effect.logError("async delivery failed", { sessionID: input.sessionID, cause })
+              yield* events.publish(Session.Event.Error, {
+                sessionID: input.sessionID,
+                error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
+              })
+            }),
+          ),
+          Effect.forkIn(scope, { startImmediately: true }),
+          Effect.asVoid,
+        )
+
+      // Same directory means this instance already is the target's, and loading
+      // it again would be a detour to the same place.
+      if (target.directory === here.directory) {
+        yield* report(prompt(input))
+        return
+      }
+
+      // Swapping InstanceRef is what routing is: every per-instance service
+      // reads its state through it, so the whole run lands in the target's
+      // instance. Same mechanism the control plane uses for a local workspace.
+      const store = yield* Effect.serviceOption(InstanceStore.Service)
+      if (store._tag === "None") {
+        // Refuse rather than quietly run it here. Running a session against
+        // another directory's files is worse than not delivering, and silence
+        // is how this went unnoticed the first time. Every entry point that
+        // builds SessionPrompt has the store, so this is a guard against a
+        // layer assembled without it rather than a path a user can reach.
+        return yield* Effect.die(
+          new Error(
+            `cannot deliver to session ${input.sessionID}: it belongs to ${target.directory}, this instance is ${here.directory}, and no InstanceStore is available to switch`,
+          ),
+        )
+      }
+      yield* report(store.value.provide({ directory: target.directory }, prompt(input)))
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -263,7 +334,7 @@ const layer = Layer.effect(
       const { task, model, lastUser, sessionID, session, msgs } = input
       const ctx = yield* InstanceState.context
       const promptOps = yield* ops()
-      const { task: taskTool } = yield* registry.named()
+      const { agent: agentTool } = yield* registry.named()
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
       const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
         id: MessageID.ascending(),
@@ -286,7 +357,7 @@ const layer = Layer.effect(
         sessionID: assistantMessage.sessionID,
         type: "tool",
         callID: ulid(),
-        tool: TaskTool.id,
+        tool: AGENT_TOOL_ID,
         state: {
           status: "running",
           input: {
@@ -298,15 +369,16 @@ const layer = Layer.effect(
           time: { start: Date.now() },
         },
       })
+      // `command` is display-only and stays in the part's recorded input; the
+      // tool itself has no such parameter.
       const taskArgs = {
         prompt: task.prompt,
         description: task.description,
         subagent_type: task.agent,
-        command: task.command,
       }
       yield* plugin.trigger(
         "tool.execute.before",
-        { tool: TaskTool.id, sessionID, callID: part.id },
+        { tool: AGENT_TOOL_ID, sessionID, callID: part.id },
         { args: taskArgs },
       )
 
@@ -321,14 +393,18 @@ const layer = Layer.effect(
 
       let error: Error | undefined
       const taskAbort = new AbortController()
-      const result = yield* taskTool
+      const result = yield* agentTool
         .execute(taskArgs, {
           agent: task.agent,
           messageID: assistantMessage.id,
           sessionID,
           abort: taskAbort.signal,
           callID: part.callID,
-          extra: { bypassAgentCheck: true, promptOps },
+          // notifyOnFinish is false only for a command subtask, which waits on
+          // the delegation below. Registering the automatic watcher as well
+          // would give the parent two messages for one delegation, and the
+          // automatic one would wake it a second time.
+          extra: { bypassAgentCheck: true, promptOps, notifyOnFinish: !task.command },
           messages: msgs,
           metadata: (val: { title?: string; metadata?: Record<string, any> }) =>
             Effect.gen(function* () {
@@ -379,6 +455,38 @@ const layer = Layer.effect(
           ),
         )
 
+      // A command subtask has to summarise what the subagent concluded, and the
+      // agent tool returns as soon as the delegation is registered — its output
+      // is "Started …". So this one internal caller waits on the same
+      // delegation. The tool the model sees is unchanged: still asynchronous,
+      // still returns immediately.
+      let awaited: { output: string } | { error: string } | undefined
+      const childSessionID = (result?.metadata as { sessionId?: string } | undefined)?.sessionId
+      if (task.command && result) {
+        if (!childSessionID) {
+          // Creation itself failed — an unavailable worktree, an unknown agent
+          // type, a rejected name — so there is no child session and no job.
+          // Waiting on an id that was never started returns no info rather than
+          // an error, which would leave every branch below unmatched and turn a
+          // clear failure into a silent hang.
+          awaited = { error: result.output }
+        } else {
+          const settled = yield* background.wait({ id: childSessionID }).pipe(
+            // A command subtask has no purpose once the command is cancelled,
+            // and leaving the subagent running with nobody to receive its result
+            // is pure waste. Cancelling the job interrupts its fiber, which is
+            // what reaches the child's own prompt through the onInterrupt that
+            // startDelegation already installs — the parent's own interruption
+            // does not reach it by itself.
+            Effect.onInterrupt(() => background.cancel(childSessionID).pipe(Effect.asVoid)),
+          )
+          const info = settled.info
+          if (info?.status === "completed") awaited = { output: info.output ?? "" }
+          else if (info?.status === "error") awaited = { error: info.error ?? "Agent failed" }
+          else awaited = { error: `Agent cancelled: ${task.description}` }
+        }
+      }
+
       const attachments = result?.attachments?.map((attachment) => ({
         ...attachment,
         id: PartID.ascending(),
@@ -388,7 +496,7 @@ const layer = Layer.effect(
 
       yield* plugin.trigger(
         "tool.execute.after",
-        { tool: TaskTool.id, sessionID, callID: part.id, args: taskArgs },
+        { tool: AGENT_TOOL_ID, sessionID, callID: part.id, args: taskArgs },
         result,
       )
 
@@ -397,18 +505,33 @@ const layer = Layer.effect(
       yield* sessions.updateMessage(assistantMessage)
 
       if (result && part.state.status === "running") {
-        yield* sessions.updatePart({
-          ...part,
-          state: {
-            status: "completed",
-            input: part.state.input,
-            title: result.title,
-            metadata: result.metadata,
-            output: result.output,
-            attachments,
-            time: { ...part.state.time, end: Date.now() },
-          },
-        } satisfies SessionV1.ToolPart)
+        // For a command subtask the part carries the subagent's own result, not
+        // the confirmation that it started.
+        if (awaited && "error" in awaited) {
+          yield* sessions.updatePart({
+            ...part,
+            state: {
+              status: "error",
+              error: awaited.error,
+              time: { start: part.state.time.start, end: Date.now() },
+              metadata: result.metadata,
+              input: part.state.input,
+            },
+          } satisfies SessionV1.ToolPart)
+        } else {
+          yield* sessions.updatePart({
+            ...part,
+            state: {
+              status: "completed",
+              input: part.state.input,
+              title: result.title,
+              metadata: result.metadata,
+              output: awaited ? awaited.output : result.output,
+              attachments,
+              time: { ...part.state.time, end: Date.now() },
+            },
+          } satisfies SessionV1.ToolPart)
+        }
       }
 
       if (!result) {
@@ -428,6 +551,11 @@ const layer = Layer.effect(
       }
 
       if (!task.command) return
+      // Only a completed delegation gets summarised. On a failure or a
+      // cancellation the part above already carries everything there is to say,
+      // and asking for a summary would point the parent at a result that does
+      // not exist.
+      if (awaited === undefined || "error" in awaited) return
 
       const summaryUserMsg: SessionV1.User = {
         id: MessageID.ascending(),
@@ -443,7 +571,7 @@ const layer = Layer.effect(
         messageID: summaryUserMsg.id,
         sessionID,
         type: "text",
-        text: "Summarize the task tool output above and continue with your task.",
+        text: "Summarize the agent result above and continue with your task.",
         synthetic: true,
       } satisfies SessionV1.TextPart)
     })
@@ -972,7 +1100,7 @@ const layer = Layer.effect(
         }
 
         if (part.type === "agent") {
-          const perm = Permission.evaluate("task", part.name, ag.permission)
+          const perm = Permission.evaluate(AGENT_TOOL_ID, part.name, ag.permission)
           const hint = perm.action === "deny" ? " . Invoked by user; guaranteed to exist." : ""
           return [
             { ...part, messageID: info.id, sessionID: input.sessionID },
@@ -982,7 +1110,7 @@ const layer = Layer.effect(
               type: "text",
               synthetic: true,
               text:
-                " Use the above message and context to generate a prompt and call the task tool with subagent: " +
+                " Use the above message and context to generate a prompt and call the agent tool with subagent_type: " +
                 part.name +
                 hint,
             },
@@ -1196,6 +1324,11 @@ const layer = Layer.effect(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(FSUtil.Service, fsys),
             Effect.provideService(Session.Service, sessions),
+          )
+          msgs = yield* SessionReminders.applyAgentRoster({ messages: msgs, session, agent }).pipe(
+            Effect.provideService(Session.Service, sessions),
+            Effect.provideService(AgentTree.Service, agentTree),
+            Effect.provideService(AgentStatusProjection.Service, agentStatus),
           )
 
           const msg: SessionV1.Assistant = {
@@ -1565,6 +1698,7 @@ const layer = Layer.effect(
     return Service.of({
       cancel,
       prompt,
+      deliverAsync,
       loop,
       shell,
       command,
@@ -1684,6 +1818,8 @@ export const node = LayerNode.make({
     SessionStatus.node,
     Session.node,
     Agent.node,
+    AgentTree.node,
+    AgentStatusProjection.node,
     Provider.node,
     SessionProcessor.node,
     SessionCompaction.node,
@@ -1700,6 +1836,7 @@ export const node = LayerNode.make({
     CrossSpawnSpawner.node,
     Instruction.node,
     SessionRunState.node,
+    BackgroundJob.node,
     SessionRevert.node,
     SessionSummary.node,
     SystemPrompt.node,

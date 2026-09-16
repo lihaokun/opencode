@@ -28,7 +28,7 @@ import type { PlanExitTool } from "@/tool/plan"
 import type { QuestionTool } from "@/tool/question"
 import type { ReadTool } from "@/tool/read"
 import type { SkillTool } from "@/tool/skill"
-import type { TaskTool } from "@/tool/task"
+import type { AgentTool } from "@/tool/agent"
 import type { TodoWriteTool } from "@/tool/todo"
 import type { WebFetchTool } from "@/tool/webfetch"
 import { webSearchProviderLabel, type WebSearchTool } from "@/tool/websearch"
@@ -98,7 +98,8 @@ type ToolDefs = {
   edit: typeof EditTool
   apply_patch: typeof ApplyPatchTool
   batch: Tool.Info
-  task: typeof TaskTool
+  task: typeof AgentTool
+  agent: typeof AgentTool
   todowrite: typeof TodoWriteTool
   question: typeof QuestionTool
   read: typeof ReadTool
@@ -363,7 +364,7 @@ function runWebSearch(p: ToolProps<typeof WebSearchTool>): ToolInline {
   }
 }
 
-function runTask(p: ToolProps<typeof TaskTool>): ToolInline {
+function runTask(p: ToolProps<typeof AgentTool>): ToolInline {
   const kind = Locale.titlecase(p.input.subagent_type || "unknown")
   const desc = p.input.description
   const icon = p.frame.status === "error" ? "✗" : p.frame.status === "running" ? "•" : "✓"
@@ -568,7 +569,7 @@ function snapPatch(p: ToolProps<typeof ApplyPatchTool>): ToolSnapshot | undefine
   }
 }
 
-function snapTask(p: ToolProps<typeof TaskTool>): ToolSnapshot {
+function snapTask(p: ToolProps<typeof AgentTool>): ToolSnapshot {
   const kind = Locale.titlecase(p.input.subagent_type || "general")
   const desc = p.input.description
   const title = text(p.frame.state.title)
@@ -752,7 +753,7 @@ function scrollPatchFinal(p: ToolProps<typeof ApplyPatchTool>): string {
   return patchLine(files[0]!)
 }
 
-function scrollTaskStart(_: ToolProps<typeof TaskTool>): string {
+function scrollTaskStart(_: ToolProps<typeof AgentTool>): string {
   return ""
 }
 
@@ -761,20 +762,20 @@ function taskResult(output: string): string | undefined {
     return undefined
   }
 
-  const match = output.match(/<task_result>\s*([\s\S]*?)\s*<\/task_result>/)
+  const match = output.match(/<(?:agent|task)_result>\s*([\s\S]*?)\s*<\/(?:agent|task)_result>/)
   if (match) {
     return match[1].trim() || undefined
   }
 
   const next = output
     .split("\n")
-    .filter((line) => !line.startsWith("task_id:"))
+    .filter((line) => !line.startsWith("task_id:") && !line.startsWith("session_id:"))
     .join("\n")
     .trim()
   return next || undefined
 }
 
-function scrollTaskFinal(p: ToolProps<typeof TaskTool>): string {
+function scrollTaskFinal(p: ToolProps<typeof AgentTool>): string {
   if (p.frame.status === "error") {
     return fail(p.frame)
   }
@@ -974,7 +975,7 @@ function permBash(p: ToolPermissionProps<typeof BashTool>): ToolPermissionInfo {
   }
 }
 
-function permTask(p: ToolPermissionProps<typeof TaskTool>): ToolPermissionInfo {
+function permTask(p: ToolPermissionProps<typeof AgentTool>): ToolPermissionInfo {
   const type = p.input.subagent_type || "general"
   const desc = p.input.description
   return {
@@ -1092,6 +1093,22 @@ const TOOL_RULES = {
     },
   },
   task: {
+    view: {
+      output: false,
+      final: true,
+      snap: "structured",
+    },
+    run: runTask,
+    snap: snapTask,
+    scroll: {
+      start: scrollTaskStart,
+      final: scrollTaskFinal,
+    },
+    permission: permTask,
+  },
+  // Same rendering under the live name. The `task` entry above stays so older
+  // transcripts still display; only `agent` is produced now.
+  agent: {
     view: {
       output: false,
       final: true,
@@ -1433,7 +1450,7 @@ export function toolEntryBody(commit: StreamCommit, raw: string): RunEntryBody |
   const ctx = toolFrame(commit, raw)
   const view = toolView(ctx.name)
 
-  if (ctx.name === "task") {
+  if (ctx.name === "agent" || ctx.name === "task") {
     if (commit.phase === "start") {
       return undefined
     }

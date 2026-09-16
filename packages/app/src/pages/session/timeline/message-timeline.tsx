@@ -92,7 +92,9 @@ const timelineFallbackItemSize = 60
 const timelineCache = new Map<string, { measurements: VirtualItem[]; toolOpen: Record<string, boolean | undefined> }>()
 
 const taskDescription = (part: PartType, sessionID: string) => {
-  if (part.type !== "tool" || part.tool !== "task") return
+  // `agent` is the live tool; `task` stays recognised so older transcripts keep
+  // rendering. Display only — the task tool itself is gone.
+  if (part.type !== "tool" || (part.tool !== "agent" && part.tool !== "task")) return
   const metadata = "metadata" in part.state ? part.state.metadata : undefined
   if (metadata?.sessionId !== sessionID) return
   const value = part.state.input?.description

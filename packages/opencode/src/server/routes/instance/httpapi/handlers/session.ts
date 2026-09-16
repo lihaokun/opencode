@@ -313,18 +313,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof PromptPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
-        Effect.catchCause((cause) =>
-          Effect.gen(function* () {
-            yield* Effect.logError("prompt_async failed", { sessionID: ctx.params.sessionID, cause })
-            yield* events.publish(Session.Event.Error, {
-              sessionID: ctx.params.sessionID,
-              error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
-            })
-          }),
-        ),
-        Effect.forkIn(scope, { startImmediately: true }),
-      )
+      // The fork, the failure reporting, and the switch to the target session's
+      // instance all live in deliverAsync, which agent_send calls too. Keeping a
+      // second copy here is how the two drifted apart in the first place.
+      yield* promptSvc.deliverAsync({ ...ctx.payload, sessionID: ctx.params.sessionID })
       return HttpApiSchema.NoContent.make()
     })
 

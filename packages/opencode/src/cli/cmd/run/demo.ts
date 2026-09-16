@@ -845,7 +845,7 @@ function emitPermission(state: State, kind: PermissionKind = "edit"): void {
     })
     askPermission(state, {
       ref,
-      permission: "task",
+      permission: "agent",
       patterns: ["explore"],
       always: ["*"],
       done: {

@@ -62,6 +62,12 @@ function forkStderrDrain(stream: ReadableStream<Uint8Array>, into: string[]) {
 function isolatedEnv(home: string, configJson: string): Record<string, string> {
   return {
     OPENCODE_TEST_HOME: home,
+    // Must match the cwd each spawn uses. opencode resolves its project from
+    // `process.env.PWD ?? process.cwd()`, and PWD is inherited from whatever
+    // shell started the test run — so leaving it alone points the child at the
+    // opencode repository no matter what cwd we set, and anything the test
+    // writes to a project-relative path lands there instead of the tmpdir.
+    PWD: home,
     HOME: home,
     XDG_CONFIG_HOME: path.join(home, ".config"),
     XDG_DATA_HOME: path.join(home, ".local/share"),
@@ -403,7 +409,7 @@ export function withCliFixture<A, E>(
         Effect.sync(() =>
           Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
             cwd: opts?.cwd ?? home,
-            env: { ...process.env, ...env, ...opts?.env },
+            env: { ...process.env, ...env, PWD: opts?.cwd ?? home, ...opts?.env },
             stdin: "pipe",
             stdout: "pipe",
             stderr: "pipe",
@@ -538,4 +544,9 @@ export const cliIt = {
       () => Effect.runPromise(Effect.scoped(withCliFixture(body))),
       opts,
     ),
+  skip: <A, E>(
+    name: string,
+    _body: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
+    opts?: number | TestOptions,
+  ) => test.skip(name, () => {}, opts),
 }

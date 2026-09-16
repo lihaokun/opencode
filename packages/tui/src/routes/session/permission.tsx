@@ -283,12 +283,14 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
               }
             }
 
-            if (permission === "task") {
+            // `agent` is the live key; `task` is kept so a permission stored
+            // under the old name still renders.
+            if (permission === "agent" || permission === "task") {
               const type = typeof data.subagent_type === "string" ? data.subagent_type : "Unknown"
               const desc = typeof data.description === "string" ? data.description : ""
               return {
                 icon: "#",
-                title: `${Locale.titlecase(type)} Task`,
+                title: `${Locale.titlecase(type)} Agent`,
                 body: (
                   <Show when={desc}>
                     <box paddingLeft={1}>
