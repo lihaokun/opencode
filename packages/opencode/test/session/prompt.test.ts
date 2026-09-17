@@ -3630,10 +3630,11 @@ unixNoLLMServer(
   30_000,
 )
 
-// Runs a real shell command and two loops around it. Thirty seconds covers that
-// on Linux and does not on the Windows runner, where spawning a process costs
-// enough to matter and the job is saturated besides — it timed out there twice
-// while passing everywhere else.
+// bun rather than sleep for the command that has to take a moment: the shell
+// behind this brings its own builtins and sleep is not among them, so on Windows
+// the command failed and the test sat waiting for a shell run that was never
+// going to finish. It is not a slow test there — it was a stuck one, and raising
+// its budget would only have made it stuck for longer.
 it.instance(
   "loop waits while shell runs and starts after shell exits",
   () =>
@@ -3648,7 +3649,7 @@ it.instance(
       yield* llm.text("after-shell")
 
       const sh = yield* prompt
-        .shell({ sessionID: chat.id, agent: "build", command: "sleep 0.2" })
+        .shell({ sessionID: chat.id, agent: "build", command: `bun -e "await Bun.sleep(200)"` })
         .pipe(Effect.forkChild)
       yield* waitForBusy(chat.id)
 
@@ -3685,7 +3686,7 @@ it.instance(
       yield* llm.text("done")
 
       const sh = yield* prompt
-        .shell({ sessionID: chat.id, agent: "build", command: "sleep 0.2" })
+        .shell({ sessionID: chat.id, agent: "build", command: `bun -e "await Bun.sleep(200)"` })
         .pipe(Effect.forkChild)
       yield* waitForBusy(chat.id)
 
@@ -3707,7 +3708,7 @@ it.instance(
       expect(yield* llm.calls).toBe(1)
     }),
   { git: true },
-  90_000,
+  30_000,
 )
 
 unix(

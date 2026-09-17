@@ -68,8 +68,8 @@ function waitDisposed(directory: string) {
 }
 
 // Boots a real instance, which on the Windows runner is filesystem work of a
-// kind that platform is slow at. It timed out there at the default budget while
-// passing everywhere else.
+// kind that platform is slow at. It timed out there once under the default
+// budget while passing everywhere else, so it gets its own.
 it.live(
   "InstanceStore.provide runs InstanceBootstrap before effect",
   () =>
