@@ -3630,6 +3630,10 @@ unixNoLLMServer(
   30_000,
 )
 
+// Runs a real shell command and two loops around it. Thirty seconds covers that
+// on Linux and does not on the Windows runner, where spawning a process costs
+// enough to matter and the job is saturated besides — it timed out there twice
+// while passing everywhere else.
 it.instance(
   "loop waits while shell runs and starts after shell exits",
   () =>
@@ -3703,7 +3707,7 @@ it.instance(
       expect(yield* llm.calls).toBe(1)
     }),
   { git: true },
-  30_000,
+  90_000,
 )
 
 unix(
