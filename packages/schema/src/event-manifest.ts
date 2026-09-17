@@ -1,5 +1,6 @@
 export * as EventManifest from "./event-manifest"
 
+import { AgentEvent } from "./agent-event"
 import { Catalog } from "./catalog"
 import { Durable } from "./durable-event-manifest"
 import { Event } from "./event"
@@ -79,6 +80,7 @@ export const Definitions = Event.inventory(
   ...WorkspaceEvent.Definitions,
   ...WorktreeEvent.Definitions,
   ...ServerEvent.Definitions,
+  ...AgentEvent.Definitions,
 )
 export const Latest = Event.latest(Definitions)
 export { Durable }

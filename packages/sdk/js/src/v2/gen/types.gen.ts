@@ -93,6 +93,7 @@ export type Event =
   | EventWorktreeFailed
   | EventServerConnected
   | EventGlobalDisposed
+  | EventAgentDelegation
   | EventServerInstanceDisposed
 
 export type QuestionReplied = {
@@ -1602,6 +1603,15 @@ export type GlobalEvent = {
           [key: string]: unknown
         }
       }
+    | {
+        id: string
+        type: "agent.delegation"
+        properties: {
+          sessionID: string
+          caller: string
+          status: "started" | "settled"
+        }
+      }
     | EventServerInstanceDisposed
     | SyncEventSessionCreated
     | SyncEventSessionUpdated
@@ -2953,6 +2963,7 @@ export type V2Event =
   | WorktreeFailed
   | ServerConnected
   | GlobalDisposed
+  | AgentDelegation
 
 export type V2EventStream = string
 
@@ -6117,6 +6128,25 @@ export type GlobalDisposed = {
   }
 }
 
+export type AgentDelegation = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "agent.delegation"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    caller: string
+    status: "started" | "settled"
+  }
+}
+
 export type QuestionV2Request = {
   id: string
   sessionID: string
@@ -7061,6 +7091,16 @@ export type EventGlobalDisposed = {
   type: "global.disposed"
   properties: {
     [key: string]: unknown
+  }
+}
+
+export type EventAgentDelegation = {
+  id: string
+  type: "agent.delegation"
+  properties: {
+    sessionID: string
+    caller: string
+    status: "started" | "settled"
   }
 }
 

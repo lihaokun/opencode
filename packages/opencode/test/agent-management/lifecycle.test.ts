@@ -112,8 +112,15 @@ describe("AgentLifecycle.create", () => {
       expect(child.parentID).toBe(root.id)
     }))
 
-  it.instance("persists the resolved identity at creation, not on the first prompt", () =>
-    Effect.gen(function* () {
+  // Longer than the file's default. This one holds a delegation open on a gate
+  // while it asserts, so it carries the delegation's event publishing too — and
+  // publishing awaits every registered listener, which in a file that builds and
+  // tears down an instance per test is not cheap. The work is small in a real
+  // run; it is the harness that makes it slow.
+  it.instance(
+    "persists the resolved identity at creation, not on the first prompt",
+    () =>
+      Effect.gen(function* () {
       const lifecycle = yield* AgentLifecycle.Service
       const sessions = yield* Session.Service
       const root = yield* sessions.create({ title: "root" })
@@ -128,8 +135,10 @@ describe("AgentLifecycle.create", () => {
       expect(child.agent).toBe("explore")
       expect(child.model?.id).toBe(ref.modelID)
       expect(child.model?.providerID).toBe(ref.providerID)
-      yield* Deferred.succeed(gate, undefined)
-    }))
+        yield* Deferred.succeed(gate, undefined)
+      }),
+    20_000,
+  )
 
   it.instance("keeps the prompt as parts so attachments survive", () =>
     Effect.gen(function* () {

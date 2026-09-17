@@ -835,7 +835,11 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 | **一次性运行在退出前排空自己启动的 Agent** | `opencode run` 跑完一个回合就退出，而委托的结果是**以通知形式回到父的对话里、父再据此回应**的——回合结束就走，等于委托白做，还留下半截工作树和跑了一半的子 Agent。老的前台路径靠阻塞天然避开了这件事。Claude Code 对 `claude -p` 的处理与此一致且更细：后台 **Bash** 任务在最终结果返回约 5 秒后被终止（dev server 不该吊住进程），而后台 **subagent 或 workflow** 则「stays open until that work completes, because its result is part of the final output」；等待以**连续空闲**计时，默认 10 分钟封顶，超时则停掉仍在跑的并丢弃部分结果，`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` 可调、设 0 不设限。本方案照此：根 Session 转 idle 时若树内仍有成员在跑则不退出，任何成员重新开工则重置计时；上限 `OPENCODE_RUN_AGENT_WAIT_MS`（默认 10 分钟，0 = 不设限），超时中止并以非零退出码如实报告。**计入"活动"的事件**为被跟踪 Session 的 `session.created` / `session.status` / `message.updated` / `message.part.updated`——"重置"而非"清除"：忙碌本身不是停表的理由，只有活动才重新计时，否则卡死在 busy 的子恰好豁免上限。**等待分两种，上界也分两种**（PR #35 评审纠正了此前"退出只由 root 的 idle 驱动"的写法）：
 
 - **有人忙但不出声** → 长上限；到点意味着有工作正在被丢掉，故 abort 并如实报告。该上限只在 root 已 idle 时武装，所以 abort 永远不会落在正在消费结果的 root 上。
-- **全体安静** → 短 settle（1 秒）；这既可能是树真的结束，也可能是一个结果正处在"产出它的子"与"将读它的父"之间——`effect/runner.ts` 的 `finishRun` 里 `yield* idle` 排在 `complete(done, exit)` 之前，故 child idle 到达时 job 尚未结算、通知尚未投递。settle 用来区分这两者，走完即**干净退出**，不报"放弃"。从未创建过子 Session 的 run 无此窗口，root 一 idle 即退出。
+- **全体安静** → 看**还欠不欠结果**。不欠即树真的结束，立即干净退出；还欠说明有结果正处在"产出它的子"与"将读它的父"之间——`effect/runner.ts` 的 `finishRun` 里 `yield* idle` 排在 `complete(done, exit)` 之前，故 child idle 到达时 job 尚未结算、通知尚未投递，此刻全体 idle、无人在跑，与"真的结束"在事件流里**完全同形**（被取消的子也是这样安静的）。
+
+  **欠账由 server 直说**：`agent.delegation` 事件在委托注册时发 `started`、在结果**投递完成后**发 `settled`（不是 job 结算时——结算只是窗口的起点）。只为 `notify: true` 的委托发：调用方自己 await 的那条全程 busy，不产生这个窗口，发了就是一笔还不掉的账。
+
+  **为什么不能用宽限期**：那是在猜一个时长，任何固定值都会被更慢的交接跑赢，而跑赢的后果是 exit 0 且结果丢失——恰是这套等待要防的事。Claude Code 的同一契约是「stays open until that work **completes**」，它能按"完成"判是因为 subagent 就跑在它自己进程里；我们把那个事实做成事件，客户端就拿到了同样的依据。退出按完成判、放弃按空闲判，各归各位。
 
 **退出条件不得锚在 root 的 idle 上**：depth 1 时 root 必然最后安静（每个子都向它汇报），depth ≥ 2 则不然——孙向自己的父汇报，root 根本不会被告知。等一个不会到来的 root idle,正是嵌套树跑完后永久挂死的原因。**放在 CLI 而非 `runLoop`**：放 loop 会让父在子跑着时一直 busy，交互模式下那是错的——你要父空闲好让用户继续打字，那正是异步委托的意义 |
 | 不引入 correlation ID、per-message output 槽或 `run_id` | `agent_send` 根本不产生结局，自然无需为消息编号 |

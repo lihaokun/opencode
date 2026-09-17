@@ -706,13 +706,18 @@ export const RunCommand = effectCmd({
           let timer: ReturnType<typeof setTimeout> | undefined
           let abandoned = false
           let rootIdle = false
-          // Whether a result may be between the child that produced it and the
-          // parent that will read it. Set when a child goes idle, cleared as
-          // soon as anything picks up work, because that is the handoff
-          // landing. Without it the grace period below would be paid on every
-          // run that used a subagent, including the ordinary case where the
-          // root has already consumed the result and is the last to go quiet.
-          let handoff = false
+          // Delegations whose result has not yet reached the session that
+          // started them. The server says so directly — see AgentEvent.Delegation
+          // — because this is the one thing the rest of the stream cannot show:
+          // between a subagent going idle and its caller waking, every session is
+          // idle and nothing is running, and a cancelled subagent looks exactly
+          // the same.
+          //
+          // It used to be a guess at how long that handoff takes. Any fixed
+          // guess loses to a slower one, and losing meant exiting successfully
+          // with the result missing — the precise thing this wait exists to
+          // prevent. Counting what is owed has no such number in it.
+          const owed = new Set<string>()
           let finished: (() => void) | undefined
 
           // A stuck agent must not hold the process open forever. The clock
@@ -723,28 +728,6 @@ export const RunCommand = effectCmd({
             if (raw === undefined) return 10 * 60 * 1000
             const parsed = Number(raw)
             return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10 * 60 * 1000
-          })()
-
-          // How long to wait, once the whole tree has gone quiet, for a result
-          // that is still in transit.
-          //
-          // A child publishes idle before its prompt returns — Runner.finishRun
-          // runs `idle` ahead of completing the deferred — so the job has not
-          // settled and the notice has not reached its parent yet. Nothing in
-          // the event stream says whether one is coming: a cancelled child sends
-          // none, and the two look identical from here. So this is a grace
-          // period, and no fixed value can be proven right.
-          //
-          // What makes a generous one affordable is that it is only spent when
-          // `handoff` says a child has just gone quiet with nobody having picked
-          // the work up yet. The ordinary case — child finishes, parent consumes
-          // the result, parent goes quiet last — does not pay it at all.
-          // OPENCODE_RUN_AGENT_SETTLE_MS overrides it.
-          const settleMs = (() => {
-            const raw = process.env["OPENCODE_RUN_AGENT_SETTLE_MS"]
-            if (raw === undefined) return 5000
-            const parsed = Number(raw)
-            return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5000
           })()
 
           const stopWaiting = () => {
@@ -785,10 +768,10 @@ export const RunCommand = effectCmd({
             if (!rootIdle) return
             if (working.size > 0) {
               // Already gave up once. Re-arming would abort again and again if
-              // the abort is not getting through; the settle ends the run
-              // instead, with the report the first attempt earned.
+              // the abort is not getting through, so this ends the run instead,
+              // with the report the first attempt earned.
               if (abandoned) {
-                timer = setTimeout(() => finished?.(), settleMs)
+                finished?.()
                 return
               }
               if (ceilingMs === 0) return
@@ -806,15 +789,18 @@ export const RunCommand = effectCmd({
               }, ceilingMs)
               return
             }
-            // Nothing can be in transit when no child ever existed, or when the
-            // last thing to happen was somebody picking work up rather than a
-            // child going quiet. Those runs end the moment the root goes idle,
-            // exactly as they did before any of this existed.
-            if (sessions.size === 1 || !handoff) {
+            // Quiet and nothing owed is the tree actually being finished, so the
+            // run ends right there — no waiting at all, including the run that
+            // never started a subagent.
+            if (owed.size === 0) {
               finished?.()
               return
             }
-            timer = setTimeout(() => finished?.(), settleMs)
+            // Quiet with something owed means a result is between the subagent
+            // that produced it and the caller that will read it. Wait for it.
+            // If it never comes, that is what the ceiling above is for, and the
+            // run says so rather than leaving successfully without it.
+            if (abandoned) finished?.()
           }
 
           // Raced against the stream so the settle timer can end the run:
@@ -933,16 +919,19 @@ export const RunCommand = effectCmd({
               UI.error(err)
             }
 
+            if (event.type === "agent.delegation" && sessions.has(event.properties.caller)) {
+              const props = event.properties
+              if (props.status === "started") owed.add(props.sessionID)
+              else owed.delete(props.sessionID)
+              reconsider()
+            }
+
             if (event.type === "session.status" && sessions.has(event.properties.sessionID)) {
               const id = event.properties.sessionID
               const idle = event.properties.status.type === "idle"
               if (idle) working.delete(id)
               else working.add(id)
               if (id === sessionID) rootIdle = idle
-              // A child going quiet may have a result on its way to its parent;
-              // anything picking work up is that result landing.
-              if (!idle) handoff = false
-              else if (id !== sessionID) handoff = true
 
               // Giving up ends the run at the root's next idle, without waiting
               // out a settle nobody is going to fill.

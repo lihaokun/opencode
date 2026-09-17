@@ -1218,6 +1218,11 @@ describe("opencode run waits for the agents it started", () => {
     TEST_TIMEOUT_MS,
   )
 
+  // The grace period this replaced cannot be tested away: proving the handoff is
+  // no longer time-bounded needs a way to delay the handoff, and there is none
+  // from outside the process. What is checked instead is that the ledger is
+  // load-bearing — disabling it fails three of the waiting tests below, the ones
+  // that would otherwise exit with a result still in flight.
   // Setting the ceiling to 0 means "wait without one", and the reviewer noted
   // the path had no coverage. It turns off giving up, not leaving: a tree that
   // finishes still ends the run, because that exit is reached by everything

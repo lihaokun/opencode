@@ -9,6 +9,8 @@ import { BackgroundJob } from "@/background/job"
 import { Config } from "@/config/config"
 import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
+import { AgentEvent } from "@opencode-ai/schema/agent-event"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { Permission } from "@/permission"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { AGENT_LIST_TOOL_ID } from "@/tool/agent"
@@ -92,6 +94,7 @@ const layer = Layer.effect(
     const background = yield* BackgroundJob.Service
     const runState = yield* SessionRunState.Service
     const truncate = yield* Truncate.Service
+    const events = yield* EventV2Bridge.Service
     const scope = yield* Scope.Scope
     // Captured here so the closures below carry them; prepareWorkdir needs the
     // filesystem, process and worktree services and the returned Interface must
@@ -232,6 +235,19 @@ const layer = Layer.effect(
         return yield* AgentDelegation.toExit(AgentDelegation.classify(result, input.session.id, limits))
       }).pipe(Effect.onInterrupt(() => input.ops.cancel(input.session.id)))
 
+      // A client watching the event stream cannot otherwise tell a finished tree
+      // from one whose result is still on its way to the caller: the subagent
+      // goes idle either way, and nothing else marks the difference. Published
+      // only for delegations that report back on their own — a caller awaiting
+      // the result itself never leaves that gap, and the pair would never close.
+      if (input.notify) {
+        yield* events.publish(AgentEvent.Delegation, {
+          sessionID: input.session.id,
+          caller: input.caller,
+          status: "started",
+        })
+      }
+
       // Job id is the child SessionID, keeping the existing identity convention.
       yield* background.start({
         id: input.session.id,
@@ -240,6 +256,7 @@ const layer = Layer.effect(
         metadata: { parentSessionId: input.caller, sessionId: input.session.id, model: input.model },
         run,
       })
+
 
       // Registered once, and only when this delegation reports for itself.
       // Silent on cancelled, because a cancellation notice comes from stop;
@@ -256,11 +273,17 @@ const layer = Layer.effect(
       yield* background
         .wait({ id: input.session.id })
         .pipe(
-          Effect.flatMap((result) => {
-            if (result.info?.status === "completed") return inject("completed", result.info.output ?? "")
-            if (result.info?.status === "error") return inject("error", result.info.error ?? "")
-            return Effect.void
-          }),
+          Effect.flatMap((result) =>
+            Effect.gen(function* () {
+              if (result.info?.status === "completed") yield* inject("completed", result.info.output ?? "")
+              else if (result.info?.status === "error") yield* inject("error", result.info.error ?? "")
+              yield* events.publish(AgentEvent.Delegation, {
+                sessionID: input.session.id,
+                caller: input.caller,
+                status: "settled",
+              })
+            }),
+          ),
           Effect.forkIn(scope, { startImmediately: true }),
         )
 
@@ -506,6 +529,7 @@ export const node = LayerNode.make({
     Agent.node,
     Config.node,
     BackgroundJob.node,
+    EventV2Bridge.node,
     SessionRunState.node,
     Truncate.node,
     FSUtil.node,
