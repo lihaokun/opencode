@@ -2199,13 +2199,14 @@ function Task(props: ToolProps) {
   )
 
   const status = createMemo(() => sync.data.session_status[sessionID() ?? ""])
-  const isRunning = createMemo(() => {
-    const value = status()
-    return (
-      props.part.state.status === "running" ||
-      (props.metadata.background === true && value !== undefined && value.type !== "idle")
-    )
-  })
+  const isRunning = createMemo(() =>
+    subagentIsRunning({
+      partStatus: props.part.state.status,
+      childSessionID: sessionID(),
+      childStatus: status(),
+    }),
+  )
+  const done = createMemo(() => !isRunning() && props.part.state.status === "completed")
   const retry = createMemo(() => {
     const value = status()
     if (value?.type !== "retry") return
@@ -2241,7 +2242,7 @@ function Task(props: ToolProps) {
       } else content.push(`↳ ${formatSubagentToolcalls(tools().length)}`)
     }
 
-    if (!isRunning() && props.part.state.status === "completed") {
+    if (done()) {
       content.push(`↳ ${formatCompletedSubagentDetail(tools().length, Locale.duration(duration()))}`)
     }
 
@@ -2250,7 +2251,7 @@ function Task(props: ToolProps) {
 
   return (
     <InlineTool
-      icon={props.part.state.status === "completed" ? "✓" : "│"}
+      icon={done() ? "✓" : "│"}
       separate={true}
       color={retry() ? theme.error : undefined}
       spinner={isRunning()}
@@ -2268,6 +2269,37 @@ function Task(props: ToolProps) {
       {content()}
     </InlineTool>
   )
+}
+
+/**
+ * Whether the subagent behind this card is still working.
+ *
+ * The tool part is the wrong thing to ask. Delegation is asynchronous, so the
+ * `agent` call completes the moment the child starts and says nothing about
+ * what follows; the child's own session status is the signal, and the card has
+ * a child session id exactly when there is one to read.
+ *
+ * This was gated on a `background` flag, which the old `task` tool wrote only
+ * for its background mode -- its foreground mode held the part `running` for
+ * the whole run, so the part status carried that case. `agent` is always
+ * asynchronous and writes no such flag, which left both branches false and the
+ * card reporting every subagent finished the instant it started: no spinner, no
+ * live tool line, a tick straight away and a duration of zero until the result
+ * landed.
+ *
+ * An unknown child status reads as finished rather than working. A transcript
+ * whose child sessions are long gone must not spin forever, and the window
+ * where a just-created child has no status yet is brief -- a tick that appears
+ * a moment early beats a spinner that never stops.
+ */
+export function subagentIsRunning(input: {
+  partStatus: ToolPart["state"]["status"]
+  childSessionID: string | undefined
+  childStatus: SessionStatus | undefined
+}) {
+  if (input.partStatus === "running") return true
+  if (!input.childSessionID) return false
+  return input.childStatus !== undefined && input.childStatus.type !== "idle"
 }
 
 export function formatSubagentToolcalls(count: number) {

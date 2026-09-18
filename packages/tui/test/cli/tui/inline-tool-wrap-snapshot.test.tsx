@@ -8,6 +8,7 @@ import {
   formatSubagentTitle,
   formatSubagentToolcalls,
   InlineToolRow,
+  subagentIsRunning,
   parseApplyPatchFiles,
   parseDiagnostics,
   parseQuestionAnswers,
@@ -289,6 +290,40 @@ describe("TUI inline tool wrapping", () => {
 
   test("keeps retry status ahead of wrapping messages", () => {
     expect(formatSubagentRetry(2, "Rate limited by provider")).toBe("Retrying (attempt 2) · Rate limited by provider")
+  })
+
+  test("reads a delegation's progress from the child, not from the tool call", () => {
+    const child = "ses_child"
+    // The regression: `agent` returns as soon as the child starts, so the part
+    // is completed for the whole of the child's run. Asking the part alone
+    // reports every subagent finished the instant it started.
+    expect(subagentIsRunning({ partStatus: "completed", childSessionID: child, childStatus: { type: "busy" } })).toBe(
+      true,
+    )
+    expect(subagentIsRunning({ partStatus: "completed", childSessionID: child, childStatus: { type: "idle" } })).toBe(
+      false,
+    )
+    // A retrying child is still working; the card shows the retry rather than a
+    // duration.
+    expect(
+      subagentIsRunning({
+        partStatus: "completed",
+        childSessionID: child,
+        childStatus: { type: "retry", attempt: 2, message: "Rate limited by provider", next: 0 },
+      }),
+    ).toBe(true)
+  })
+
+  test("falls back to the tool call when there is no child to read", () => {
+    // A synchronous delegation holds the part running for the whole run, and a
+    // failed one never gets a child session id at all.
+    expect(subagentIsRunning({ partStatus: "running", childSessionID: undefined, childStatus: undefined })).toBe(true)
+    expect(subagentIsRunning({ partStatus: "error", childSessionID: undefined, childStatus: undefined })).toBe(false)
+    // Unknown child status settles as finished: an old transcript whose child
+    // sessions are gone must not spin forever.
+    expect(subagentIsRunning({ partStatus: "completed", childSessionID: "ses_child", childStatus: undefined })).toBe(
+      false,
+    )
   })
 
   test("snapshots consecutive grep, glob, and read rows at a narrow width", async () => {
