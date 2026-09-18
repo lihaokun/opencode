@@ -108,6 +108,13 @@ describe("AgentInbox", () => {
       const gate = yield* Deferred.make<void>()
       const { ops, seen } = recordingOps({ block: gate })
 
+      // deliver reads the default agent, and the first such read builds Agent's
+      // instance state, which scans the filesystem for skill directories. That
+      // cost is unrelated to what is being measured here and on Windows it
+      // alone can exceed the budget below. Pay it up front so the budget covers
+      // deliver's own work.
+      yield* (yield* Agent.Service).defaultInfo()
+
       // If deliver awaited the prompt this would never return, because the
       // stub blocks until the gate opens.
       const accepted = yield* awaitWithTimeout(
