@@ -223,11 +223,16 @@ export const AgentListTool = Tool.define(
           projection.of(member.session_id).pipe(
             Effect.map((status) => ({
               session_id: member.session_id,
-              name: member.name ?? "",
-              agent_type: member.agent_type ?? "",
+              // name, agent_type and title all originate with the model and
+              // land in a tab-separated table read by another model. A tab
+              // shifts the columns and a newline forges an entire row --
+              // session_id included, which is the field a reader routes on. The
+              // same encoding the message header uses, for the same reason.
+              name: AgentInbox.escapeField(member.name ?? ""),
+              agent_type: AgentInbox.escapeField(member.agent_type ?? ""),
               relation: member.relation,
               status,
-              title: member.title,
+              title: AgentInbox.escapeField(member.title),
               workdir: member.workdir?.path ?? "",
             })),
           ),
