@@ -572,7 +572,7 @@ Only analyze code and suggest changes.
 
 ### Разрешения задач
 
-Управляйте тем, какие субагенты агент может вызывать с помощью инструмента задач с помощью `permission.task`. Использует шаблоны glob для гибкого сопоставления.
+Управляйте тем, какие субагенты агент может вызывать с помощью инструмента задач с помощью `permission.agent`. Использует шаблоны glob для гибкого сопоставления.
 
 ```json title="opencode.json"
 {
@@ -580,7 +580,7 @@ Only analyze code and suggest changes.
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

@@ -120,6 +120,20 @@ export interface Interface {
   readonly makeWorktreeInfo: (options?: { name?: string; detached?: boolean }) => Effect.Effect<Info, Error>
   readonly createFromInfo: (info: Info, startCommand?: string) => Effect.Effect<void, Error>
   readonly create: (input?: CreateInput) => Effect.Effect<Info, Error>
+  /**
+   * Internal entry for Agent workspaces. Deliberately absent from CreateInput —
+   * that schema is the experimental HTTP payload, so a destination root there
+   * would let a client pick where worktrees land.
+   *
+   * Unlike `create`, this is ready on return: tracked files are checked out
+   * before it resolves, because an Agent started against `create` would begin
+   * in an empty directory.
+   */
+  readonly createForAgent: (input: {
+    destinationRoot: string
+    baseCommit: string
+    name?: string
+  }) => Effect.Effect<Info, Error>
   readonly list: () => Effect.Effect<(Omit<Info, "branch"> & { branch?: string })[], Error>
   readonly remove: (input: RemoveInput) => Effect.Effect<boolean, Error>
   readonly reset: (input: ResetInput) => Effect.Effect<boolean, Error>
@@ -284,6 +298,45 @@ const layer: Layer.Layer<
         Effect.catchCause((cause) => Effect.logError("worktree bootstrap failed", { cause })),
         Effect.forkIn(scope),
       )
+    })
+
+    const createForAgent = Effect.fn("Worktree.createForAgent")(function* (input: {
+      destinationRoot: string
+      baseCommit: string
+      name?: string
+    }) {
+      const ctx = yield* InstanceState.context
+      if (ctx.project.vcs !== "git") {
+        return yield* new NotGitError({ message: "Worktrees are only supported for git projects" })
+      }
+      yield* fs.makeDirectory(input.destinationRoot, { recursive: true }).pipe(Effect.orDie)
+      const info = yield* candidate({ root: input.destinationRoot, name: input.name ? slugify(input.name) : "" })
+
+      const created = yield* git(
+        info.branch
+          ? ["worktree", "add", "--no-checkout", "-b", info.branch, info.directory, input.baseCommit]
+          : ["worktree", "add", "--no-checkout", "--detach", info.directory, input.baseCommit],
+        { cwd: ctx.worktree },
+      )
+      if (created.code !== 0) {
+        return yield* new CreateFailedError({
+          message: created.stderr || created.text || "Failed to create git worktree",
+        })
+      }
+
+      // The ready contract. `setup` adds the worktree with --no-checkout and
+      // the populating reset happens in `boot`, which `createFromInfo` forks —
+      // so waiting here is the difference between an Agent seeing the project
+      // and an Agent seeing an empty directory.
+      const populated = yield* git(["reset", "--hard"], { cwd: info.directory })
+      if (populated.code !== 0) {
+        return yield* new CreateFailedError({
+          message: populated.stderr || populated.text || "Failed to populate worktree",
+        })
+      }
+
+      yield* project.addSandbox(ctx.project.id, info.directory).pipe(Effect.catch(() => Effect.void))
+      return info
     })
 
     const create = Effect.fn("Worktree.create")(function* (input?: CreateInput) {
@@ -610,7 +663,7 @@ const layer: Layer.Layer<
       return true
     })
 
-    return Service.of({ makeWorktreeInfo, createFromInfo, create, list, remove, reset })
+    return Service.of({ makeWorktreeInfo, createFromInfo, create, createForAgent, list, remove, reset })
   }),
 )
 

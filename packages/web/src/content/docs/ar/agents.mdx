@@ -572,7 +572,7 @@ Only analyze code and suggest changes.
 
 ### أذونات Task
 
-تحكم في أي الوكلاء الفرعيين يمكن لوكيل استدعاؤهم عبر أداة Task باستخدام `permission.task`. يستخدم أنماط glob لمطابقة مرنة.
+تحكم في أي الوكلاء الفرعيين يمكن لوكيل استدعاؤهم عبر أداة Task باستخدام `permission.agent`. يستخدم أنماط glob لمطابقة مرنة.
 
 ```json title="opencode.json"
 {
@@ -580,7 +580,7 @@ Only analyze code and suggest changes.
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

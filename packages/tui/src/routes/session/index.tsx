@@ -212,26 +212,17 @@ export function Session() {
       .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   })
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
-  const foregroundTasks = createMemo(() =>
-    sync.data.capabilities.experimentalBackgroundSubagents
-      ? messages().flatMap((message) =>
-          (sync.data.part[message.id] ?? []).filter(
-            (part): part is ToolPart =>
-              part.type === "tool" &&
-              part.tool === "task" &&
-              part.state.status === "running" &&
-              part.state.metadata?.background !== true,
-          ),
-        )
-      : [],
-  )
+  const descendants = createMemo(() => {
+    const rootID = session()?.parentID ?? session()?.id
+    return rootID ? collectSubtree(sync.data.session, rootID) : []
+  })
   const permissions = createMemo(() => {
     if (session()?.parentID) return []
-    return children().flatMap((x) => sync.data.permission[x.id] ?? [])
+    return descendants().flatMap((id) => sync.data.permission[id] ?? [])
   })
   const questions = createMemo(() => {
     if (session()?.parentID) return []
-    return children().flatMap((x) => sync.data.question[x.id] ?? [])
+    return descendants().flatMap((id) => sync.data.question[id] ?? [])
   })
   const visible = createMemo(() => !session()?.parentID && permissions().length === 0 && questions().length === 0)
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
@@ -1026,20 +1017,6 @@ export function Session() {
       },
     },
     {
-      title: "Background subagents",
-      value: "session.background",
-      category: "Session",
-      hidden: true,
-      enabled: foregroundTasks().length > 0,
-      run: () => {
-        void sdk.client.experimental.session.background({
-          sessionID: route.sessionID,
-          workspace: project.workspace.current(),
-        })
-        dialog.clear()
-      },
-    },
-    {
       title: "Go to child session",
       value: "session.child.first",
       category: "Session",
@@ -1117,13 +1094,6 @@ export function Session() {
   useBindings(() => ({
     mode: OPENCODE_BASE_MODE,
     bindings: tuiConfig.keybinds.gather("session", sessionBindingCommands),
-  }))
-
-  useBindings(() => ({
-    mode: OPENCODE_BASE_MODE,
-    enabled: foregroundTasks().length > 0,
-    priority: 1,
-    bindings: tuiConfig.keybinds.get("session.background"),
   }))
 
   const revertInfo = createMemo(() => session()?.revert)
@@ -1489,7 +1459,6 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
   })
 
   const childShortcut = useCommandShortcut("session.child.first")
-  const backgroundShortcut = useCommandShortcut("session.background")
 
   return (
     <>
@@ -1508,27 +1477,11 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
           )
         }}
       </For>
-      <Show when={props.parts.some((x) => x.type === "tool" && x.tool === "task")}>
+      <Show when={props.parts.some((x) => x.type === "tool" && isSubagentTool(x.tool))}>
         <box paddingTop={1} paddingLeft={3}>
           <text fg={theme.text}>
             {childShortcut()}
             <span style={{ fg: theme.textMuted }}> view subagents</span>
-            <Show
-              when={
-                sync.data.capabilities.experimentalBackgroundSubagents &&
-                props.parts.some(
-                  (x) =>
-                    x.type === "tool" &&
-                    x.tool === "task" &&
-                    x.state.status === "running" &&
-                    x.state.metadata?.background !== true,
-                )
-              }
-            >
-              <span style={{ fg: theme.textMuted }}> · </span>
-              {backgroundShortcut()}
-              <span style={{ fg: theme.textMuted }}> background</span>
-            </Show>
           </text>
         </box>
       </Show>
@@ -2246,13 +2199,14 @@ function Task(props: ToolProps) {
   )
 
   const status = createMemo(() => sync.data.session_status[sessionID() ?? ""])
-  const isRunning = createMemo(() => {
-    const value = status()
-    return (
-      props.part.state.status === "running" ||
-      (props.metadata.background === true && value !== undefined && value.type !== "idle")
-    )
-  })
+  const isRunning = createMemo(() =>
+    subagentIsRunning({
+      partStatus: props.part.state.status,
+      childSessionID: sessionID(),
+      childStatus: status(),
+    }),
+  )
+  const done = createMemo(() => !isRunning() && props.part.state.status === "completed")
   const retry = createMemo(() => {
     const value = status()
     if (value?.type !== "retry") return
@@ -2288,7 +2242,7 @@ function Task(props: ToolProps) {
       } else content.push(`↳ ${formatSubagentToolcalls(tools().length)}`)
     }
 
-    if (!isRunning() && props.part.state.status === "completed") {
+    if (done()) {
       content.push(`↳ ${formatCompletedSubagentDetail(tools().length, Locale.duration(duration()))}`)
     }
 
@@ -2297,7 +2251,7 @@ function Task(props: ToolProps) {
 
   return (
     <InlineTool
-      icon={props.part.state.status === "completed" ? "✓" : "│"}
+      icon={done() ? "✓" : "│"}
       separate={true}
       color={retry() ? theme.error : undefined}
       spinner={isRunning()}
@@ -2315,6 +2269,37 @@ function Task(props: ToolProps) {
       {content()}
     </InlineTool>
   )
+}
+
+/**
+ * Whether the subagent behind this card is still working.
+ *
+ * The tool part is the wrong thing to ask. Delegation is asynchronous, so the
+ * `agent` call completes the moment the child starts and says nothing about
+ * what follows; the child's own session status is the signal, and the card has
+ * a child session id exactly when there is one to read.
+ *
+ * This was gated on a `background` flag, which the old `task` tool wrote only
+ * for its background mode -- its foreground mode held the part `running` for
+ * the whole run, so the part status carried that case. `agent` is always
+ * asynchronous and writes no such flag, which left both branches false and the
+ * card reporting every subagent finished the instant it started: no spinner, no
+ * live tool line, a tick straight away and a duration of zero until the result
+ * landed.
+ *
+ * An unknown child status reads as finished rather than working. A transcript
+ * whose child sessions are long gone must not spin forever, and the window
+ * where a just-created child has no status yet is brief -- a tick that appears
+ * a moment early beats a spinner that never stops.
+ */
+export function subagentIsRunning(input: {
+  partStatus: ToolPart["state"]["status"]
+  childSessionID: string | undefined
+  childStatus: SessionStatus | undefined
+}) {
+  if (input.partStatus === "running") return true
+  if (!input.childSessionID) return false
+  return input.childStatus !== undefined && input.childStatus.type !== "idle"
 }
 
 export function formatSubagentToolcalls(count: number) {
@@ -2653,7 +2638,50 @@ const toolDisplays = new Set([
   "execute",
 ])
 
+/**
+ * Subagent parts are `agent` now. Historical transcripts still carry `task`
+ * parts and stay readable — recognising the old name here is display only and
+ * does not bring the old tool back.
+ */
+export function isSubagentTool(tool: string) {
+  return tool === "agent" || tool === "task"
+}
+
+/**
+ * The session and everything beneath it, by parentID.
+ *
+ * Exported so the depth behaviour can be tested without rendering: the property
+ * that matters is that a grandchild is reachable, since with nesting allowed a
+ * permission request from one would otherwise be collected nowhere.
+ */
+export function collectSubtree(sessions: { id: string; parentID?: string }[], rootID: string): string[] {
+  const byParent = new Map<string, string[]>()
+  for (const item of sessions) {
+    if (!item.parentID) continue
+    const siblings = byParent.get(item.parentID) ?? []
+    siblings.push(item.id)
+    byParent.set(item.parentID, siblings)
+  }
+  const acc: string[] = []
+  const seen = new Set<string>([rootID])
+  const frontier = [rootID]
+  // Terminates: every id pushed is newly added to `seen`, which only grows and
+  // is bounded by the number of sessions. The dedupe is defensive — a parentID
+  // chain cannot cycle.
+  while (frontier.length > 0) {
+    const id = frontier.pop()!
+    acc.push(id)
+    for (const child of byParent.get(id) ?? []) {
+      if (seen.has(child)) continue
+      seen.add(child)
+      frontier.push(child)
+    }
+  }
+  return acc
+}
+
 export function toolDisplay(tool: string) {
+  if (isSubagentTool(tool)) return "task"
   return toolDisplays.has(tool) ? tool : "generic"
 }
 

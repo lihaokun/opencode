@@ -573,7 +573,7 @@ S'applique uniquement aux agents `mode: subagent`.
 
 ### Autorisations de tâches
 
-Contrôlez quels sous-agents un agent peut appeler via l'outil Tâche avec `permission.task`. Utilise des patterns glob pour une correspondance flexible.
+Contrôlez quels sous-agents un agent peut appeler via l'outil Tâche avec `permission.agent`. Utilise des patterns glob pour une correspondance flexible.
 
 ```json title="opencode.json"
 {
@@ -581,7 +581,7 @@ Contrôlez quels sous-agents un agent peut appeler via l'outil Tâche avec `perm
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

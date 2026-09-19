@@ -144,6 +144,9 @@ describe("Permission.disabled for task tool", () => {
 })
 
 // Integration tests that load permissions from real config files
+// Config still writes the legacy `task` key; the runtime reads `agent`. Asserting
+// against `agent` here is what proves the normalisation actually happened — a
+// legacy deny that stopped taking effect would be a permission widening.
 describe("permission.task with real config files", () => {
   it.instance(
     "loads task permissions from opencode.json config",
@@ -152,9 +155,9 @@ describe("permission.task with real config files", () => {
         const config = yield* load
         const ruleset = Permission.fromConfig(config.permission ?? {})
         // general and orchestrator-fast should be allowed, code-reviewer denied
-        expect(Permission.evaluate("task", "general", ruleset).action).toBe("allow")
-        expect(Permission.evaluate("task", "orchestrator-fast", ruleset).action).toBe("allow")
-        expect(Permission.evaluate("task", "code-reviewer", ruleset).action).toBe("deny")
+        expect(Permission.evaluate("agent", "general", ruleset).action).toBe("allow")
+        expect(Permission.evaluate("agent", "orchestrator-fast", ruleset).action).toBe("allow")
+        expect(Permission.evaluate("agent", "code-reviewer", ruleset).action).toBe("deny")
       }),
     {
       git: true,
@@ -176,9 +179,9 @@ describe("permission.task with real config files", () => {
         const config = yield* load
         const ruleset = Permission.fromConfig(config.permission ?? {})
         // general and code-reviewer should be ask, orchestrator-* denied
-        expect(Permission.evaluate("task", "general", ruleset).action).toBe("ask")
-        expect(Permission.evaluate("task", "code-reviewer", ruleset).action).toBe("ask")
-        expect(Permission.evaluate("task", "orchestrator-fast", ruleset).action).toBe("deny")
+        expect(Permission.evaluate("agent", "general", ruleset).action).toBe("ask")
+        expect(Permission.evaluate("agent", "code-reviewer", ruleset).action).toBe("ask")
+        expect(Permission.evaluate("agent", "orchestrator-fast", ruleset).action).toBe("deny")
       }),
     {
       git: true,
@@ -199,10 +202,10 @@ describe("permission.task with real config files", () => {
       Effect.gen(function* () {
         const config = yield* load
         const ruleset = Permission.fromConfig(config.permission ?? {})
-        expect(Permission.evaluate("task", "general", ruleset).action).toBe("allow")
-        expect(Permission.evaluate("task", "code-reviewer", ruleset).action).toBe("deny")
+        expect(Permission.evaluate("agent", "general", ruleset).action).toBe("allow")
+        expect(Permission.evaluate("agent", "code-reviewer", ruleset).action).toBe("deny")
         // Unspecified agents default to "ask"
-        expect(Permission.evaluate("task", "unknown-agent", ruleset).action).toBe("ask")
+        expect(Permission.evaluate("agent", "unknown-agent", ruleset).action).toBe("ask")
       }),
     {
       git: true,
@@ -225,8 +228,8 @@ describe("permission.task with real config files", () => {
         const ruleset = Permission.fromConfig(config.permission ?? {})
 
         // Verify task permissions
-        expect(Permission.evaluate("task", "general", ruleset).action).toBe("allow")
-        expect(Permission.evaluate("task", "code-reviewer", ruleset).action).toBe("deny")
+        expect(Permission.evaluate("agent", "general", ruleset).action).toBe("allow")
+        expect(Permission.evaluate("agent", "code-reviewer", ruleset).action).toBe("deny")
 
         // Verify other tool permissions
         expect(Permission.evaluate("bash", "*", ruleset).action).toBe("allow")
@@ -263,14 +266,16 @@ describe("permission.task with real config files", () => {
         const ruleset = Permission.fromConfig(config.permission ?? {})
 
         // Last matching rule wins - "*" deny is last, so all agents are denied
-        expect(Permission.evaluate("task", "general", ruleset).action).toBe("deny")
-        expect(Permission.evaluate("task", "code-reviewer", ruleset).action).toBe("deny")
-        expect(Permission.evaluate("task", "unknown", ruleset).action).toBe("deny")
+        expect(Permission.evaluate("agent", "general", ruleset).action).toBe("deny")
+        expect(Permission.evaluate("agent", "code-reviewer", ruleset).action).toBe("deny")
+        expect(Permission.evaluate("agent", "unknown", ruleset).action).toBe("deny")
 
         // Since "*": "deny" is the last rule, disabled() finds it with findLast
-        // and sees pattern: "*" with action: "deny", so task is disabled
-        const disabled = Permission.disabled(["task"], ruleset)
-        expect(disabled.has("task")).toBe(true)
+        // and sees pattern: "*" with action: "deny", so the agent tool is disabled.
+        // The tool id is `agent` now; the legacy `task` config reached it through
+        // normalisation.
+        const disabled = Permission.disabled(["agent"], ruleset)
+        expect(disabled.has("agent")).toBe(true)
       }),
     {
       git: true,
@@ -294,9 +299,9 @@ describe("permission.task with real config files", () => {
         const ruleset = Permission.fromConfig(config.permission ?? {})
 
         // Evaluate uses findLast - "general" allow comes after "*" deny
-        expect(Permission.evaluate("task", "general", ruleset).action).toBe("allow")
+        expect(Permission.evaluate("agent", "general", ruleset).action).toBe("allow")
         // Other agents still denied by the earlier "*" deny
-        expect(Permission.evaluate("task", "code-reviewer", ruleset).action).toBe("deny")
+        expect(Permission.evaluate("agent", "code-reviewer", ruleset).action).toBe("deny")
 
         // disabled() uses findLast and checks if the last rule has pattern: "*" with action: "deny"
         // In this case, the last rule is {pattern: "general", action: "allow"}, not pattern: "*"

@@ -571,7 +571,7 @@ Si applica solo ad agenti con `mode: subagent`.
 
 ### Permessi Task
 
-Controlla quali subagenti un agente può invocare tramite lo strumento Task con `permission.task`. Usa glob pattern per un matching flessibile.
+Controlla quali subagenti un agente può invocare tramite lo strumento Task con `permission.agent`. Usa glob pattern per un matching flessibile.
 
 ```json title="opencode.json"
 {
@@ -579,7 +579,7 @@ Controlla quali subagenti un agente può invocare tramite lo strumento Task con 
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

@@ -572,7 +572,7 @@ Yalnızca `mode: subagent` agent'ları için geçerlidir.
 
 ### Görev izinleri
 
-`permission.task` ile bir agent'ın Task aracı aracılığıyla hangi alt agent'ları çağırabileceğini kontrol edin. Esnek eşleştirme için küresel desenleri kullanır.
+`permission.agent` ile bir agent'ın Task aracı aracılığıyla hangi alt agent'ları çağırabileceğini kontrol edin. Esnek eşleştirme için küresel desenleri kullanır.
 
 ```json title="opencode.json"
 {
@@ -580,7 +580,7 @@ Yalnızca `mode: subagent` agent'ları için geçerlidir.
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

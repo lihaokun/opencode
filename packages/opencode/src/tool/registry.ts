@@ -9,7 +9,20 @@ import { EditTool } from "./edit"
 import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
-import { TaskTool } from "./task"
+import {
+  AgentTool,
+  AgentListTool,
+  AgentSendTool,
+  AgentStopTool,
+  AGENT_TOOL_ID,
+  AGENT_TOOL_IDS,
+  visibleAgentTools,
+} from "./agent"
+import { AgentTree } from "@/agent-management/tree"
+import { AgentLifecycle } from "@/agent-management/lifecycle"
+import { AgentInbox } from "@/agent-management/inbox"
+import { AgentStatusProjection } from "@/agent-management/status"
+import { SessionID } from "@/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
@@ -64,25 +77,32 @@ export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false
   )
 }
 
-type TaskDef = Tool.InferDef<typeof TaskTool>
+type AgentDef = Tool.InferDef<typeof AgentTool>
 type ReadDef = Tool.InferDef<typeof ReadTool>
 
 type State = {
   custom: Tool.Def[]
   builtin: Tool.Def[]
-  task: TaskDef
+  agent: AgentDef
   read: ReadDef
 }
 
 export interface Interface {
   readonly ids: () => Effect.Effect<string[]>
   readonly all: () => Effect.Effect<Tool.Def[]>
-  readonly named: () => Effect.Effect<{ task: TaskDef; read: ReadDef }>
+  readonly named: () => Effect.Effect<{ agent: AgentDef; read: ReadDef }>
   readonly tools: (model: {
     providerID: ProviderV2.ID
     modelID: ModelV2.ID
     agent: Agent.Info
     permission?: PermissionV1.Ruleset
+    /**
+     * Whose tool list this is. Agent tool visibility depends on how deep the
+     * session sits, and this is the only point where that can be decided —
+     * Tool.Context does not exist until a tool runs, by which time the schema
+     * the model sees has already gone out.
+     */
+    sessionID?: SessionID
   }) => Effect.Effect<Tool.Def[]>
 }
 
@@ -99,7 +119,11 @@ const layer = Layer.effect(
     const mcp = yield* MCP.Service
 
     const invalid = yield* InvalidTool
-    const task = yield* TaskTool
+    const agentTool = yield* AgentTool
+    const agentListTool = yield* AgentListTool
+    const agentSendTool = yield* AgentSendTool
+    const agentStopTool = yield* AgentStopTool
+    const agentTree = yield* AgentTree.Service
     const read = yield* ReadTool
     const question = yield* QuestionTool
     const todo = yield* TodoWriteTool
@@ -214,7 +238,10 @@ const layer = Layer.effect(
           grep: Tool.init(greptool),
           edit: Tool.init(edit),
           write: Tool.init(writetool),
-          task: Tool.init(task),
+          agent: Tool.init(agentTool),
+          agentList: Tool.init(agentListTool),
+          agentSend: Tool.init(agentSendTool),
+          agentStop: Tool.init(agentStopTool),
           fetch: Tool.init(webfetch),
           todo: Tool.init(todo),
           search: Tool.init(websearch),
@@ -237,7 +264,10 @@ const layer = Layer.effect(
             tool.grep,
             tool.edit,
             tool.write,
-            tool.task,
+            tool.agent,
+            tool.agentList,
+            tool.agentSend,
+            tool.agentStop,
             tool.fetch,
             tool.todo,
             tool.search,
@@ -247,7 +277,7 @@ const layer = Layer.effect(
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
           ],
-          task: tool.task,
+          agent: tool.agent,
           read: tool.read,
         }
       }),
@@ -262,10 +292,13 @@ const layer = Layer.effect(
       return (yield* all()).map((tool) => tool.id)
     })
 
-    const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
+    const describeAgents = Effect.fn("ToolRegistry.describeAgents")(function* (agent: Agent.Info) {
       const items = (yield* agents.list()).filter((item) => item.mode !== "primary")
+      // Canonical key. Legacy `task` rules are normalised to `agent` when config
+      // is read, so evaluating the old name here would consult a key nothing
+      // writes any more.
       const filtered = items.filter(
-        (item) => Permission.evaluate("task", item.name, agent.permission).action !== "deny",
+        (item) => Permission.evaluate(AGENT_TOOL_ID, item.name, agent.permission).action !== "deny",
       )
       const list = filtered.toSorted((a, b) => a.name.localeCompare(b.name))
       const description = list
@@ -289,6 +322,12 @@ const layer = Layer.effect(
     })
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
+      const agentTools = input.sessionID
+        ? yield* visibleAgentTools(input.sessionID).pipe(
+            Effect.provideService(AgentTree.Service, agentTree),
+            Effect.provideService(Config.Service, config),
+          )
+        : AGENT_TOOL_IDS
       const filtered = (yield* all()).filter((tool) => {
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
@@ -298,6 +337,13 @@ const layer = Layer.effect(
           input.modelID.includes("gpt-") && !input.modelID.includes("oss") && !input.modelID.includes("gpt-4")
         if (tool.id === ApplyPatchTool.id) return usePatch
         if (tool.id === EditTool.id || tool.id === WriteTool.id) return !usePatch
+
+        // Depth decides which Agent tools exist at all. Withdrawing them beats
+        // letting the call fail: a model that has to try, hit the wall and
+        // replan has wasted a turn.
+        if (AGENT_TOOL_IDS.includes(tool.id)) {
+          return agentTools.includes(tool.id)
+        }
 
         return true
       })
@@ -324,7 +370,7 @@ const layer = Layer.effect(
             id: tool.id,
             description: [
               output.description,
-              tool.id === TaskTool.id ? yield* describeTask(input.agent) : undefined,
+              tool.id === AGENT_TOOL_ID ? yield* describeAgents(input.agent) : undefined,
               tool.id === "execute" ? codeModeDescription : undefined,
             ]
               .filter(Boolean)
@@ -341,7 +387,7 @@ const layer = Layer.effect(
 
     const named: Interface["named"] = Effect.fn("ToolRegistry.named")(function* () {
       const s = yield* InstanceState.get(state)
-      return { task: s.task, read: s.read }
+      return { agent: s.agent, read: s.read }
     })
 
     return Service.of({ ids, all, named, tools })
@@ -449,6 +495,10 @@ export const node = LayerNode.make({
     MCP.node,
     Database.node,
     Ripgrep.node,
+    AgentTree.node,
+    AgentLifecycle.node,
+    AgentInbox.node,
+    AgentStatusProjection.node,
   ],
 })
 

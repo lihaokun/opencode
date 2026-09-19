@@ -572,7 +572,7 @@ Only analyze code and suggest changes.
 
 ### 任務權限
 
-使用 `permission.task` 控制代理可以透過 Task 工具呼叫哪些子代理。使用 glob 模式進行靈活匹配。
+使用 `permission.agent` 控制代理可以透過 Task 工具呼叫哪些子代理。使用 glob 模式進行靈活匹配。
 
 ```json title="opencode.json"
 {
@@ -580,7 +580,7 @@ Only analyze code and suggest changes.
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

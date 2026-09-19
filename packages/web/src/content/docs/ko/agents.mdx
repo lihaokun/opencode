@@ -572,7 +572,7 @@ Only analyze code and suggest changes.
 
 ### Task permissions
 
-`permission.task`로 Task tool을 통해 해당 agent가 호출할 수 있는 subagent 범위를 제어합니다. 유연한 매칭을 위해 glob 패턴을 사용합니다.
+`permission.agent`로 Task tool을 통해 해당 agent가 호출할 수 있는 subagent 범위를 제어합니다. 유연한 매칭을 위해 glob 패턴을 사용합니다.
 
 ```json title="opencode.json"
 {
@@ -580,7 +580,7 @@ Only analyze code and suggest changes.
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

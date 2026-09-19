@@ -62,6 +62,9 @@ export function toToolKind(toolName: string): ToolKind {
     case "read":
       return "read"
 
+    // `task` is the name this tool had before; a session recorded then still
+    // has parts under it, so both classify the same way.
+    case "agent":
     case "task":
       return "think"
 

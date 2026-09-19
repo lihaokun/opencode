@@ -22,7 +22,7 @@ env:
 
 jobs:
   unit:
-    name: unit (${{ matrix.settings.name }})
+    name: unit (${{ matrix.settings.name }} ${{ matrix.shard }}/3)
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +33,11 @@ jobs:
           - name: windows
             host: windows-latest
             timeout: 60
+        # The opencode package is around 98% of this job: 1999s of 2038s on
+        # Windows, where it runs its CLI tests one at a time against real
+        # subprocesses. Splitting it by test file is the part worth splitting;
+        # everything else runs once, on the first shard.
+        shard: [1, 2, 3]
     runs-on: ${{ matrix.settings.host }}
     defaults:
       run:
@@ -73,21 +78,28 @@ jobs:
       - name: Run unit tests
         timeout-minutes: ${{ matrix.settings.timeout }}
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            GITHUB_ACTIONS=false bun turbo test --concurrency=1
-          else
-            GITHUB_ACTIONS=false bun turbo test
+          CONCURRENCY=""
+          if [ "$RUNNER_OS" = "Windows" ]; then CONCURRENCY="--concurrency=1"; fi
+
+          # Everything but opencode is roughly forty seconds in total, so it is
+          # not worth splitting and it runs once rather than three times.
+          if [ "${{ matrix.shard }}" = "1" ]; then
+            GITHUB_ACTIONS=false bun turbo test $CONCURRENCY --filter='!opencode'
           fi
+
+          # bun splits by test file, and turbo hashes the passed-through argument,
+          # so a later shard cannot collect an earlier one's cached result.
+          GITHUB_ACTIONS=false bun turbo test $CONCURRENCY --filter=opencode -- --shard=${{ matrix.shard }}/3
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
 
       - name: Check generated client
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.shard == 1
         working-directory: packages/client
         run: bun run check:generated
 
       - name: Run HttpApi exerciser gates
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.shard == 1
         timeout-minutes: 20
         working-directory: packages/opencode
         run: bun run test:httpapi

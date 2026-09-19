@@ -150,20 +150,26 @@ describe("tool.registry", () => {
     }),
   )
 
-  it.instance("hides task background parameter unless experimental background subagents are enabled", () =>
+  // The task tool is gone and with it the experimental background flag: agents
+  // are always asynchronous, so there is no foreground variant to switch off.
+  // What matters now is that the four management tools are offered at all.
+  it.instance("offers the agent management tools", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const agent = yield* Agent.Service
       const build = yield* agent.get("build")
       if (!build) throw new Error("build agent not found")
-      const task = (yield* registry.tools({
+      const ids = (yield* registry.tools({
         providerID: ProviderV2.ID.opencode,
         modelID: ModelV2.ID.make("test"),
         agent: build,
-      })).find((tool) => tool.id === "task")
+      })).map((tool) => tool.id)
 
-      expect(task?.jsonSchema).toBeDefined()
-      expect((task?.jsonSchema?.properties as Record<string, unknown> | undefined)?.background).toBeUndefined()
+      expect(ids).toContain("agent")
+      expect(ids).toContain("agent_list")
+      expect(ids).toContain("agent_send")
+      expect(ids).toContain("agent_stop")
+      expect(ids).not.toContain("task")
     }),
   )
 

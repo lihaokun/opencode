@@ -573,7 +573,7 @@ Sólo aplica para agentes `mode: subagent`.
 
 ### Permisos de tarea
 
-Controle qué subagentes puede invocar un agente a través de la herramienta Tarea con `permission.task`. Utiliza patrones globales para una combinación flexible.
+Controle qué subagentes puede invocar un agente a través de la herramienta Tarea con `permission.agent`. Utiliza patrones globales para una combinación flexible.
 
 ```json title="opencode.json"
 {
@@ -581,7 +581,7 @@ Controle qué subagentes puede invocar un agente a través de la herramienta Tar
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

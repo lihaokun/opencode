@@ -49,6 +49,8 @@ export function ToolErrorCard(props: ToolErrorCardProps) {
       list: "ui.tool.list",
       glob: "ui.tool.glob",
       grep: "ui.tool.grep",
+      agent: "ui.tool.task",
+      // `task` is the tool's former name, kept for history.
       task: "ui.tool.task",
       webfetch: "ui.tool.webfetch",
       websearch: "ui.tool.websearch",

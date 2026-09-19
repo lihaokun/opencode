@@ -697,12 +697,140 @@ export const RunCommand = effectCmd({
         async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
           const toggles = new Map<string, boolean>()
           const sessions = new Set([sessionID])
+          // Which of them are working right now. A one-shot run must not leave
+          // while an agent it started is still going: agents are asynchronous,
+          // so their result comes back as a message that wakes this session
+          // again, and that reply is part of this run's output.
+          const working = new Set<string>()
           let error: string | undefined
+          let timer: ReturnType<typeof setTimeout> | undefined
+          let abandoned = false
+          let rootIdle = false
+          // Delegations whose result has not yet reached the session that
+          // started them. The server says so directly — see AgentEvent.Delegation
+          // — because this is the one thing the rest of the stream cannot show:
+          // between a subagent going idle and its caller waking, every session is
+          // idle and nothing is running, and a cancelled subagent looks exactly
+          // the same.
+          //
+          // It used to be a guess at how long that handoff takes. Any fixed
+          // guess loses to a slower one, and losing meant exiting successfully
+          // with the result missing — the precise thing this wait exists to
+          // prevent. Counting what is owed has no such number in it.
+          const owed = new Set<string>()
+          let finished: (() => void) | undefined
 
-          for await (const event of events.stream) {
-            if (event.type === "session.created" && event.properties.info.parentID) {
-              if (sessions.has(event.properties.info.parentID)) sessions.add(event.properties.info.id)
+          // A stuck agent must not hold the process open forever. The clock
+          // measures continuous idleness, so it restarts whenever anything
+          // picks up work again.
+          const ceilingMs = (() => {
+            const raw = process.env["OPENCODE_RUN_AGENT_WAIT_MS"]
+            if (raw === undefined) return 10 * 60 * 1000
+            const parsed = Number(raw)
+            return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10 * 60 * 1000
+          })()
+
+          const stopWaiting = () => {
+            if (timer === undefined) return
+            clearTimeout(timer)
+            timer = undefined
+          }
+
+          /**
+           * Decides what this run is waiting for, and how long it is prepared
+           * to wait. Called after every event from a tracked session, so any
+           * sign of life restarts whichever clock applies — that is what
+           * "continuous idleness" means, and being busy is not a reason to stop
+           * the clock, since an agent stuck in busy produces no events at all.
+           *
+           * Three states:
+           *
+           * - The root is producing. Nothing to bound; it is the run's own
+           *   output.
+           * - Something is busy but silent. The long ceiling applies, and
+           *   running out of it means work is being dropped, so it aborts and
+           *   says so. The root is idle whenever that fires, by construction,
+           *   so the abort is never landing on a root in the middle of reading
+           *   a result.
+           * - Everything is quiet. Either the tree is finished or a result is
+           *   between the child that produced it and the parent that will read
+           *   it. The short settle tells those apart, and reaching the end of
+           *   it is a clean finish, not an abandonment.
+           *
+           * Deliberately not anchored on the root's own idle. At depth one the
+           * root is always last to go quiet, because every child reports to it;
+           * deeper than that it is not, since a grandchild reports to its own
+           * parent and the root is never told. Waiting for a root idle that
+           * cannot come is how a finished nested tree used to hang forever.
+           */
+          const reconsider = () => {
+            stopWaiting()
+            if (!rootIdle) return
+            if (working.size > 0) {
+              // Already gave up once. Re-arming would abort again and again if
+              // the abort is not getting through, so this ends the run instead,
+              // with the report the first attempt earned.
+              if (abandoned) {
+                finished?.()
+                return
+              }
+              if (ceilingMs === 0) return
+              timer = setTimeout(() => {
+                abandoned = true
+                // Stop what is still running and take the partial result rather
+                // than hanging. Aborting the root cascades to the agents it
+                // started.
+                void client.session.abort({ sessionID }).catch(() => {})
+                // And decide again straight away rather than waiting for an
+                // event to do it. An abort that fails, or that reaches a session
+                // already gone, produces nothing at all — and this used to be
+                // the one path where nothing was left to end the run.
+                reconsider()
+              }, ceilingMs)
+              return
             }
+            // Quiet and nothing owed is the tree actually being finished, so the
+            // run ends right there — no waiting at all, including the run that
+            // never started a subagent.
+            if (owed.size === 0) {
+              finished?.()
+              return
+            }
+            // Quiet with something owed means a result is between the subagent
+            // that produced it and the caller that will read it. Wait for it.
+            // If it never comes, that is what the ceiling above is for, and the
+            // run says so rather than leaving successfully without it.
+            if (abandoned) finished?.()
+          }
+
+          // Raced against the stream so the settle timer can end the run:
+          // `for await` has no way out except an event, and the whole point of
+          // the settle is that no further event is coming.
+          const iterator = events.stream[Symbol.asyncIterator]()
+          const done = new Promise<"done">((resolve) => {
+            finished = () => resolve("done")
+          })
+
+          while (true) {
+            const next = await Promise.race([iterator.next(), done])
+            if (next === "done") break
+            if (next.done) break
+            const event = next.value
+
+            if (event.type === "session.created" && event.properties.info.parentID) {
+              if (sessions.has(event.properties.info.parentID)) {
+                sessions.add(event.properties.info.id)
+                // Counted as working from the moment it exists, not from its
+                // first busy event. The session is created during the parent's
+                // tool call, but its first status can arrive after the parent
+                // has already gone idle — and then the run would leave believing
+                // nothing was left to do.
+                working.add(event.properties.info.id)
+                reconsider()
+              }
+            }
+
+            if (event.type === "message.updated" && sessions.has(event.properties.sessionID)) reconsider()
 
             if (
               event.type === "message.updated" &&
@@ -719,6 +847,7 @@ export const RunCommand = effectCmd({
 
             if (event.type === "message.part.updated") {
               const part = event.properties.part
+              if (sessions.has(part.sessionID)) reconsider()
               if (part.sessionID !== sessionID) continue
 
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
@@ -733,7 +862,7 @@ export const RunCommand = effectCmd({
 
               if (
                 part.type === "tool" &&
-                part.tool === "task" &&
+                (part.tool === "agent" || part.tool === "task") &&
                 part.state.status === "running" &&
                 args.format !== "json"
               ) {
@@ -790,12 +919,28 @@ export const RunCommand = effectCmd({
               UI.error(err)
             }
 
-            if (
-              event.type === "session.status" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.status.type === "idle"
-            ) {
-              break
+            if (event.type === "agent.delegation" && sessions.has(event.properties.caller)) {
+              const props = event.properties
+              if (props.status === "started") owed.add(props.sessionID)
+              else owed.delete(props.sessionID)
+              reconsider()
+            }
+
+            if (event.type === "session.status" && sessions.has(event.properties.sessionID)) {
+              const id = event.properties.sessionID
+              const idle = event.properties.status.type === "idle"
+              if (idle) working.delete(id)
+              else working.add(id)
+              if (id === sessionID) rootIdle = idle
+
+              // Giving up ends the run at the root's next idle, without waiting
+              // out a settle nobody is going to fill.
+              if (abandoned && id === sessionID && idle) {
+                stopWaiting()
+                break
+              }
+
+              reconsider()
             }
 
             if (event.type === "permission.asked") {
@@ -819,6 +964,12 @@ export const RunCommand = effectCmd({
                 })
               }
             }
+          }
+          stopWaiting()
+          if (abandoned) {
+            const message = `Gave up waiting for agents still running after ${Math.round(ceilingMs / 1000)}s; their work was stopped and any partial result dropped.`
+            error = error ? error + EOL + message : message
+            if (!emit("error", { error: { name: "AgentWaitCeiling", data: { message } } })) UI.error(message)
           }
           return error
         }
@@ -895,7 +1046,6 @@ export const RunCommand = effectCmd({
             initialInput,
             createSession: createFreshSession,
             thinking,
-            backgroundSubagents: flags.experimentalBackgroundSubagents,
             demo: args.demo,
           })
         } catch (error) {
@@ -932,7 +1082,6 @@ export const RunCommand = effectCmd({
             files,
             initialInput,
             thinking,
-            backgroundSubagents: flags.experimentalBackgroundSubagents,
             demo: args.demo,
           })
         } catch (error) {

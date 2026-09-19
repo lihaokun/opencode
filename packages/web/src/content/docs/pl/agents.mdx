@@ -572,7 +572,7 @@ Dotyczy tylko agentów z `mode: subagent`.
 
 ### Task Permissions (Uprawnienia zadań)
 
-Kontroluj, których subagentów może wywołać ten agent za pomocą narzędzia zadania, używając `permission.task`. Używa wzorców glob do elastycznego dopasowywania.
+Kontroluj, których subagentów może wywołać ten agent za pomocą narzędzia zadania, używając `permission.agent`. Używa wzorców glob do elastycznego dopasowywania.
 
 ```json title="opencode.json"
 {
@@ -580,7 +580,7 @@ Kontroluj, których subagentów może wywołać ten agent za pomocą narzędzia 
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"

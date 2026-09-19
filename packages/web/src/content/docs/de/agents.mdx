@@ -559,7 +559,7 @@ Gilt nur für `mode: subagent`-Agenten.
 
 ### Task-Berechtigungen
 
-Steuern Sie, welche Subagenten ein Agent über das Task-Tool mit `permission.task` aufrufen kann. Verwendet Glob-Muster für eine flexible Zuordnung.
+Steuern Sie, welche Subagenten ein Agent über das Task-Tool mit `permission.agent` aufrufen kann. Verwendet Glob-Muster für eine flexible Zuordnung.
 
 ```json title="opencode.json"
 {
@@ -567,7 +567,7 @@ Steuern Sie, welche Subagenten ein Agent über das Task-Tool mit `permission.tas
     "orchestrator": {
       "mode": "primary",
       "permission": {
-        "task": {
+        "agent": {
           "*": "deny",
           "orchestrator-*": "allow",
           "code-reviewer": "ask"
