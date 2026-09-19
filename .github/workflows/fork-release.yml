@@ -1,0 +1,107 @@
+# Publishes a fork build as a GitHub release on this fork.
+#
+# Not publish.yml: that one bumps the npm version and publishes `opencode-ai`
+# to the public registry, which is upstream's to do and is guarded by a
+# repository check that is false here. This builds the same binaries and puts
+# them on a release of this repository, nothing more.
+#
+# The heavy lifting is already in packages/opencode/script/build.ts, which
+# cross-compiles every target from one Linux runner -- the same single-runner
+# path upstream uses for every release. It can package and upload too, under
+# OPENCODE_RELEASE, but that publishes all twelve targets under its own naming;
+# this keeps the five the fork actually ships and the archive formats the
+# existing releases use, so it does its own packaging instead.
+name: fork-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Fork version, no leading v (e.g. 1.18.25-fmv3)"
+        required: true
+        type: string
+      prerelease:
+        description: "Publish as a pre-release"
+        required: false
+        type: boolean
+        default: false
+      assets:
+        description: "Space-separated build keys to publish"
+        required: false
+        type: string
+        default: >-
+          opencode-linux-x64 opencode-linux-arm64
+          opencode-darwin-x64 opencode-darwin-arm64
+          opencode-windows-x64
+      notes:
+        description: "Release notes (markdown). Left empty, the release is created with a placeholder to edit afterwards."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Upstream has its own release pipeline; this must never run there.
+    if: github.repository != 'anomalyco/opencode'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: ./.github/actions/setup-bun
+
+      # No OPENCODE_RELEASE: that flag makes build.ts package and upload every
+      # target itself. Building only is what is wanted here.
+      - name: Build every target
+        run: ./packages/opencode/script/build.ts
+        env:
+          OPENCODE_CHANNEL: dev
+          OPENCODE_VERSION: ${{ inputs.version }}
+
+      # tar.gz for linux and darwin, zip for windows -- matching the archives
+      # the fork's existing releases carry.
+      - name: Package the published targets
+        working-directory: packages/opencode
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for key in ${{ inputs.assets }}; do
+            if [ ! -d "dist/$key/bin" ]; then
+              echo "::error::build produced no dist/$key/bin -- is '$key' a real build key?"
+              exit 1
+            fi
+            # Archived from inside bin/ so entries sit at the root of the
+            # archive, the way build.ts writes them.
+            case "$key" in
+              *windows*) (cd "dist/$key/bin" && zip -qr "../../../out/$key.zip" *) ;;
+              *)         (cd "dist/$key/bin" && tar -czf "../../../out/$key.tar.gz" *) ;;
+            esac
+          done
+          (cd out && sha256sum opencode-* > sha256sums.txt)
+          ls -l out
+
+      - name: Publish
+        working-directory: packages/opencode
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ inputs.version }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists; replacing its assets"
+          else
+            printf '%s' "${NOTES:-Fork build ${TAG}.}" > notes.md
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "${{ inputs.version }}" \
+              --notes-file notes.md \
+              ${{ inputs.prerelease && '--prerelease' || '' }}
+          fi
+          gh release upload "$TAG" out/* --clobber
+          gh release view "$TAG" --json assets --jq '.assets[].name'
