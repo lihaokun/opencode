@@ -75,11 +75,14 @@ jobs:
               echo "::error::build produced no dist/$key/bin -- is '$key' a real build key?"
               exit 1
             fi
-            # Archived from inside bin/ so entries sit at the root of the
-            # archive, the way build.ts writes them.
+            # The whole <key>/ directory, not its contents: an archive that
+            # unpacks to opencode-linux-x64/bin/opencode is what the existing
+            # releases carry and what their install instructions name. It also
+            # keeps package.json, and bin/rg beside the binary -- without that
+            # ripgrep the program downloads one at runtime instead.
             case "$key" in
-              *windows*) (cd "dist/$key/bin" && zip -qr "../../../out/$key.zip" *) ;;
-              *)         (cd "dist/$key/bin" && tar -czf "../../../out/$key.tar.gz" *) ;;
+              *windows*) (cd dist && zip -qr "../out/$key.zip" "$key") ;;
+              *)         tar -czf "out/$key.tar.gz" -C dist "$key" ;;
             esac
           done
           (cd out && sha256sum opencode-* > sha256sums.txt)
