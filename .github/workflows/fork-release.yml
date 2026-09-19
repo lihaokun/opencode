@@ -63,6 +63,41 @@ jobs:
           OPENCODE_CHANNEL: dev
           OPENCODE_VERSION: ${{ inputs.version }}
 
+      # build.ts does not bundle ripgrep -- upstream declares it a package
+      # dependency for AUR and Homebrew instead, which a downloaded archive has
+      # no equivalent of. Without it the program fetches ripgrep from GitHub on
+      # first use, so a machine that is offline, or behind a proxy that is not,
+      # has a broken grep and glob. The fork's earlier releases carried it. The
+      # version comes from the source that decides what to fetch at runtime, so
+      # the bundled copy cannot drift from the expected one.
+      - name: Bundle ripgrep for each target
+        working-directory: packages/opencode
+        run: |
+          set -euo pipefail
+          RG=$(grep -oP 'const VERSION = "\K[^"]+' ../core/src/ripgrep/binary.ts)
+          echo "bundling ripgrep $RG"
+          for key in ${{ inputs.assets }}; do
+            case "$key" in
+              *linux-x64)     triple=x86_64-unknown-linux-musl; ext=tar.gz ;;
+              *linux-arm64)   triple=aarch64-unknown-linux-gnu; ext=tar.gz ;;
+              *darwin-x64)    triple=x86_64-apple-darwin;       ext=tar.gz ;;
+              *darwin-arm64)  triple=aarch64-apple-darwin;      ext=tar.gz ;;
+              *windows-x64)   triple=x86_64-pc-windows-msvc;    ext=zip ;;
+              *windows-arm64) triple=aarch64-pc-windows-msvc;   ext=zip ;;
+              *) echo "::error::no ripgrep triple known for '$key'"; exit 1 ;;
+            esac
+            stem="ripgrep-$RG-$triple"
+            curl -fsSL -o "/tmp/$stem.$ext" "https://github.com/BurntSushi/ripgrep/releases/download/$RG/$stem.$ext"
+            rm -rf /tmp/rg-extract && mkdir -p /tmp/rg-extract
+            if [ "$ext" = "zip" ]; then
+              unzip -qo "/tmp/$stem.$ext" -d /tmp/rg-extract
+              install -m 0755 "/tmp/rg-extract/$stem/rg.exe" "dist/$key/bin/rg.exe"
+            else
+              tar -xzf "/tmp/$stem.$ext" -C /tmp/rg-extract
+              install -m 0755 "/tmp/rg-extract/$stem/rg" "dist/$key/bin/rg"
+            fi
+          done
+
       # tar.gz for linux and darwin, zip for windows -- matching the archives
       # the fork's existing releases carry.
       - name: Package the published targets
