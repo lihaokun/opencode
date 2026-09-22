@@ -197,6 +197,21 @@ export interface AgentMessage {
 }
 
 /**
+ * A delivery into an Agent's inbox, tagged by sender kind. "agent" is agent_send
+ * traffic and the single cancellation notice — messages from another session,
+ * whose fields land in the rendered header and are escaped accordingly. "user"
+ * is a message from the human through the TUI: no sender session exists, the
+ * header is a fixed string with nothing to escape, and the body travels as
+ * parts so file attachments get the same treatment as a normal prompt.
+ *
+ * Both kinds flow through one identity resolution — the target's own
+ * agent/model/variant — which is why they share a single deliver entry.
+ */
+export type InboxMessage =
+  | { kind: "agent"; message: AgentMessage }
+  | { kind: "user"; message: { target: SessionID; parts: SessionPrompt.PromptInput["parts"] } }
+
+/**
  * As strong as the existing HTTP 204: the asynchronous request was accepted and
  * scheduled. Not that the message is persisted, was handled, will be handled, or
  * was answered.

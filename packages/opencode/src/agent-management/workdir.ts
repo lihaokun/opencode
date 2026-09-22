@@ -82,9 +82,7 @@ export const prepareWorkdir = Effect.fn("AgentWorkdir.prepare")(function* (input
       paths: [],
     })
   }
-  const created = yield* worktree
-    .createForAgent({ destinationRoot, baseCommit: head.text.trim() })
-    .pipe(Effect.exit)
+  const created = yield* worktree.createForAgent({ destinationRoot, baseCommit: head.text.trim() }).pipe(Effect.exit)
   if (Exit.isFailure(created)) {
     // Only promises no Session, no prompt and no Agent. Anything already written
     // to info/exclude, and any directory or branch created on the way, may
@@ -138,9 +136,7 @@ const registerIgnore = Effect.fn("AgentWorkdir.registerIgnore")(function* (input
   if (existing.split("\n").some((line) => line.trim() === entry)) return
 
   const next = existing.trimEnd()
-  yield* fs
-    .writeFileString(file, next ? `${next}\n${entry}\n` : `${entry}\n`)
-    .pipe(Effect.catch(() => Effect.void))
+  yield* fs.writeFileString(file, next ? `${next}\n${entry}\n` : `${entry}\n`).pipe(Effect.catch(() => Effect.void))
 })
 
 /**
@@ -162,16 +158,14 @@ export function escapeIgnorePattern(relative: string) {
 
 const runGit = Effect.fn("AgentWorkdir.git")(function* (args: string[], cwd: string) {
   const appProcess = yield* AppProcess.Service
-  return yield* appProcess
-    .run(ChildProcess.make("git", args, { cwd, extendEnv: true, stdin: "ignore" }))
-    .pipe(
-      Effect.map((result) => ({
-        code: result.exitCode,
-        text: result.stdout.toString("utf8"),
-        stderr: result.stderr.toString("utf8"),
-      })),
-      Effect.catch(() => Effect.succeed({ code: 1, text: "", stderr: "git invocation failed" })),
-    )
+  return yield* appProcess.run(ChildProcess.make("git", args, { cwd, extendEnv: true, stdin: "ignore" })).pipe(
+    Effect.map((result) => ({
+      code: result.exitCode,
+      text: result.stdout.toString("utf8"),
+      stderr: result.stderr.toString("utf8"),
+    })),
+    Effect.catch(() => Effect.succeed({ code: 1, text: "", stderr: "git invocation failed" })),
+  )
 })
 
 export * as AgentWorkdir from "./workdir"

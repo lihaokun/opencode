@@ -75,10 +75,7 @@ export interface Interface {
     caller: SessionID
     target: SessionID
     ops: AgentManagement.AgentPromptOps
-  }) => Effect.Effect<
-    AgentManagement.StopOutcome,
-    AgentManagement.NotAChild | AgentManagement.AgentNotFound
-  >
+  }) => Effect.Effect<AgentManagement.StopOutcome, AgentManagement.NotAChild | AgentManagement.AgentNotFound>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/AgentLifecycle") {}
@@ -257,7 +254,6 @@ const layer = Layer.effect(
         run,
       })
 
-
       // Registered once, and only when this delegation reports for itself.
       // Silent on cancelled, because a cancellation notice comes from stop;
       // adding one here would produce two for a single agent_stop.
@@ -270,22 +266,20 @@ const layer = Layer.effect(
       // of this switch has to be exactly one delegation.
       if (!input.notify) return
 
-      yield* background
-        .wait({ id: input.session.id })
-        .pipe(
-          Effect.flatMap((result) =>
-            Effect.gen(function* () {
-              if (result.info?.status === "completed") yield* inject("completed", result.info.output ?? "")
-              else if (result.info?.status === "error") yield* inject("error", result.info.error ?? "")
-              yield* events.publish(AgentEvent.Delegation, {
-                sessionID: input.session.id,
-                caller: input.caller,
-                status: "settled",
-              })
-            }),
-          ),
-          Effect.forkIn(scope, { startImmediately: true }),
-        )
+      yield* background.wait({ id: input.session.id }).pipe(
+        Effect.flatMap((result) =>
+          Effect.gen(function* () {
+            if (result.info?.status === "completed") yield* inject("completed", result.info.output ?? "")
+            else if (result.info?.status === "error") yield* inject("error", result.info.error ?? "")
+            yield* events.publish(AgentEvent.Delegation, {
+              sessionID: input.session.id,
+              caller: input.caller,
+              status: "settled",
+            })
+          }),
+        ),
+        Effect.forkIn(scope, { startImmediately: true }),
+      )
 
       function inject(state: "completed" | "error", text: string) {
         return Effect.gen(function* () {
@@ -307,9 +301,7 @@ const layer = Layer.effect(
             // createUserMessage pick the default agent, which is the right
             // answer for a session that never bound one.
             agent: parent.agent,
-            model: parent.model
-              ? { providerID: parent.model.providerID, modelID: parent.model.id }
-              : undefined,
+            model: parent.model ? { providerID: parent.model.providerID, modelID: parent.model.id } : undefined,
             variant: parent.model?.variant === "default" ? undefined : parent.model?.variant,
             parts: [
               {
@@ -365,9 +357,7 @@ const layer = Layer.effect(
       // caller is using for this very turn. The variant is inherited only when
       // the subagent has not pinned a model — carrying a parent's variant onto a
       // different model is meaningless.
-      const model = next.model
-        ? { providerID: next.model.providerID, modelID: next.model.modelID }
-        : input.model
+      const model = next.model ? { providerID: next.model.providerID, modelID: next.model.modelID } : input.model
       const variant = next.model ? undefined : input.variant
 
       const workdir = yield* AgentWorkdir.prepareWorkdir({
@@ -490,11 +480,14 @@ const layer = Layer.effect(
       yield* inbox
         .deliver({
           message: {
-            target: input.caller,
-            sender: input.target,
-            sender_name: info.metadata?.[AgentManagement.METADATA_AGENT_NAME],
-            sender_agent: info.agent,
-            body: renderTermination(info, stopped.length - 1),
+            kind: "agent",
+            message: {
+              target: input.caller,
+              sender: input.target,
+              sender_name: info.metadata?.[AgentManagement.METADATA_AGENT_NAME],
+              sender_agent: info.agent,
+              body: renderTermination(info, stopped.length - 1),
+            },
           },
           ops: input.ops,
         })

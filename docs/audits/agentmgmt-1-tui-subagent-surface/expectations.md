@@ -5,35 +5,35 @@
 
 ## 1. 契约源（multi-doc）
 
-| 文档 | 用途 | 相关节 |
-|---|---|---|
-| `docs/design/agent-management/subplans/agentmgmt-1-tui-subagent-surface.md` | **主契约**（数据结构/接口/流程/论证） | §0-§7 全部 |
-| issue #37 / #38 / #39 | 需求源（问题定义、范围界定、"待定"决议） | 各 issue 正文 |
-| `docs/design/agent-management/architecture.md` | 所属 feature 的既有架构（身份规则、通知通道归属） | — |
-| 既有契约（本子计划引用且**不改**） | `AgentInbox.escapeField`/`render` 语义、`deliverAsync` 的 fork+实例路由与 noReply 语义、`collectSubtree`、`createUserMessage` 的 `setAgentModel` 回写规则 | — |
+| 文档                                                                        | 用途                                                                                                                                                      | 相关节        |
+| --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
+| `docs/design/agent-management/subplans/agentmgmt-1-tui-subagent-surface.md` | **主契约**（数据结构/接口/流程/论证）                                                                                                                     | §0-§7 全部    |
+| issue #37 / #38 / #39                                                       | 需求源（问题定义、范围界定、"待定"决议）                                                                                                                  | 各 issue 正文 |
+| `docs/design/agent-management/architecture.md`                              | 所属 feature 的既有架构（身份规则、通知通道归属）                                                                                                         | —             |
+| 既有契约（本子计划引用且**不改**）                                          | `AgentInbox.escapeField`/`render` 语义、`deliverAsync` 的 fork+实例路由与 noReply 语义、`collectSubtree`、`createUserMessage` 的 `setAgentModel` 回写规则 | —             |
 
 ## 2. Schema 字段（机械化）
 
-| 字段 | 类型 | 契约来源 | 实现位置（计划） | 一致性机制 |
-|---|---|---|---|---|
-| TextPart.metadata.kind | `"agent_notification"` | 主契约 §4.1 | server: `lifecycle.inject`；TUI: `UserMessage` | 双侧常量 + §10 |
-| TextPart.metadata.summary | `string`（预渲染，server 独占措辞） | 主契约 §4.1 | 同上 | TUI 禁止拼接文案（测试断言原样显示） |
-| InboxMessage.kind | `"agent" \| "user"` | 主契约 §4.2 | server `agent-management/schema.ts` | server 内部，TUI 不接触 |
-| InboxMessage.message（agent） | 既有 `AgentMessage` 原形 | 主契约 §4.2 | 同上 | 字段不变（回归） |
-| InboxMessage.message（user） | `{ target: SessionID; parts: PromptInput["parts"] }` | 主契约 §4.2 | 同上 | 无 sender 字段（类型层） |
-| HTTP payload | **仅** `{ parts }` | 主契约 §4.3/§5.3.2 | `httpapi/groups/session.ts` | **负向断言**：payload schema 的 keys 集合恰为 `{"parts"}`，不得含 `agent/model/variant/sessionID/messageID/noReply/tools/system/format` |
-| PromptProps.onSubmitUserMessage | `(input: {text, parts}) => boolean`（可选） | 主契约 §4.4 | `tui/component/prompt/index.tsx` | 未提供时路径逐分支不变 |
-| PromptProps.onHistoryNextAtBottom | `() => boolean`（可选） | 主契约 §5.2.2 | 同上 | 未消费（false/undefined）→ 既有 `move()` |
-| history.atLive() | `() => boolean` = `store.index === 0` | 主契约 §5.2.1 | `tui/prompt/history.tsx` | INV-5 |
+| 字段                              | 类型                                                                                  | 契约来源           | 实现位置（计划）                               | 一致性机制                                                                                                                              |
+| --------------------------------- | ------------------------------------------------------------------------------------- | ------------------ | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| TextPart.metadata.kind            | `"agent_notification"`                                                                | 主契约 §4.1        | server: `lifecycle.inject`；TUI: `UserMessage` | 双侧常量 + §10                                                                                                                          |
+| TextPart.metadata.summary         | `string`（预渲染，server 独占措辞）                                                   | 主契约 §4.1        | 同上                                           | TUI 禁止拼接文案（测试断言原样显示）                                                                                                    |
+| InboxMessage.kind                 | `"agent" \| "user"`                                                                   | 主契约 §4.2        | server `agent-management/schema.ts`            | server 内部，TUI 不接触                                                                                                                 |
+| InboxMessage.message（agent）     | 既有 `AgentMessage` 原形                                                              | 主契约 §4.2        | 同上                                           | 字段不变（回归）                                                                                                                        |
+| InboxMessage.message（user）      | `{ target: SessionID; parts: PromptInput["parts"] }`                                  | 主契约 §4.2        | 同上                                           | 无 sender 字段（类型层）                                                                                                                |
+| HTTP payload                      | **仅** `{ parts }`                                                                    | 主契约 §4.3/§5.3.2 | `httpapi/groups/session.ts`                    | **负向断言**：payload schema 的 keys 集合恰为 `{"parts"}`，不得含 `agent/model/variant/sessionID/messageID/noReply/tools/system/format` |
+| PromptProps.onSubmitUserMessage   | `(input: {text, parts}) => void`（可选；实施裁决：初稿 boolean 返回值无消费者，裁掉） | 主契约 §4.4        | `tui/component/prompt/index.tsx`               | 未提供时路径逐分支不变                                                                                                                  |
+| PromptProps.onHistoryNextAtBottom | `() => boolean`（可选）                                                               | 主契约 §5.2.2      | 同上                                           | 未消费（false/undefined）→ 既有 `move()`                                                                                                |
+| history.atLive()                  | `() => boolean` = `store.index === 0`                                                 | 主契约 §5.2.1      | `tui/prompt/history.tsx`                       | INV-5                                                                                                                                   |
 
 ## 3. 枚举值（机械化）
 
-| 枚举 | 合法集合 | 共享常量 | import 路径 |
-|---|---|---|---|
-| InboxMessage.kind | `"agent"` \| `"user"` | server 侧字面量类型 | `@/agent-management/schema`（server 唯一） |
-| metadata.kind | `"agent_notification"` | **双处常量**（无共享包可 import，SDK metadata 为自由 record 不经 codegen） | server: `agent-management` 常量；TUI: `routes/session` 常量 |
-| inject 终态 | `"completed"` \| `"error"`（既有，不变） | 既有 | `lifecycle.ts` |
-| session_status.type | `idle` \| `busy` \| `retry`（既有，TUI 只读） | SDK `SessionStatus` | `@opencode-ai/sdk/v2` |
+| 枚举                | 合法集合                                      | 共享常量                                                                   | import 路径                                                 |
+| ------------------- | --------------------------------------------- | -------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| InboxMessage.kind   | `"agent"` \| `"user"`                         | server 侧字面量类型                                                        | `@/agent-management/schema`（server 唯一）                  |
+| metadata.kind       | `"agent_notification"`                        | **双处常量**（无共享包可 import，SDK metadata 为自由 record 不经 codegen） | server: `agent-management` 常量；TUI: `routes/session` 常量 |
+| inject 终态         | `"completed"` \| `"error"`（既有，不变）      | 既有                                                                       | `lifecycle.ts`                                              |
+| session_status.type | `idle` \| `busy` \| `retry`（既有，TUI 只读） | SDK `SessionStatus`                                                        | `@opencode-ai/sdk/v2`                                       |
 
 ## 4. 流程步骤（机械化）
 
@@ -114,13 +114,13 @@
 
 ## 10. 跨实现一致性
 
-| 项 | 机制 |
-|---|---|
+| 项                                             | 机制                                                                                                                                                   |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `"agent_notification"` 字面量（server ↔ TUI） | 双处常量 + 双侧 fixture 测试各断言本侧字面量；权威值以本文件 §2 为准（无共享包可 import，SDK metadata 为自由 record 不经 codegen——显式记录双定义事实） |
-| summary 措辞 | owner = server（`inject()` 既有三元表达式）；TUI 渲染测试断言**原样显示**，禁止 UI 拼接 |
-| `renderOutput` 文本 | 保持纯模型面向；TUI 零解析（INV-2 回归） |
-| SDK 再生成 | `httpapi-codegen` 链；干净树 + `bun install --frozen-lockfile` 复跑（防 `.bun` 残留伪回归，CLAUDE.md 已知限制） |
-| 头行 `[Message from user]` | server 侧常量；TUI 测试经 transcript fixture 断言显示（不 import server 常量） |
+| summary 措辞                                   | owner = server（`inject()` 既有三元表达式）；TUI 渲染测试断言**原样显示**，禁止 UI 拼接                                                                |
+| `renderOutput` 文本                            | 保持纯模型面向；TUI 零解析（INV-2 回归）                                                                                                               |
+| SDK 再生成                                     | `httpapi-codegen` 链；干净树 + `bun install --frozen-lockfile` 复跑（防 `.bun` 残留伪回归，CLAUDE.md 已知限制）                                        |
+| 头行 `[Message from user]`                     | server 侧常量；TUI 测试经 transcript fixture 断言显示（不 import server 常量）                                                                         |
 
 ## Step 5 验证记录（实施后回填）
 

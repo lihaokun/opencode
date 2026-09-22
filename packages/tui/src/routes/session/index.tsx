@@ -224,7 +224,10 @@ export function Session() {
     if (session()?.parentID) return []
     return descendants().flatMap((id) => sync.data.question[id] ?? [])
   })
-  const visible = createMemo(() => !session()?.parentID && permissions().length === 0 && questions().length === 0)
+  // Permission and question requests never appear in a child view (they are
+  // collected at the root), so dropping the parentID condition only opens the
+  // input for subagent sessions — which is Step P5's prerequisite for Step P7.
+  const visible = createMemo(() => permissions().length === 0 && questions().length === 0)
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
 
   const pending = createMemo(() => {
@@ -447,6 +450,25 @@ export function Session() {
       if (!session()?.parentID || dialog.stack.length > 0) return
       func()
     }
+  }
+
+  // Steps P7-P8 consumer: subagent sessions take over submission. Identity is
+  // resolved server-side from the target session (I1) — nothing from the
+  // globally selected agent/model enters the request, which is why this path
+  // never reads local.agent or local.model.
+  function submitUserMessage(input: { text: string; parts: PromptInfo["parts"] }) {
+    void sdk.client.session
+      .agentMessage({
+        sessionID: route.sessionID,
+        parts: [{ type: "text", text: input.text }, ...input.parts],
+      })
+      .catch((error) => {
+        toast.show({
+          title: "Failed to send message",
+          message: errorMessage(error),
+          variant: "error",
+        })
+      })
   }
 
   // Step P10 consumer: down at the exhausted prompt history opens the
@@ -1313,6 +1335,7 @@ export function Session() {
                       }}
                       sessionID={route.sessionID}
                       onHistoryNextAtBottom={openSubagentList}
+                      onSubmitUserMessage={session()?.parentID ? submitUserMessage : undefined}
                       right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
                     />
                   </pluginRuntime.Slot>

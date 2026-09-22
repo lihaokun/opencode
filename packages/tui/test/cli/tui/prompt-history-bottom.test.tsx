@@ -192,10 +192,7 @@ test.skip("down stays with the editor when the session has no subagents", async 
 
 test.skip("down does not hijack the keystroke while the input has text", async () => {
   const app = await boot({
-    sessions: [
-      root,
-      session("ses_a", { parentID: "ses_root", agent: "explore", metadata: { agentName: "alpha" } }),
-    ],
+    sessions: [root, session("ses_a", { parentID: "ses_root", agent: "explore", metadata: { agentName: "alpha" } })],
   })
 
   try {

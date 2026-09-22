@@ -73,8 +73,7 @@ export const {
       provider_default: Record<string, string>
       provider_next: ProviderListResponse
       console_state: ConsoleState
-      capabilities: {
-      }
+      capabilities: {}
       provider_auth: Record<string, ProviderAuthMethod[]>
       agent: Agent[]
       command: Command[]
@@ -117,8 +116,7 @@ export const {
         connected: [],
       },
       console_state: emptyConsoleState,
-      capabilities: {
-      },
+      capabilities: {},
       provider_auth: {},
       config: {},
       status: "loading",

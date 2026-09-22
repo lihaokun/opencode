@@ -7172,6 +7172,111 @@
         ]
       }
     },
+    "/session/{sessionID}/agent-message": {
+      "post": {
+        "tags": ["session"],
+        "operationId": "session.agent_message",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Message accepted"
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Deliver a message from the human into the session's agent inbox. The session's own identity (agent, model, variant) is resolved server-side and cannot be overridden by the payload. Returns once accepted; delivery and the run itself happen asynchronously.",
+        "summary": "Deliver a user message into the agent inbox",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "parts": {
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/TextPartInput"
+                        },
+                        {
+                          "$ref": "#/components/schemas/FilePartInput"
+                        },
+                        {
+                          "$ref": "#/components/schemas/AgentPartInput"
+                        },
+                        {
+                          "$ref": "#/components/schemas/SubtaskPartInput"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "required": ["parts"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.agent_message({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/session/{sessionID}/command": {
       "post": {
         "tags": ["session"],
@@ -15454,6 +15559,9 @@
             "$ref": "#/components/schemas/EventGlobalDisposed"
           },
           {
+            "$ref": "#/components/schemas/EventAgentDelegation"
+          },
+          {
             "$ref": "#/components/schemas/EventServerInstanceDisposed"
           }
         ]
@@ -20354,6 +20462,40 @@
                 "additionalProperties": false
               },
               {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["agent.delegation"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "caller": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "status": {
+                        "type": "string",
+                        "enum": ["started", "settled"]
+                      }
+                    },
+                    "required": ["sessionID", "caller", "status"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
                 "$ref": "#/components/schemas/EventServerInstanceDisposed"
               },
               {
@@ -24240,6 +24382,9 @@
           },
           {
             "$ref": "#/components/schemas/GlobalDisposed"
+          },
+          {
+            "$ref": "#/components/schemas/AgentDelegation"
           }
         ]
       },
@@ -33675,6 +33820,62 @@
         "required": ["id", "type", "data"],
         "additionalProperties": false
       },
+      "AgentDelegation": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["agent.delegation"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/LocationRef"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "caller": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "status": {
+                "type": "string",
+                "enum": ["started", "settled"]
+              }
+            },
+            "required": ["sessionID", "caller", "status"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "data"],
+        "additionalProperties": false
+      },
       "QuestionV2Request": {
         "type": "object",
         "properties": {
@@ -36650,6 +36851,40 @@
           "properties": {
             "type": "object",
             "properties": {}
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventAgentDelegation": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["agent.delegation"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "caller": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "status": {
+                "type": "string",
+                "enum": ["started", "settled"]
+              }
+            },
+            "required": ["sessionID", "caller", "status"],
+            "additionalProperties": false
           }
         },
         "required": ["id", "type", "properties"],

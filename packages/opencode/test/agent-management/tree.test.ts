@@ -51,7 +51,8 @@ describe("AgentTree", () => {
       expect(result.members[0].relation).toBe("self")
       expect(result.members[0].depth).toBe(0)
       expect(result.members[0].parent_id).toBeUndefined()
-    }))
+    }),
+  )
 
   it.instance("neighborhood covers parent, children and siblings but never grandchildren", () =>
     Effect.gen(function* () {
@@ -76,7 +77,8 @@ describe("AgentTree", () => {
       expect(byId.get(root.id)!.relation).toBe("parent")
       expect(byId.get(b.id)!.relation).toBe("sibling")
       expect(byId.get(grandchild.id)!.relation).toBe("child")
-    }))
+    }),
+  )
 
   it.instance("assigns depth relative to the tree root", () =>
     Effect.gen(function* () {
@@ -94,7 +96,8 @@ describe("AgentTree", () => {
       expect(byId.get(root.id)!.depth).toBe(0)
       expect(byId.get(a.id)!.depth).toBe(1)
       expect(byId.get(grandchild.id)!.depth).toBe(2)
-    }))
+    }),
+  )
 
   it.instance("orders members by relation then creation then id so the roster is stable", () =>
     Effect.gen(function* () {
@@ -111,7 +114,8 @@ describe("AgentTree", () => {
       expect(first).toEqual(second)
       const relations = (yield* tree.neighborhood(a.id)).members.map((m) => m.relation)
       expect(relations).toEqual(["self", "parent", "child", "child", "sibling"])
-    }))
+    }),
+  )
 
   it.instance("descendants returns the closure without the root of the subtree", () =>
     Effect.gen(function* () {
@@ -129,7 +133,8 @@ describe("AgentTree", () => {
       expect(ids).toContain(c.id)
       expect(result.find((m) => m.session_id === b.id)!.depth).toBe(2)
       expect(result.find((m) => m.session_id === c.id)!.depth).toBe(3)
-    }))
+    }),
+  )
 
   it.instance("isChild only accepts direct children", () =>
     Effect.gen(function* () {
@@ -141,7 +146,8 @@ describe("AgentTree", () => {
       expect(yield* tree.isChild(root.id, a.id)).toBe(true)
       expect(yield* tree.isChild(root.id, b.id)).toBe(false)
       expect(yield* tree.isChild(a.id, b.id)).toBe(true)
-    }))
+    }),
+  )
 
   it.instance("resolveTarget passes a session id through without looking at names", () =>
     Effect.gen(function* () {
@@ -151,7 +157,8 @@ describe("AgentTree", () => {
 
       const resolved = yield* tree.resolveTarget({ caller: root.id, value: a.id, scope: "child" })
       expect(resolved).toBe(a.id)
-    }))
+    }),
+  )
 
   it.instance("resolveTarget finds a unique instance name", () =>
     Effect.gen(function* () {
@@ -161,7 +168,8 @@ describe("AgentTree", () => {
 
       expect(yield* tree.resolveTarget({ caller: root.id, value: "reviewer", scope: "child" })).toBe(a.id)
       expect(yield* tree.resolveTarget({ caller: root.id, value: "reviewer", scope: "neighbor" })).toBe(a.id)
-    }))
+    }),
+  )
 
   it.instance("resolveTarget reports every candidate when a name is ambiguous", () =>
     Effect.gen(function* () {
@@ -170,39 +178,36 @@ describe("AgentTree", () => {
       const a = yield* spawn({ parentID: root.id, title: "a", name: "twin" })
       const b = yield* spawn({ parentID: root.id, title: "b", name: "twin" })
 
-      const error = yield* tree
-        .resolveTarget({ caller: root.id, value: "twin", scope: "child" })
-        .pipe(Effect.flip)
+      const error = yield* tree.resolveTarget({ caller: root.id, value: "twin", scope: "child" }).pipe(Effect.flip)
 
       expect(error._tag).toBe("TargetNotResolved")
       expect((error as AgentManagement.TargetNotResolved).matches.toSorted()).toEqual([a.id, b.id].toSorted())
-    }))
+    }),
+  )
 
   it.instance("resolveTarget fails with no candidates when nothing matches", () =>
     Effect.gen(function* () {
       const tree = yield* AgentTree.Service
       const root = yield* spawn({ title: "root" })
 
-      const error = yield* tree
-        .resolveTarget({ caller: root.id, value: "nobody", scope: "child" })
-        .pipe(Effect.flip)
+      const error = yield* tree.resolveTarget({ caller: root.id, value: "nobody", scope: "child" }).pipe(Effect.flip)
 
       expect(error._tag).toBe("TargetNotResolved")
       expect((error as AgentManagement.TargetNotResolved).matches).toEqual([])
-    }))
+    }),
+  )
 
   it.instance("resolveTarget never resolves a caller to itself by name", () =>
     Effect.gen(function* () {
       const tree = yield* AgentTree.Service
       const root = yield* spawn({ title: "root", name: "boss" })
 
-      const error = yield* tree
-        .resolveTarget({ caller: root.id, value: "boss", scope: "neighbor" })
-        .pipe(Effect.flip)
+      const error = yield* tree.resolveTarget({ caller: root.id, value: "boss", scope: "neighbor" }).pipe(Effect.flip)
 
       expect(error._tag).toBe("TargetNotResolved")
       expect((error as AgentManagement.TargetNotResolved).matches).toEqual([])
-    }))
+    }),
+  )
 
   it.instance("resolveTarget matches instance names only, never agent types", () =>
     Effect.gen(function* () {
@@ -211,13 +216,12 @@ describe("AgentTree", () => {
       const root = yield* spawn({ title: "root" })
       yield* sessions.create({ parentID: root.id, title: "a", agent: "explore" })
 
-      const error = yield* tree
-        .resolveTarget({ caller: root.id, value: "explore", scope: "child" })
-        .pipe(Effect.flip)
+      const error = yield* tree.resolveTarget({ caller: root.id, value: "explore", scope: "child" }).pipe(Effect.flip)
 
       expect(error._tag).toBe("TargetNotResolved")
       expect((error as AgentManagement.TargetNotResolved).matches).toEqual([])
-    }))
+    }),
+  )
 
   it.instance("resolveTarget with child scope does not see siblings", () =>
     Effect.gen(function* () {
@@ -231,5 +235,6 @@ describe("AgentTree", () => {
 
       const viaNeighbor = yield* tree.resolveTarget({ caller: a.id, value: "peer", scope: "neighbor" })
       expect(viaNeighbor).toBeDefined()
-    }))
+    }),
+  )
 })

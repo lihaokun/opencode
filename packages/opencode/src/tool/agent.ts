@@ -103,9 +103,7 @@ function failed<M extends { [key: string]: unknown }>(title: string, output: str
 
 function requireOps(ctx: Tool.Context) {
   const ops = ctx.extra?.promptOps as AgentManagement.AgentPromptOps | undefined
-  return ops
-    ? Effect.succeed(ops)
-    : Effect.fail(new Error("The agent tools require promptOps in ctx.extra"))
+  return ops ? Effect.succeed(ops) : Effect.fail(new Error("The agent tools require promptOps in ctx.extra"))
 }
 
 export const AgentTool = Tool.define(
@@ -210,9 +208,7 @@ export const AgentListTool = Tool.define(
     const projection = yield* AgentStatusProjection.Service
 
     const run = Effect.fn("AgentListTool.execute")(function* (_params: unknown, ctx: Tool.Context) {
-      const result = yield* tree
-        .neighborhood(ctx.sessionID)
-        .pipe(Effect.catch((error) => Effect.succeed(error)))
+      const result = yield* tree.neighborhood(ctx.sessionID).pipe(Effect.catch((error) => Effect.succeed(error)))
       if ("_tag" in result) return failed<ListMeta>("agents", result.message)
 
       // Status is assembled here, not in the tree: it is a different observed
@@ -284,13 +280,16 @@ export const AgentSendTool = Tool.define(
       const accepted = yield* inbox
         .deliver({
           message: {
-            target,
-            // Taken from the execution context, never from the arguments, so a
-            // model cannot claim to be someone else.
-            sender: ctx.sessionID,
-            sender_name: self.metadata?.[AgentManagement.METADATA_AGENT_NAME],
-            sender_agent: self.agent ?? ctx.agent,
-            body: params.message,
+            kind: "agent",
+            message: {
+              target,
+              // Taken from the execution context, never from the arguments, so a
+              // model cannot claim to be someone else.
+              sender: ctx.sessionID,
+              sender_name: self.metadata?.[AgentManagement.METADATA_AGENT_NAME],
+              sender_agent: self.agent ?? ctx.agent,
+              body: params.message,
+            },
           },
           ops,
         })
@@ -380,7 +379,9 @@ export const AgentStopTool = Tool.define(
  * Tool.Context, which does not exist until a tool actually runs, by which point
  * the schema the model sees has already been sent.
  */
-export const visibleAgentTools = Effect.fn("AgentTools.visible")(function* (sessionID: Parameters<AgentTree.Interface["callerDepth"]>[0]) {
+export const visibleAgentTools = Effect.fn("AgentTools.visible")(function* (
+  sessionID: Parameters<AgentTree.Interface["callerDepth"]>[0],
+) {
   const tree = yield* AgentTree.Service
   const config = yield* Config.Service
   const cfg = yield* config.get()

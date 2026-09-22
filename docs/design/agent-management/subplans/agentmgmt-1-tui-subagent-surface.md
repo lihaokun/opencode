@@ -1,6 +1,7 @@
 # 子计划设计 — agent-management / `agentmgmt-1-tui-subagent-surface`
 
 > 三个 issue 的合并子计划：TUI subagent 操作面。
+>
 > - #39 委派结果通知不可见（渲染）
 > - #38 无 subagent 列表（导航）
 > - #37 subagent 会话只读（人 → subagent 输入）
@@ -13,11 +14,11 @@
 
 ### 0.1 goal → 模块映射
 
-| goal | 模块 | commit |
-|---|---|---|
-| G1 委派结果在父会话转录中可见（一行提示） | 服务端 `lifecycle.inject` + TUI `UserMessage` | #39 |
-| G2 主界面 `down` 链式回退到 subagent 列表 | TUI `prompt/history` + `Prompt` + 新 `DialogSubagentList` | #38 |
-| G3 人可直接给 subagent 发消息且不改写其身份 | 服务端 `AgentInbox` + HTTP 端点 + TUI `Prompt`/session 路由 | #37 |
+| goal                                        | 模块                                                        | commit |
+| ------------------------------------------- | ----------------------------------------------------------- | ------ |
+| G1 委派结果在父会话转录中可见（一行提示）   | 服务端 `lifecycle.inject` + TUI `UserMessage`               | #39    |
+| G2 主界面 `down` 链式回退到 subagent 列表   | TUI `prompt/history` + `Prompt` + 新 `DialogSubagentList`   | #38    |
+| G3 人可直接给 subagent 发消息且不改写其身份 | 服务端 `AgentInbox` + HTTP 端点 + TUI `Prompt`/session 路由 | #37    |
 
 ### 0.2 关键假设
 
@@ -35,13 +36,14 @@
 
 ## 1. 范围
 
-| commit | 触及文件 | 契约变更 |
-|---|---|---|
-| 1（#39） | `packages/opencode/src/agent-management/lifecycle.ts`；`packages/tui/src/routes/session/index.tsx` | synthetic text part 新增 metadata 约定（server→TUI） |
-| 2（#38） | `packages/tui/src/prompt/history.tsx`、`component/prompt/index.tsx`、`routes/session/index.tsx`、新 `component/dialog-subagent-list.tsx` | 无（UI 内部） |
+| commit   | 触及文件                                                                                                                                                                                                                               | 契约变更                                                        |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| 1（#39） | `packages/opencode/src/agent-management/lifecycle.ts`；`packages/tui/src/routes/session/index.tsx`                                                                                                                                     | synthetic text part 新增 metadata 约定（server→TUI）            |
+| 2（#38） | `packages/tui/src/prompt/history.tsx`、`component/prompt/index.tsx`、`routes/session/index.tsx`、新 `component/dialog-subagent-list.tsx`                                                                                               | 无（UI 内部）                                                   |
 | 3（#37） | `packages/opencode/src/agent-management/{schema,inbox}.ts`、`server/routes/instance/httpapi/{groups,handlers}/session.ts`、`packages/sdk`（codegen 再生成）；`packages/tui/src/component/prompt/index.tsx`、`routes/session/index.tsx` | `AgentMessage` 扩展 sender-kind；新 HTTP 端点；`Prompt` 新 prop |
 
 明确不做（记录再引入条件）：
+
 - `agent_send` / 取消通知压成一行（#39 待定②）——等"长消息灌满转录"成为实际诉求再统一。
 - 通知行点击跳转子会话（#39 待定①的另一个方向）——#38 列表已承担导航。
 - 失败通知按状态着色——summary 文本已含 "Agent failed" 语义。
@@ -49,15 +51,15 @@
 
 ## 2. 与已有代码的复用点
 
-| 复用件 | 位置 | 用途 |
-|---|---|---|
-| `AgentInbox.deliver` 的身份解析 + `deliverAsync` 路由 | `inbox.ts:87-120` | G3 的唯一 owner，扩展而非复制 |
-| `escapeField` / `render` | `inbox.ts:40-65` | agent 路署名的既有编码规则（user 路不需要：头行无模型来源字段） |
-| `collectSubtree` | `index.tsx:2645`（已有测试 `subagent-subtree.test.ts`） | 列表数据源 |
-| `enterChild` / `moveChild` | `index.tsx:418-442` | 列表项 action |
-| `DialogSelect` / `DialogSessionList` 模式 | `ui/dialog-select.tsx`、`component/dialog-session-list.tsx` | 列表对话框骨架与按键栈行为 |
-| `local.model` / `local.agent` | `context/local.tsx` | **不进入 G3 的请求构造**（I1）——既有读取保留但值不进 payload，见 §4.4 |
-| SDK codegen 链 | `httpapi-codegen` → `packages/sdk/js/src/v2/gen` | G3 新端点走既有生成链 |
+| 复用件                                                | 位置                                                        | 用途                                                                  |
+| ----------------------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------- |
+| `AgentInbox.deliver` 的身份解析 + `deliverAsync` 路由 | `inbox.ts:87-120`                                           | G3 的唯一 owner，扩展而非复制                                         |
+| `escapeField` / `render`                              | `inbox.ts:40-65`                                            | agent 路署名的既有编码规则（user 路不需要：头行无模型来源字段）       |
+| `collectSubtree`                                      | `index.tsx:2645`（已有测试 `subagent-subtree.test.ts`）     | 列表数据源                                                            |
+| `enterChild` / `moveChild`                            | `index.tsx:418-442`                                         | 列表项 action                                                         |
+| `DialogSelect` / `DialogSessionList` 模式             | `ui/dialog-select.tsx`、`component/dialog-session-list.tsx` | 列表对话框骨架与按键栈行为                                            |
+| `local.model` / `local.agent`                         | `context/local.tsx`                                         | **不进入 G3 的请求构造**（I1）——既有读取保留但值不进 payload，见 §4.4 |
+| SDK codegen 链                                        | `httpapi-codegen` → `packages/sdk/js/src/v2/gen`            | G3 新端点走既有生成链                                                 |
 
 ## 3. 错误处理策略
 
@@ -131,11 +133,13 @@ payload：{ parts: PromptInput["parts"] }   ← 刻意【不含】agent/model/va
 ```
 数据结构：PromptProps.onSubmitUserMessage（可选）
 
-  (input: { text: string; parts: PromptInfo["parts"] }) => boolean
+  (input: { text: string; parts: PromptInfo["parts"] }) => void
 
 语义：存在即表示当前会话由外部接管提交（子会话视图）。接管分支是 submitInner
 模式分支链的第一个分支（shell/slash/prompt 之前），此时 inputText 与 parts 已
 完成粘贴展开；分支返回后自然落入既有共享收尾（append 历史、清空输入）。
+【实施裁决】初稿为返回 boolean 表示"已消费"，实施时裁掉：prop 存在本身即接管
+（路由仅在子会话视图注入），返回值无消费者——按剃刀收敛为 void。
 
 插入点约束（按 submitInner 实序）：local.agent/model 的**读取**（:961/:968，
 纯读无副作用）与 exit/quit、workspace 守卫先于接管分支发生，语义有意保持：
@@ -152,12 +156,14 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
 ### 5.1 commit 1（#39）：通知可见
 
 #### 5.1.1 `lifecycle.ts inject()` — 附 metadata
+
 - 在既有 `parts: [{type:"text", synthetic:true, text: renderOutput(...)}]` 上加
   `metadata: { kind: "agent_notification", summary }`，`summary` 即现有三元表达式结果。
 - 文本与 `renderOutput` 一字不动（模型面向契约，I2）。
 - **正确性论证**：trivial（单字段添加；消费端容忍缺失，见 5.1.2 负例）。
 
 #### 5.1.2 TUI `UserMessage` — 识别并渲染一行
+
 - 新 memo：`notification = parts.find(p => p.type === "text" && p.metadata?.kind === "agent_notification")`。
 - 渲染分支：`notification` 存在 → 渲染独立一行 muted 样式 `↳ {summary}`（样式对齐既有 muted 提示行）；不存在 → 现状（synthetic-only 消息整体不可见，负例即兼容性回归）。
 - 分支覆盖：有/无 metadata、有/无 file parts（file 照常渲染，不受影响）。
@@ -168,16 +174,19 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   - 后置：completed/error 两态在父转录中各显示一行；取消通知不经此路（走 inbox 全文，范围外）。
 
 #### 5.1.3 测试
+
 - 服务端：inject 产出的 part 携带 `{kind, summary}`（扩展既有 lifecycle 测试）。
 - TUI：有 metadata → 渲染一行且不含正文；无 metadata → 不渲染（兼容负例）。
 
 ### 5.2 commit 2（#38）：down 链式回退到 subagent 列表
 
 #### 5.2.1 `prompt/history.tsx` — 暴露 `atLive()`
+
 - 新只读方法 `atLive(): boolean` = `store.index === 0`。不加参数、不改 `move`。
 - **论证**：trivial（getter）。`move` 语义不动（I3）。
 
 #### 5.2.2 `Prompt` — `prompt.history.next` 触发点
+
 - `run()` 在光标末尾守卫之后、`history.move` 之前插入：
   `if (input.plainText.length === 0 && history.atLive() && props.onHistoryNextAtBottom?.()) return`
 - 未消费（false/未传）→ 落入既有 `move` 调用，行为与今天一致（空输入 + live = no-op）。
@@ -192,6 +201,7 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   - 后置：触发与否不改变输入框内容与历史游标。
 
 #### 5.2.3 `DialogSubagentList`（新组件）
+
 - 数据：`rootID = session()?.parentID ?? session()?.id`；成员 = `collectSubtree(sessions, rootID)` 去掉 **root 会话与当前会话**（root 不是 subagent，回根由 `up` 承担；从根视图打开时两者重合，即纯子 agent 列表）。
 - 行内容：名字 = `metadata.agentName`（SDK `Session.metadata` 已暴露）→ 缺省回退 `session.agent` 类型 → 再回退 SubagentFooter 式 title 解析；类型 = `session.agent`；状态 = `sync.data.session_status[id]?.type`（idle/busy/retry）；缩进 = 子树深度（孙子可达，直接子优先，按 `time.created` 排序）。
 - action：选中 → `enterChild(id)`（复用，含 retry 弹窗行为）→ `dialog.clear()`。
@@ -199,11 +209,13 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
 - 无新 keybinding；不占任何既有键。
 
 #### 5.2.4 测试
+
 - `atLive` 语义（空历史/有历史/翻完回 live）；触发三条件合取与各自否定；列表过滤（排除当前会话、含孙子、深度缩进）；action 跳转。
 
 ### 5.3 commit 3（#37）：人 → subagent 输入
 
 #### 5.3.1 `inbox.ts deliver` — sender-kind 扩展
+
 - 入参改为 §4.2 的 `InboxMessage`；身份解析块（`inbox.ts:87-103`）原样共享：
   `agent = target.agent ?? defaultInfo()`、`model = target.model`、`variant` 折叠 `"default" → undefined`。
 - 渲染分支：`kind="agent"` → 既有 `render(message)`（单 text part）；`kind="user"` → 头行 part（§4.3）+ 用户 parts，走同一 `ops.deliverAsync`。
@@ -214,6 +226,7 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   - 后置：204 已受理语义与 agent_send 一致；幂等性同 promptAsync（无幂等键，重复提交会重复投递——与既有 session.prompt 同级，不新增缓解）。
 
 #### 5.3.2 HTTP 端点 + SDK
+
 - `groups/session.ts` 定义路由与 `AgentMessagePayload = Schema.Struct({ parts: PromptInput.fields.parts })`。
   **pick 而非 omit**：从 `PromptPayload` 做 omit 会残留 `messageID/noReply/tools/system/format` 等本设计未审字段；其中 `noReply: true` 尤其有害——`deliverAsync → prompt` 会持久化消息但**不跑 loop**，消息沉底、子 agent 永不被唤醒（`inbox.ts` 注释明确记载该语义）。只留 parts = I1 的类型强制 + 这类洞的收口。
 - handler：`requireSession` → `inbox.deliver({kind:"user", message:{target, parts}})`，头行 part 插入在 deliver 内完成（§4.2）。
@@ -221,6 +234,7 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
 - **论证**：trivial（与 `promptAsync` handler 同构，仅多 inbox 调用）。
 
 #### 5.3.3 TUI session 路由 — `visible()` 放开 + 提供接管回调
+
 - `visible()`：去掉 `!session()?.parentID` 合取项 → 子会话视图渲染 `Prompt`；`SubagentFooter` 保留（footer 在上、输入框在下，并列 `<Show>` 天然共存）。
 - 提供 `onSubmitUserMessage`（仅当 `session()?.parentID`）：调 `sdk.client.session.agentMessage({sessionID, parts})`，catch → toast。
 - 已知限制（记录，不做 UI）：子会话视图内子 agent 发起权限/提问时，请求归根会话视图处理（H3）——用户需 `up` 回根会话；footer 不提示。
@@ -228,6 +242,7 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
 - **论证**：`permissions()/questions()` 在子视图恒空（H3）→ 放开后 `disabled` 恒 false → Prompt 可用；根视图行为不变（合取项去掉后根视图求值不变，负例回归覆盖）。
 
 #### 5.3.4 `Prompt` — 接管路径
+
 - §4.4 prop；实现为模式分支链的第一个分支（`store.mode === "shell"` 分支之前，`:1059`），此时 `inputText`/`nonTextParts` 已就绪（`:1026-1037`）：分支内调 `void sdk.client.session.agentMessage({ sessionID, parts: [textPart, ...nonTextParts] })`，随后落入各分支共享的收尾（历史 append、清空、`props.onSubmit`）。
 - `local.agent/model` 的既有读取（`:961/:968`）保留——纯读，值不进 payload（I1 由 §4.3 schema 保证）；其前置守卫的两个边界见 §4.4。
 - 底部 meta 行的 agent/model 选择器（`:1446-1470`）：接管路径存在时隐藏（全局选择与本次提交无关，显示即误导）。
@@ -237,6 +252,7 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   - 后置：子会话收到 `[Message from user]` + 正文（普通 user 消息，非 synthetic）→ 子转录可见、可被唤醒（运行中入队 / 停止则唤回，H5）。
 
 #### 5.3.5 测试
+
 - 服务端：user 路身份解析（含 `"default"` 折叠）、头行插入顺序、deliverAsync 收到的 sessionID/agent/model/variant 断言；agent 路回归（agent_send/stop 不变形）。
 - TUI：子会话提交走 `agentMessage` 且不读 local.agent/model；根会话路径不变负例；选择器隐藏。
 

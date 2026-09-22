@@ -68,6 +68,13 @@ export const SummarizePayload = Schema.Struct({
   auto: Schema.optional(Schema.Boolean),
 })
 export const PromptPayload = Schema.Struct(Struct.omit(SessionPrompt.PromptInput.fields, ["sessionID"]))
+
+// Parts only — deliberately NOT an omit of PromptPayload. Omitting
+// agent/model/variant would still leave messageID/noReply/tools/system/format
+// in the accepted payload; noReply in particular persists a message without
+// ever running the loop. With parts alone the target's identity is
+// unrepresentable in the request (I1) and the noReply hole is closed outright.
+export const AgentMessagePayload = Schema.Struct({ parts: SessionPrompt.PromptInput.fields.parts })
 export const CommandPayload = Schema.Struct(Struct.omit(SessionPrompt.CommandInput.fields, ["sessionID"]))
 export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.fields, ["sessionID"]))
 export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput.fields, ["sessionID"]))
@@ -94,6 +101,7 @@ export const SessionPaths = {
   summarize: `${root}/:sessionID/summarize`,
   prompt: `${root}/:sessionID/message`,
   promptAsync: `${root}/:sessionID/prompt_async`,
+  agentMessage: `${root}/:sessionID/agent-message`,
   command: `${root}/:sessionID/command`,
   shell: `${root}/:sessionID/shell`,
   revert: `${root}/:sessionID/revert`,
@@ -338,6 +346,20 @@ export const SessionApi = HttpApi.make("session")
             summary: "Send async message",
             description:
               "Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.",
+          }),
+        ),
+        HttpApiEndpoint.post("agentMessage", SessionPaths.agentMessage, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: AgentMessagePayload,
+          success: described(HttpApiSchema.NoContent, "Message accepted"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.agent_message",
+            summary: "Deliver a user message into the agent inbox",
+            description:
+              "Deliver a message from the human into the session's agent inbox. The session's own identity (agent, model, variant) is resolved server-side and cannot be overridden by the payload. Returns once accepted; delivery and the run itself happen asynchronously.",
           }),
         ),
         HttpApiEndpoint.post("command", SessionPaths.command, {

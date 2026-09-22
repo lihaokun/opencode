@@ -72,6 +72,14 @@ export type PromptProps = {
    * falls through to the same no-op move() has always produced there.
    */
   onHistoryNextAtBottom?: () => boolean
+  /**
+   * Takes over submission entirely — the subagent view, where identity is
+   * resolved server-side from the target session and the globally selected
+   * agent/model must not enter the request (I1). Presence reroutes submitInner
+   * to this callback ahead of the shell/slash/prompt branches, and hides the
+   * agent/model readout, which no longer describes what a submit will do.
+   */
+  onSubmitUserMessage?: (input: { text: string; parts: PromptInfo["parts"] }) => void
   ref?: (ref: PromptRef | undefined) => void
   hint?: JSX.Element
   right?: JSX.Element
@@ -911,6 +919,8 @@ export function Prompt(props: PromptProps) {
           title: "Next prompt history",
           category: "Prompt",
           run() {
+            // Step P9: the existing cursor guard — down only considers history
+            // (or the subagent list) once the cursor sits at the end.
             if (input.cursorOffset !== input.plainText.length) {
               if (
                 input.scrollY + input.visualCursor.visualRow ===
@@ -1034,6 +1044,8 @@ export function Prompt(props: PromptProps) {
       sessionID = res.data.id
     }
 
+    // Step P6: paste expansion — the takeover branch consumes the same
+    // expanded text and parts as every other branch.
     const inputText = expandTrackedPastedText(
       store.prompt.input,
       input.extmarks.getAllForTypeId(promptPartTypeId).flatMap((extmark) => {
@@ -1067,7 +1079,13 @@ export function Prompt(props: PromptProps) {
           ]
         : []
 
-    if (store.mode === "shell") {
+    // Step P7: subagent view — the route owns submission. Identity is resolved
+    // server-side from the target session (I1), so the shell/slash/prompt
+    // branches below are unreachable here by construction.
+    if (props.onSubmitUserMessage) {
+      move.startSubmit()
+      props.onSubmitUserMessage({ text: inputText, parts: nonTextParts })
+    } else if (store.mode === "shell") {
       move.startSubmit()
       void sdk.client.session.shell({
         sessionID,
@@ -1130,6 +1148,8 @@ export function Prompt(props: PromptProps) {
         })
       if (editorParts.length > 0) editor.markSelectionSent()
     }
+    // Step P8: the shared tail — history record and input clear — runs for
+    // every branch above, takeover included.
     history.append({
       ...store.prompt,
       mode: currentMode,
@@ -1454,37 +1474,39 @@ export function Prompt(props: PromptProps) {
             />
             <box flexDirection="row" flexShrink={0} paddingTop={1} gap={1} justifyContent="space-between">
               <box flexDirection="row" gap={1}>
-                <Show when={local.agent.current()} fallback={<box height={1} />}>
-                  {(agent) => (
-                    <>
-                      <text fg={fadeColor(highlight(), agentMetaAlpha())}>
-                        {store.mode === "shell" ? "Shell" : Locale.titlecase(agent().name)}
-                      </text>
-                      <Show when={store.mode === "normal" && local.permission.mode === "auto"}>
-                        <text fg={fadeColor(theme.textMuted, agentMetaAlpha())}>auto</text>
-                      </Show>
-                      <Show when={store.mode === "normal"}>
-                        <box flexDirection="row" gap={1}>
-                          <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>
-                          <text
-                            flexShrink={0}
-                            fg={fadeColor(leader() ? theme.textMuted : theme.text, modelMetaAlpha())}
-                          >
-                            {local.model.parsed().model}
-                          </text>
-                          <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{currentProviderLabel()}</text>
-                          <Show when={showVariant()}>
-                            <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>·</text>
-                            <text>
-                              <span style={{ fg: fadeColor(theme.warning, variantMetaAlpha()), bold: true }}>
-                                {local.model.variant.current()}
-                              </span>
+                <Show when={!props.onSubmitUserMessage} fallback={<box height={1} />}>
+                  <Show when={local.agent.current()} fallback={<box height={1} />}>
+                    {(agent) => (
+                      <>
+                        <text fg={fadeColor(highlight(), agentMetaAlpha())}>
+                          {store.mode === "shell" ? "Shell" : Locale.titlecase(agent().name)}
+                        </text>
+                        <Show when={store.mode === "normal" && local.permission.mode === "auto"}>
+                          <text fg={fadeColor(theme.textMuted, agentMetaAlpha())}>auto</text>
+                        </Show>
+                        <Show when={store.mode === "normal"}>
+                          <box flexDirection="row" gap={1}>
+                            <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>
+                            <text
+                              flexShrink={0}
+                              fg={fadeColor(leader() ? theme.textMuted : theme.text, modelMetaAlpha())}
+                            >
+                              {local.model.parsed().model}
                             </text>
-                          </Show>
-                        </box>
-                      </Show>
-                    </>
-                  )}
+                            <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{currentProviderLabel()}</text>
+                            <Show when={showVariant()}>
+                              <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>·</text>
+                              <text>
+                                <span style={{ fg: fadeColor(theme.warning, variantMetaAlpha()), bold: true }}>
+                                  {local.model.variant.current()}
+                                </span>
+                              </text>
+                            </Show>
+                          </box>
+                        </Show>
+                      </>
+                    )}
+                  </Show>
                 </Show>
               </box>
               <Show when={hasRightContent()}>
