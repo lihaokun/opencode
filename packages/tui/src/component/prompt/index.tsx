@@ -65,6 +65,13 @@ export type PromptProps = {
   visible?: boolean
   disabled?: boolean
   onSubmit?: () => void
+  /**
+   * Called when "next history" is pressed at the live input with nothing
+   * typed — the state where history has nowhere left to go. Returning true
+   * consumes the keystroke; returning false (or leaving this undefined)
+   * falls through to the same no-op move() has always produced there.
+   */
+  onHistoryNextAtBottom?: () => boolean
   ref?: (ref: PromptRef | undefined) => void
   hint?: JSX.Element
   right?: JSX.Element
@@ -912,6 +919,10 @@ export function Prompt(props: PromptProps) {
                 input.cursorOffset = input.plainText.length
               return false
             }
+
+            // Step P10: at the live input with an empty line, "next" has
+            // nowhere left to go — the route may claim the keystroke.
+            if (input.plainText.length === 0 && history.atLive() && props.onHistoryNextAtBottom?.()) return
 
             const item = history.move(1, input.plainText)
             if (!item) return false

@@ -91,6 +91,13 @@
 - **INV-4**：列表成员恒等于 `collectSubtree(root) − {root, current}`；无重复；含孙子（深度 >1 可达）。
 - **INV-5**：对任意 `move` 序列，`atLive() ⇔ store.index === 0`。
 
+> **INV-3 / INV-5 的覆盖方式（commit 2 实施时记录）**：二者属"按键级"行为——`atLive()` 是
+> 一行 getter（`store.index === 0`，由构造成立），触发合取式位于 keymap 绑定的 `run()` 内，
+> 需要 editor/keymap 测试环境才能驱动。history store 经 `createSimpleContext` 的 `init`
+> 创建，`init` 依赖 hooks，无法无渲染实例化；为测试抽取纯核心属于无第二消费者的 seam，
+> 按项目剃刀纪律不做。故 INV-5 由构造成立 + INV-4 式纯函数测试不适用；INV-3 的"未消费
+> 落回既有 move()"以代码路径唯一性论证。将作为 ⚠️ 项记录到 Step 5 的 decisions.md。
+
 ## 8. 性能契约（机械化）
 
 **N/A** —— 本子计划无性能诉求契约。列表规模上界为子树会话数（`subagent_depth` ≤ 3），不设时长/规模断言。若实现中发现渲染路径引入超线性扫描，回填本节。

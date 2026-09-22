@@ -52,6 +52,7 @@ import { DialogConfirm } from "../../ui/dialog-confirm"
 import { DialogTimeline } from "./dialog-timeline"
 import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
+import { DialogSubagentList } from "../../component/dialog-subagent-list"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
 import { filetype } from "../../util/filetype"
@@ -446,6 +447,19 @@ export function Session() {
       if (!session()?.parentID || dialog.stack.length > 0) return
       func()
     }
+  }
+
+  // Step P10 consumer: down at the exhausted prompt history opens the
+  // subagent list. Returning false hands the keystroke back to the editor —
+  // the no-op it has always been here (INV-3, Step P11).
+  function openSubagentList() {
+    if (dialog.stack.length > 0) return false
+    const rootID = session()?.parentID ?? session()?.id
+    if (!rootID) return false
+    const members = subagentListMembers(sync.data.session, rootID, route.sessionID)
+    if (members.length === 0) return false
+    dialog.replace(() => <DialogSubagentList members={members} onPick={enterChild} />)
+    return true
   }
 
   const sessionCommandList = createMemo(() => [
@@ -1298,6 +1312,7 @@ export function Session() {
                         toBottom()
                       }}
                       sessionID={route.sessionID}
+                      onHistoryNextAtBottom={openSubagentList}
                       right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
                     />
                   </pluginRuntime.Slot>
@@ -2717,6 +2732,43 @@ export function agentNotificationSummary(parts: Part[]): string | undefined {
     return typeof summary === "string" ? summary : undefined
   }
   return undefined
+}
+
+export type SubagentListMember = {
+  id: string
+  /** Hops from the view's root session: direct children are 1, grandchildren 2. */
+  depth: number
+}
+
+/**
+ * Members of the subagent list: the current view's subtree minus the root
+ * session (not a subagent — going back is the parent shortcut's job) and the
+ * session being viewed. Direct children sort first, then by creation time,
+ * so grandchildren indent beneath their elders (INV-4).
+ *
+ * Terminates like collectSubtree above; the depth walk goes strictly upward
+ * and a parentID chain cannot cycle.
+ */
+export function subagentListMembers(
+  sessions: { id: string; parentID?: string; time: { created: number } }[],
+  rootID: string,
+  currentID: string,
+): SubagentListMember[] {
+  const byId = new Map(sessions.map((item) => [item.id, item]))
+  const exclude = new Set([rootID, currentID])
+  return collectSubtree(sessions, rootID)
+    .filter((id) => !exclude.has(id))
+    .map((id) => {
+      let depth = 0
+      let cursor: string | undefined = id
+      while (cursor && cursor !== rootID) {
+        cursor = byId.get(cursor)?.parentID
+        depth += 1
+      }
+      return { id, depth, created: byId.get(id)?.time.created ?? 0 }
+    })
+    .toSorted((a, b) => a.depth - b.depth || a.created - b.created)
+    .map(({ id, depth }) => ({ id, depth }))
 }
 
 export function toolDisplay(tool: string) {
