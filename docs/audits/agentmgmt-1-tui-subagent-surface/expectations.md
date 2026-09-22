@@ -124,6 +124,7 @@
 
 ## Step 5 验证记录（实施后回填）
 
+- [ ] 手动验证清单 `manual-verification.md`（按键级/视觉级缺口的人工闭环，三 commit 合入后执行）
 - [ ] 路径 A：本仓库未自备 `scripts/contract_audit` 专用脚本；§2/§3/§4 的机械化检查以**仓库单测**承担（schema keys 集合断言、`# Step Pn:` grep、双侧常量断言），逐项回填测试名。专用脚本化仍 N/A——理由：单子计划成本 > 收益，跟踪至第二个子计划复用时再评估。
 - [ ] 路径 B：subagent 独立审（按 `templates/contract-audit/subagent-prompt-template.md`；该模板目录在本仓库尚不存在时按 §6.3 十节结构自述）
 - [ ] `audit-report.md` 0 critical / unresolved

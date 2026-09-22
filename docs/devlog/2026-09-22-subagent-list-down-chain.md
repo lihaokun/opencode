@@ -58,8 +58,9 @@ input → **再按 down 展开列表**，纯增量，不占任何既有键。
 3. **tmux 驱动真实 TUI**——进程正常启动（日志确认配置加载、无错误），但 opentui 的
    输出对 `capture-pane` 不可见（passthrough/协议协商问题），视觉断言不可达，放弃。
 
-**残余未验证**：活体 TUI 中按键→列表打开的最终一跳。已向用户提供 30 秒手动验证步骤；
-按键级回归由 skip 测试接管为完成路径。
+**残余未验证**：活体 TUI 中按键→列表打开的最终一跳。手动验证步骤已固化为
+`docs/audits/agentmgmt-1-tui-subagent-surface/manual-verification.md`（覆盖三个 commit 的
+人工闭环清单），由用户在合并前执行回填；按键级回归由 skip 测试接管为完成路径。
 
 ## 度量
 
