@@ -1362,8 +1362,29 @@ function UserMessage(props: {
 
   const compaction = createMemo(() => props.parts.find((x) => x.type === "compaction"))
 
+  // Step P12: a delegation outcome is identified by metadata only — the
+  // synthetic envelope text stays model-facing and is never parsed (INV-2).
+  const notification = createMemo(() => agentNotificationSummary(props.parts))
+
   return (
     <>
+      <Show when={notification()}>
+        {(summary) => (
+          <box
+            id={props.message.id}
+            ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
+            marginTop={props.index === 0 ? 0 : 1}
+            paddingLeft={3}
+            flexShrink={0}
+          >
+            {/* Step P13: without the metadata this branch stays hidden and the
+                message renders exactly as it did before this feature. */}
+            <text fg={theme.textMuted} wrapMode="none">
+              ↳ {summary()}
+            </text>
+          </box>
+        )}
+      </Show>
       <Show when={text()}>
         <box
           id={props.message.id}
@@ -2666,6 +2687,36 @@ export function collectSubtree(sessions: { id: string; parentID?: string }[], ro
     }
   }
   return acc
+}
+
+/**
+ * Server counterpart: this literal is written by the agent-management
+ * notification injector (packages/opencode/src/agent-management/lifecycle.ts,
+ * `NOTIFICATION_METADATA_KIND`). Part metadata is a free-form record on the
+ * SDK side, so there is nothing to import — the two constants are held
+ * together by contract-audit expectations §10 and fixture tests on both
+ * sides.
+ */
+const AGENT_NOTIFICATION_METADATA_KIND = "agent_notification"
+
+/**
+ * The one-line summary of a delegation outcome notification, if `parts`
+ * carries one. Identification is metadata-only: the synthetic envelope text
+ * is what the model reads and must stay opaque to this UI (INV-2). Returns
+ * undefined for anything else, including old transcripts — which is what
+ * keeps the pre-feature rendering untouched (Step P13).
+ *
+ * Exported so recognition can be tested without rendering, like
+ * collectSubtree above.
+ */
+export function agentNotificationSummary(parts: Part[]): string | undefined {
+  for (const part of parts) {
+    if (part.type !== "text") continue
+    if (part.metadata?.kind !== AGENT_NOTIFICATION_METADATA_KIND) continue
+    const summary = part.metadata.summary
+    return typeof summary === "string" ? summary : undefined
+  }
+  return undefined
 }
 
 export function toolDisplay(tool: string) {

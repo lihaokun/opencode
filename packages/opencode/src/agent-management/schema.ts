@@ -63,6 +63,18 @@ export const METADATA_AGENT_NAME = "agentName"
 export const METADATA_AGENT_WORKDIR = "agentWorkdir"
 
 /**
+ * TextPart.metadata.kind marking a delegation outcome notification — the
+ * synthetic message inject() writes to the caller when a background
+ * delegation settles. The TUI renders one line from `summary` and never
+ * parses the model-facing text, so this literal is the only UI-facing
+ * contract that notification carries. The TUI cannot import it (part
+ * metadata is a free-form record on the SDK side, nothing is generated for
+ * it), so it keeps its own copy; the two are held together by contract-audit
+ * expectations §10 and fixture tests on both sides.
+ */
+export const NOTIFICATION_METADATA_KIND = "agent_notification"
+
+/**
  * Instance names must not be mistakable for a SessionID, because target
  * resolution short-circuits on this prefix before doing any name lookup.
  */

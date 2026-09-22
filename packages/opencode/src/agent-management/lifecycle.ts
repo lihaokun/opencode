@@ -289,6 +289,10 @@ const layer = Layer.effect(
 
       function inject(state: "completed" | "error", text: string) {
         return Effect.gen(function* () {
+          // The summary's wording is owned here: the TUI displays it verbatim
+          // and never re-derives it from state or description.
+          const summary =
+            state === "completed" ? `Agent completed: ${input.description}` : `Agent failed: ${input.description}`
           // Re-read the parent's identity at delivery time. Passing no model lets
           // the parent's agent definition override and persist over its current
           // model, and a variant captured when the child was created would revert
@@ -314,12 +318,16 @@ const layer = Layer.effect(
                 text: AgentDelegation.renderOutput({
                   sessionID: input.session.id,
                   state,
-                  summary:
-                    state === "completed"
-                      ? `Agent completed: ${input.description}`
-                      : `Agent failed: ${input.description}`,
+                  summary,
                   text,
                 }),
+                // Step P12: the TUI renders one line from this metadata and
+                // never parses the model-facing text above — the literal and
+                // the wording both stay owned here.
+                metadata: {
+                  kind: AgentManagement.NOTIFICATION_METADATA_KIND,
+                  summary,
+                },
               },
             ],
           })

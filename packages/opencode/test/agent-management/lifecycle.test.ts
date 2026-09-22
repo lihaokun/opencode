@@ -393,6 +393,81 @@ describe("AgentLifecycle delegation notice", () => {
       expect(notice.model?.modelID).toBe(ModelV2.ID.make("m2"))
       expect(notice.variant).toBeUndefined()
     }))
+
+  it.instance("marks the completed notice with render metadata for the TUI", () =>
+    Effect.gen(function* () {
+      const lifecycle = yield* AgentLifecycle.Service
+      const sessions = yield* Session.Service
+      const root = yield* sessions.create({ title: "root" })
+      const { ops, seen } = stubOps()
+
+      yield* lifecycle.create(baseCreate(root.id, ops))
+      yield* awaitWithTimeout(
+        Effect.gen(function* () {
+          while (!seen.some((input) => input.sessionID === root.id)) yield* Effect.sleep("10 millis")
+        }),
+        "the creator was never notified",
+      )
+
+      const notice = seen.find((input) => input.sessionID === root.id)!
+      const part = notice.parts.find((item) => item.type === "text")
+      if (!part || part.type !== "text") throw new Error("notice carried no text part")
+      expect(part.text).toContain('<agent id=')
+      // The TUI's one-line hint travels only through metadata; the text stays
+      // the model-facing envelope (INV-2).
+      expect(part.metadata).toEqual({
+        kind: AgentManagement.NOTIFICATION_METADATA_KIND,
+        summary: "Agent completed: look around",
+      })
+    }))
+
+  it.instance("marks the failed notice with the failed summary", () =>
+    Effect.gen(function* () {
+      const lifecycle = yield* AgentLifecycle.Service
+      const sessions = yield* Session.Service
+      const root = yield* sessions.create({ title: "root" })
+      const seen: SessionPrompt.PromptInput[] = []
+      // Every run ends in a plain error, so classify() routes the child to the
+      // failed outcome and inject("error", ...) carries the failed summary.
+      // The parent's notification prompt has its return value ignored, so the
+      // same shape is harmless there.
+      const ops: AgentManagement.AgentPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            seen.push(input)
+            return {
+              info: {
+                role: "assistant",
+                id: "msg",
+                sessionID: input.sessionID,
+                finish: "stop",
+                error: { name: "Boom", data: { message: "exploded" } },
+                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              },
+              parts: [{ type: "text", text: "done" }],
+            } as unknown as SessionV1.WithParts
+          }),
+        deliverAsync: (input) => Effect.forkDetach(ops.prompt(input)).pipe(Effect.asVoid),
+      }
+
+      yield* lifecycle.create(baseCreate(root.id, ops))
+      yield* awaitWithTimeout(
+        Effect.gen(function* () {
+          while (!seen.some((input) => input.sessionID === root.id)) yield* Effect.sleep("10 millis")
+        }),
+        "the creator was never notified",
+      )
+
+      const notice = seen.find((input) => input.sessionID === root.id)!
+      const part = notice.parts.find((item) => item.type === "text")
+      if (!part || part.type !== "text") throw new Error("notice carried no text part")
+      expect(part.metadata).toEqual({
+        kind: AgentManagement.NOTIFICATION_METADATA_KIND,
+        summary: "Agent failed: look around",
+      })
+    }))
 })
 
 describe("AgentLifecycle workspaces", () => {
