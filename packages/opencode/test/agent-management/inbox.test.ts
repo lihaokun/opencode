@@ -408,6 +408,7 @@ describe("AgentInbox", () => {
       // Identity is the target's own — never a caller-supplied value, never the
       // default agent. This is the write-back hazard the user path exists to
       // avoid (INV-1).
+      expect(delivered.sessionID).toBe(target.id)
       expect(delivered.agent).toBe("explore")
       expect(delivered.model?.modelID).toBe(ModelV2.ID.make("m1"))
       expect(delivered.variant).toBeUndefined()

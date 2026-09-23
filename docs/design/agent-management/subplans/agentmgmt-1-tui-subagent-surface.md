@@ -116,8 +116,12 @@ httpapi handlers（新）、inbox.ts（owner）。
 
 POST /session/{sessionID}/agent-message
 payload：{ parts: PromptInput["parts"] }   ← 刻意【不含】agent/model/variant/sessionID（I1）
+query：WorkspaceRoutingQuery（directory/workspace，与既有 session 级端点同构，H4）
 响应：204 NoContent（已受理；fork/路由在 deliverAsync 内部，失败走事件流）
-错误：AgentNotFound → BadRequest
+错误：会话不存在 → 404 NotFoundError（requireSession 先行，与 prompt 同形）；
+      deliver 的 AgentNotFound → BadRequest（经 HTTP 实际不可达——requireSession
+      已把缺会话拦在前面；保留该通道与 inbox 错误类型一致）
+【路径 B 审核 §3-1/§3-2 裁决】按上述声明修订契约（实现合理，原稿漏写 404 与 query）。
 
 协议约定：
   - 调用方（TUI）：只传 parts；会话必须是子会话（v1 由 TUI 侧保证，服务端不限制——
@@ -194,6 +198,8 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   1. **输入非空不触发**——`plainText.length === 0` 守卫（用户在写东西）。
   2. **无 subagent**——路由侧回调返回 false → 现状 no-op，无任何 UI。
   3. **列表打开后按键归 dialog 栈**——复用 DialogSelect 既有按键行为，不新造。
+  4. 【路径 B 审核 §3-5 补记】**对话框已打开时不触发**——`openSubagentList` 另有
+     `dialog.stack.length > 0` 前置（良性：按键本就归 dialog 栈），实现为第 4 守卫。
 - 边界：历史为空时 `atLive()` 恒真 → 直接触发（"历史翻完"含"没有历史"）；多行非空输入光标在末尾 → 长度守卫拦下。
 - **正确性论证**：
   - 前置：`prompt.history.next` 绑定 `down`（`keybind.ts:199`），光标末尾守卫已过。
@@ -203,7 +209,7 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
 #### 5.2.3 `DialogSubagentList`（新组件）
 
 - 数据：`rootID = session()?.parentID ?? session()?.id`；成员 = `collectSubtree(sessions, rootID)` 去掉 **root 会话与当前会话**（root 不是 subagent，回根由 `up` 承担；从根视图打开时两者重合，即纯子 agent 列表）。
-- 行内容：名字 = `metadata.agentName`（SDK `Session.metadata` 已暴露）→ 缺省回退 `session.agent` 类型 → 再回退 SubagentFooter 式 title 解析；类型 = `session.agent`；状态 = `sync.data.session_status[id]?.type`（idle/busy/retry）；缩进 = 子树深度（孙子可达，直接子优先，按 `time.created` 排序）。
+- 行内容：名字 = `metadata.agentName`（SDK `Session.metadata` 已暴露）→ 缺省回退 `session.agent` 类型 → 再回退 SubagentFooter 式 title 解析 → 最终兜底占位 `"Subagent"`【路径 B 审核 §3-6 补记】；描述 = `[类型, 状态].filter(Boolean).join(" · ")`（可空）；状态 = `sync.data.session_status[id]?.type`（idle/busy/retry）；缩进 = 子树深度（孙子可达，直接子优先，按 `time.created` 排序）。
 - action：选中 → `enterChild(id)`（复用，含 retry 弹窗行为）→ `dialog.clear()`。
 - **论证**：列表项是既有跳转逻辑的枚举化（`session_child_first/cycle` 的 action 等价）；终止性 trivial（collectSubtree 已证）。
 - 无新 keybinding；不占任何既有键。
@@ -243,7 +249,11 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
 
 #### 5.3.4 `Prompt` — 接管路径
 
-- §4.4 prop；实现为模式分支链的第一个分支（`store.mode === "shell"` 分支之前，`:1059`），此时 `inputText`/`nonTextParts` 已就绪（`:1026-1037`）：分支内调 `void sdk.client.session.agentMessage({ sessionID, parts: [textPart, ...nonTextParts] })`，随后落入各分支共享的收尾（历史 append、清空、`props.onSubmit`）。
+- §4.4 prop；实现为模式分支链的第一个分支（`store.mode === "shell"` 分支之前，`:1059`），此时 `inputText`/`nonTextParts` 已就绪（`:1026-1037`）：分支委托 `props.onSubmitUserMessage({ text, parts })`，SDK 调用（`agentMessage`）由路由回调完成（§5.3.3），随后落入各分支共享的收尾（历史 append、清空、`props.onSubmit`）。
+  【路径 B 审核 §3-4 声明】连带后果（记录，v1 接受）：子会话视图内编辑器选区上下文
+  （`editorParts`）不进请求、`editor.markSelectionSent()` 不执行——选区若在子会话视图
+  就绪，会保持 pending 到下一次主会话提交。若成为实际诉求，修法是把 `editorParts` 并入
+  接管分支的 parts（payload 通道已支持）并补 markSelectionSent。
 - `local.agent/model` 的既有读取（`:961/:968`）保留——纯读，值不进 payload（I1 由 §4.3 schema 保证）；其前置守卫的两个边界见 §4.4。
 - 底部 meta 行的 agent/model 选择器（`:1446-1470`）：接管路径存在时隐藏（全局选择与本次提交无关，显示即误导）。
 - **论证**：

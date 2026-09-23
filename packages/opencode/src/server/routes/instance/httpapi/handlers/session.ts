@@ -63,9 +63,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const summary = yield* SessionSummary.Service
     const events = yield* EventV2Bridge.Service
     const inbox = yield* AgentInbox.Service
-    // The same ops slice the agent tool receives, built from SessionPrompt so
-    // the endpoint and agent_send share one path. prompt dies on error here —
-    // deliver only calls deliverAsync, which fails through the event stream.
+    // Inline construction rather than a shared factory: SessionPrompt.Service
+    // does not structurally satisfy AgentPromptOps (prompt's error channel).
+    // deliver only exercises deliverAsync, which fails through the event
+    // stream; prompt here dies on error — a branch no code path reaches today.
     const ops: AgentManagement.AgentPromptOps = {
       cancel: (sessionID) => promptSvc.cancel(sessionID),
       resolvePromptParts: (template) => promptSvc.resolvePromptParts(template),
