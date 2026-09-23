@@ -18,6 +18,7 @@
 | D11 | 测试缺口 4：HTTP 层零覆盖（§4） | **接受 + 跟踪** | handler 逻辑薄（requireSession + 一次 deliver 调用），核心语义已由 inbox 单测与 payload keys 断言覆盖；httpapi-exercise 层补测列入后续 |
 | D12 | 测试缺口 5：user 路 sessionID 断言缺失（§4） | **已修** | user 路测试补 `delivered.sessionID` 断言 |
 | D13 | inbox.test.ts 单次时序抖动（awaitWithTimeout 超时一次，复跑稳定） | **接受 + 记录** | 并行负载下的轮询超时，非产品缺陷；连续两轮全绿（103/103、19/19） |
+| D14 | v1.18.31-fmv3-beta.1 冒烟修正：payload 多余键的运行时语义是**剥离**而非拒绝——`noReply-excess` 返回 204 且 `noReply` 被丢弃（Effect Schema 默认 onExcessProperty=ignore），`missing-parts` 才 400 | **文档化** | "noReply 不可经新端点传入"的保证成立（剥离 = 无法抵达 inbox），但机制与"拒绝"不同；expectations §2 的 keys 断言描述的是 schema 形状。若要响亮拒绝可加 `onExcessProperty: "reject"`（一行），v1 不做——与 API 表面其余端点的剥离语义一致 |
 
 ## 退出核对（§6.6）
 

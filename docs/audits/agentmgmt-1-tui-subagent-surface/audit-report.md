@@ -99,3 +99,11 @@
 - 缺口 5（sessionID 断言）：**已补**——user 路测试新增 `delivered.sessionID` 断言。
 - 缺口 1-4：**维持既有处置**——atLive/触发条件/渲染分支的覆盖裁决见 expectations §7 注（skip 阻塞与补齐配方已记录）；HTTP 层覆盖缺口以 issue 跟踪，不阻断合入。
 - 单次时序抖动：`inbox.test.ts` 在并行负载下出现过 1 次 awaitWithTimeout 超时，复跑稳定（连续两轮全绿）——记录在案，非产品缺陷。
+
+## §7 发布冒烟（v1.18.31-fmv3-beta.1，linux-x64，审核后补做）
+
+- sha256 与 sha256sums.txt 一致；`--version` = `1.18.31-fmv3-beta.1`；包内嵌 `rg` 可运行
+- 隔离 XDG 起 `serve`：`/project`、`/agent` 均 200（JSON）
+- **新端点全链路**：`POST /session/{id}/agent-message` → **204**；消息落库为 `[Message from user]` + 正文两个非 synthetic text part
+- **D14 修正的实证**：`{"parts":[…],"noReply":true}` → 204 且 noReply 被剥离（未抵达 inbox）；`{"noReply":true}`（缺 parts）→ 400（校验在跑）
+- 冒烟事故记录：首次探测全部打在一个 **9 月 17 日的僵尸 opencode 进程**上（占 4921 端口、致新 serve EADDRINUSE、agent-message 落 UI catch-all 返回 HTML）——先核对**监听进程**再信状态码。
