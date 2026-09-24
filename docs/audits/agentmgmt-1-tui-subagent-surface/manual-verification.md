@@ -45,7 +45,7 @@
 | 2.7 | 列表打开后按 `up`/`down`/输入文字                                                         | 按键归列表（DialogSelect 既有行为回归）：上下移动选择、输入即过滤                                             |
 | 2.8 | 导航删除回归：按 `up`、`left`、`right`、`<leader>down`；观察子会话视图 footer             | 四键均无导航行为；footer 不再显示 Parent/Prev/Next 按钮，左侧信息（名称/序号/token/开销）保留                 |
 | 2.9 | 有 subagent 的会话，观察 assistant 消息尾部提示                                           | 提示为 `<down> view agents`（不再是 "view subagents"）                                                        |
-| 2.10 | 观察输入框右上角                                                                   | 常驻 muted 提示 `<down> agents`（键位随配置显示）；输入内容时不消失、不与正文重叠（位于输入区上方独立一行）    |
+| 2.10 | 空输入且在 live 位置时，观察输入框右上角；随后输入文字再观察                        | 显示 `down view agents`——**`down` 高亮**（leader 和弦期间保持 muted）、其余 muted；输入文字或翻历史即隐藏；行高占位不引起布局跳动 |
 
 ## 3. commit 3（#37）人 → subagent 输入（实施后适用）
 

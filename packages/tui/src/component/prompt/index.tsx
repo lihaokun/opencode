@@ -1401,10 +1401,14 @@ export function Prompt(props: PromptProps) {
             {/* Affordance for the Agents list (P1): down at the exhausted
                 history opens it. Shown exactly when the gesture would fire —
                 empty input at the live position — and the row reserves its
-                height so typing never shifts the layout. */}
+                height so typing never shifts the layout. The key renders
+                bright against the muted rest. */}
             <box flexDirection="row" justifyContent="flex-end" height={1} flexShrink={0}>
               <Show when={!store.prompt.input && history.atLive()}>
-                <text fg={theme.textMuted}>{agentsListShortcut()} agents</text>
+                <text fg={theme.textMuted}>
+                  <span style={{ fg: leader() ? theme.textMuted : theme.text }}>{agentsListShortcut()}</span> view
+                  agents
+                </text>
               </Show>
             </box>
             <textarea
