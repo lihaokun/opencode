@@ -138,10 +138,6 @@ const sessionBindingCommands = [
   "messages.copy",
   "session.copy",
   "session.export",
-  "session.child.first",
-  "session.parent",
-  "session.child.next",
-  "session.child.previous",
 ] as const
 
 const sessionGlobalBindingCommands = [
@@ -205,12 +201,6 @@ export function Session() {
     setEpilogue(sessionEpilogue({ title, sessionID: session()?.id }))
   })
   onCleanup(() => setEpilogue())
-  const children = createMemo(() => {
-    const parentID = session()?.parentID ?? session()?.id
-    return sync.data.session
-      .filter((x) => x.parentID === parentID || x.id === parentID)
-      .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-  })
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const descendants = createMemo(() => {
     const rootID = session()?.parentID ?? session()?.id
@@ -428,30 +418,6 @@ export function Session() {
     if (status?.type === "retry") void DialogAlert.show(dialog, "Retry Error", status.message)
   }
 
-  function moveFirstChild() {
-    if (children().length === 1) return
-    const next = children().find((x) => !!x.parentID)
-    if (next) enterChild(next.id)
-  }
-
-  function moveChild(direction: number) {
-    if (children().length === 1) return
-
-    const sessions = children().filter((x) => !!x.parentID)
-    let next = sessions.findIndex((x) => x.id === session()?.id) - direction
-
-    if (next >= sessions.length) next = 0
-    if (next < 0) next = sessions.length - 1
-    if (sessions[next]) enterChild(sessions[next].id)
-  }
-
-  function childSessionHandler(func: () => void) {
-    return () => {
-      if (!session()?.parentID || dialog.stack.length > 0) return
-      func()
-    }
-  }
-
   // Steps P7-P8 consumer: subagent sessions take over submission. Identity is
   // resolved server-side from the target session (I1) — nothing from the
   // globally selected agent/model enters the request, which is why this path
@@ -471,16 +437,17 @@ export function Session() {
       })
   }
 
-  // Step P10 consumer: down at the exhausted prompt history opens the
-  // subagent list. Returning false hands the keystroke back to the editor —
-  // the no-op it has always been here (INV-3, Step P11).
+  // Step P10 consumer: down at the exhausted prompt history opens the Agents
+  // list. Returning false hands the keystroke back to the editor (only when a
+  // dialog is already up — the list itself always has the tree, finding P1).
   function openSubagentList() {
     if (dialog.stack.length > 0) return false
     const rootID = session()?.parentID ?? session()?.id
     if (!rootID) return false
-    const members = subagentListMembers(sync.data.session, rootID, route.sessionID)
-    if (members.length === 0) return false
-    dialog.replace(() => <DialogSubagentList members={members} onPick={enterChild} />)
+    const members = subagentListMembers(sync.data.session, rootID)
+    dialog.replace(() => (
+      <DialogSubagentList members={members} rootID={rootID} currentID={route.sessionID} onPick={enterChild} />
+    ))
     return true
   }
 
@@ -1051,55 +1018,6 @@ export function Session() {
         dialog.clear()
       },
     },
-    {
-      title: "Go to child session",
-      value: "session.child.first",
-      category: "Session",
-      hidden: true,
-      run: () => {
-        dialog.clear()
-        moveFirstChild()
-      },
-    },
-    {
-      title: "Go to parent session",
-      value: "session.parent",
-      category: "Session",
-      hidden: true,
-      enabled: !!session()?.parentID,
-      run: childSessionHandler(() => {
-        const parentID = session()?.parentID
-        if (parentID) {
-          navigate({
-            type: "session",
-            sessionID: parentID,
-          })
-        }
-        dialog.clear()
-      }),
-    },
-    {
-      title: "Next child session",
-      value: "session.child.next",
-      category: "Session",
-      hidden: true,
-      enabled: !!session()?.parentID,
-      run: childSessionHandler(() => {
-        dialog.clear()
-        moveChild(1)
-      }),
-    },
-    {
-      title: "Previous child session",
-      value: "session.child.previous",
-      category: "Session",
-      hidden: true,
-      enabled: !!session()?.parentID,
-      run: childSessionHandler(() => {
-        dialog.clear()
-        moveChild(-1)
-      }),
-    },
   ])
 
   const sessionCommands = createMemo(() =>
@@ -1516,7 +1434,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
     return props.message.time.completed - user.time.created
   })
 
-  const childShortcut = useCommandShortcut("session.child.first")
+  const agentsShortcut = useCommandShortcut("prompt.history.next")
 
   return (
     <>
@@ -1538,8 +1456,8 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
       <Show when={props.parts.some((x) => x.type === "tool" && isSubagentTool(x.tool))}>
         <box paddingTop={1} paddingLeft={3}>
           <text fg={theme.text}>
-            {childShortcut()}
-            <span style={{ fg: theme.textMuted }}> view subagents</span>
+            {agentsShortcut()}
+            <span style={{ fg: theme.textMuted }}> view agents</span>
           </text>
         </box>
       </Show>
@@ -2360,7 +2278,9 @@ export function formatSubagentToolcalls(count: number) {
 }
 
 export function formatSubagentTitle(agent: string, description: string, background: boolean) {
-  return `${agent} Task${background ? " (background)" : ""} — ${description}`
+  // The agent type leads; no "Task" — the tool it named was removed in #35 and
+  // the word must not resurface in user-visible rows (verification finding P2).
+  return `${agent}${background ? " (background)" : ""} — ${description}`
 }
 
 export function formatSubagentRetry(attempt: number, message: string) {
@@ -2759,15 +2679,19 @@ export function agentNotificationSummary(parts: Part[]): string | undefined {
 
 export type SubagentListMember = {
   id: string
-  /** Hops from the view's root session: direct children are 1, grandchildren 2. */
+  /** Hops from the tree's root session: the root itself is 0, direct children 1, grandchildren 2. */
   depth: number
 }
 
 /**
- * Members of the subagent list: the current view's subtree minus the root
- * session (not a subagent — going back is the parent shortcut's job) and the
- * session being viewed. Direct children sort first, then by creation time,
- * so grandchildren indent beneath their elders (INV-4).
+ * Members of the Agents list: every session in the current tree — the root
+ * ("Main"), every subagent, and the session being viewed (verification finding
+ * P1). One list is the single navigation surface, so it shows where you can go
+ * from anywhere, including where you are; the view's position is conveyed by
+ * the current marker in the dialog, not by omitting rows.
+ *
+ * Direct children sort first, then by creation time, so grandchildren indent
+ * beneath their elders.
  *
  * Terminates like collectSubtree above; the depth walk goes strictly upward
  * and a parentID chain cannot cycle.
@@ -2775,12 +2699,9 @@ export type SubagentListMember = {
 export function subagentListMembers(
   sessions: { id: string; parentID?: string; time: { created: number } }[],
   rootID: string,
-  currentID: string,
 ): SubagentListMember[] {
   const byId = new Map(sessions.map((item) => [item.id, item]))
-  const exclude = new Set([rootID, currentID])
   return collectSubtree(sessions, rootID)
-    .filter((id) => !exclude.has(id))
     .map((id) => {
       let depth = 0
       let cursor: string | undefined = id

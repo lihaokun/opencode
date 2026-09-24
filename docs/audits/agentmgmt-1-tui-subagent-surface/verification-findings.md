@@ -29,7 +29,7 @@
 - `packages/sdk`：无
 - 文档连带：设计文档 §5.2.3（裁决修订）、expectations §5（"无 subagent 时 down 无反应"→"仅 Main 无变化"语义微调——根视图下列表含 Main+children，2.5 的"完全无反应"不再成立，改为"列表打开且 Main 标记"）、manual-verification §2 重写
 
-**状态**：待修
+**状态**：已修（见修复 commit）
 
 ## P2 工具行显示名仍为 "Task"，应改为 "Agent"
 
@@ -48,4 +48,5 @@
 
 **范围**：TUI 显示层；task 工具移除本身（#35）不动。
 
-**状态**：待修
+**状态**：已修——`formatSubagentTitle` 去掉 "Task"（agent 类型名打头，背景态保留
+`(background)` 标注），快照与断言同步更新；`formatTranscript` 无 "Task" 字样，无需改。

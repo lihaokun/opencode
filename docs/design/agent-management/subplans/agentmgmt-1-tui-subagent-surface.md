@@ -64,7 +64,7 @@
 ## 3. 错误处理策略
 
 - 服务端：沿用既有映射——`AgentNotFound` → `HttpApiError.BadRequest`（与 `prompt` 一致）；投递失败由 `deliverAsync` 内部的 `report` 走 `Session.Event.Error`（既有），HTTP 层不等待运行结果（204 = 已受理，与 `promptAsync` 同语义）。
-- TUI：新端点调用失败 → toast（同 `submitInner` 现有 `.catch` 分支样式）；列表空/无子会话 → 回调返回 false，维持现状（无 UI）。
+- TUI：新端点调用失败 → toast（同 `submitInner` 现有 `.catch` 分支样式）；【P1 修订】列表恒含全树（至少 Main 行），无"空列表"分支；回调仅在对话框已打开时返回 false（按键本就归 dialog 栈）。
 - 测试失败处理遵循 workflow §5.4，禁止改测试凑绿。
 
 ## 4. 数据结构定义
@@ -208,11 +208,23 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
 
 #### 5.2.3 `DialogSubagentList`（新组件）
 
-- 数据：`rootID = session()?.parentID ?? session()?.id`；成员 = `collectSubtree(sessions, rootID)` 去掉 **root 会话与当前会话**（root 不是 subagent，回根由 `up` 承担；从根视图打开时两者重合，即纯子 agent 列表）。
-- 行内容：名字 = `metadata.agentName`（SDK `Session.metadata` 已暴露）→ 缺省回退 `session.agent` 类型 → 再回退 SubagentFooter 式 title 解析 → 最终兜底占位 `"Subagent"`【路径 B 审核 §3-6 补记】；描述 = `[类型, 状态].filter(Boolean).join(" · ")`（可空）；状态 = `sync.data.session_status[id]?.type`（idle/busy/retry）；缩进 = 子树深度（孙子可达，直接子优先，按 `time.created` 排序）。
+- 数据【P1 修订，验证反馈推翻原裁决】：成员 = `collectSubtree(sessions, rootID)` **全量**——
+  root（Main 行）+ 所有 subagent + 当前会话，不再排除任何成员。理由：用户验证反馈确立
+  "单一导航面"——列表在树的任何视图内容一致，观察者位置由 current 标记表达而非删行；
+  原裁决（排除 root、回根交给 up）连同 up/left/right/<leader>down 键位一并废止。
+- 行内容：root 行固定标签 **`Main`**；其余 = `metadata.agentName` → `session.agent` 类型 →
+  title 的 `@type subagent` 段 → 占位 `"Subagent"`；描述 = `[类型, 状态, current?]` 拼接；
+  当前会话经 DialogSelect `current` 属性预选 + 描述列 `current` 标记；缩进 = 子树深度
+  （root 0 不缩进）；排序 =（深度，创建时间）。状态 = `sync.data.session_status[id]?.type`。
+- 标题/占位：`Agents` / `Filter agents`。
+- 导航唯一化【P1 修订】：删除 footer 的 Parent/Prev/Next 按钮区（左侧信息保留）与键位
+  `session_parent`/`session_child_cycle`/`session_child_cycle_reverse`/`session_child_first`
+  （up/left/right/<leader>down 归还编辑器），连带 `moveFirstChild`/`moveChild`/
+  `childSessionHandler` 与四个隐藏命令；列表 action 仍是 `enterChild` → `dialog.clear()`。
+  转录尾部提示改挂 `prompt.history.next`（"view agents"）。
 - action：选中 → `enterChild(id)`（复用，含 retry 弹窗行为）→ `dialog.clear()`。
-- **论证**：列表项是既有跳转逻辑的枚举化（`session_child_first/cycle` 的 action 等价）；终止性 trivial（collectSubtree 已证）。
-- 无新 keybinding；不占任何既有键。
+- **论证**：action 与既有跳转逻辑等价（enterChild）；终止性 trivial（collectSubtree 已证）。
+- 删除 4 个既有导航键位，不新增任何键（down 既有）。
 
 #### 5.2.4 测试
 

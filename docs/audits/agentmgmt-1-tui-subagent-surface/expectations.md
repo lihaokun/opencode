@@ -70,7 +70,7 @@
 - 四处既有 synthetic 过滤行为不变（转录文本渲染、可见消息定位、undo 聚合、跳转最后一条用户消息）。
 - 子会话视图出现输入框；提交后子会话身份（agent/model/variant）不发生任何持久化变化。
 - 主会话的提交路径逐分支不变（未提供接管回调时与基线行为等价）。
-- 无 subagent 时按 `down` 行为与今天一致（无列表、无 UI）。
+- 无 subagent 时按 `down` 仍打开 Agents 列表（至少含 Main 行）——【P1 修订】原"无列表、无 UI"语义随列表收编全树而废止；导航唯一入口不变。
 - `agent_send` 工具与 stop 通知的投递行为不变形（union 改动为纯增量包裹）。
 
 ## 6. 时序/状态契约（人审）
@@ -88,7 +88,7 @@
 - **INV-1（= I1）**：对任意目标会话，user 路投递时 `deliverAsync` 收到 `agent === target.agent ?? default`、`model === target.model`、`variant === (target.model.variant === "default" ? undefined : target.model.variant)`；且 HTTP payload schema keys 恰为 `{"parts"}`。
 - **INV-2（= I2）**：UI 识别仅经 `metadata.kind`——固定 synthetic 正文文本做任意变更的 fixture，渲染结果不变；无 metadata 的 synthetic part 渲染不变（现状）。
 - **INV-3（= I3）**：`onHistoryNextAtBottom` 未消费时，任意输入/游标/历史游标状态下按 `down` 的（输入, 游标, index）转移与基线逐分支相等。
-- **INV-4**：列表成员恒等于 `collectSubtree(root) − {root, current}`；无重复；含孙子（深度 >1 可达）。
+- **INV-4**【P1 修订，原"subtree − {root, current}"废止】：列表成员恒等于`collectSubtree(root)` 全量——含 Main（root）、当前会话与全部后代；无重复；root 行标签 Main、当前会话行带 current 标记并预选。
 - **INV-5**：对任意 `move` 序列，`atLive() ⇔ store.index === 0`。
 
 > **INV-3 / INV-5 的覆盖方式（commit 2 实施时记录；补偿验证后修订）**：二者属"按键级"行为。
