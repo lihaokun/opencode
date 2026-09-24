@@ -1398,11 +1398,12 @@ export function Prompt(props: PromptProps) {
             flexGrow={1}
             width="100%"
           >
-            {/* Persistent affordance for the Agents list (P1): down at the
-                exhausted history opens it. Top-right of the input, muted, so
-                the gesture is discoverable before it is needed. */}
+            {/* Affordance for the Agents list (P1): down at the exhausted
+                history opens it. Shown exactly when the gesture would fire —
+                empty input at the live position — and the row reserves its
+                height so typing never shifts the layout. */}
             <box flexDirection="row" justifyContent="flex-end" height={1} flexShrink={0}>
-              <Show when={agentsListShortcut()}>
+              <Show when={!store.prompt.input && history.atLive()}>
                 <text fg={theme.textMuted}>{agentsListShortcut()} agents</text>
               </Show>
             </box>
