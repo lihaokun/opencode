@@ -31,6 +31,14 @@
 
 **状态**：已修（见修复 commit）
 
+### P1 修复回归（用户复验发现，同日修复）
+
+最底层会话打开列表只有"当前 + 父会话"，且父会话被标 Main。根因：`openSubagentList`
+沿用了 `parentID ?? id` 两层级惯用法——深度 ≥ 2 时它给出的是父节点而非树根，
+`collectSubtree` 随之只收子树；组件的 `isRoot` 判定又把该节点贴上 Main。修复：新增
+纯函数 `treeRoot()`（沿 parentID 走到无父祖先，cycle 安全、链断回落自身），
+`openSubagentList` 改用之；回归测试覆盖根/中层/最底层三个座位、断链回落与未知会话。
+
 ## P2 工具行显示名仍为 "Task"，应改为 "Agent"
 
 **用户要求**（验证反馈，2026-09-23）：thinking 结束后转录里的 subagent 工具行显示

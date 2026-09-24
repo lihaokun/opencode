@@ -442,8 +442,11 @@ export function Session() {
   // dialog is already up — the list itself always has the tree, finding P1).
   function openSubagentList() {
     if (dialog.stack.length > 0) return false
-    const rootID = session()?.parentID ?? session()?.id
-    if (!rootID) return false
+    if (!session()) return false
+    // The tree's true root, not the parent — from a grandchild the idiom
+    // `parentID ?? id` yields the middle node and shrank the list to two rows
+    // with "Main" on the parent (P1 regression).
+    const rootID = treeRoot(sync.data.session, route.sessionID)
     const members = subagentListMembers(sync.data.session, rootID)
     dialog.replace(() => (
       <DialogSubagentList members={members} rootID={rootID} currentID={route.sessionID} onPick={enterChild} />
@@ -2681,6 +2684,27 @@ export type SubagentListMember = {
   id: string
   /** Hops from the tree's root session: the root itself is 0, direct children 1, grandchildren 2. */
   depth: number
+}
+
+/**
+ * The tree's root: walk parentID up to the parentless ancestor. The
+ * `parentID ?? id` idiom answers this correctly only from depth ≤ 1 — from a
+ * grandchild it yields the parent, which is how the Agents list once shrank
+ * to "current + parent" with "Main" pinned on the parent (P1 regression).
+ * Falls back to the given id when the chain is missing from the projection;
+ * terminates like collectSubtree — a parentID chain cannot cycle.
+ *
+ * Exported so the walk can be tested without rendering.
+ */
+export function treeRoot(sessions: { id: string; parentID?: string }[], sessionID: string): string {
+  const byId = new Map(sessions.map((item) => [item.id, item]))
+  const seen = new Set([sessionID])
+  let cursor = byId.get(sessionID)
+  while (cursor?.parentID && !seen.has(cursor.parentID)) {
+    seen.add(cursor.parentID)
+    cursor = byId.get(cursor.parentID)
+  }
+  return cursor?.id ?? sessionID
 }
 
 /**

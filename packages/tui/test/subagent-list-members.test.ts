@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { subagentListMembers } from "../src/routes/session/index"
+import { subagentListMembers, treeRoot } from "../src/routes/session/index"
 
 // INV-4 (revised per verification finding P1): the list is the tree's full
 // membership — root, every subagent, and the session being viewed. One list,
@@ -44,5 +44,29 @@ describe("subagentListMembers", () => {
   test("a bare session lists just itself at depth 0 (Main row)", () => {
     expect(subagentListMembers([session("root")], "root")).toEqual([{ id: "root", depth: 0 }])
     expect(subagentListMembers([], "root")).toEqual([{ id: "root", depth: 0 }])
+  })
+})
+
+// P1 regression: from a grandchild, `parentID ?? id` yields the middle node —
+// the list shrank to "current + parent" with "Main" pinned on the parent.
+describe("treeRoot", () => {
+  const tree = [
+    session("root"),
+    session("mid", "root"),
+    session("leaf", "mid"),
+  ]
+
+  test("resolves the true root from every seat in the tree", () => {
+    for (const seat of ["root", "mid", "leaf"]) {
+      expect(treeRoot(tree, seat)).toBe("root")
+    }
+  })
+
+  test("falls back to the seat itself when the chain is missing from the projection", () => {
+    expect(treeRoot([session("leaf", "gone")], "leaf")).toBe("leaf")
+  })
+
+  test("an unknown seat resolves to itself", () => {
+    expect(treeRoot([], "ses_elsewhere")).toBe("ses_elsewhere")
   })
 })
