@@ -180,6 +180,7 @@ export function Prompt(props: PromptProps) {
   const stash = usePromptStash()
   const keymap = useOpencodeKeymap()
   const agentShortcut = useCommandShortcut("agent.cycle")
+  const agentsListShortcut = useCommandShortcut("prompt.history.next")
   const paletteShortcut = useCommandShortcut("command.palette.show")
   const renderer = useRenderer()
   const exit = useExit()
@@ -1397,6 +1398,14 @@ export function Prompt(props: PromptProps) {
             flexGrow={1}
             width="100%"
           >
+            {/* Persistent affordance for the Agents list (P1): down at the
+                exhausted history opens it. Top-right of the input, muted, so
+                the gesture is discoverable before it is needed. */}
+            <box flexDirection="row" justifyContent="flex-end" height={1} flexShrink={0}>
+              <Show when={agentsListShortcut()}>
+                <text fg={theme.textMuted}>{agentsListShortcut()} agents</text>
+              </Show>
+            </box>
             <textarea
               width="100%"
               placeholder={placeholderText()}
