@@ -30,3 +30,22 @@
 - 文档连带：设计文档 §5.2.3（裁决修订）、expectations §5（"无 subagent 时 down 无反应"→"仅 Main 无变化"语义微调——根视图下列表含 Main+children，2.5 的"完全无反应"不再成立，改为"列表打开且 Main 标记"）、manual-verification §2 重写
 
 **状态**：待修
+
+## P2 工具行显示名仍为 "Task"，应改为 "Agent"
+
+**用户要求**（验证反馈，2026-09-23）：thinking 结束后转录里的 subagent 工具行显示
+`Task …`——task 工具已在 #35 被完全抛弃，用户不应再看到这个词。
+
+**机制**：`routes/session/index.tsx` 的 `toolDisplay()` 将 `agent` 工具（连同历史遗留
+`task` 工具名）映射为显示键 `"task"`，`ToolPart` 派发链与用户可见行标签都来自它。#35
+之前的遗留显示问题，非本子计划引入。
+
+**修复方向**：
+1. 显示名改 **`Agent`**（新 `agent` part 与历史 `task` part 一致；旧调用即同一机制）
+2. 内部派发键可保留（不影响用户可见）
+3. 修复时全量 grep TUI 用户可见的 `Task` 字符串一并清理，含 `formatTranscript`
+   （复制/导出路径）
+
+**范围**：TUI 显示层；task 工具移除本身（#35）不动。
+
+**状态**：待修
