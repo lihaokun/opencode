@@ -2785,7 +2785,7 @@ export function formatAgentRow(input: {
   usage: { tokens: number; pct: string | undefined } | undefined
   statusType: string | undefined
   now: number
-}): { title: string; description: string | undefined; footer: string | undefined } {
+}): { indent: string; label: string; description: string | undefined; footer: string | undefined } {
   const { member, isRoot, info, usage, statusType, now } = input
   const name = isRoot ? "Main" : typeof info?.metadata?.agentName === "string" ? info.metadata.agentName : undefined
   const type = info?.agent
@@ -2813,7 +2813,8 @@ export function formatAgentRow(input: {
     .filter(Boolean)
     .join(" · ")
   return {
-    title: `${"  ".repeat(member.depth)}${label}`,
+    indent: "  ".repeat(member.depth),
+    label,
     description: description || undefined,
     footer: footer || undefined,
   }

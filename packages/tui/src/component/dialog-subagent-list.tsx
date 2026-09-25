@@ -35,8 +35,7 @@ export function DialogSubagentList(props: {
   const options = createMemo(() =>
     props.members.map((member) => {
       const info = sync.session.get(member.id)
-      return {
-        ...formatAgentRow({
+      const row = formatAgentRow({
           member,
           isRoot: member.id === props.rootID,
           info,
@@ -46,7 +45,14 @@ export function DialogSubagentList(props: {
           }),
           statusType: sync.data.session_status[member.id]?.type,
           now: now(),
-        }),
+      })
+      // The dot lives in the gutter with the indent, so marking the current
+      // row never shifts its label relative to the other rows.
+      return {
+        title: row.label,
+        description: row.description,
+        footer: row.footer,
+        gutter: () => <text>{(member.id === props.currentID ? "● " : "  ") + row.indent}</text>,
         value: member.id,
       }
     }),

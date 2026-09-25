@@ -134,7 +134,8 @@ describe("formatAgentRow", () => {
       statusType: "busy",
       now: 61_000,
     })
-    expect(row.title).toBe("  alpha")
+    expect(row.indent).toBe("  ")
+    expect(row.label).toBe("alpha")
     expect(row.description).toBe("反方辩手立论 · explore · busy")
     expect(row.footer).toBe(`1.0K (12%) · ${Locale.duration(60_000)}`)
   })
@@ -148,7 +149,8 @@ describe("formatAgentRow", () => {
       statusType: "idle",
       now: 900_000,
     })
-    expect(row.title).toBe("Main")
+    expect(row.indent).toBe("")
+    expect(row.label).toBe("Main")
     expect(row.description).toBe("build · idle")
     expect(row.footer).toBe(`12.3K · ${Locale.duration(20_000)}`)
   })
@@ -162,7 +164,8 @@ describe("formatAgentRow", () => {
       statusType: "idle",
       now: 1,
     })
-    expect(row.title).toBe("    Explore")
+    expect(row.indent).toBe("    ")
+    expect(row.label).toBe("Explore")
     expect(row.description).toBe("inspect · idle")
   })
 
@@ -175,7 +178,8 @@ describe("formatAgentRow", () => {
       statusType: undefined,
       now: 1,
     })
-    expect(row.title).toBe("  Subagent")
+    expect(row.indent).toBe("  ")
+    expect(row.label).toBe("Subagent")
     expect(row.description).toBeUndefined()
     expect(row.footer).toBeUndefined()
   })
