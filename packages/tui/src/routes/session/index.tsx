@@ -53,6 +53,7 @@ import { DialogTimeline } from "./dialog-timeline"
 import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { DialogSubagentList } from "../../component/dialog-subagent-list"
+import { AgentsPanel } from "../../component/agents-panel"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
 import { filetype } from "../../util/filetype"
@@ -436,6 +437,18 @@ export function Session() {
         })
       })
   }
+
+  // The persistent Agents panel (finding P4): same rows as the down dialog,
+  // always on screen below the input. Shown from two members up — a lone
+  // current session would be a one-row "Main" noise strip.
+  const agentsPanelRootID = createMemo(() => {
+    if (!session()) return undefined
+    return treeRoot(sync.data.session, route.sessionID)
+  })
+  const agentsPanelMembers = createMemo(() => {
+    const rootID = agentsPanelRootID()
+    return rootID ? subagentListMembers(sync.data.session, rootID) : []
+  })
 
   // Step P10 consumer: down at the exhausted prompt history opens the Agents
   // list. Returning false hands the keystroke back to the editor (only when a
@@ -1260,6 +1273,18 @@ export function Session() {
                       right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
                     />
                   </pluginRuntime.Slot>
+                </Show>
+                <Show when={visible() ? agentsPanelRootID() : undefined} keyed>
+                  {(rootID) => (
+                    <Show when={agentsPanelMembers().length >= 2}>
+                      <AgentsPanel
+                        members={agentsPanelMembers()}
+                        rootID={rootID}
+                        currentID={route.sessionID}
+                        onPick={enterChild}
+                      />
+                    </Show>
+                  )}
                 </Show>
               </box>
             </Show>
@@ -2716,6 +2741,66 @@ export function formatListElapsed(input: {
   const running = input.statusType === "busy" || input.statusType === "retry"
   const ms = running ? Math.max(0, input.now - input.created) : Math.max(0, input.updated - input.created)
   return ms > 0 ? Locale.duration(ms) : undefined
+}
+
+/**
+ * One Agents-list row, shared by the down dialog and the persistent panel
+ * (verification finding P4) — a single owner for the row anatomy: indent +
+ * label, the muted work blurb, then type/status/current, with token spend and
+ * elapsed meters at the far right.
+ */
+export function formatAgentRow(input: {
+  member: SubagentListMember
+  isRoot: boolean
+  isCurrent: boolean
+  info?:
+    | {
+        agent?: string
+        title?: string
+        metadata?: Record<string, unknown>
+        tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+        time: { created: number; updated: number }
+      }
+    | undefined
+  statusType: string | undefined
+  now: number
+}): { title: string; description: string | undefined; footer: string | undefined } {
+  const { member, isRoot, isCurrent, info, statusType, now } = input
+  const name = isRoot ? "Main" : typeof info?.metadata?.agentName === "string" ? info.metadata.agentName : undefined
+  const type = info?.agent
+  const fromTitle = info?.title?.match(/@(\w+) subagent/)?.[1]
+  const label = name ?? type ?? (fromTitle ? Locale.titlecase(fromTitle) : isRoot ? "Main" : "Subagent")
+  const description = [
+    isRoot ? undefined : subagentDescription(info?.title),
+    type,
+    statusType,
+    isCurrent ? "current" : undefined,
+  ]
+    .filter(Boolean)
+    .join(" · ")
+  const tokens = info?.tokens
+    ? info.tokens.input +
+      info.tokens.output +
+      info.tokens.reasoning +
+      info.tokens.cache.read +
+      info.tokens.cache.write
+    : undefined
+  const footer = [
+    formatListTokens(tokens),
+    formatListElapsed({
+      statusType,
+      created: info?.time.created ?? 0,
+      updated: info?.time.updated ?? 0,
+      now,
+    }),
+  ]
+    .filter(Boolean)
+    .join(" · ")
+  return {
+    title: `${"  ".repeat(member.depth)}${label}`,
+    description: description || undefined,
+    footer: footer || undefined,
+  }
 }
 
 export type SubagentListMember = {

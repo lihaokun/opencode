@@ -1,12 +1,22 @@
 import { describe, expect, test } from "bun:test"
 import { Locale } from "../src/util/locale"
 import {
+  formatAgentRow,
   formatListElapsed,
   formatListTokens,
   subagentDescription,
   subagentListMembers,
   treeRoot,
 } from "../src/routes/session/index"
+
+const info = (over: Record<string, unknown> = {}) => ({
+  agent: "explore",
+  title: "反方辩手立论 (@general subagent)",
+  metadata: { agentName: "alpha" },
+  tokens: { input: 900, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+  time: { created: 1000, updated: 21_000 },
+  ...over,
+})
 
 // INV-4 (revised per verification finding P1): the list is the tree's full
 // membership — root, every subagent, and the session being viewed. One list,
@@ -122,5 +132,63 @@ describe("formatListElapsed", () => {
 
   test("no timestamps — no readout", () => {
     expect(formatListElapsed({ statusType: "idle", created: 0, updated: 0, now: 1000 })).toBeUndefined()
+  })
+})
+
+// Verification finding P4: the persistent panel shares the dialog's row
+// anatomy through one owner.
+describe("formatAgentRow", () => {
+  test("subagent row: indent, name, blurb, type/status/current, meters", () => {
+    const row = formatAgentRow({
+      member: { id: "a", depth: 1 },
+      isRoot: false,
+      isCurrent: true,
+      info: info(),
+      statusType: "busy",
+      now: 61_000,
+    })
+    expect(row.title).toBe("  alpha")
+    expect(row.description).toBe("反方辩手立论 · explore · busy · current")
+    expect(row.footer).toBe(`1.0k tok · ${Locale.duration(60_000)}`)
+  })
+
+  test("Main row: fixed label, no blurb, own meters", () => {
+    const row = formatAgentRow({
+      member: { id: "root", depth: 0 },
+      isRoot: true,
+      isCurrent: true,
+      info: info({ agent: "build", title: "New session", metadata: {} }),
+      statusType: "idle",
+      now: 900_000,
+    })
+    expect(row.title).toBe("Main")
+    expect(row.description).toBe("build · idle · current")
+  })
+
+  test("nameless subagent falls through type to title parse", () => {
+    const row = formatAgentRow({
+      member: { id: "x", depth: 2 },
+      isRoot: false,
+      isCurrent: false,
+      info: info({ metadata: {}, agent: undefined, title: "inspect (@explore subagent)" }),
+      statusType: "idle",
+      now: 1,
+    })
+    expect(row.title).toBe("    Explore")
+    expect(row.description).toBe("inspect · idle")
+  })
+
+  test("no info at all — placeholder label, no meters", () => {
+    const row = formatAgentRow({
+      member: { id: "y", depth: 1 },
+      isRoot: false,
+      isCurrent: false,
+      info: undefined,
+      statusType: undefined,
+      now: 1,
+    })
+    expect(row.title).toBe("  Subagent")
+    expect(row.description).toBeUndefined()
+    expect(row.footer).toBeUndefined()
   })
 })

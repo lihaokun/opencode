@@ -222,6 +222,11 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   `tokens · 时长`——token 为 `session.tokens` 聚合的紧凑格式，时长 busy/retry 时
   `now − created` 随对话框 1s tick 实时、完成后定格 `updated − created`；
   纯函数 `subagentDescription`/`formatListTokens`/`formatListElapsed` 可无渲染测试。
+- 常驻面板【P4 修订，验证反馈】：同源行解剖（`formatAgentRow` 单一 owner）以面板形态
+  常驻输入框底部（权限/提问面板之下顺位、SubagentFooter 之上），行可点击跳转、
+  1s tick 实时；树内 ≥2 成员显示；>5 行截断为 `+N more — down opens the list`
+  （原确认的"面板内滚动区"改为截断+指向对话框：非聚焦 scroll 区滚轮行为不可验证，
+  截断不吞行）；down 对话框保留为过滤/键盘导航面，两者并存。
 - 导航唯一化【P1 修订】：删除 footer 的 Parent/Prev/Next 按钮区（左侧信息保留）与键位
   `session_parent`/`session_child_cycle`/`session_child_cycle_reverse`/`session_child_first`
   （up/left/right/<leader>down 归还编辑器），连带 `moveFirstChild`/`moveChild`/
