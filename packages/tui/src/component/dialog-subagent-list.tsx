@@ -46,16 +46,17 @@ export function DialogSubagentList(props: {
           statusType: sync.data.session_status[member.id]?.type,
           now: now(),
       })
-      // P6: no dot (the primary-colored title marks the current row) and
-      // pl 0 — scrollbox(1) + 0 + Option's internal 3 puts the labels on the
-      // Filter "F" column (4) and the meters on the esc-tail column
-      // (width - 4). The tree indent travels inside the title.
+      // P6: no dot (the primary-colored title marks the current row). The
+      // 3-space prefix is measured, not stylistic: opentui ignores
+      // paddingLeft on <text> (and partially inside scrollbox rows), so the
+      // only reliable way to put the labels on the Filter "F" column (4) is
+      // literal content spacing. The meters already end on the esc-tail
+      // column (width - 4). The tree indent travels after the prefix.
       return {
-        title: row.indent + row.label,
+        title: "   " + row.indent + row.label,
         description: row.description,
         footer: row.footer,
         dot: false,
-        pl: 0,
         value: member.id,
       }
     }),
