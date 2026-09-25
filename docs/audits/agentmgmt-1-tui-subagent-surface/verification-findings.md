@@ -88,6 +88,17 @@
    的 title 拆出为独立 `indent` 字段，圆点进固定宽度前置槽（当前 `● ` / 其余两空格），
    对话框经 DialogSelect `gutter` 槽同款处理——标记不再影响任何行的缩进。
 
+### P5 修复二度回归（用户复验发现，当日修复）
+
+面板仍与输入框不齐、缩进怪异。根因（第三次）：**面板一直在手搓行布局**，与对话框的
+行渲染是两套代码，对齐靠猜必漂移。用户指路："看 down 弹出的列表的缩进怎么做的"。
+对话框真结构：`scrollbox(padding 1/1)` → 行容器（`paddingLeft = 有圆点/gutter 时 1
+否则 3`、`paddingRight 3`、`gap 1`）→ `Option`（title 自带 paddingLeft 3、description
+内联 muted、footer 右对齐）。修正：**导出 DialogSelect 的 `Option`，面板渲染同一个
+组件 + 同一行容器**（全行带 gutter → paddingLeft 恒 1；缩进与圆点同在 gutter）——
+缩进与对话框"由构造相同"，不再存在两套布局。`formatAgentRow` 维持 indent/label
+分离，两侧共用。设计文档 §5.2.3 的"面板镜像输入框框体"表述由本条取代。
+
 ## P4 Agents 列表常驻显示在输入框底部
 
 **用户要求**（验证反馈，2026-09-25）：把 Agents 列表放到输入框底部，常驻显示。

@@ -729,7 +729,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   )
 }
 
-function Option(props: {
+export function Option(props: {
   title: string
   titleView?: JSX.Element
   description?: string

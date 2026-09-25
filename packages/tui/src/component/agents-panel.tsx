@@ -1,26 +1,23 @@
 import { For, Show, createMemo, createSignal, onCleanup } from "solid-js"
+import { RGBA } from "@opentui/core"
+import { Option } from "../ui/dialog-select"
 import { useSync } from "../context/sync"
 import { useTheme } from "../context/theme"
-import { SplitBorder } from "../ui/border"
 import { contextUsage, formatAgentRow, type SubagentListMember } from "../routes/session/index"
 
 const ROW_CAP = 5
 
 /**
  * The persistent Agents panel below the input (verification finding P4): the
- * same row anatomy as the down dialog — Main, blurbs, status, live
- * token/elapsed meters — always on screen, each row click-to-jump. The down
- * dialog stays the keyboard/filter surface; this one is glanceability.
- *
- * Frame mirrors the input box (left border + inner padding 2/2), so the
- * panel's edges coincide with the input's (P5-1). The current session is
- * highlighted with a dot and the primary title color; the dot lives in a
- * fixed-width gutter that every row reserves, so marking it never shifts the
- * labels (P5-2).
- *
- * Hidden by the route when the tree has a single member (a lone Main row is
- * noise). More than ROW_CAP rows truncate with a tail pointing at the dialog
- * rather than trap rows inside an unfocused scroll region.
+ * same rows as the down dialog — because they ARE the down dialog's rows.
+ * After two rounds of hand-rolled layout drifting out of alignment, the panel
+ * now renders the dialog's own Option component inside the dialog's exact row
+ * container (conditional padding 1/3, gap 1, paddingRight 3), inside the same
+ * scrollbox padding (1/1) — so its indentation is the dialog's, by
+ * construction. Rows carry the indent and the current dot in a gutter; each
+ * row click-to-jump; meters tick once per second. The down dialog stays the
+ * keyboard/filter surface. More than ROW_CAP rows truncate with a tail
+ * pointing at it rather than trap rows in an unfocused scroll region.
  */
 export function AgentsPanel(props: {
   members: SubagentListMember[]
@@ -59,38 +56,38 @@ export function AgentsPanel(props: {
   const overflow = createMemo(() => rows().length - visible().length)
 
   return (
-    <box flexShrink={0} border={["left"]} borderColor={theme.border} customBorderChars={SplitBorder.customBorderChars}>
-      <box paddingLeft={2} paddingRight={2}>
+    <box flexShrink={0}>
+      <box paddingLeft={1} paddingRight={1}>
         <For each={visible()}>
           {(row) => (
             <box
-              flexDirection="row"
-              justifyContent="space-between"
+              flexDirection="column"
               onMouseOver={() => setHover(row.id)}
               onMouseOut={() => setHover(undefined)}
               onMouseUp={() => props.onPick(row.id)}
-              backgroundColor={hover() === row.id ? theme.backgroundElement : theme.backgroundPanel}
             >
-              <text flexShrink={0} fg={row.isCurrent ? theme.primary : theme.textMuted}>
-                {row.isCurrent ? "● " : "  "}
-                {row.indent}
-              </text>
-              <text fg={row.isCurrent ? theme.primary : theme.text} overflow="hidden" wrapMode="none">
-                {row.label}
-                <Show when={row.description}>
-                  <span style={{ fg: theme.textMuted }}> {row.description}</span>
-                </Show>
-              </text>
-              <Show when={row.footer} fallback={<box width={0} />}>
-                <text flexShrink={0} fg={theme.textMuted}>
-                  {row.footer}
-                </text>
-              </Show>
+              <box
+                flexDirection="row"
+                paddingLeft={1}
+                paddingRight={3}
+                gap={1}
+                backgroundColor={hover() === row.id ? theme.backgroundElement : RGBA.fromInts(0, 0, 0, 0)}
+              >
+                <Option
+                  title={row.label}
+                  description={row.description}
+                  footer={row.footer}
+                  current={row.isCurrent}
+                  gutter={() => <text>{(row.isCurrent ? "● " : "  ") + row.indent}</text>}
+                />
+              </box>
             </box>
           )}
         </For>
         <Show when={overflow() > 0}>
-          <text fg={theme.textMuted}>+{overflow()} more — down opens the list</text>
+          <box paddingLeft={3} paddingRight={3}>
+            <text fg={theme.textMuted}>+{overflow()} more — down opens the list</text>
+          </box>
         </Show>
       </box>
     </box>

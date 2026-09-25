@@ -233,6 +233,10 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   1s tick 实时；树内 ≥2 成员显示；>5 行截断为 `+N more — down opens the list`
   （原确认的"面板内滚动区"改为截断+指向对话框：非聚焦 scroll 区滚轮行为不可验证，
   截断不吞行）；down 对话框保留为过滤/键盘导航面，两者并存。
+- 面板行渲染【P5 二度回归修订，验证反馈】：面板**复用 DialogSelect 导出的 `Option`
+  组件与同一行容器**（条件 padding 1/3、gap 1、paddingRight 3、scrollbox padding
+  1/1），缩进与当前圆点同在 gutter——面板缩进与对话框"由构造相同"；此前手搓行布局
+  两度漂移的教训：**同一视觉行不允许存在两份渲染代码**。
 - 导航唯一化【P1 修订】：删除 footer 的 Parent/Prev/Next 按钮区（左侧信息保留）与键位
   `session_parent`/`session_child_cycle`/`session_child_cycle_reverse`/`session_child_first`
   （up/left/right/<leader>down 归还编辑器），连带 `moveFirstChild`/`moveChild`/
