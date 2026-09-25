@@ -131,8 +131,12 @@ export interface Interface {
    */
   readonly createForAgent: (input: {
     destinationRoot: string
-    baseCommit: string
+    /** Absent only when `orphan` is set: an unborn HEAD has none to offer. */
+    baseCommit?: string
     name?: string
+    /** Start on a branch with no history, the only shape git will give for a
+     * repository with nothing committed. */
+    orphan?: boolean
   }) => Effect.Effect<Info, Error>
   readonly list: () => Effect.Effect<(Omit<Info, "branch"> & { branch?: string })[], Error>
   readonly remove: (input: RemoveInput) => Effect.Effect<boolean, Error>
@@ -302,8 +306,17 @@ const layer: Layer.Layer<
 
     const createForAgent = Effect.fn("Worktree.createForAgent")(function* (input: {
       destinationRoot: string
-      baseCommit: string
+      /** Absent only when `orphan` is set: an unborn HEAD has none to offer. */
+      baseCommit?: string
       name?: string
+      /**
+       * Start the worktree on a branch with no history instead of branching
+       * from a commit. For a repository with nothing committed this is the only
+       * shape git will produce -- `worktree add` otherwise demands a commit-ish
+       * that does not exist. The result is empty either way, since nothing is
+       * committed to check out.
+       */
+      orphan?: boolean
     }) {
       const ctx = yield* InstanceState.context
       if (ctx.project.vcs !== "git") {
@@ -312,10 +325,14 @@ const layer: Layer.Layer<
       yield* fs.makeDirectory(input.destinationRoot, { recursive: true }).pipe(Effect.orDie)
       const info = yield* candidate({ root: input.destinationRoot, name: input.name ? slugify(input.name) : "" })
 
+      // --orphan refuses to run with --no-checkout, and has nothing to check
+      // out in any case, so it skips the flag and the populating reset below.
       const created = yield* git(
-        info.branch
-          ? ["worktree", "add", "--no-checkout", "-b", info.branch, info.directory, input.baseCommit]
-          : ["worktree", "add", "--no-checkout", "--detach", info.directory, input.baseCommit],
+        input.orphan
+          ? ["worktree", "add", "--orphan", "-b", info.branch!, info.directory]
+          : info.branch
+            ? ["worktree", "add", "--no-checkout", "-b", info.branch, info.directory, input.baseCommit!]
+            : ["worktree", "add", "--no-checkout", "--detach", info.directory, input.baseCommit!],
         { cwd: ctx.worktree },
       )
       if (created.code !== 0) {
@@ -327,12 +344,15 @@ const layer: Layer.Layer<
       // The ready contract. `setup` adds the worktree with --no-checkout and
       // the populating reset happens in `boot`, which `createFromInfo` forks —
       // so waiting here is the difference between an Agent seeing the project
-      // and an Agent seeing an empty directory.
-      const populated = yield* git(["reset", "--hard"], { cwd: info.directory })
-      if (populated.code !== 0) {
-        return yield* new CreateFailedError({
-          message: populated.stderr || populated.text || "Failed to populate worktree",
-        })
+      // and an Agent seeing an empty directory. An orphan branch has no commit
+      // to reset onto and is already checked out, so it skips this.
+      if (!input.orphan) {
+        const populated = yield* git(["reset", "--hard"], { cwd: info.directory })
+        if (populated.code !== 0) {
+          return yield* new CreateFailedError({
+            message: populated.stderr || populated.text || "Failed to populate worktree",
+          })
+        }
       }
 
       yield* project.addSandbox(ctx.project.id, info.directory).pipe(Effect.catch(() => Effect.void))

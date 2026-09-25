@@ -9,6 +9,7 @@ import { path as pathNode } from "@opencode-ai/core/effect/app-node-platform"
 import { InstanceBootstrap } from "@/project/bootstrap"
 import { InstanceStore } from "@/project/instance-store"
 import { Worktree } from "@/worktree"
+import { AgentManagement } from "@/agent-management/schema"
 import { AgentWorkdir } from "@/agent-management/workdir"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -81,6 +82,60 @@ describe("agent working directory", () => {
       const result = yield* AgentWorkdir.prepareWorkdir({ cwd: absolute })
       expect(result).toEqual({ path: absolute, source: "provided_cwd" })
     }))
+
+  // The reason this test exists: `git init` with nothing committed leaves HEAD
+  // naming a branch that does not exist, and `prepareWorkdir` used to read it
+  // with a plain `rev-parse HEAD` and fail the whole creation. Nothing can be
+  // branched from, but git will still open a worktree on a branch with no
+  // history, which is what a repository with no commits has to offer.
+  gitOnly(
+    "opens a worktree for a repository that has no commits yet",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        // The fixture commits a root commit of its own, so the branch ref is
+        // dropped to put HEAD back where `git init` leaves it. HEAD keeps
+        // naming the branch; the branch simply has nothing behind it.
+        const branch = (yield* run(test.directory, ["symbolic-ref", "--short", "HEAD"])).trim()
+        yield* run(test.directory, ["update-ref", "-d", `refs/heads/${branch}`])
+
+        const result = yield* AgentWorkdir.prepareWorkdir({})
+
+        expect(result.source).toBe("generated_git_worktree")
+        const fs = yield* FSUtil.Service
+        expect(yield* fs.existsSafe(result.path)).toBe(true)
+        // The repository is left exactly as it was found. Creating a commit to
+        // give HEAD something to point at would have worked too, and would have
+        // written to history the caller never asked to change.
+        const count = (yield* run(test.directory, ["rev-list", "--all", "--count"])).trim()
+        expect(count).toBe("0")
+      }),
+    { git: true },
+  )
+
+  // Guards the other direction: the unborn branch must not swallow ordinary
+  // repositories. An orphan worktree for one that has commits would hand the
+  // subagent an empty directory and none of the project.
+  gitOnly(
+    "still branches from HEAD when the repository has commits",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const fs = yield* FSUtil.Service
+        yield* fs.writeFileString(path.join(test.directory, "tracked.txt"), "present\n")
+        yield* run(test.directory, ["add", "tracked.txt"])
+        yield* run(test.directory, ["commit", "-m", "add tracked file"])
+
+        // Typed against the contract rather than the inferred union: `note` is
+        // optional on AgentWorkdir, and asserting its absence is the point.
+        const result: Omit<AgentManagement.AgentWorkdir, "enforced"> = yield* AgentWorkdir.prepareWorkdir({})
+
+        expect(result.source).toBe("generated_git_worktree")
+        expect(result.note).toBeUndefined()
+        expect(yield* fs.existsSafe(path.join(result.path, "tracked.txt"))).toBe(true)
+      }),
+    { git: true },
+  )
 
   // The value is stored on the session and read back later, so a relative one
   // would mean whatever the reader's process directory happened to be — the

@@ -477,11 +477,31 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
         - **不调 Snapshot 的 `sync`**：它会连带重写 Snapshot 自己的 block 列表（§2.2）。
         - 必要性：ripgrep 默认尊重 `info/exclude`，不登记则 `glob`/`grep` 会搜出每个工作目录的副本。
      c. `baseDirectory = parentWorkdir?.path ?? ctx.directory`；
-        `baseCommit = git -C <baseDirectory> rev-parse HEAD`。失败 → `WorktreeUnavailable`。
+        `baseCommit = git -C <baseDirectory> rev-parse --verify -q HEAD`，按退出码分三路：
+        - **0**：解析出 commit，走 d 的常规分支。
+        - **1**：HEAD 指向一个尚不存在的分支，即**仓库已 init 但从未提交**（unborn）。
+          `--verify -q` 在此返回 1 且 stderr 为空，与真错误可区分。走 d 的 orphan 分支。
+        - **其它（典型 128）**：真错误（仓库损坏等）→ `WorktreeUnavailable`，
+          **不降级**，否则会把损坏的仓库静默当成空仓库处理。
         - 显式取 baseCommit 而非依赖隐式 cwd：嵌套派生时创建者自己也在一个工作目录里。
         - 只继承父**已提交到 HEAD** 的内容；未提交修改不会出现。
      d. 调工作树内部入口：`git worktree add -b <branch> <destination> <baseCommit>` 后**等待**
         tracked files checkout 完成。
+        - **unborn 分支**：改用 `git worktree add --orphan -b <branch> <destination>`。
+          空仓库里不存在可作基点的 commit，而 `--orphan` 正是「不需要基点、在此开一条
+          全新历史」的构造方式。它**不修改用户仓库**（HEAD 仍是 unborn、提交数仍为 0），
+          产出的是真正的 linked worktree——内容为空，但那是正确的：仓库本就没有已提交内容。
+          - **不能带 `--no-checkout`**（git 拒绝二者共用），且**跳过随后的 `reset --hard`**
+            （已完成检出，且无内容可 reset）。
+          - **只在退出码为 1 时使用**。在有提交的仓库里误用 orphan 会让 Agent 拿到空目录、
+            看不到项目内容。
+          - `--orphan` 需 git ≥ 2.42，而 Ubuntu 22.04（2.34）、Debian 12（2.39）仍在支持期。
+            **不解析 `git --version`**（各发行版后缀与 `2.42.0.windows.1` 是解析陷阱），
+            改为直接尝试、失败即降级到 3 的空目录，并带上 `note` 说明原因
+            （旧 git 上 `--orphan` 在参数解析阶段即失败，不留半成品）。
+          - **不自动创建空提交来让 HEAD 可解析**：那会在用户当前分支上留下一个他没有要求的
+            提交，而此时用户往往正是还没决定要提交什么；且依赖 `user.name`/`user.email`
+            已配置。`--orphan` 达成同样目标且完全不触碰用户历史。
         - **ready 契约**：既有 `Worktree.create()` 的 `setup` 是 `--no-checkout`、
           populate 在 fork 出去的 `boot` 里（`worktree/index.ts:281-292`），返回时目录是**空的**。
           本入口必须在返回时满足"目录存在且 tracked files 完整可读"。

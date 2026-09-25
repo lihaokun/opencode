@@ -184,6 +184,10 @@ export const AgentTool = Tool.define(
           `session_id: ${info.session_id}`,
           ...(info.name ? [`name: ${info.name}`] : []),
           `working directory: ${info.workdir.path}`,
+          // Present only when the workspace is not the one that would normally
+          // have been prepared, so the caller is not left guessing why a git
+          // project produced no worktree.
+          ...(info.workdir.note ? [`note: ${info.workdir.note}`] : []),
           "",
           // Not "running": the job may not have started yet, and claiming a
           // status here would contradict agent_list a moment later.
