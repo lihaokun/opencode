@@ -145,10 +145,7 @@ export function renderOutput(input: {
   ].join("\n")
 }
 
-export type Outcome =
-  | { kind: "completed"; text: string }
-  | { kind: "failed"; text: string }
-  | { kind: "cancelled" }
+export type Outcome = { kind: "completed"; text: string } | { kind: "failed"; text: string } | { kind: "cancelled" }
 
 /**
  * Classify a finished delegation. The order is load-bearing: an abort is also an

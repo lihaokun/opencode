@@ -52,6 +52,8 @@ import { DialogConfirm } from "../../ui/dialog-confirm"
 import { DialogTimeline } from "./dialog-timeline"
 import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
+import { DialogSubagentList } from "../../component/dialog-subagent-list"
+import { AgentsPanel } from "../../component/agents-panel"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
 import { filetype } from "../../util/filetype"
@@ -137,10 +139,6 @@ const sessionBindingCommands = [
   "messages.copy",
   "session.copy",
   "session.export",
-  "session.child.first",
-  "session.parent",
-  "session.child.next",
-  "session.child.previous",
 ] as const
 
 const sessionGlobalBindingCommands = [
@@ -204,12 +202,6 @@ export function Session() {
     setEpilogue(sessionEpilogue({ title, sessionID: session()?.id }))
   })
   onCleanup(() => setEpilogue())
-  const children = createMemo(() => {
-    const parentID = session()?.parentID ?? session()?.id
-    return sync.data.session
-      .filter((x) => x.parentID === parentID || x.id === parentID)
-      .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-  })
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const descendants = createMemo(() => {
     const rootID = session()?.parentID ?? session()?.id
@@ -223,7 +215,10 @@ export function Session() {
     if (session()?.parentID) return []
     return descendants().flatMap((id) => sync.data.question[id] ?? [])
   })
-  const visible = createMemo(() => !session()?.parentID && permissions().length === 0 && questions().length === 0)
+  // Permission and question requests never appear in a child view (they are
+  // collected at the root), so dropping the parentID condition only opens the
+  // input for subagent sessions — which is Step P5's prerequisite for Step P7.
+  const visible = createMemo(() => permissions().length === 0 && questions().length === 0)
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
 
   const pending = createMemo(() => {
@@ -424,28 +419,52 @@ export function Session() {
     if (status?.type === "retry") void DialogAlert.show(dialog, "Retry Error", status.message)
   }
 
-  function moveFirstChild() {
-    if (children().length === 1) return
-    const next = children().find((x) => !!x.parentID)
-    if (next) enterChild(next.id)
+  // Steps P7-P8 consumer: subagent sessions take over submission. Identity is
+  // resolved server-side from the target session (I1) — nothing from the
+  // globally selected agent/model enters the request, which is why this path
+  // never reads local.agent or local.model.
+  function submitUserMessage(input: { text: string; parts: PromptInfo["parts"] }) {
+    void sdk.client.session
+      .agentMessage({
+        sessionID: route.sessionID,
+        parts: [{ type: "text", text: input.text }, ...input.parts],
+      })
+      .catch((error) => {
+        toast.show({
+          title: "Failed to send message",
+          message: errorMessage(error),
+          variant: "error",
+        })
+      })
   }
 
-  function moveChild(direction: number) {
-    if (children().length === 1) return
+  // The persistent Agents panel (finding P4): same rows as the down dialog,
+  // always on screen below the input. Shown from two members up — a lone
+  // current session would be a one-row "Main" noise strip.
+  const agentsPanelRootID = createMemo(() => {
+    if (!session()) return undefined
+    return treeRoot(sync.data.session, route.sessionID)
+  })
+  const agentsPanelMembers = createMemo(() => {
+    const rootID = agentsPanelRootID()
+    return rootID ? subagentListMembers(sync.data.session, rootID) : []
+  })
 
-    const sessions = children().filter((x) => !!x.parentID)
-    let next = sessions.findIndex((x) => x.id === session()?.id) - direction
-
-    if (next >= sessions.length) next = 0
-    if (next < 0) next = sessions.length - 1
-    if (sessions[next]) enterChild(sessions[next].id)
-  }
-
-  function childSessionHandler(func: () => void) {
-    return () => {
-      if (!session()?.parentID || dialog.stack.length > 0) return
-      func()
-    }
+  // Step P10 consumer: down at the exhausted prompt history opens the Agents
+  // list. Returning false hands the keystroke back to the editor (only when a
+  // dialog is already up — the list itself always has the tree, finding P1).
+  function openSubagentList() {
+    if (dialog.stack.length > 0) return false
+    if (!session()) return false
+    // The tree's true root, not the parent — from a grandchild the idiom
+    // `parentID ?? id` yields the middle node and shrank the list to two rows
+    // with "Main" on the parent (P1 regression).
+    const rootID = treeRoot(sync.data.session, route.sessionID)
+    const members = subagentListMembers(sync.data.session, rootID)
+    dialog.replace(() => (
+      <DialogSubagentList members={members} rootID={rootID} currentID={route.sessionID} onPick={enterChild} />
+    ))
+    return true
   }
 
   const sessionCommandList = createMemo(() => [
@@ -1015,55 +1034,6 @@ export function Session() {
         dialog.clear()
       },
     },
-    {
-      title: "Go to child session",
-      value: "session.child.first",
-      category: "Session",
-      hidden: true,
-      run: () => {
-        dialog.clear()
-        moveFirstChild()
-      },
-    },
-    {
-      title: "Go to parent session",
-      value: "session.parent",
-      category: "Session",
-      hidden: true,
-      enabled: !!session()?.parentID,
-      run: childSessionHandler(() => {
-        const parentID = session()?.parentID
-        if (parentID) {
-          navigate({
-            type: "session",
-            sessionID: parentID,
-          })
-        }
-        dialog.clear()
-      }),
-    },
-    {
-      title: "Next child session",
-      value: "session.child.next",
-      category: "Session",
-      hidden: true,
-      enabled: !!session()?.parentID,
-      run: childSessionHandler(() => {
-        dialog.clear()
-        moveChild(1)
-      }),
-    },
-    {
-      title: "Previous child session",
-      value: "session.child.previous",
-      category: "Session",
-      hidden: true,
-      enabled: !!session()?.parentID,
-      run: childSessionHandler(() => {
-        dialog.clear()
-        moveChild(-1)
-      }),
-    },
   ])
 
   const sessionCommands = createMemo(() =>
@@ -1298,9 +1268,23 @@ export function Session() {
                         toBottom()
                       }}
                       sessionID={route.sessionID}
+                      onHistoryNextAtBottom={openSubagentList}
+                      onSubmitUserMessage={session()?.parentID ? submitUserMessage : undefined}
                       right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
                     />
                   </pluginRuntime.Slot>
+                </Show>
+                <Show when={visible() ? agentsPanelRootID() : undefined} keyed>
+                  {(rootID) => (
+                    <Show when={agentsPanelMembers().length >= 2}>
+                      <AgentsPanel
+                        members={agentsPanelMembers()}
+                        rootID={rootID}
+                        currentID={route.sessionID}
+                        onPick={enterChild}
+                      />
+                    </Show>
+                  )}
                 </Show>
               </box>
             </Show>
@@ -1362,8 +1346,29 @@ function UserMessage(props: {
 
   const compaction = createMemo(() => props.parts.find((x) => x.type === "compaction"))
 
+  // Step P12: a delegation outcome is identified by metadata only — the
+  // synthetic envelope text stays model-facing and is never parsed (INV-2).
+  const notification = createMemo(() => agentNotificationSummary(props.parts))
+
   return (
     <>
+      <Show when={notification()}>
+        {(summary) => (
+          <box
+            id={props.message.id}
+            ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
+            marginTop={props.index === 0 ? 0 : 1}
+            paddingLeft={3}
+            flexShrink={0}
+          >
+            {/* Step P13: without the metadata this branch stays hidden and the
+                message renders exactly as it did before this feature. */}
+            <text fg={theme.textMuted} wrapMode="none">
+              ↳ {summary()}
+            </text>
+          </box>
+        )}
+      </Show>
       <Show when={text()}>
         <box
           id={props.message.id}
@@ -1457,7 +1462,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
     return props.message.time.completed - user.time.created
   })
 
-  const childShortcut = useCommandShortcut("session.child.first")
+  const agentsShortcut = useCommandShortcut("prompt.history.next")
 
   return (
     <>
@@ -1479,8 +1484,8 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
       <Show when={props.parts.some((x) => x.type === "tool" && isSubagentTool(x.tool))}>
         <box paddingTop={1} paddingLeft={3}>
           <text fg={theme.text}>
-            {childShortcut()}
-            <span style={{ fg: theme.textMuted }}> view subagents</span>
+            {agentsShortcut()}
+            <span style={{ fg: theme.textMuted }}> view agents</span>
           </text>
         </box>
       </Show>
@@ -2301,7 +2306,9 @@ export function formatSubagentToolcalls(count: number) {
 }
 
 export function formatSubagentTitle(agent: string, description: string, background: boolean) {
-  return `${agent} Task${background ? " (background)" : ""} — ${description}`
+  // The agent type leads; no "Task" — the tool it named was removed in #35 and
+  // the word must not resurface in user-visible rows (verification finding P2).
+  return `${agent}${background ? " (background)" : ""} — ${description}`
 }
 
 export function formatSubagentRetry(attempt: number, message: string) {
@@ -2666,6 +2673,210 @@ export function collectSubtree(sessions: { id: string; parentID?: string }[], ro
     }
   }
   return acc
+}
+
+/**
+ * Server counterpart: this literal is written by the agent-management
+ * notification injector (packages/opencode/src/agent-management/lifecycle.ts,
+ * `NOTIFICATION_METADATA_KIND`). Part metadata is a free-form record on the
+ * SDK side, so there is nothing to import — the two constants are held
+ * together by contract-audit expectations §10 and fixture tests on both
+ * sides.
+ */
+const AGENT_NOTIFICATION_METADATA_KIND = "agent_notification"
+
+/**
+ * The one-line summary of a delegation outcome notification, if `parts`
+ * carries one. Identification is metadata-only: the synthetic envelope text
+ * is what the model reads and must stay opaque to this UI (INV-2). Returns
+ * undefined for anything else, including old transcripts — which is what
+ * keeps the pre-feature rendering untouched (Step P13).
+ *
+ * Exported so recognition can be tested without rendering, like
+ * collectSubtree above.
+ */
+export function agentNotificationSummary(parts: Part[]): string | undefined {
+  for (const part of parts) {
+    if (part.type !== "text") continue
+    if (part.metadata?.kind !== AGENT_NOTIFICATION_METADATA_KIND) continue
+    const summary = part.metadata.summary
+    return typeof summary === "string" ? summary : undefined
+  }
+  return undefined
+}
+
+/**
+ * The delegation description embedded in a subagent's session title —
+ * `"反方辩手立论 (@general subagent)"` yields `"反方辩手立论"`. Titles without
+ * the suffix (the root session, hand-made titles) yield nothing: the row
+ * simply has no work blurb.
+ *
+ * Exported for testing without rendering, like the list helpers below.
+ */
+export function subagentDescription(title: string | undefined): string | undefined {
+  const match = title?.match(/^(.*) \(@\w+ subagent\)$/)
+  return match?.[1] || undefined
+}
+
+/**
+ * Elapsed time for an Agents list row (verification finding P3): live from
+ * creation while the agent is running (busy/retry), frozen work duration
+ * once it is done.
+ */
+export function formatListElapsed(input: {
+  statusType: string | undefined
+  created: number
+  updated: number
+  now: number
+}): string | undefined {
+  if (!input.created) return undefined
+  const running = input.statusType === "busy" || input.statusType === "retry"
+  const ms = running ? Math.max(0, input.now - input.created) : Math.max(0, input.updated - input.created)
+  return ms > 0 ? Locale.duration(ms) : undefined
+}
+
+/**
+ * The context-usage readout shared by the SubagentFooter, the Agents dialog
+ * and the persistent panel (verification finding P5-4): the last assistant
+ * message's token aggregate — what the conversation currently occupies — plus
+ * its percentage of the model's context limit. Sessions without a scoring
+ * assistant message yield undefined, which callers render as no readout.
+ */
+export function contextUsage(input: {
+  messages: {
+    role: string
+    tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+    providerID?: string
+    modelID?: string
+  }[]
+  providers: { id: string; models: Record<string, { limit?: { context?: number } }> }[]
+}): { tokens: number; pct: string | undefined } | undefined {
+  for (let i = input.messages.length - 1; i >= 0; i--) {
+    const item = input.messages[i]!
+    if (item.role !== "assistant" || !item.tokens || item.tokens.output <= 0) continue
+    const tokens =
+      item.tokens.input + item.tokens.output + item.tokens.reasoning + item.tokens.cache.read + item.tokens.cache.write
+    if (tokens <= 0) return undefined
+    const limit = input.providers.find((provider) => provider.id === item.providerID)?.models[item.modelID ?? ""]
+      ?.limit?.context
+    const pct = limit ? `${Math.round((tokens / limit) * 100)}%` : undefined
+    return { tokens, pct }
+  }
+  return undefined
+}
+
+/**
+ * One Agents-list row, shared by the down dialog and the persistent panel
+ * (verification finding P4) — a single owner for the row anatomy: indent +
+ * label, the muted work blurb, then type/status/current, with token spend and
+ * elapsed meters at the far right.
+ */
+export function formatAgentRow(input: {
+  member: SubagentListMember
+  isRoot: boolean
+  info?:
+    | {
+        agent?: string
+        title?: string
+        metadata?: Record<string, unknown>
+        time: { created: number; updated: number }
+      }
+    | undefined
+  usage: { tokens: number; pct: string | undefined } | undefined
+  statusType: string | undefined
+  now: number
+}): { indent: string; label: string; description: string | undefined; footer: string | undefined } {
+  const { member, isRoot, info, usage, statusType, now } = input
+  const name = isRoot ? "Main" : typeof info?.metadata?.agentName === "string" ? info.metadata.agentName : undefined
+  const type = info?.agent
+  const fromTitle = info?.title?.match(/@(\w+) subagent/)?.[1]
+  const label = name ?? type ?? (fromTitle ? Locale.titlecase(fromTitle) : isRoot ? "Main" : "Subagent")
+  const description = [
+    isRoot ? undefined : subagentDescription(info?.title),
+    type,
+    statusType,
+  ]
+    .filter(Boolean)
+    .join(" · ")
+  // P5-4 ruling: one readout everywhere — the context-usage convention, no
+  // "tok" unit, the percentage carrying the meaning.
+  const meter = usage ? `${Locale.number(usage.tokens)}${usage.pct ? ` (${usage.pct})` : ""}` : undefined
+  const footer = [
+    meter,
+    formatListElapsed({
+      statusType,
+      created: info?.time.created ?? 0,
+      updated: info?.time.updated ?? 0,
+      now,
+    }),
+  ]
+    .filter(Boolean)
+    .join(" · ")
+  return {
+    indent: "  ".repeat(member.depth),
+    label,
+    description: description || undefined,
+    footer: footer || undefined,
+  }
+}
+
+export type SubagentListMember = {
+  id: string
+  /** Hops from the tree's root session: the root itself is 0, direct children 1, grandchildren 2. */
+  depth: number
+}
+
+/**
+ * The tree's root: walk parentID up to the parentless ancestor. The
+ * `parentID ?? id` idiom answers this correctly only from depth ≤ 1 — from a
+ * grandchild it yields the parent, which is how the Agents list once shrank
+ * to "current + parent" with "Main" pinned on the parent (P1 regression).
+ * Falls back to the given id when the chain is missing from the projection;
+ * terminates like collectSubtree — a parentID chain cannot cycle.
+ *
+ * Exported so the walk can be tested without rendering.
+ */
+export function treeRoot(sessions: { id: string; parentID?: string }[], sessionID: string): string {
+  const byId = new Map(sessions.map((item) => [item.id, item]))
+  const seen = new Set([sessionID])
+  let cursor = byId.get(sessionID)
+  while (cursor?.parentID && !seen.has(cursor.parentID)) {
+    seen.add(cursor.parentID)
+    cursor = byId.get(cursor.parentID)
+  }
+  return cursor?.id ?? sessionID
+}
+
+/**
+ * Members of the Agents list: every session in the current tree — the root
+ * ("Main"), every subagent, and the session being viewed (verification finding
+ * P1). One list is the single navigation surface, so it shows where you can go
+ * from anywhere, including where you are; the view's position is conveyed by
+ * the current marker in the dialog, not by omitting rows.
+ *
+ * Direct children sort first, then by creation time, so grandchildren indent
+ * beneath their elders.
+ *
+ * Terminates like collectSubtree above; the depth walk goes strictly upward
+ * and a parentID chain cannot cycle.
+ */
+export function subagentListMembers(
+  sessions: { id: string; parentID?: string; time: { created: number } }[],
+  rootID: string,
+): SubagentListMember[] {
+  const byId = new Map(sessions.map((item) => [item.id, item]))
+  return collectSubtree(sessions, rootID)
+    .map((id) => {
+      let depth = 0
+      let cursor: string | undefined = id
+      while (cursor && cursor !== rootID) {
+        cursor = byId.get(cursor)?.parentID
+        depth += 1
+      }
+      return { id, depth, created: byId.get(id)?.time.created ?? 0 }
+    })
+    .toSorted((a, b) => a.depth - b.depth || a.created - b.created)
+    .map(({ id, depth }) => ({ id, depth }))
 }
 
 export function toolDisplay(tool: string) {

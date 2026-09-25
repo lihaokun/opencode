@@ -34,9 +34,7 @@ function createAdapterState(normalization: ReasoningNormalization) {
   }
 }
 
-export function adapterState(
-  options: { readonly coalesceOpenAICompatibleReasoning?: boolean } = {},
-) {
+export function adapterState(options: { readonly coalesceOpenAICompatibleReasoning?: boolean } = {}) {
   return createAdapterState(
     Object.freeze({
       coalesceOpenAICompatibleReasoning: options.coalesceOpenAICompatibleReasoning === true,
@@ -376,10 +374,7 @@ export function toLLMEvents(
     if (state.normalizationDisabled) return mapNormally(state, event)
 
     if (event.type === "reasoning-start") {
-      if (
-        event.id === openAICompatibleReasoningID &&
-        state.pendingReasoningEnd?.textID === openAICompatibleTextID
-      ) {
+      if (event.id === openAICompatibleReasoningID && state.pendingReasoningEnd?.textID === openAICompatibleTextID) {
         state.pendingReasoningEnd = undefined
         return Effect.succeed([])
       }
@@ -398,10 +393,7 @@ export function toLLMEvents(
     }
 
     if (event.type === "reasoning-delta") {
-      if (
-        event.id === openAICompatibleReasoningID &&
-        state.pendingReasoningEnd?.textID === openAICompatibleTextID
-      ) {
+      if (event.id === openAICompatibleReasoningID && state.pendingReasoningEnd?.textID === openAICompatibleTextID) {
         state.pendingReasoningEnd = undefined
         return mapNormally(state, event)
       }

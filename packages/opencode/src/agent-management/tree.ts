@@ -120,9 +120,7 @@ const layer = Layer.effect(
       // not fail in practice; if it does the store is inconsistent and
       // AgentNotFound is the honest answer.
       const parent = self.parentID ? yield* get(self.parentID) : undefined
-      const siblings = self.parentID
-        ? (yield* sessions.children(self.parentID)).filter((row) => row.id !== caller)
-        : []
+      const siblings = self.parentID ? (yield* sessions.children(self.parentID)).filter((row) => row.id !== caller) : []
 
       const members = [
         toSkeleton(self, "self", depth),

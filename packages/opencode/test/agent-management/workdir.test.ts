@@ -80,7 +80,8 @@ describe("agent working directory", () => {
       const absolute = path.join(instance.directory, "somewhere")
       const result = yield* AgentWorkdir.prepareWorkdir({ cwd: absolute })
       expect(result).toEqual({ path: absolute, source: "provided_cwd" })
-    }))
+    }),
+  )
 
   // The value is stored on the session and read back later, so a relative one
   // would mean whatever the reader's process directory happened to be — the
@@ -90,7 +91,8 @@ describe("agent working directory", () => {
       const instance = yield* TestInstance
       const result = yield* AgentWorkdir.prepareWorkdir({ cwd: "./somewhere" })
       expect(result).toEqual({ path: path.join(instance.directory, "somewhere"), source: "provided_cwd" })
-    }))
+    }),
+  )
 })
 
 const run = Effect.fn("WorkdirTest.git")(function* (cwd: string, args: string[]) {

@@ -63,6 +63,18 @@ export const METADATA_AGENT_NAME = "agentName"
 export const METADATA_AGENT_WORKDIR = "agentWorkdir"
 
 /**
+ * TextPart.metadata.kind marking a delegation outcome notification — the
+ * synthetic message inject() writes to the caller when a background
+ * delegation settles. The TUI renders one line from `summary` and never
+ * parses the model-facing text, so this literal is the only UI-facing
+ * contract that notification carries. The TUI cannot import it (part
+ * metadata is a free-form record on the SDK side, nothing is generated for
+ * it), so it keeps its own copy; the two are held together by contract-audit
+ * expectations §10 and fixture tests on both sides.
+ */
+export const NOTIFICATION_METADATA_KIND = "agent_notification"
+
+/**
  * Instance names must not be mistakable for a SessionID, because target
  * resolution short-circuits on this prefix before doing any name lookup.
  */
@@ -183,6 +195,21 @@ export interface AgentMessage {
   sender_agent: string | undefined
   body: string
 }
+
+/**
+ * A delivery into an Agent's inbox, tagged by sender kind. "agent" is agent_send
+ * traffic and the single cancellation notice — messages from another session,
+ * whose fields land in the rendered header and are escaped accordingly. "user"
+ * is a message from the human through the TUI: no sender session exists, the
+ * header is a fixed string with nothing to escape, and the body travels as
+ * parts so file attachments get the same treatment as a normal prompt.
+ *
+ * Both kinds flow through one identity resolution — the target's own
+ * agent/model/variant — which is why they share a single deliver entry.
+ */
+export type InboxMessage =
+  | { kind: "agent"; message: AgentMessage }
+  | { kind: "user"; message: { target: SessionID; parts: SessionPrompt.PromptInput["parts"] } }
 
 /**
  * As strong as the existing HTTP 204: the asynchronous request was accepted and
