@@ -237,6 +237,12 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   组件与同一行容器**（条件 padding 1/3、gap 1、paddingRight 3、scrollbox padding
   1/1），缩进与当前圆点同在 gutter——面板缩进与对话框"由构造相同"；此前手搓行布局
   两度漂移的教训：**同一视觉行不允许存在两份渲染代码**。
+- 面板布局定稿【P5 三修，验证反馈最终版】：面板**不再复用 Option**——用户要求无圆点
+  （primary 高亮已表达当前会话）、左缘对齐上一行目录路径的字形列（容器+1，Option 内置
+  paddingLeft 3 无法达到）与行距拉开。定稿为刻意独立的紧凑布局：`marginTop 1` +
+  `paddingLeft 1` + 极简行（indent+label+blurb 左 / 仪表右）+ 行点击跳转；"复用 Option"
+  的上一版表述废止。规则修订：**同一观感的行不允许两份渲染代码**——面板与对话框现为
+  刻意不同的观感，各自一份是合法的。
 - 导航唯一化【P1 修订】：删除 footer 的 Parent/Prev/Next 按钮区（左侧信息保留）与键位
   `session_parent`/`session_child_cycle`/`session_child_cycle_reverse`/`session_child_first`
   （up/left/right/<leader>down 归还编辑器），连带 `moveFirstChild`/`moveChild`/
