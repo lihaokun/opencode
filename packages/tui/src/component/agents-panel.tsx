@@ -57,7 +57,11 @@ export function AgentsPanel(props: {
 
   return (
     <box flexShrink={0}>
-      <box paddingLeft={1} paddingRight={1}>
+      {/* Right padding stays 0 at both levels: the route container already
+          insets the panel by 2, and the input's bottom hints line ("…
+          commands") ends exactly at that same container edge — the meters
+          must end there too. Left keeps the dialog's 1 + 1. */}
+      <box paddingLeft={1}>
         <For each={visible()}>
           {(row) => (
             <box
@@ -69,7 +73,6 @@ export function AgentsPanel(props: {
               <box
                 flexDirection="row"
                 paddingLeft={1}
-                paddingRight={3}
                 gap={1}
                 backgroundColor={hover() === row.id ? theme.backgroundElement : RGBA.fromInts(0, 0, 0, 0)}
               >
