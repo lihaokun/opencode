@@ -1,6 +1,5 @@
 import { For, Show, createMemo, createSignal, onCleanup } from "solid-js"
 import { RGBA } from "@opentui/core"
-import { Option } from "../ui/dialog-select"
 import { useSync } from "../context/sync"
 import { useTheme } from "../context/theme"
 import { contextUsage, formatAgentRow, type SubagentListMember } from "../routes/session/index"
@@ -56,43 +55,44 @@ export function AgentsPanel(props: {
   const overflow = createMemo(() => rows().length - visible().length)
 
   return (
-    <box flexShrink={0}>
-      {/* Right padding stays 0 at both levels: the route container already
-          insets the panel by 2, and the input's bottom hints line ("…
-          commands") ends exactly at that same container edge — the meters
-          must end there too. Left keeps the dialog's 1 + 1. */}
-      <box paddingLeft={1}>
-        <For each={visible()}>
-          {(row) => (
-            <box
-              flexDirection="column"
-              onMouseOver={() => setHover(row.id)}
-              onMouseOut={() => setHover(undefined)}
-              onMouseUp={() => props.onPick(row.id)}
-            >
-              <box
-                flexDirection="row"
-                paddingLeft={1}
-                gap={1}
-                backgroundColor={hover() === row.id ? theme.backgroundElement : RGBA.fromInts(0, 0, 0, 0)}
-              >
-                <Option
-                  title={row.label}
-                  description={row.description}
-                  footer={row.footer}
-                  current={row.isCurrent}
-                  gutter={() => <text>{(row.isCurrent ? "● " : "  ") + row.indent}</text>}
-                />
-              </box>
-            </box>
-          )}
-        </For>
-        <Show when={overflow() > 0}>
-          <box paddingLeft={3} paddingRight={3}>
-            <text fg={theme.textMuted}>+{overflow()} more — down opens the list</text>
+    // The panel is deliberately its own compact layout, not the dialog's: the
+    // hints line above carries the directory path at container+1 (its
+    // marginLeft) and ends at the container edge ("... commands"), so the
+    // panel sits one line down (marginTop), starts its glyphs at container+1
+    // (paddingLeft 1, no gutter, no dot -- the primary title marks the
+    // current session) and ends its meters at the container edge. Rows stay
+    // clickable.
+  <box flexShrink={0} marginTop={1} paddingLeft={1}>
+    <For each={visible()}>
+      {(row) => {
+        const isCurrent = row.id === props.currentID
+        return (
+          <box
+            flexDirection="row"
+            justifyContent="space-between"
+            onMouseOver={() => setHover(row.id)}
+            onMouseOut={() => setHover(undefined)}
+            onMouseUp={() => props.onPick(row.id)}
+            backgroundColor={hover() === row.id ? theme.backgroundElement : RGBA.fromInts(0, 0, 0, 0)}
+          >
+            <text fg={isCurrent ? theme.primary : theme.text} overflow="hidden" wrapMode="none">
+              {row.indent + row.label}
+              <Show when={row.description}>
+                <span style={{ fg: theme.textMuted }}> {row.description}</span>
+              </Show>
+            </text>
+            <Show when={row.footer} fallback={<box width={0} />}>
+              <text flexShrink={0} fg={theme.textMuted}>
+                {row.footer}
+              </text>
+            </Show>
           </box>
-        </Show>
-      </box>
-    </box>
+        )
+      }}
+    </For>
+    <Show when={overflow() > 0}>
+      <text fg={theme.textMuted}>+{overflow()} more -- down opens the list</text>
+    </Show>
+  </box>
   )
 }
