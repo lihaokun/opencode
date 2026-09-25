@@ -66,6 +66,13 @@ export interface DialogSelectOption<T = any> {
   categoryView?: JSX.Element
   disabled?: boolean
   bg?: RGBA
+  /** Set false to suppress the built-in current-row dot; the Agent dialog
+   * highlights its current row by title color alone. Default true. */
+  dot?: boolean
+  /** Overrides the row container's left padding (default: 1 for dot/gutter
+   * rows, 3 otherwise). The Agent dialog sets 0 so its labels land on the
+   * Filter "F" column. */
+  pl?: number
   gutter?: () => JSX.Element
   margin?: JSX.Element
   onSelect?: (ctx: DialogContext) => void
@@ -666,7 +673,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
                         >
                           <box
                             flexDirection="row"
-                            paddingLeft={current() || option.gutter ? 1 : 3}
+                            paddingLeft={option.pl ?? (current() || option.gutter ? 1 : 3)}
                             paddingRight={3}
                             gap={1}
                             backgroundColor={
@@ -691,6 +698,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
                               description={option.description !== category ? option.description : undefined}
                               active={active()}
                               current={current()}
+                              dot={option.dot}
                               muted={actionFocused()}
                               gutter={option.gutter}
                             />
@@ -735,6 +743,8 @@ export function Option(props: {
   description?: string
   active?: boolean
   current?: boolean
+  /** Set false to suppress the built-in current-row dot. Default true. */
+  dot?: boolean
   muted?: boolean
   footer?: JSX.Element | string
   titleWidth?: number
@@ -753,7 +763,7 @@ export function Option(props: {
 
   return (
     <>
-      <Show when={props.current && !props.gutter}>
+      <Show when={props.current && props.dot !== false && !props.gutter}>
         <text flexShrink={0} fg={text()} marginRight={0}>
           ●
         </text>

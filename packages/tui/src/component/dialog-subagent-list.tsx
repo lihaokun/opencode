@@ -46,13 +46,16 @@ export function DialogSubagentList(props: {
           statusType: sync.data.session_status[member.id]?.type,
           now: now(),
       })
-      // The dot lives in the gutter with the indent, so marking the current
-      // row never shifts its label relative to the other rows.
+      // P6: no dot (the primary-colored title marks the current row) and
+      // pl 0 — scrollbox(1) + 0 + Option's internal 3 puts the labels on the
+      // Filter "F" column (4) and the meters on the esc-tail column
+      // (width - 4). The tree indent travels inside the title.
       return {
-        title: row.label,
+        title: row.indent + row.label,
         description: row.description,
         footer: row.footer,
-        gutter: () => <text>{(member.id === props.currentID ? "● " : "  ") + row.indent}</text>,
+        dot: false,
+        pl: 0,
         value: member.id,
       }
     }),

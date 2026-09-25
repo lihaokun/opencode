@@ -166,3 +166,23 @@ Option）：`marginTop 1`（行距）+ `paddingLeft 1`（左缘=路径字形列�
 2. `● ` 前缀插在带缩进的标题前，当前行比其他行凸出 2 列。修正：缩进从 `formatAgentRow`
    的 title 拆出为独立 `indent` 字段，圆点进固定宽度前置槽（当前 `● ` / 其余两空格），
    对话框经 DialogSelect `gutter` 槽同款处理——标记不再影响任何行的缩进。
+
+## P6 down 对话框：去圆点 + 行列与 Filter/esc 对齐
+
+**用户要求**（验证反馈，2026-09-25）：down 弹出的 Agents 列表删掉当前行的圆点；
+行最左侧与过滤框占位符 "Filter" 的 F 对齐；最右侧与底部提示行 "esc" 的尾部对齐。
+
+**几何推导**（静态算术，非猜测）：F 的字形列 = 标题块 `paddingLeft 4` = 容器 +4；
+esc 尾列 = `paddingRight 4` = width−4。对话框行经 `scrollbox(padding 1/1)` →
+行容器（条件 pl 1/3、pr 3）→ `Option`（title 内置 `paddingLeft 3`）：
+- 无 gutter 的行：标签列 = 1+3 = **4 = F ✓**；仪表右缘 = 1+3 = **width−4 = esc 尾 ✓**
+- 唯一障碍：Option 对 current 行内绘 `●`（占列且行 pl 变 1 → 标签 5 且带回圆点）
+
+**实现**：`DialogSelectOption` 新增两个 additive 选项（默认不变，其他对话框零影响）：
+- `dot?: boolean`（默认 true）= false 时抑制 Option 内置圆点（行容器仍给 pl 1，
+  但无圆点列 → 标签 1+3 = 4 = F；仪表 width−4 = esc 尾）
+- `pl?: number` = 行容器左 padding 显式覆盖（本对话框未用到 0 档，留作该类需求的
+  通用出口——**反悔记录**：实施时先做了 pl 覆盖，后发现 dot:false + 无 gutter 的行
+  天然落在 pl 3 档即满足 F/esc，故行上只传 `dot: false`；pl 作为通用出口保留）
+
+**状态**：已修（本轮）
