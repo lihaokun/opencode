@@ -2,7 +2,7 @@ import { createMemo, createSignal, onCleanup } from "solid-js"
 import { useDialog } from "../ui/dialog"
 import { DialogSelect } from "../ui/dialog-select"
 import { useSync } from "../context/sync"
-import { formatAgentRow, type SubagentListMember } from "../routes/session/index"
+import { contextUsage, formatAgentRow, type SubagentListMember } from "../routes/session/index"
 
 /**
  * The Agents list opened from the session view (Step P10). Rows are display
@@ -39,8 +39,11 @@ export function DialogSubagentList(props: {
         ...formatAgentRow({
           member,
           isRoot: member.id === props.rootID,
-          isCurrent: member.id === props.currentID,
           info,
+          usage: contextUsage({
+            messages: sync.data.message[member.id] ?? [],
+            providers: sync.data.provider,
+          }),
           statusType: sync.data.session_status[member.id]?.type,
           now: now(),
         }),

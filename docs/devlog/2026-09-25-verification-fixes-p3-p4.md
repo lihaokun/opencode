@@ -1,4 +1,4 @@
-# devlog — 人工验证修复轮二（子计划 agentmgmt-1：P3 行仪表 / P4 常驻面板）
+# devlog — 人工验证修复轮二（子计划 agentmgmt-1：P3 行仪表 / P4 常驻面板 / P5 四项修正）
 
 日期：2026-09-25　分支：`agentmgmt-1-tui-subagent-surface`
 
@@ -39,3 +39,19 @@
 | 发现 bug 数 | 1（路径事故，当轮修正）+ 1（正则漏括号，测试抓出即修） |
 | 修复 bug 数 | 2 |
 | 迭代轮次 | 2（P3 一轮；P4 一轮含两处类型修正） |
+
+## P5（同日追加）：面板四项修正
+
+1. **对齐**：面板容器改 `paddingLeft 5 / paddingRight 3`（左对齐转录文本列、右对齐输入
+   框内边右缘）——列基准从 JSX padding 链推得，待用户实测确认
+2. **当前行高亮**：`●` + primary；`formatAgentRow` 删除 isCurrent/current 文字标记
+   （高亮归渲染面，行装配不再掺呈现语义）
+3. **删输入框提示行**：面板常驻后冗余
+4. **计数口径统一（用户选 1）**：新共享纯函数 `contextUsage`（最后一条 assistant 消息
+   聚合 + % of limit）为 footer/对话框/面板唯一 owner；footer 重构复用（显示不变）；
+   `session.tokens` 累计口径与 `formatListTokens` 删除。教训：**写"消耗量"之前先问
+   口径**——累计 vs 上下文占用是两个都会被叫"token 数"的数，先核实投影实现
+   （projector 是累加）再讨论，避免空对空。
+
+度量：新增 ~90（contextUsage + 面板高亮 + 测试 3 例），删除 ~45（提示行/
+formatListTokens/旧口径）；文件 7；测试 TUI 235 跑 / 4 skip / 0 fail。

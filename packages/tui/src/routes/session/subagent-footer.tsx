@@ -3,8 +3,8 @@ import { useRouteData } from "../../context/route"
 import { useSync } from "../../context/sync"
 import { useTheme } from "../../context/theme"
 import { SplitBorder } from "../../ui/border"
-import type { AssistantMessage } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
+import { contextUsage } from "./index"
 import { useTerminalDimensions } from "@opentui/solid"
 
 // Informational only since verification finding P1: navigation lives in the
@@ -34,25 +34,19 @@ export function SubagentFooter() {
   })
 
   const usage = createMemo(() => {
-    const msg = messages()
-    const last = msg.findLast((item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0)
-    if (!last) return
+    // The shared context-usage readout (P5-4): one convention across the
+    // footer, the Agents dialog and the persistent panel.
+    const readout = contextUsage({ messages: messages(), providers: sync.data.provider })
+    if (!readout) return
 
-    const tokens =
-      last.tokens.input + last.tokens.output + last.tokens.reasoning + last.tokens.cache.read + last.tokens.cache.write
-    if (tokens <= 0) return
-
-    const model = sync.data.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
-    const pct = model?.limit.context ? `${Math.round((tokens / model.limit.context) * 100)}%` : undefined
     const cost = session()?.cost ?? 0
-
     const money = new Intl.NumberFormat("en-US", {
       style: "currency",
       currency: "USD",
     })
 
     return {
-      context: pct ? `${Locale.number(tokens)} (${pct})` : Locale.number(tokens),
+      context: `${Locale.number(readout.tokens)}${readout.pct ? ` (${readout.pct})` : ""}`,
       cost: cost > 0 ? money.format(cost) : undefined,
     }
   })

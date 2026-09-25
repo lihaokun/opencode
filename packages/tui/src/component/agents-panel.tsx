@@ -1,7 +1,7 @@
 import { For, Show, createMemo, createSignal, onCleanup } from "solid-js"
 import { useSync } from "../context/sync"
 import { useTheme } from "../context/theme"
-import { formatAgentRow, type SubagentListMember } from "../routes/session/index"
+import { contextUsage, formatAgentRow, type SubagentListMember } from "../routes/session/index"
 
 const ROW_CAP = 5
 
@@ -34,8 +34,11 @@ export function AgentsPanel(props: {
       ...formatAgentRow({
         member,
         isRoot: member.id === props.rootID,
-        isCurrent: member.id === props.currentID,
         info: sync.session.get(member.id),
+        usage: contextUsage({
+          messages: sync.data.message[member.id] ?? [],
+          providers: sync.data.provider,
+        }),
         statusType: sync.data.session_status[member.id]?.type,
         now: now(),
       }),
@@ -45,9 +48,11 @@ export function AgentsPanel(props: {
   const overflow = createMemo(() => rows().length - visible().length)
 
   return (
-    <box flexShrink={0} paddingLeft={2} paddingRight={2}>
+    <box flexShrink={0} paddingLeft={5} paddingRight={3}>
       <For each={visible()}>
-        {(row) => (
+        {(row) => {
+          const isCurrent = row.id === props.currentID
+          return (
           <box
             flexDirection="row"
             justifyContent="space-between"
@@ -57,7 +62,10 @@ export function AgentsPanel(props: {
             backgroundColor={hover() === row.id ? theme.backgroundElement : theme.backgroundPanel}
           >
             <text fg={theme.text} overflow="hidden" wrapMode="none">
-              {row.title}
+              <Show when={isCurrent}>
+                <span style={{ fg: theme.primary }}>● </span>
+              </Show>
+              <span style={{ fg: isCurrent ? theme.primary : theme.text }}>{row.title}</span>
               <Show when={row.description}>
                 <span style={{ fg: theme.textMuted }}> {row.description}</span>
               </Show>
@@ -68,7 +76,8 @@ export function AgentsPanel(props: {
               </text>
             </Show>
           </box>
-        )}
+          )
+        }}
       </For>
       <Show when={overflow() > 0}>
         <box backgroundColor={theme.backgroundPanel}>

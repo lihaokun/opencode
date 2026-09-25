@@ -221,7 +221,13 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   `(@type subagent)` 后缀，Main 不加）→ 最右侧 footer 槽（flexShrink 0）显示
   `tokens · 时长`——token 为 `session.tokens` 聚合的紧凑格式，时长 busy/retry 时
   `now − created` 随对话框 1s tick 实时、完成后定格 `updated − created`；
-  纯函数 `subagentDescription`/`formatListTokens`/`formatListElapsed` 可无渲染测试。
+  纯函数 `subagentDescription`/`formatListElapsed`/`contextUsage`/`formatAgentRow`
+  可无渲染测试。
+- 面板修正【P5 修订，验证反馈】：容器对齐转录文本列（左 5）与输入框内边右缘（右 3）；
+  当前行 `●` + primary 高亮（`current` 文字标记删除）；输入框右上角 `down view agents`
+  提示删除（面板常驻后冗余）；**计量口径统一**——共享纯函数 `contextUsage`（最后一条
+  assistant 消息聚合 + % of limit）为 footer/对话框/面板三处的唯一 owner，
+  `session.tokens` 累计口径与 `formatListTokens`（"tok" 单位）删除（用户裁决选项 1）。
 - 常驻面板【P4 修订，验证反馈】：同源行解剖（`formatAgentRow` 单一 owner）以面板形态
   常驻输入框底部（权限/提问面板之下顺位、SubagentFooter 之上），行可点击跳转、
   1s tick 实时；树内 ≥2 成员显示；>5 行截断为 `+N more — down opens the list`

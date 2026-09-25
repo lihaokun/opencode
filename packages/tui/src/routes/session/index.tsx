@@ -2718,14 +2718,6 @@ export function subagentDescription(title: string | undefined): string | undefin
   return match?.[1] || undefined
 }
 
-/** Compact token readout for an Agents list row. */
-export function formatListTokens(tokens: number | undefined): string | undefined {
-  if (tokens === undefined) return undefined
-  if (tokens < 1000) return `${tokens} tok`
-  if (tokens < 1_000_000) return `${(tokens / 1000).toFixed(1)}k tok`
-  return `${(tokens / 1_000_000).toFixed(1)}M tok`
-}
-
 /**
  * Elapsed time for an Agents list row (verification finding P3): live from
  * creation while the agent is running (busy/retry), frozen work duration
@@ -2744,6 +2736,36 @@ export function formatListElapsed(input: {
 }
 
 /**
+ * The context-usage readout shared by the SubagentFooter, the Agents dialog
+ * and the persistent panel (verification finding P5-4): the last assistant
+ * message's token aggregate — what the conversation currently occupies — plus
+ * its percentage of the model's context limit. Sessions without a scoring
+ * assistant message yield undefined, which callers render as no readout.
+ */
+export function contextUsage(input: {
+  messages: {
+    role: string
+    tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+    providerID?: string
+    modelID?: string
+  }[]
+  providers: { id: string; models: Record<string, { limit?: { context?: number } }> }[]
+}): { tokens: number; pct: string | undefined } | undefined {
+  for (let i = input.messages.length - 1; i >= 0; i--) {
+    const item = input.messages[i]!
+    if (item.role !== "assistant" || !item.tokens || item.tokens.output <= 0) continue
+    const tokens =
+      item.tokens.input + item.tokens.output + item.tokens.reasoning + item.tokens.cache.read + item.tokens.cache.write
+    if (tokens <= 0) return undefined
+    const limit = input.providers.find((provider) => provider.id === item.providerID)?.models[item.modelID ?? ""]
+      ?.limit?.context
+    const pct = limit ? `${Math.round((tokens / limit) * 100)}%` : undefined
+    return { tokens, pct }
+  }
+  return undefined
+}
+
+/**
  * One Agents-list row, shared by the down dialog and the persistent panel
  * (verification finding P4) — a single owner for the row anatomy: indent +
  * label, the muted work blurb, then type/status/current, with token spend and
@@ -2752,20 +2774,19 @@ export function formatListElapsed(input: {
 export function formatAgentRow(input: {
   member: SubagentListMember
   isRoot: boolean
-  isCurrent: boolean
   info?:
     | {
         agent?: string
         title?: string
         metadata?: Record<string, unknown>
-        tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
         time: { created: number; updated: number }
       }
     | undefined
+  usage: { tokens: number; pct: string | undefined } | undefined
   statusType: string | undefined
   now: number
 }): { title: string; description: string | undefined; footer: string | undefined } {
-  const { member, isRoot, isCurrent, info, statusType, now } = input
+  const { member, isRoot, info, usage, statusType, now } = input
   const name = isRoot ? "Main" : typeof info?.metadata?.agentName === "string" ? info.metadata.agentName : undefined
   const type = info?.agent
   const fromTitle = info?.title?.match(/@(\w+) subagent/)?.[1]
@@ -2774,19 +2795,14 @@ export function formatAgentRow(input: {
     isRoot ? undefined : subagentDescription(info?.title),
     type,
     statusType,
-    isCurrent ? "current" : undefined,
   ]
     .filter(Boolean)
     .join(" · ")
-  const tokens = info?.tokens
-    ? info.tokens.input +
-      info.tokens.output +
-      info.tokens.reasoning +
-      info.tokens.cache.read +
-      info.tokens.cache.write
-    : undefined
+  // P5-4 ruling: one readout everywhere — the context-usage convention, no
+  // "tok" unit, the percentage carrying the meaning.
+  const meter = usage ? `${Locale.number(usage.tokens)}${usage.pct ? ` (${usage.pct})` : ""}` : undefined
   const footer = [
-    formatListTokens(tokens),
+    meter,
     formatListElapsed({
       statusType,
       created: info?.time.created ?? 0,

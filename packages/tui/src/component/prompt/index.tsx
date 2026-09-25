@@ -180,7 +180,6 @@ export function Prompt(props: PromptProps) {
   const stash = usePromptStash()
   const keymap = useOpencodeKeymap()
   const agentShortcut = useCommandShortcut("agent.cycle")
-  const agentsListShortcut = useCommandShortcut("prompt.history.next")
   const paletteShortcut = useCommandShortcut("command.palette.show")
   const renderer = useRenderer()
   const exit = useExit()
@@ -1398,19 +1397,6 @@ export function Prompt(props: PromptProps) {
             flexGrow={1}
             width="100%"
           >
-            {/* Affordance for the Agents list (P1): down at the exhausted
-                history opens it. Shown exactly when the gesture would fire —
-                empty input at the live position — and the row reserves its
-                height so typing never shifts the layout. The key renders
-                bright against the muted rest. */}
-            <box flexDirection="row" justifyContent="flex-end" height={1} flexShrink={0}>
-              <Show when={!store.prompt.input && history.atLive()}>
-                <text fg={theme.textMuted}>
-                  <span style={{ fg: leader() ? theme.textMuted : theme.text }}>{agentsListShortcut()}</span> view
-                  agents
-                </text>
-              </Show>
-            </box>
             <textarea
               width="100%"
               placeholder={placeholderText()}

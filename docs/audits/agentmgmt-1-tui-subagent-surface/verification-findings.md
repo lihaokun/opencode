@@ -94,3 +94,26 @@
 - 位置：输入框之下、（子会话视图时）SubagentFooter 之上
 
 **状态**：已修（本轮）
+
+
+## P5 常驻面板四项修正（对齐 / 当前行高亮 / 删提示 / 计数口径统一）
+
+**用户要求**（验证反馈，2026-09-25）：
+1. 面板左缘未与上面转录的目录路径对齐、右缘未与输入框内 commands 末尾对齐
+2. 面板应高亮标记当前显示的 agent（修订：`current` 文字标记删掉，只保留视觉高亮）
+3. 输入框内的 `down view agents` 提示删掉（面板常驻后冗余；转录尾部提示保留）
+4. 面板 token 计数与 footer/状态栏不一致
+
+**实现**：
+1. 面板容器 `paddingLeft 5 / paddingRight 3`——左缘对齐转录文本列（外层 2 + 消息
+   border/padding 3），右缘对齐输入框内边右缘；以实测为准，偏差一行即调
+2. 当前行：行首 `●` + 名称 primary 主题色（与对话框选中同视觉语言）；
+   `formatAgentRow` 删除 `isCurrent`/`current` 文字标记（高亮归各渲染面）
+3. 提示行与 accessor 删除
+4. **口径裁决（用户选 1）**：新共享纯函数 `contextUsage`（最后一条 assistant 消息
+   聚合 + % of context limit）为唯一 owner——footer、对话框、面板三处同源；
+   footer 重构为调用它（显示不变）；面板删除 `session.tokens` 累计口径；
+   `formatListTokens`（"tok" 单位）连带删除。运行时语义注记：HttpApi payload
+   多余键为剥离非拒绝（沿用 D14 结论），与本条无关，防混淆特此注明。
+
+**状态**：已修（本轮）
