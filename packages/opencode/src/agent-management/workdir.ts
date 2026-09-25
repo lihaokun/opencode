@@ -40,15 +40,15 @@ export const prepareWorkdir = Effect.fn("AgentWorkdir.prepare")(function* (input
 
   const destinationRoot = pathSvc.join(ctx.directory, WORKTREE_ROOT)
 
-  if (ctx.project.vcs !== "git") {
-    // Entirely new ground: the worktree service refuses non-git outright, so
-    // there is nothing to reuse. An empty directory, and the Agent is told where
-    // the source is and left to copy what it needs.
-    // A monotonic unique id, not a timestamp: two workspaces created in the
-    // same millisecond would land on the same directory. Slug.create is no use
-    // here either — 29 adjectives by 31 nouns is 899 combinations, so it
-    // collides at even odds by the 35th directory. It is a display name, not an
-    // identifier.
+  // An empty directory, with the Agent told where the source is and left to
+  // copy what it needs. Reached both when the project is not a git repository
+  // at all and when git declines to give a worktree for one that is.
+  //
+  // A monotonic unique id, not a timestamp: two workspaces created in the same
+  // millisecond would land on the same directory. Slug.create is no use here
+  // either — 29 adjectives by 31 nouns is 899 combinations, so it collides at
+  // even odds by the 35th directory. It is a display name, not an identifier.
+  const emptyWorkspace = Effect.fn("AgentWorkdir.emptyWorkspace")(function* (note?: string) {
     const directory = pathSvc.join(destinationRoot, Identifier.create("agent", "ascending"))
     const made = yield* fs.ensureDir(directory).pipe(Effect.exit)
     if (Exit.isFailure(made)) {
@@ -57,19 +57,28 @@ export const prepareWorkdir = Effect.fn("AgentWorkdir.prepare")(function* (input
         paths: [directory],
       })
     }
-    return { path: directory, source: "generated_empty_workspace" as const }
-  }
+    return { path: directory, source: "generated_empty_workspace" as const, ...(note ? { note } : {}) }
+  })
+
+  // The worktree service refuses non-git outright, so there is nothing to reuse.
+  if (ctx.project.vcs !== "git") return yield* emptyWorkspace()
 
   yield* registerIgnore({ worktreeDir: ctx.worktree, destinationRoot })
 
   const baseDirectory = input.parentWorkdir?.path ?? ctx.directory
-  const head = yield* runGit(["rev-parse", "HEAD"], baseDirectory)
-  if (head.code !== 0) {
+  // `--verify -q` separates the three outcomes that matter. 0 resolves to a
+  // commit. 1 means HEAD names a branch that does not exist yet -- a repository
+  // that has been initialised and never committed to -- and says so quietly,
+  // with an empty stderr. Anything else is a genuine failure and keeps the hard
+  // error it always had, so a broken repository is not silently downgraded.
+  const head = yield* runGit(["rev-parse", "--verify", "-q", "HEAD"], baseDirectory)
+  if (head.code !== 0 && head.code !== 1) {
     return yield* new AgentManagement.WorktreeUnavailable({
       reason: `could not read HEAD of ${baseDirectory}: ${head.stderr || head.text}`,
       paths: [],
     })
   }
+  const unborn = head.code === 1
 
   // Looked up rather than depended on. Making it a layer dependency would drag
   // the project store and its bootstrap into every layer that can reach the
@@ -83,9 +92,24 @@ export const prepareWorkdir = Effect.fn("AgentWorkdir.prepare")(function* (input
     })
   }
   const created = yield* worktree
-    .createForAgent({ destinationRoot, baseCommit: head.text.trim() })
+    .createForAgent(
+      unborn ? { destinationRoot, orphan: true } : { destinationRoot, baseCommit: head.text.trim() },
+    )
     .pipe(Effect.exit)
   if (Exit.isFailure(created)) {
+    // An unborn HEAD needs `worktree add --orphan`, which git only grew in
+    // 2.42 -- and Ubuntu 22.04 and Debian 12 are both still supported with
+    // older ones. Rather than parse `git --version`, whose release suffixes and
+    // `2.42.0.windows.1` forms are their own trap, the call is simply attempted
+    // and an empty workspace serves where it fails: that is what a project
+    // without git already gets, and a repository with nothing committed is in
+    // the same position. The reason travels back so the caller is not left
+    // wondering why a git project produced no worktree.
+    if (unborn) {
+      return yield* emptyWorkspace(
+        `${baseDirectory} has no commits yet and this git could not create a worktree without one, so the workspace starts empty. Commit something for later subagents to get a real worktree, or pass cwd to place one somewhere specific.`,
+      )
+    }
     // Only promises no Session, no prompt and no Agent. Anything already written
     // to info/exclude, and any directory or branch created on the way, may
     // survive; the paths go back with the error for a human to deal with.

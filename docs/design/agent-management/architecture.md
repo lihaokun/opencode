@@ -159,13 +159,21 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
   - value: "generated_git_worktree" | "generated_empty_workspace" | "provided_cwd"
 
 语义：
-  - generated_git_worktree    Git 项目，本 feature 建的真实 git worktree
-  - generated_empty_workspace 非 Git 项目，本 feature 建的空目录
+  - generated_git_worktree    Git 项目，本 feature 建的真实 git worktree。
+                              仓库无任何提交（unborn HEAD）时，该 worktree 开在一条
+                              无历史的 orphan 分支上——同样是真实 worktree，内容为空，
+                              因为仓库本就没有已提交内容。用户仓库不被修改。
+  - generated_empty_workspace 本 feature 建的普通空目录。两种情形共用：非 Git 项目；
+                              以及 unborn 仓库上 git 版本过旧、无法建 orphan worktree
+                              而降级（此时 note 说明原因）。
   - provided_cwd              调用方经 cwd 指定，本 feature 未创建任何东西
 
 类型不变量：
   - 三者互斥且穷尽
   - provided_cwd 的目录不由本 feature 管理，任何情况下都不被本 feature 删除
+  - **取值只表达「工作目录是怎么来的」，不表达「为什么」**。降级的缘由由 AgentWorkdir.note
+    承载：该枚举全仓库只有一个消费者（决定 Agent 收到哪段开场指令），而降级出的空目录
+    需要的正是空目录那段指令，为它新增取值会被那个唯一消费者立刻抹平。
 
 跨模块共享性：跨模块共享 — consumer: M4（产出）、M5（渲染）
 ```
@@ -586,9 +594,14 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 未给 cwd + Git 项目：
   destination = <项目目录>/.opencode/worktrees/<slug>          ← 平铺，不嵌套
   baseDirectory = 父 Session 的 metadata.agentWorkdir.path ?? instance directory
-  baseCommit    = git -C <baseDirectory> rev-parse HEAD
-  git worktree add -b <branch> <destination> <baseCommit>
-  → 必须等 tracked files checkout 完成（ready 契约）
+  baseCommit    = git -C <baseDirectory> rev-parse --verify -q HEAD
+    exit 0   → git worktree add -b <branch> <destination> <baseCommit>
+               → 必须等 tracked files checkout 完成（ready 契约）
+    exit 1   → 仓库无任何提交（unborn HEAD），没有可作基点的 commit
+               → git worktree add --orphan -b <branch> <destination>
+                 （不能带 --no-checkout，且跳过 reset --hard；用户仓库不被修改）
+               → 失败（git < 2.42）则降级为空目录并附 note 说明
+    其它     → WorktreeUnavailable（真错误，不降级）
   source = generated_git_worktree
 
 未给 cwd + 非 Git 项目：
