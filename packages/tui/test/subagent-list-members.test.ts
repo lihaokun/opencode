@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test"
-import { subagentListMembers, treeRoot } from "../src/routes/session/index"
+import { Locale } from "../src/util/locale"
+import {
+  formatListElapsed,
+  formatListTokens,
+  subagentDescription,
+  subagentListMembers,
+  treeRoot,
+} from "../src/routes/session/index"
 
 // INV-4 (revised per verification finding P1): the list is the tree's full
 // membership — root, every subagent, and the session being viewed. One list,
@@ -68,5 +75,52 @@ describe("treeRoot", () => {
 
   test("an unknown seat resolves to itself", () => {
     expect(treeRoot([], "ses_elsewhere")).toBe("ses_elsewhere")
+  })
+})
+
+// Verification finding P3: row blurb and right-hand meters.
+describe("subagentDescription", () => {
+  test("strips the @type subagent suffix from the session title", () => {
+    expect(subagentDescription("反方辩手立论 (@general subagent)")).toBe("反方辩手立论")
+  })
+
+  test("yields nothing without the suffix (root, hand-made titles)", () => {
+    expect(subagentDescription("New session")).toBeUndefined()
+    expect(subagentDescription(undefined)).toBeUndefined()
+  })
+
+  test("yields nothing for an empty description", () => {
+    expect(subagentDescription("(@general subagent)")).toBeUndefined()
+  })
+})
+
+describe("formatListTokens", () => {
+  test("formats compactly across magnitudes", () => {
+    expect(formatListTokens(0)).toBe("0 tok")
+    expect(formatListTokens(999)).toBe("999 tok")
+    expect(formatListTokens(1000)).toBe("1.0k tok")
+    expect(formatListTokens(12_345)).toBe("12.3k tok")
+    expect(formatListTokens(1_234_567)).toBe("1.2M tok")
+  })
+
+  test("no tokens yet — no readout", () => {
+    expect(formatListTokens(undefined)).toBeUndefined()
+  })
+})
+
+describe("formatListElapsed", () => {
+  test("runs live from creation while busy or retrying", () => {
+    const input = { statusType: "busy", created: 1000, updated: 2000, now: 61_000 }
+    expect(formatListElapsed(input)).toBe(Locale.duration(60_000))
+    expect(formatListElapsed({ ...input, statusType: "retry" })).toBe(Locale.duration(60_000))
+  })
+
+  test("freezes to the work duration when done", () => {
+    const input = { statusType: "idle", created: 1000, updated: 21_000, now: 900_000 }
+    expect(formatListElapsed(input)).toBe(Locale.duration(20_000))
+  })
+
+  test("no timestamps — no readout", () => {
+    expect(formatListElapsed({ statusType: "idle", created: 0, updated: 0, now: 1000 })).toBeUndefined()
   })
 })

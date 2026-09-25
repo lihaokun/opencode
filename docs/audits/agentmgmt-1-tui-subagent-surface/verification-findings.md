@@ -58,3 +58,22 @@
 
 **状态**：已修——`formatSubagentTitle` 去掉 "Task"（agent 类型名打头，背景态保留
 `(background)` 标注），快照与断言同步更新；`formatTranscript` 无 "Task" 字样，无需改。
+
+
+## P3 Agents 列表行信息补全：工作简述 + 实时 token/时长
+
+**用户要求**（验证反馈，2026-09-25）：每个 subagent 名称之后加工作内容的一句话描述；
+行最右侧实时显示 token 消耗与已运行时间。
+
+**实现**（用户确认后直接修）：
+- 简述 = 子会话标题剥去 `(@type subagent)` 后缀（委派时模型给的一句话，零新数据），
+  muted 内联在名称之后；Main 行不加
+- 右侧 = `session.tokens` 聚合（紧凑格式 `12.3k tok`）+ 时长（busy/retry =
+  `now − created` 随对话框内 1s tick 实时跳动；完成后定格 `updated − created`）；
+  Main 行同样显示（对称）
+- 渲染槽位：description 内联（名称后）、footer 右对齐（flexShrink 0 恒可见），
+  超长简述被行宽裁剪、右侧数据永不被挤
+- 纯函数 `subagentDescription` / `formatListTokens` / `formatListElapsed` 可无渲染测试
+  （11 例；正则漏括号被"正常用例"当场抓出）
+
+**状态**：已修（本轮）

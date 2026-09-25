@@ -217,6 +217,11 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   当前会话经 DialogSelect `current` 属性预选 + 描述列 `current` 标记；缩进 = 子树深度
   （root 0 不缩进）；排序 =（深度，创建时间）。状态 = `sync.data.session_status[id]?.type`。
 - 标题/占位：`Agents` / `Filter agents`。
+- 行解剖【P3 修订，验证反馈】：名称（Main / 解析链）→ muted 简述（子会话标题剥去
+  `(@type subagent)` 后缀，Main 不加）→ 最右侧 footer 槽（flexShrink 0）显示
+  `tokens · 时长`——token 为 `session.tokens` 聚合的紧凑格式，时长 busy/retry 时
+  `now − created` 随对话框 1s tick 实时、完成后定格 `updated − created`；
+  纯函数 `subagentDescription`/`formatListTokens`/`formatListElapsed` 可无渲染测试。
 - 导航唯一化【P1 修订】：删除 footer 的 Parent/Prev/Next 按钮区（左侧信息保留）与键位
   `session_parent`/`session_child_cycle`/`session_child_cycle_reverse`/`session_child_first`
   （up/left/right/<leader>down 归还编辑器），连带 `moveFirstChild`/`moveChild`/

@@ -2680,6 +2680,44 @@ export function agentNotificationSummary(parts: Part[]): string | undefined {
   return undefined
 }
 
+/**
+ * The delegation description embedded in a subagent's session title —
+ * `"反方辩手立论 (@general subagent)"` yields `"反方辩手立论"`. Titles without
+ * the suffix (the root session, hand-made titles) yield nothing: the row
+ * simply has no work blurb.
+ *
+ * Exported for testing without rendering, like the list helpers below.
+ */
+export function subagentDescription(title: string | undefined): string | undefined {
+  const match = title?.match(/^(.*) \(@\w+ subagent\)$/)
+  return match?.[1] || undefined
+}
+
+/** Compact token readout for an Agents list row. */
+export function formatListTokens(tokens: number | undefined): string | undefined {
+  if (tokens === undefined) return undefined
+  if (tokens < 1000) return `${tokens} tok`
+  if (tokens < 1_000_000) return `${(tokens / 1000).toFixed(1)}k tok`
+  return `${(tokens / 1_000_000).toFixed(1)}M tok`
+}
+
+/**
+ * Elapsed time for an Agents list row (verification finding P3): live from
+ * creation while the agent is running (busy/retry), frozen work duration
+ * once it is done.
+ */
+export function formatListElapsed(input: {
+  statusType: string | undefined
+  created: number
+  updated: number
+  now: number
+}): string | undefined {
+  if (!input.created) return undefined
+  const running = input.statusType === "busy" || input.statusType === "retry"
+  const ms = running ? Math.max(0, input.now - input.created) : Math.max(0, input.updated - input.created)
+  return ms > 0 ? Locale.duration(ms) : undefined
+}
+
 export type SubagentListMember = {
   id: string
   /** Hops from the tree's root session: the root itself is 0, direct children 1, grandchildren 2. */
