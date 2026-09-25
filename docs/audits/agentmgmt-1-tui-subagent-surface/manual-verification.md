@@ -47,6 +47,7 @@
 | 2.9 | 有 subagent 的会话，观察 assistant 消息尾部提示                                           | 提示为 `<down> view agents`（不再是 "view subagents"；输入框右上角提示已删除——P5）                                                        |
 | 2.11 | 有**运行中**子 agent 时打开列表，停留观察右侧时长列；待其完成后再打开                 | 运行中：时长每秒递增（如 `1m 03s`）；完成后：定格为工作时长不再跳动；token 数在子 agent 产出后增长 |
 | 2.12 | 观察输入框底部的**常驻 Agents 面板**：左缘对齐转录文本列、右缘对齐输入框内边右缘；当前会话行 `●` + primary 高亮；鼠标悬停/点击行；树内仅剩 1 个会话时观察；子 agent 多于 5 个时观察尾部；token 计数与 footer 对照 | 左右缘对齐；当前行 `●` + primary 色（无 current 文字）；悬停高亮、点击直接跳转；单成员时面板隐藏；>5 行截断为 `+N more — down opens the list`；**面板 token 数与 footer 一致（同 `contextUsage` 口径）** |
+| 2.13 | 按 `down` 打开 Agents 对话框（P6 复验）：观察圆点、行标签列、仪表右缘 | 无圆点（当前行以 primary 高亮）；**标签列与 Filter 占位符 "F" 对齐**；**仪表右缘与底部 "esc" 尾对齐** |
 
 ## 3. commit 3（#37）人 → subagent 输入（实施后适用）
 

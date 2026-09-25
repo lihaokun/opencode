@@ -243,6 +243,10 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   `paddingLeft 1` + 极简行（indent+label+blurb 左 / 仪表右）+ 行点击跳转；"复用 Option"
   的上一版表述废止。规则修订：**同一观感的行不允许两份渲染代码**——面板与对话框现为
   刻意不同的观感，各自一份是合法的。
+- 对话框行对齐【P6 修订，验证反馈】：圆点删除（primary 高亮表达当前行）、行标签列
+  与 Filter 占位符 "F" 对齐（容器+4）、仪表右缘与 "esc" 尾对齐（width−4）。实现为
+  `DialogSelectOption` 的两个 additive 选项 `dot?: boolean` / `pl?: number`
+  （默认维持原行为，其他对话框零影响）。
 - 导航唯一化【P1 修订】：删除 footer 的 Parent/Prev/Next 按钮区（左侧信息保留）与键位
   `session_parent`/`session_child_cycle`/`session_child_cycle_reverse`/`session_child_first`
   （up/left/right/<leader>down 归还编辑器），连带 `moveFirstChild`/`moveChild`/
