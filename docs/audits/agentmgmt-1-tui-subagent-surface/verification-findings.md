@@ -78,15 +78,6 @@
 
 **状态**：已修（本轮）
 
-### P5 修复二回归根因（用户复验"左未对齐"，实测定位）
-
-三轮对齐失败的**真正根因**由测量测试（`dialog-select-agents.test.tsx`，渲染真实
-DialogSelect 并 captureCharFrame 逐列测量）定位：**opentui 的 `<text>` 元素不认
-`paddingLeft`**（box 才认）——Option 内部 3 列、行容器 3 列全被布局吞掉，标签恒在
-gutter/scrollbox 给出的列。修复：对话框行标题用**内容前缀空格**（3 空格 + 树缩进 +
-名称）——内容空格必然渲染，标签列 = Filter 的 F 列（4），仪表右缘 = esc 尾
-（width−4，实测一致）。对齐从此由逐列测量测试钉死，不再靠 padding 推算。
-
 ### P5 修复回归（用户复验发现，同日修复）
 
 1. 对齐仍未中：首次按猜的 `paddingLeft 5 / paddingRight 3` 落偏。根因：未先读输入框

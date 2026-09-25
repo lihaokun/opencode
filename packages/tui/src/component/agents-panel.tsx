@@ -69,8 +69,6 @@ export function AgentsPanel(props: {
         return (
           <box
             flexDirection="row"
-            paddingLeft={3}
-            paddingRight={3}
             justifyContent="space-between"
             onMouseOver={() => setHover(row.id)}
             onMouseOut={() => setHover(undefined)}
