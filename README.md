@@ -1,3 +1,8 @@
+> **这是 [anomalyco/opencode](https://github.com/anomalyco/opencode) 的 fork。**
+> 在上游之上加了 Agent 管理能力（`agent` / `agent_list` / `agent_send` / `agent_stop` 四个工具，替代原 `task`）和一批 session 层修复。
+> `main` 稳定、`dev` 实验；安装见 [`FORK_INSTALL.md`](FORK_INSTALL.md)，各版本变化见 [Releases](https://github.com/lihaokun/opencode/releases)。
+> 上游原版 README 如下。
+
 <p align="center">
   <a href="https://opencode.ai">
     <picture>
