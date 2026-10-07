@@ -15,6 +15,7 @@ import { Permission } from "@/permission"
 import { AGENT_LIST_TOOL_ID } from "@/tool/agent"
 import { AgentTree } from "@/agent-management/tree"
 import { AgentInbox } from "@/agent-management/inbox"
+import { AgentManagement } from "@/agent-management/schema"
 import { AgentStatusProjection } from "@/agent-management/status"
 
 /** Marks a roster part so a later turn can find the most recent one. */
@@ -95,18 +96,44 @@ export const applyAgentRoster = Effect.fn("SessionReminders.applyAgentRoster")(f
   const ruleset = Permission.merge(input.agent?.permission ?? [], input.session.permission ?? [])
   if (Permission.evaluate(AGENT_LIST_TOOL_ID, "*", ruleset).action === "deny") return input.messages
 
-  const rows = yield* Effect.forEach(children, (child) =>
-    projection.of(child.session_id).pipe(
-      Effect.map((status) => {
-        // Escaped for the same reason a message header is: a name comes from
-        // the model, and a newline in one would forge a row of its own.
-        const type = AgentInbox.escapeField(child.agent_type ?? "agent")
-        const label = child.name ? `${AgentInbox.escapeField(child.name)} (${type})` : `(${type})`
-        return `  ${child.session_id}  ${label}  ${status}`
-      }),
-    ),
-  )
-  const text = [AGENT_ROSTER_SENTINEL, "Your subagents at this point:", ...rows].join("\n")
+  // Running only. The old list was every child the session had ever started,
+  // which is what "at this point" promised and what made it grow without
+  // bound: on one real session it reached 133 rows of which 6 were running,
+  // was re-injected whenever any of the other 127 changed state, and came to
+  // 58% of the text in the recent window. What a reader needs is who is
+  // working alongside it now; the full picture is agent_list's job, and
+  // reaching anyone at all is agent_send's.
+  const live = yield* Effect.forEach(children, (child) =>
+    projection.of(child.session_id).pipe(Effect.map((status) => (status === "running" ? child : undefined))),
+  ).pipe(Effect.map((items) => items.filter((item) => item !== undefined)))
+
+  // Newest first, then capped. A session that fans out widely would otherwise
+  // trade one unbounded list for a slightly shorter unbounded list.
+  const ordered = live.toSorted((a, b) => b.time_created - a.time_created)
+  const shown = ordered.slice(0, AgentManagement.ROSTER_MAX_ROWS)
+  const rows = shown.map((child) => {
+    // Escaped for the same reason a message header is: the name and the title
+    // both come from the model, and a newline in either would forge a row of
+    // its own. The title carries the agent type already -- it is built as
+    // `<description> (@<type> subagent)` -- so there is no separate type here.
+    const name = child.name ? `${AgentInbox.escapeField(child.name)}  ` : ""
+    return `  ${child.session_id}  ${name}— ${AgentInbox.escapeField(child.title)}`
+  })
+  const omitted = ordered.length - shown.length
+  // Facts only, no tool directions: the model has the tool descriptions, and a
+  // line that says what to call would be repeated at the start of every turn.
+  // When nothing is running the roster still says so in one line rather than
+  // vanishing -- a parent whose children have all finished keeps the one fact
+  // that it has them, and the count tells it how many it has to account for.
+  const finished = children.length - live.length
+  const text = [
+    AGENT_ROSTER_SENTINEL,
+    rows.length === 0
+      ? `Your subagents working right now: none (${finished} finished).`
+      : "Your subagents working right now:",
+    ...rows,
+    ...(omitted > 0 ? [`  ${omitted} more are running.`] : []),
+  ].join("\n")
 
   const previous = input.messages
     .flatMap((msg) => msg.parts)
