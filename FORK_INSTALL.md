@@ -1,5 +1,10 @@
 # Fork 安装说明
 
+> **分支**：`main` 是稳定线，发布版从它构建；`dev` 是实验线，改动先落这里跑一阵再晋升到 `main`。
+> 想要已发布的版本看 [Releases](https://github.com/lihaokun/opencode/releases)；想试最新改动就从 `dev` 构建。
+> 无论在哪个分支构建，`OPENCODE_CHANNEL` 都保持 `dev`——它决定的是数据目录（`opencode-dev.db`），不是分支；
+> 不设时它会取当前分支名，在 `main` 上裸构建会得到一份空的 `opencode-main.db`。
+
 本 fork 需要**从源码构建**并自定义版本号(当前为 `1.18.31-fmv2`),因为:
 
 - 官方的 `curl … | bash` 安装脚本和 `npm i -g opencode-ai` 只**下载已发布的预编译版本**,装不出我们 fork 的改动;

@@ -13,6 +13,16 @@ import { SessionID } from "../session/schema"
  */
 export type AgentStatus = "running" | "idle"
 
+/**
+ * How many Agents an injected roster or neighbour snapshot will name.
+ *
+ * The lists exist so a reader knows it has company and who that is; enumerating
+ * everyone is agent_list's job and reaching anyone is agent_send's. Ten keeps a
+ * widely fanned-out session from trading one unbounded list for a longer one,
+ * and sits at the same order of magnitude as the task prompt it travels with.
+ */
+export const ROSTER_MAX_ROWS = 10
+
 /** Where an Agent's suggested working directory came from. */
 export type WorkdirSource = "generated_git_worktree" | "generated_empty_workspace" | "provided_cwd"
 
@@ -25,6 +35,17 @@ export interface AgentWorkdir {
    * it, so this path is a suggestion carried in the Agent's initial prompt.
    */
   enforced: false
+  /**
+   * Why this is not the workspace that would normally be prepared, in words
+   * meant for the person reading the tool's output. Absent when nothing needs
+   * explaining, which is the usual case.
+   *
+   * Deliberately not another `WorkdirSource`: that value decides which opening
+   * instruction the subagent receives, and a workspace that fell back here
+   * needs exactly the instruction an empty one already gets. A separate value
+   * would have to be collapsed back into the old one at its only reader.
+   */
+  note?: string
 }
 
 export type AgentRelation = "self" | "parent" | "child" | "sibling"

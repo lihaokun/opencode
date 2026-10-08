@@ -159,13 +159,21 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
   - value: "generated_git_worktree" | "generated_empty_workspace" | "provided_cwd"
 
 语义：
-  - generated_git_worktree    Git 项目，本 feature 建的真实 git worktree
-  - generated_empty_workspace 非 Git 项目，本 feature 建的空目录
+  - generated_git_worktree    Git 项目，本 feature 建的真实 git worktree。
+                              仓库无任何提交（unborn HEAD）时，该 worktree 开在一条
+                              无历史的 orphan 分支上——同样是真实 worktree，内容为空，
+                              因为仓库本就没有已提交内容。用户仓库不被修改。
+  - generated_empty_workspace 本 feature 建的普通空目录。两种情形共用：非 Git 项目；
+                              以及 unborn 仓库上 git 版本过旧、无法建 orphan worktree
+                              而降级（此时 note 说明原因）。
   - provided_cwd              调用方经 cwd 指定，本 feature 未创建任何东西
 
 类型不变量：
   - 三者互斥且穷尽
   - provided_cwd 的目录不由本 feature 管理，任何情况下都不被本 feature 删除
+  - **取值只表达「工作目录是怎么来的」，不表达「为什么」**。降级的缘由由 AgentWorkdir.note
+    承载：该枚举全仓库只有一个消费者（决定 Agent 收到哪段开场指令），而降级出的空目录
+    需要的正是空目录那段指令，为它新增取值会被那个唯一消费者立刻抹平。
 
 跨模块共享性：跨模块共享 — consumer: M4（产出）、M5（渲染）
 ```
@@ -381,11 +389,19 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
 
 类型不变量：
   - 只含**直接子**，不含父与兄弟（后两者与本 Agent 的决策关系不大，agent_list 随时可查）
-  - 每项含 session_id、name（若有）、agent_type、status
-  - 无直接子时不产出本结构（不注入任何内容）
+  - **只含 `running` 的直接子**。曾经列出全部历史孩子，由标题 `Your subagents at this point:`
+    的完整性承诺所迫，于是只增不减：一个真实会话上达到 133 行（6 running / 127 idle）、
+    注入 265 次、占近期窗口文本 58%。读者需要的是"此刻谁在和我并行干活"；
+    完整枚举是 `agent_list` 的职责（见 `docs/fixes/agent-management-fix-roster-live-only.md`）
+  - 每项含 session_id、name（若有）、title（即创建时给的 description，自带 `(@<type> subagent)`
+    后缀，故不另列 agent_type）；**不含 status**——列出者按定义皆为 running
+  - **上限 `ROSTER_MAX_ROWS`（10）行**，按 time_created 取最近；超出时附一行剩余计数，
+    上限不静默
+  - 从未有过直接子时不产出本结构；有子但**全部不在运行**时产出**一行占位**
+    `Your subagents working right now: none (N finished).`——保留"我有过孩子"这一事实
+  - **只陈述事实，不指挥工具**：不写"use agent_list"之类——模型持有工具描述，
+    而这段话每轮开头都会出现
   - 带一个固定前缀行作为识别标记，使下一轮能在历史中定位最近一条
-  - 首行措辞明示为**时点快照**（`Your subagents at this point:`）：历史中会留下若干条过期的
-    roster，权威来源始终是 `agent_list`。这与 transcript 中其他随时间失效的事实同性质
 
 跨模块共享性：跨模块共享 — producer: M5 AgentTools；consumer: 既有 SessionReminders 注入点
 ```
@@ -586,9 +602,14 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 未给 cwd + Git 项目：
   destination = <项目目录>/.opencode/worktrees/<slug>          ← 平铺，不嵌套
   baseDirectory = 父 Session 的 metadata.agentWorkdir.path ?? instance directory
-  baseCommit    = git -C <baseDirectory> rev-parse HEAD
-  git worktree add -b <branch> <destination> <baseCommit>
-  → 必须等 tracked files checkout 完成（ready 契约）
+  baseCommit    = git -C <baseDirectory> rev-parse --verify -q HEAD
+    exit 0   → git worktree add -b <branch> <destination> <baseCommit>
+               → 必须等 tracked files checkout 完成（ready 契约）
+    exit 1   → 仓库无任何提交（unborn HEAD），没有可作基点的 commit
+               → git worktree add --orphan -b <branch> <destination>
+                 （不能带 --no-checkout，且跳过 reset --hard；用户仓库不被修改）
+               → 失败（git < 2.42）则降级为空目录并附 note 说明
+    其它     → WorktreeUnavailable（真错误，不降级）
   source = generated_git_worktree
 
 未给 cwd + 非 Git 项目：
@@ -809,7 +830,7 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 | **roster 必须落盘，不能每轮内存重建** | 非落盘那种会**改写一条已经发出去的消息**：reminder 挂在最后一条 user message 上，同轮多个 step 里那条消息不变，step 1 发 `userMsg + roster_v1`、step 2 重建成 `roster_v2`，前缀对不上 ⇒ **从那条消息往后的缓存全部失效**，包括 step 1 产生的全部 assistant 与 tool 消息。落盘的 part 有稳定 id、字节级稳定；落盘之后"只出现一次"即成立 |
 | roster 的判据基于**已过滤**的可见历史 | `filterCompacted` 把边界前的消息换成 summary，边界前的 roster 不再进请求；而 reminder 阶段拿到的本就是过滤后的视图。于是压缩后"倒找不到" ⇒ 自动重发。**首次派生、状态翻转、压缩之后三种情况走同一条规则，无需特判** |
 | **roster 边沿触发、回合边界投递** | 判据是 `idle→running`（最后一条 user 之后尚无 assistant）或刚压缩过。**它比"只在异常恢复时注入"宽**——普通新回合同样命中，这是明确的取舍而非疏漏：收敛靠内容去重，实际语义为"子的整体状态自上次告知以来变化时，在下一个回合边界告知一次"。好处是覆盖更广（子悄悄转 idle 而通知未达也会被纠正）且**无需枚举失效原因**——任何导致父停止又恢复的原因，其恢复动作必然表现为一次 `idle→running`。代价如实记录：**注入次数与被观察到的状态变化数线性相关，Session 生命周期内无固定上界**（同一子可经 `agent_send` 反复 resume），旧快照靠压缩折叠。不删旧表——那要改写历史消息，会从该点起废掉整段缓存 |
-| **兄弟快照面向子、启动时一次、不含状态** | 新建的子不知道自己有父，想回话必须先调 `agent_list`。集合是 `{C} ∪ (children(C) \ {D})`，即**新子视角下的父与兄弟**（不是调用者的父与兄弟——那是新子的祖父与叔伯）。权限判据取**接收方**：`agent_list` 被 deny 的用意就是"这个子不该知道别的 Agent 存在"，换条投递路径绕过去等于在权限表面开后门。CC 的同名机制亦按接收方决定——其文档载明 roster "appears only when the subagent's tools include `SendMessage`" |
+| **兄弟快照面向子、启动时一次、不含状态、只列 running** | 新建的子不知道自己有父，想回话必须先调 `agent_list`。集合是 `{C} ∪ (running children(C) \ {D})`，即**新子视角下的父与正在运行的兄弟**（不是调用者的父与兄弟——那是新子的祖父与叔伯）。只列 running 并设 10 行上限：全量列出曾在一个真实会话上达到 132 行、为任务本身的 5 倍，见 `docs/fixes/agent-management-fix-roster-live-only.md`。权限判据取**接收方**：`agent_list` 被 deny 的用意就是"这个子不该知道别的 Agent 存在"，换条投递路径绕过去等于在权限表面开后门。CC 的同名机制亦按接收方决定——其文档载明 roster "appears only when the subagent's tools include `SendMessage`" |
 | roster 只列直接子、只在有子时注入、渲染成一行 | 父与兄弟与本 Agent 的决策关系不大，`agent_list` 随时可查；绝大多数 subagent 没有子，一个字都不加 |
 | 停止级联到整棵子树 | 避免"停了父、子变孤儿继续消耗"；是否改为只停目标本身列为 follow-up（issue #26） |
 | **创建不返回实时 status** | 在 BackgroundJob 启动后硬编码 `running` 与"status 唯一来自 `SessionStatus`"冲突。创建只表达"已创建并启动"；完整 `AgentInfo.status` 只在 `agent_list` 装配 |

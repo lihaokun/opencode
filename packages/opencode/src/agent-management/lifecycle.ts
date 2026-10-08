@@ -20,6 +20,7 @@ import { SessionID, MessageID } from "../session/schema"
 import { Truncate } from "../tool/truncate"
 import { AgentDelegation } from "./delegation"
 import { AgentInbox } from "./inbox"
+import { AgentStatusProjection } from "./status"
 import { AgentTree } from "./tree"
 import { AgentWorkdir } from "./workdir"
 import { AgentManagement } from "./schema"
@@ -84,6 +85,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const tree = yield* AgentTree.Service
+    const status = yield* AgentStatusProjection.Service
     const inbox = yield* AgentInbox.Service
     const sessions = yield* Session.Service
     const agents = yield* Agent.Service
@@ -163,27 +165,54 @@ const layer = Layer.effect(
       const siblings = (yield* tree.children(input.caller.id, depth + 1)).filter(
         (item) => item.session_id !== input.child,
       )
+      // Running only. Listing every sibling the parent had ever started is what
+      // the old heading promised -- everyone reachable -- and agent_send
+      // reaches anyone at all by session_id, so that promise had no bound: on
+      // one real session this came to 132 rows, five times the size of the task
+      // the Agent was being given. What a new Agent needs is who is working
+      // beside it; enumerating is agent_list's job.
+      const live = yield* Effect.forEach(siblings, (item) =>
+        status.of(item.session_id).pipe(Effect.map((state) => (state === "running" ? item : undefined))),
+      ).pipe(Effect.map((items) => items.filter((item) => item !== undefined)))
 
-      // Names and types come from the model and go into lines this writes, so
+      // Names and titles come from the model and go into lines this writes, so
       // they are encoded the same way a message header's fields are — a newline
       // in one would otherwise add a row of its own to a list the reader is
-      // meant to trust.
+      // meant to trust. A title already reads `<description> (@<type>
+      // subagent)`, so it carries the agent type and no separate column does.
       const raw = input.caller.metadata?.[AgentManagement.METADATA_AGENT_NAME]
-      const callerName = raw === undefined ? undefined : AgentInbox.escapeField(raw)
-      const rows = [
-        `  ${input.caller.id}  ${callerName ? `${callerName} (your parent)` : "your parent"}`,
-        ...siblings.map((item) => {
-          const label = item.name
-            ? AgentInbox.escapeField(item.name)
-            : `(${AgentInbox.escapeField(item.agent_type ?? "agent")})`
-          return `  ${item.session_id}  ${label}`
-        }),
-      ]
+      const callerName = raw === undefined ? undefined : `${AgentInbox.escapeField(raw)}  `
+      const parent = `Your parent: ${input.caller.id}  ${callerName ?? ""}— ${AgentInbox.escapeField(input.caller.title)}`
+
+      // Newest first, then capped: a parent that fans out widely would
+      // otherwise trade one unbounded list for a shorter unbounded list.
+      const ordered = live.toSorted((a, b) => b.time_created - a.time_created)
+      const shown = ordered.slice(0, AgentManagement.ROSTER_MAX_ROWS)
+      const omitted = ordered.length - shown.length
+      // No relation column: the parent has its own line above and everything
+      // below it is a sibling by construction, so repeating a constant per row
+      // carries nothing.
+      const rows = shown.map((item) => {
+        const name = item.name ? `${AgentInbox.escapeField(item.name)}  ` : ""
+        return `  ${item.session_id}  ${name}— ${AgentInbox.escapeField(item.title)}`
+      })
+
       return [
-        "Agents you can message with agent_send:",
-        ...rows,
+        parent,
+        ...(rows.length > 0
+          ? [
+              "",
+              "Working alongside you right now:",
+              ...rows,
+              ...(omitted > 0 ? [`  ${omitted} more are running.`] : []),
+            ]
+          : []),
         "",
-        "This is a snapshot taken when you started; Agents created later are not in it. Use agent_list for the current picture.",
+        // Two facts and no tool directions. The list is not everyone the Agent
+        // can reach, and it was taken at the moment the Agent started; both are
+        // worth saying so the list is not mistaken for either. Which tool gives
+        // the current picture is already in the tool descriptions.
+        "Not everyone you can reach, and not current past this moment.",
       ].join("\n")
     })
 
@@ -525,6 +554,7 @@ export const node = LayerNode.make({
   layer,
   deps: [
     AgentTree.node,
+    AgentStatusProjection.node,
     AgentInbox.node,
     Session.node,
     Agent.node,

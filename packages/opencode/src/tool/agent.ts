@@ -31,7 +31,7 @@ export const Parameters = Schema.Struct({
   cwd: Schema.optional(
     Schema.String.annotate({
       description:
-        "Working directory for this Agent. When omitted a separate working directory is prepared for it automatically.",
+        "Working directory for this Agent. To have it continue work in an existing directory or worktree, pass that path here. When omitted a NEW working directory is created and the Agent is told to use it -- so a directory named only in the prompt will be contradicted by that instruction.",
     }),
   ),
 })
@@ -65,7 +65,8 @@ const AGENT_DESCRIPTION = [
   "- Always asynchronous: this returns once the subagent has started, not when it finishes. Its result arrives later as a message in your conversation",
   "- Do not sleep, poll, or message a subagent to ask whether it is done — you will be told",
   "- Launch several in one response when the work is genuinely independent",
-  "- Each subagent gets its own working directory and is told to use it, so parallel work does not collide. This is a convention, not a sandbox: it can still reach the rest of the project by absolute path. Pass `cwd` to place it somewhere specific instead",
+  "- Each subagent gets its own working directory and is told to use it, so parallel work does not collide. This is a convention, not a sandbox: it can still reach the rest of the project by absolute path",
+  "- To continue work in an existing directory or worktree, pass it as `cwd`. Naming it only in the prompt is not enough: a fresh directory is created regardless and the Agent is told to use that one, so the two instructions conflict",
   "- The returned `session_id` always works as a target for agent_send and agent_stop",
   "- `name` is optional and shorter to use, but is not guaranteed unique; if two subagents share one, that name is refused and you must use the session_id",
   "- Nesting is bounded: a subagent deep enough in the tree is not offered this tool at all",
@@ -182,6 +183,10 @@ export const AgentTool = Tool.define(
           `session_id: ${info.session_id}`,
           ...(info.name ? [`name: ${info.name}`] : []),
           `working directory: ${info.workdir.path}`,
+          // Present only when the workspace is not the one that would normally
+          // have been prepared, so the caller is not left guessing why a git
+          // project produced no worktree.
+          ...(info.workdir.note ? [`note: ${info.workdir.note}`] : []),
           "",
           // Not "running": the job may not have started yet, and claiming a
           // status here would contradict agent_list a moment later.

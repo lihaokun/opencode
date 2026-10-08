@@ -477,11 +477,31 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
         - **不调 Snapshot 的 `sync`**：它会连带重写 Snapshot 自己的 block 列表（§2.2）。
         - 必要性：ripgrep 默认尊重 `info/exclude`，不登记则 `glob`/`grep` 会搜出每个工作目录的副本。
      c. `baseDirectory = parentWorkdir?.path ?? ctx.directory`；
-        `baseCommit = git -C <baseDirectory> rev-parse HEAD`。失败 → `WorktreeUnavailable`。
+        `baseCommit = git -C <baseDirectory> rev-parse --verify -q HEAD`，按退出码分三路：
+        - **0**：解析出 commit，走 d 的常规分支。
+        - **1**：HEAD 指向一个尚不存在的分支，即**仓库已 init 但从未提交**（unborn）。
+          `--verify -q` 在此返回 1 且 stderr 为空，与真错误可区分。走 d 的 orphan 分支。
+        - **其它（典型 128）**：真错误（仓库损坏等）→ `WorktreeUnavailable`，
+          **不降级**，否则会把损坏的仓库静默当成空仓库处理。
         - 显式取 baseCommit 而非依赖隐式 cwd：嵌套派生时创建者自己也在一个工作目录里。
         - 只继承父**已提交到 HEAD** 的内容；未提交修改不会出现。
      d. 调工作树内部入口：`git worktree add -b <branch> <destination> <baseCommit>` 后**等待**
         tracked files checkout 完成。
+        - **unborn 分支**：改用 `git worktree add --orphan -b <branch> <destination>`。
+          空仓库里不存在可作基点的 commit，而 `--orphan` 正是「不需要基点、在此开一条
+          全新历史」的构造方式。它**不修改用户仓库**（HEAD 仍是 unborn、提交数仍为 0），
+          产出的是真正的 linked worktree——内容为空，但那是正确的：仓库本就没有已提交内容。
+          - **不能带 `--no-checkout`**（git 拒绝二者共用），且**跳过随后的 `reset --hard`**
+            （已完成检出，且无内容可 reset）。
+          - **只在退出码为 1 时使用**。在有提交的仓库里误用 orphan 会让 Agent 拿到空目录、
+            看不到项目内容。
+          - `--orphan` 需 git ≥ 2.42，而 Ubuntu 22.04（2.34）、Debian 12（2.39）仍在支持期。
+            **不解析 `git --version`**（各发行版后缀与 `2.42.0.windows.1` 是解析陷阱），
+            改为直接尝试、失败即降级到 3 的空目录，并带上 `note` 说明原因
+            （旧 git 上 `--orphan` 在参数解析阶段即失败，不留半成品）。
+          - **不自动创建空提交来让 HEAD 可解析**：那会在用户当前分支上留下一个他没有要求的
+            提交，而此时用户往往正是还没决定要提交什么；且依赖 `user.name`/`user.email`
+            已配置。`--orphan` 达成同样目标且完全不触碰用户历史。
         - **ready 契约**：既有 `Worktree.create()` 的 `setup` 是 `--no-checkout`、
           populate 在 fork 出去的 `boot` 里（`worktree/index.ts:281-292`），返回时目录是**空的**。
           本入口必须在返回时满足"目录存在且 tracked files 完整可读"。
@@ -870,17 +890,25 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
      绝大多数 subagent 属于这一类，一个字都不加。
   1b. 求值调用者的 `agent_list` 权限；为 `deny` → **不注入**。
      roster 与 `agent_list` 暴露同一类信息，换条投递路径就绕过去等于在权限表面开后门。
-  2. 对每个子调 M2 `of` 取 status，渲染成**一行**：
+  2. 对每个子调 M2 `of` 取 status，**只保留 `running` 的**，按 time_created 取最近
+     `ROSTER_MAX_ROWS`（10）个，每个渲染成**一行**：
 
      ```
      <SENTINEL>
-     Your subagents at this point:
-       ses_abc123  reviewer (explore)   idle
-       ses_def456  (explore)            running
+     Your subagents working right now:
+       ses_abc123  reviewer  — review the parser (@explore subagent)
+       ses_def456  — scan the tests (@explore subagent)
+       3 more are running.
      ```
 
-     - 首行措辞明示为**时点快照**：历史中会留下若干条过期的 roster，
-       权威来源始终是 `agent_list`。
+     - 每行：session_id、name（若有）、title。title 是创建时的 description 加
+       `(@<type> subagent)` 后缀，自带类型，故不另列；不含 status——列出者皆 running。
+     - 有子但无一 running 时渲染一行占位：`Your subagents working right now: none (N finished).`
+     - **只陈述事实，不指挥工具**：不写"use agent_list"。模型持有工具描述，
+       这段话又在每轮开头出现，提醒是纯噪音。
+     - 为何只列 running：旧版列全部历史孩子，由标题"at this point"的完整性承诺所迫而无界增长，
+       实测一个会话上 133 行（6 running）、注入 265 次、占近期窗口 58%。
+       详见 `docs/fixes/agent-management-fix-roster-live-only.md`。
 
      - `<SENTINEL>` 是固定前缀行，供步骤 3 在历史中定位。
      - `name` 缺省时只显示 `(agent_type, status)`。
@@ -928,15 +956,33 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 - **集合的准确定义**：设调用者为 C、新建的子为 D，
 
   ```
-  snapshot = {C} ∪ (children(C) \ {D})
+  snapshot = {C} ∪ (running children(C) \ {D})
   ```
 
-  即 **D 的父与 D 的兄弟**。
+  即 **D 的父与 D 正在运行的兄弟**。
   **不是"调用者的父与兄弟"**——那是 D 的**祖父与叔伯**，与 D 能向谁发消息无关。
-- **内容**：每项 `session_id` + `name`（若有），**不含状态**。
-  并明写这是**启动时快照，之后新建的 Agent 不在其中**——照 CC 语义：
-  *"It is a snapshot taken when the subagent starts, so agents named later don't appear."*
-  含状态会立刻过期且与 roster 的职责重叠。
+  **只取 running**：旧版 `children(C)` 不过滤，由标题 `Agents you can message with agent_send:`
+  的完整性承诺所迫（`agent_send` 可达任意 session_id，故"可发消息的"等于所有人），
+  实测在一个会话上长到 132 行、为任务本身的 5 倍。见
+  `docs/fixes/agent-management-fix-roster-live-only.md`。
+- **内容与形状**：
+
+  ```
+  Your parent: <C.session_id>  <C.name 若有>  — <C.title>
+
+  Working alongside you right now:
+    <session_id>  <name 若有>  — <title>
+    …（最多 ROSTER_MAX_ROWS=10 行，按 time_created 取最近）
+    N more are running.            ← 仅截断时
+
+  Not everyone you can reach, and not current past this moment.
+  ```
+
+  - 父亲单独一段；其下按集合定义皆为兄弟，故不列 relation。
+  - title 自带 `(@<type> subagent)` 后缀，故不另列 agent_type。**不含状态**：
+    含状态会立刻过期且与 roster 的职责重叠。
+  - 无 running 兄弟时省略"Working alongside"整段，仅保留父亲与尾注。
+  - 尾注**只陈述两个事实**（不完整、是快照），**不点名工具**。
 - **权限**：受 **D 自己的** `agent_list` 权限约束；D 为 `deny` 时返回 `undefined`（不注入）。
   判据取**接收方**而非调用者：`agent_list` 被 deny 的用意就是"这个子不该知道别的 Agent 存在"，
   换一种投递方式就绕过去，等于在权限表面开后门。
