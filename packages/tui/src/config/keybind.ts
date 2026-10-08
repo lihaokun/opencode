@@ -99,6 +99,10 @@ export const Definitions = {
   session_toggle_timestamps: keybind("none", "Toggle message timestamps"),
   session_toggle_generic_tool_output: keybind("none", "Toggle generic tool output"),
   session_queued_prompts: keybind("<leader>q", "Manage queued prompts"),
+  /** Run mode only: the run footer registers this command for its subagent
+   * tabs menu. The session route deliberately does not register it (P1:
+   * navigation lives in the Agents list), so the binding is inert there. */
+  session_child_first: keybind("<leader>down", "View subagents"),
   session_pin_toggle: keybind("ctrl+f", "Pin or unpin session in the session list"),
   session_quick_switch_1: keybind("<leader>1", "Switch to session in quick slot 1"),
   session_quick_switch_2: keybind("<leader>2", "Switch to session in quick slot 2"),
