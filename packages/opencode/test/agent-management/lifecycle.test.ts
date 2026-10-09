@@ -319,165 +319,29 @@ describe("AgentLifecycle.stop", () => {
   )
 })
 
-describe("AgentLifecycle delegation notice", () => {
-  it.instance("never switches the parent to the child's agent when notifying it", () =>
+describe("AgentLifecycle run-end notice", () => {
+  // The notice itself is SessionPrompt's: it reports at the end of every run of
+  // the child, the first one included, from what create persists here. The job
+  // path writes nothing to the creator any more — one mechanism, not two.
+  it.instance("persists what the run loop needs and leaves the notice to it", () =>
     Effect.gen(function* () {
       const lifecycle = yield* AgentLifecycle.Service
       const sessions = yield* Session.Service
-      // A parent that has not bound an agent yet. The notice must not fill that
-      // in with the child's type: doing so adopts the subagent definition's
-      // model as well and persists it, so a subagent pinned to a model the
-      // parent cannot use would drag the parent onto it.
+      const background = yield* BackgroundJob.Service
       const root = yield* sessions.create({ title: "root" })
       const { ops, seen } = stubOps()
 
-      yield* lifecycle.create(baseCreate(root.id, ops))
-      yield* awaitWithTimeout(
-        Effect.gen(function* () {
-          while (!seen.some((input) => input.sessionID === root.id)) yield* Effect.sleep("10 millis")
-        }),
-        "the creator was never notified",
-      )
+      const first = yield* lifecycle.create(baseCreate(root.id, ops))
+      const child = yield* sessions.get(first.session_id)
+      expect(child.metadata?.[AgentManagement.METADATA_AGENT_DESCRIPTION]).toBe("look around")
+      expect(child.metadata?.[AgentManagement.METADATA_AGENT_NOTIFY]).toBe(true)
 
-      const notice = seen.find((input) => input.sessionID === root.id)!
-      expect(notice.agent).toBeUndefined()
-      const parent = yield* sessions.get(root.id)
-      expect(parent.agent).toBeUndefined()
-    }),
-  )
+      const quiet = yield* lifecycle.create(baseCreate(root.id, ops, { notify: false }))
+      expect((yield* sessions.get(quiet.session_id)).metadata?.[AgentManagement.METADATA_AGENT_NOTIFY]).toBe(false)
 
-  it.instance("re-reads the parent's identity at delivery time", () =>
-    Effect.gen(function* () {
-      const lifecycle = yield* AgentLifecycle.Service
-      const sessions = yield* Session.Service
-      const root = yield* sessions.create({
-        title: "root",
-        agent: "build",
-        model: { id: ModelV2.ID.make("m1"), providerID: ProviderV2.ID.make("p") },
-      })
-      // Hold the child inside its delegation so the parent can switch model
-      // while it is still running; otherwise the notice goes out first and the
-      // test proves nothing.
-      const gate = yield* Deferred.make<void>()
-      const seen: SessionPrompt.PromptInput[] = []
-      const ops: AgentManagement.AgentPromptOps = {
-        cancel: () => Effect.void,
-        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
-        prompt: (input) =>
-          Effect.gen(function* () {
-            seen.push(input)
-            if (input.sessionID !== root.id) yield* Deferred.await(gate)
-            return {
-              info: {
-                role: "assistant",
-                id: "msg",
-                sessionID: input.sessionID,
-                finish: "stop",
-                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-              },
-              parts: [{ type: "text", text: "done" }],
-            } as unknown as SessionV1.WithParts
-          }),
-        deliverAsync: (input) => Effect.forkDetach(ops.prompt(input)).pipe(Effect.asVoid),
-      }
-
-      yield* lifecycle.create(baseCreate(root.id, ops))
-      // The parent switches model while the child runs. The notice has to carry
-      // the new one, not the one captured when the child was created.
-      yield* sessions.setAgentModel({
-        sessionID: root.id,
-        agent: "build",
-        model: { id: ModelV2.ID.make("m2"), providerID: ProviderV2.ID.make("p"), variant: "default" },
-        time: Date.now(),
-      })
-      yield* Deferred.succeed(gate, undefined)
-      yield* awaitWithTimeout(
-        Effect.gen(function* () {
-          while (!seen.some((input) => input.sessionID === root.id)) yield* Effect.sleep("10 millis")
-        }),
-        "the creator was never notified",
-      )
-
-      const notice = seen.find((input) => input.sessionID === root.id)!
-      expect(notice.model?.modelID).toBe(ModelV2.ID.make("m2"))
-      expect(notice.variant).toBeUndefined()
-    }),
-  )
-
-  it.instance("marks the completed notice with render metadata for the TUI", () =>
-    Effect.gen(function* () {
-      const lifecycle = yield* AgentLifecycle.Service
-      const sessions = yield* Session.Service
-      const root = yield* sessions.create({ title: "root" })
-      const { ops, seen } = stubOps()
-
-      yield* lifecycle.create(baseCreate(root.id, ops))
-      yield* awaitWithTimeout(
-        Effect.gen(function* () {
-          while (!seen.some((input) => input.sessionID === root.id)) yield* Effect.sleep("10 millis")
-        }),
-        "the creator was never notified",
-      )
-
-      const notice = seen.find((input) => input.sessionID === root.id)!
-      const part = notice.parts.find((item) => item.type === "text")
-      if (!part || part.type !== "text") throw new Error("notice carried no text part")
-      expect(part.text).toContain("<agent id=")
-      // The TUI's one-line hint travels only through metadata; the text stays
-      // the model-facing envelope (INV-2).
-      expect(part.metadata).toEqual({
-        kind: AgentManagement.NOTIFICATION_METADATA_KIND,
-        summary: "Agent completed: look around",
-      })
-    }),
-  )
-
-  it.instance("marks the failed notice with the failed summary", () =>
-    Effect.gen(function* () {
-      const lifecycle = yield* AgentLifecycle.Service
-      const sessions = yield* Session.Service
-      const root = yield* sessions.create({ title: "root" })
-      const seen: SessionPrompt.PromptInput[] = []
-      // Every run ends in a plain error, so classify() routes the child to the
-      // failed outcome and inject("error", ...) carries the failed summary.
-      // The parent's notification prompt has its return value ignored, so the
-      // same shape is harmless there.
-      const ops: AgentManagement.AgentPromptOps = {
-        cancel: () => Effect.void,
-        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
-        prompt: (input) =>
-          Effect.gen(function* () {
-            seen.push(input)
-            return {
-              info: {
-                role: "assistant",
-                id: "msg",
-                sessionID: input.sessionID,
-                finish: "stop",
-                error: { name: "Boom", data: { message: "exploded" } },
-                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-              },
-              parts: [{ type: "text", text: "done" }],
-            } as unknown as SessionV1.WithParts
-          }),
-        deliverAsync: (input) => Effect.forkDetach(ops.prompt(input)).pipe(Effect.asVoid),
-      }
-
-      yield* lifecycle.create(baseCreate(root.id, ops))
-      yield* awaitWithTimeout(
-        Effect.gen(function* () {
-          while (!seen.some((input) => input.sessionID === root.id)) yield* Effect.sleep("10 millis")
-        }),
-        "the creator was never notified",
-      )
-
-      const notice = seen.find((input) => input.sessionID === root.id)!
-      const part = notice.parts.find((item) => item.type === "text")
-      if (!part || part.type !== "text") throw new Error("notice carried no text part")
-      expect(part.metadata).toEqual({
-        kind: AgentManagement.NOTIFICATION_METADATA_KIND,
-        summary: "Agent failed: look around",
-      })
+      const settled = yield* background.wait({ id: first.session_id })
+      expect(settled.info?.status).toBe("completed")
+      expect(seen.filter((input) => input.sessionID === root.id)).toEqual([])
     }),
   )
 })
