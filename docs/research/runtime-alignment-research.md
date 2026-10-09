@@ -1,7 +1,7 @@
 # 调研报告 — 通用 Agent runtime 对齐（issue #46）
 
 > 状态：**讨论稿**。决策点均为"倾向"而非决定，待逐项确认后进入对应流程（§7 修复 / §4 设计）。
-> 关联：lihaokun/opencode#46（系统提示词、上下文压缩恢复、tool call / tool result 的三方对照）。
+> 关联：lihaokun/opencode#46（系统提示词、上下文压缩恢复、tool call / tool result 的三方对照）；`docs/research/zcode-replacement-assessment.md`（ZCode 全面对照与替换决策评估）。
 > 核验基线：fork `dev@1343833857`。本文所有 file:line 均以该基线为准，全部为只读核实结论，未修改任何代码。
 > 阅读方式：§2 讲清楚系统的两条数据流（这是理解一切的前提），§3 沿数据流逐站追踪三个 P0 问题，§4/§5 从事实推导出决策选项与倾向。只想要结论可看 §4.0 概览与 §7 清单，但建议至少读完 §2。
 
