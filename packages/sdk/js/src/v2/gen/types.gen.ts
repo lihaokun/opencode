@@ -10210,6 +10210,42 @@ export type SessionPromptAsyncResponses = {
 
 export type SessionPromptAsyncResponse = SessionPromptAsyncResponses[keyof SessionPromptAsyncResponses]
 
+export type SessionAgentMessageData = {
+  body?: {
+    parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/agent-message"
+}
+
+export type SessionAgentMessageErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionAgentMessageError = SessionAgentMessageErrors[keyof SessionAgentMessageErrors]
+
+export type SessionAgentMessageResponses = {
+  /**
+   * Message accepted
+   */
+  204: void
+}
+
+export type SessionAgentMessageResponse = SessionAgentMessageResponses[keyof SessionAgentMessageResponses]
+
 export type SessionCommandData = {
   body?: {
     messageID?: string

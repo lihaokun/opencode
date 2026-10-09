@@ -110,7 +110,8 @@ describe("AgentLifecycle.create", () => {
       expect("status" in result).toBe(false)
       const child = yield* sessions.get(result.session_id)
       expect(child.parentID).toBe(root.id)
-    }))
+    }),
+  )
 
   // Longer than the file's default. This one holds a delegation open on a gate
   // while it asserts, so it carries the delegation's event publishing too — and
@@ -121,20 +122,20 @@ describe("AgentLifecycle.create", () => {
     "persists the resolved identity at creation, not on the first prompt",
     () =>
       Effect.gen(function* () {
-      const lifecycle = yield* AgentLifecycle.Service
-      const sessions = yield* Session.Service
-      const root = yield* sessions.create({ title: "root" })
-      const gate = yield* Deferred.make<void>()
-      const { ops } = stubOps({ block: gate })
+        const lifecycle = yield* AgentLifecycle.Service
+        const sessions = yield* Session.Service
+        const root = yield* sessions.create({ title: "root" })
+        const gate = yield* Deferred.make<void>()
+        const { ops } = stubOps({ block: gate })
 
-      const result = yield* lifecycle.create(baseCreate(root.id, ops))
+        const result = yield* lifecycle.create(baseCreate(root.id, ops))
 
-      // Still blocked inside the delegation, so nothing has been written by the
-      // prompt path yet.
-      const child = yield* sessions.get(result.session_id)
-      expect(child.agent).toBe("explore")
-      expect(child.model?.id).toBe(ref.modelID)
-      expect(child.model?.providerID).toBe(ref.providerID)
+        // Still blocked inside the delegation, so nothing has been written by the
+        // prompt path yet.
+        const child = yield* sessions.get(result.session_id)
+        expect(child.agent).toBe("explore")
+        expect(child.model?.id).toBe(ref.modelID)
+        expect(child.model?.providerID).toBe(ref.providerID)
         yield* Deferred.succeed(gate, undefined)
       }),
     20_000,
@@ -158,7 +159,8 @@ describe("AgentLifecycle.create", () => {
       const kinds = seen[0].parts.map((part) => part.type)
       expect(kinds).toContain("file")
       expect((seen[0].parts[0] as { text: string }).text).toContain("Your working directory")
-    }))
+    }),
+  )
 
   it.instance("refuses a duplicate instance name without creating anything", () =>
     Effect.gen(function* () {
@@ -174,7 +176,8 @@ describe("AgentLifecycle.create", () => {
 
       expect(error._tag).toBe("AgentNameConflict")
       expect((yield* sessions.children(root.id)).length).toBe(before)
-    }))
+    }),
+  )
 
   it.instance("refuses a name that could be mistaken for a session id", () =>
     Effect.gen(function* () {
@@ -186,7 +189,8 @@ describe("AgentLifecycle.create", () => {
       const error = yield* lifecycle.create(baseCreate(root.id, ops, { name: "session-one" })).pipe(Effect.flip)
       expect(error._tag).toBe("AgentNameConflict")
       expect((error as AgentManagement.AgentNameConflict).reason).toBe("reserved_prefix")
-    }))
+    }),
+  )
 
   it.instance("rejects an unknown agent type without creating a session", () =>
     Effect.gen(function* () {
@@ -195,13 +199,12 @@ describe("AgentLifecycle.create", () => {
       const root = yield* sessions.create({ title: "root" })
       const { ops } = stubOps()
 
-      const error = yield* lifecycle
-        .create(baseCreate(root.id, ops, { subagent_type: "nope" }))
-        .pipe(Effect.flip)
+      const error = yield* lifecycle.create(baseCreate(root.id, ops, { subagent_type: "nope" })).pipe(Effect.flip)
 
       expect(error._tag).toBe("AgentTypeNotFound")
       expect((yield* sessions.children(root.id)).length).toBe(0)
-    }))
+    }),
+  )
 
   it.instance(
     "stops spawning at the depth limit",
@@ -237,7 +240,8 @@ describe("AgentLifecycle.stop", () => {
 
       const error = yield* lifecycle.stop({ caller: root.id, target: b.id, ops }).pipe(Effect.flip)
       expect(error._tag).toBe("NotAChild")
-    }))
+    }),
+  )
 
   it.instance("cancels the whole subtree and reports every member", () =>
     Effect.gen(function* () {
@@ -253,7 +257,8 @@ describe("AgentLifecycle.stop", () => {
 
       expect(outcome.stopped.toSorted()).toEqual([a.id, b.id, c.id].toSorted())
       expect(outcome.failed).toEqual([])
-    }))
+    }),
+  )
 
   it.instance("notifies only the caller, never a member of the stop set", () =>
     Effect.gen(function* () {
@@ -277,7 +282,8 @@ describe("AgentLifecycle.stop", () => {
       expect(seen[0].sessionID).toBe(root.id)
       // Nothing was sent to a, which is exactly what could wake it back up.
       expect(seen.some((input) => input.sessionID === a.id || input.sessionID === b.id)).toBe(false)
-    }))
+    }),
+  )
 
   it.instance("is idempotent: stopping an idle subtree again is harmless", () =>
     Effect.gen(function* () {
@@ -293,7 +299,8 @@ describe("AgentLifecycle.stop", () => {
       expect(first.stopped).toEqual([a.id])
       expect(second.stopped).toEqual([a.id])
       expect(second.failed).toEqual([])
-    }))
+    }),
+  )
 
   it.instance("leaves the session and its history intact so it can be resumed", () =>
     Effect.gen(function* () {
@@ -308,7 +315,8 @@ describe("AgentLifecycle.stop", () => {
       const still = yield* sessions.get(a.id)
       expect(still.id).toBe(a.id)
       expect(still.title).toBe("a")
-    }))
+    }),
+  )
 })
 
 describe("AgentLifecycle delegation notice", () => {
@@ -335,7 +343,8 @@ describe("AgentLifecycle delegation notice", () => {
       expect(notice.agent).toBeUndefined()
       const parent = yield* sessions.get(root.id)
       expect(parent.agent).toBeUndefined()
-    }))
+    }),
+  )
 
   it.instance("re-reads the parent's identity at delivery time", () =>
     Effect.gen(function* () {
@@ -392,7 +401,85 @@ describe("AgentLifecycle delegation notice", () => {
       const notice = seen.find((input) => input.sessionID === root.id)!
       expect(notice.model?.modelID).toBe(ModelV2.ID.make("m2"))
       expect(notice.variant).toBeUndefined()
-    }))
+    }),
+  )
+
+  it.instance("marks the completed notice with render metadata for the TUI", () =>
+    Effect.gen(function* () {
+      const lifecycle = yield* AgentLifecycle.Service
+      const sessions = yield* Session.Service
+      const root = yield* sessions.create({ title: "root" })
+      const { ops, seen } = stubOps()
+
+      yield* lifecycle.create(baseCreate(root.id, ops))
+      yield* awaitWithTimeout(
+        Effect.gen(function* () {
+          while (!seen.some((input) => input.sessionID === root.id)) yield* Effect.sleep("10 millis")
+        }),
+        "the creator was never notified",
+      )
+
+      const notice = seen.find((input) => input.sessionID === root.id)!
+      const part = notice.parts.find((item) => item.type === "text")
+      if (!part || part.type !== "text") throw new Error("notice carried no text part")
+      expect(part.text).toContain("<agent id=")
+      // The TUI's one-line hint travels only through metadata; the text stays
+      // the model-facing envelope (INV-2).
+      expect(part.metadata).toEqual({
+        kind: AgentManagement.NOTIFICATION_METADATA_KIND,
+        summary: "Agent completed: look around",
+      })
+    }),
+  )
+
+  it.instance("marks the failed notice with the failed summary", () =>
+    Effect.gen(function* () {
+      const lifecycle = yield* AgentLifecycle.Service
+      const sessions = yield* Session.Service
+      const root = yield* sessions.create({ title: "root" })
+      const seen: SessionPrompt.PromptInput[] = []
+      // Every run ends in a plain error, so classify() routes the child to the
+      // failed outcome and inject("error", ...) carries the failed summary.
+      // The parent's notification prompt has its return value ignored, so the
+      // same shape is harmless there.
+      const ops: AgentManagement.AgentPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            seen.push(input)
+            return {
+              info: {
+                role: "assistant",
+                id: "msg",
+                sessionID: input.sessionID,
+                finish: "stop",
+                error: { name: "Boom", data: { message: "exploded" } },
+                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              },
+              parts: [{ type: "text", text: "done" }],
+            } as unknown as SessionV1.WithParts
+          }),
+        deliverAsync: (input) => Effect.forkDetach(ops.prompt(input)).pipe(Effect.asVoid),
+      }
+
+      yield* lifecycle.create(baseCreate(root.id, ops))
+      yield* awaitWithTimeout(
+        Effect.gen(function* () {
+          while (!seen.some((input) => input.sessionID === root.id)) yield* Effect.sleep("10 millis")
+        }),
+        "the creator was never notified",
+      )
+
+      const notice = seen.find((input) => input.sessionID === root.id)!
+      const part = notice.parts.find((item) => item.type === "text")
+      if (!part || part.type !== "text") throw new Error("notice carried no text part")
+      expect(part.metadata).toEqual({
+        kind: AgentManagement.NOTIFICATION_METADATA_KIND,
+        summary: "Agent failed: look around",
+      })
+    }),
+  )
 })
 
 describe("AgentLifecycle workspaces", () => {
@@ -418,7 +505,8 @@ describe("AgentLifecycle workspaces", () => {
       // holds on Windows too.
       expect(result.workdir.path).toContain(path.join(".opencode", "worktrees"))
       expect(result.workdir.enforced).toBe(false)
-    }))
+    }),
+  )
 
   // A timestamp was the directory name before this. Two workspaces created
   // inside the same millisecond took the same one.
@@ -445,7 +533,8 @@ describe("AgentLifecycle workspaces", () => {
       )
 
       expect(made[0].workdir.path).not.toBe(made[1].workdir.path)
-    }))
+    }),
+  )
 })
 
 // Without this a subagent does not know it has a parent, and has to call

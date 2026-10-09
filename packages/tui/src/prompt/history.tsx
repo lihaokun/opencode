@@ -66,6 +66,14 @@ export const { use: usePromptHistory, provider: PromptHistoryProvider } = create
     })
 
     return {
+      // Step P10: true when the cursor sits on the live input (index 0) — the
+      // "history is exhausted" state prompt.history.next needs before it can
+      // hand the keystroke to the route. move() alone cannot express it: at
+      // the bottom it returns the live item, truthy, so its !item branch is
+      // dead in the down direction.
+      atLive() {
+        return store.index === 0
+      },
       move(direction: 1 | -1, input: string) {
         if (!store.history.length) return undefined
         const current = store.history.at(store.index)

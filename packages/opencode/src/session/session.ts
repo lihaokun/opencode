@@ -1105,7 +1105,10 @@ function listByProject(
     .orderBy(desc(SessionTable.time_updated))
     .limit(limit)
     .all()
-    .pipe(Effect.orDie, Effect.map((rows) => rows.map(fromRow)))
+    .pipe(
+      Effect.orDie,
+      Effect.map((rows) => rows.map(fromRow)),
+    )
 }
 
 export const node = LayerNode.make({

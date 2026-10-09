@@ -1,13 +1,16 @@
-import { createMemo, createSignal, Show } from "solid-js"
+import { createMemo, Show } from "solid-js"
 import { useRouteData } from "../../context/route"
 import { useSync } from "../../context/sync"
 import { useTheme } from "../../context/theme"
 import { SplitBorder } from "../../ui/border"
-import type { AssistantMessage } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
+import { contextUsage } from "./index"
 import { useTerminalDimensions } from "@opentui/solid"
-import { useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 
+// Informational only since verification finding P1: navigation lives in the
+// Agents list (down at the exhausted prompt history), so the Parent/Prev/Next
+// shortcuts and their keybindings are gone. What remains is where you are and
+// what it cost.
 export function SubagentFooter() {
   const route = useRouteData("session")
   const sync = useSync()
@@ -31,35 +34,24 @@ export function SubagentFooter() {
   })
 
   const usage = createMemo(() => {
-    const msg = messages()
-    const last = msg.findLast((item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0)
-    if (!last) return
+    // The shared context-usage readout (P5-4): one convention across the
+    // footer, the Agents dialog and the persistent panel.
+    const readout = contextUsage({ messages: messages(), providers: sync.data.provider })
+    if (!readout) return
 
-    const tokens =
-      last.tokens.input + last.tokens.output + last.tokens.reasoning + last.tokens.cache.read + last.tokens.cache.write
-    if (tokens <= 0) return
-
-    const model = sync.data.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
-    const pct = model?.limit.context ? `${Math.round((tokens / model.limit.context) * 100)}%` : undefined
     const cost = session()?.cost ?? 0
-
     const money = new Intl.NumberFormat("en-US", {
       style: "currency",
       currency: "USD",
     })
 
     return {
-      context: pct ? `${Locale.number(tokens)} (${pct})` : Locale.number(tokens),
+      context: `${Locale.number(readout.tokens)}${readout.pct ? ` (${readout.pct})` : ""}`,
       cost: cost > 0 ? money.format(cost) : undefined,
     }
   })
 
   const { theme } = useTheme()
-  const keymap = useOpencodeKeymap()
-  const parentShortcut = useCommandShortcut("session.parent")
-  const previousShortcut = useCommandShortcut("session.child.previous")
-  const nextShortcut = useCommandShortcut("session.child.next")
-  const [hover, setHover] = createSignal<"parent" | "prev" | "next" | null>(null)
   useTerminalDimensions()
 
   return (
@@ -75,7 +67,7 @@ export function SubagentFooter() {
         flexShrink={0}
         backgroundColor={theme.backgroundPanel}
       >
-        <box flexDirection="row" justifyContent="space-between" gap={1}>
+        <box flexDirection="row" gap={1}>
           <box flexDirection="row" gap={1}>
             <text fg={theme.text}>
               <b>{subagentInfo().label}</b>
@@ -92,38 +84,6 @@ export function SubagentFooter() {
                 </text>
               )}
             </Show>
-          </box>
-          <box flexDirection="row" gap={2}>
-            <box
-              onMouseOver={() => setHover("parent")}
-              onMouseOut={() => setHover(null)}
-              onMouseUp={() => keymap.dispatchCommand("session.parent")}
-              backgroundColor={hover() === "parent" ? theme.backgroundElement : theme.backgroundPanel}
-            >
-              <text fg={theme.text}>
-                Parent <span style={{ fg: theme.textMuted }}>{parentShortcut()}</span>
-              </text>
-            </box>
-            <box
-              onMouseOver={() => setHover("prev")}
-              onMouseOut={() => setHover(null)}
-              onMouseUp={() => keymap.dispatchCommand("session.child.previous")}
-              backgroundColor={hover() === "prev" ? theme.backgroundElement : theme.backgroundPanel}
-            >
-              <text fg={theme.text}>
-                Prev <span style={{ fg: theme.textMuted }}>{previousShortcut()}</span>
-              </text>
-            </box>
-            <box
-              onMouseOver={() => setHover("next")}
-              onMouseOut={() => setHover(null)}
-              onMouseUp={() => keymap.dispatchCommand("session.child.next")}
-              backgroundColor={hover() === "next" ? theme.backgroundElement : theme.backgroundPanel}
-            >
-              <text fg={theme.text}>
-                Next <span style={{ fg: theme.textMuted }}>{nextShortcut()}</span>
-              </text>
-            </box>
           </box>
         </box>
       </box>

@@ -8,12 +8,9 @@ import { AgentManagement } from "./schema"
 
 export interface Interface {
   readonly deliver: (input: {
-    message: AgentManagement.AgentMessage
+    message: AgentManagement.InboxMessage
     ops: AgentManagement.AgentPromptOps
-  }) => Effect.Effect<
-    AgentManagement.Accepted,
-    AgentManagement.AgentNotFound | AgentManagement.SelfDelivery
-  >
+  }) => Effect.Effect<AgentManagement.Accepted, AgentManagement.AgentNotFound | AgentManagement.SelfDelivery>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/AgentInbox") {}
@@ -48,6 +45,15 @@ export function escapeField(value: string) {
 }
 
 /**
+ * The header line for a message from the human, sent through the TUI's
+ * agent-message endpoint. Deliberately field-free: there is no sender session
+ * to name, nothing model-sourced to escape, and no reply instruction — the
+ * human is watching this transcript and the target answers in place. The TUI
+ * keeps its own copy of the literal for its tests (expectations §10).
+ */
+export const USER_MESSAGE_HEADER = "[Message from user]"
+
+/**
  * The system-written prefix. The reply instruction always names the sender's
  * session_id rather than its name: a name is a weak alias that may be missing or
  * ambiguous, while a session_id works from anywhere.
@@ -73,53 +79,66 @@ const layer = Layer.effect(
     const scope = yield* Scope.Scope
 
     const deliver = Effect.fn("AgentInbox.deliver")(function* (input: {
-      message: AgentManagement.AgentMessage
+      message: AgentManagement.InboxMessage
       ops: AgentManagement.AgentPromptOps
     }) {
       const message = input.message
-      if (message.sender === message.target) {
-        return yield* new AgentManagement.SelfDelivery({ target: message.target })
+      if (message.kind === "agent" && message.message.sender === message.message.target) {
+        return yield* new AgentManagement.SelfDelivery({ target: message.message.target })
       }
 
       // No neighbour check and no same-tree check: a message transfers no
       // authority, and the target always acts under its own Session's
       // permissions.
+      const targetID = message.message.target
+      // Step P1: target lookup — the only failure path, mapped to BadRequest by
+      // the HTTP layer.
       const target = yield* sessions
-        .get(message.target)
-        .pipe(Effect.mapError(() => new AgentManagement.AgentNotFound({ session_id: message.target })))
+        .get(targetID)
+        .pipe(Effect.mapError(() => new AgentManagement.AgentNotFound({ session_id: targetID })))
 
-      // All three identity fields are read from the target and passed
+      // Step P2: all three identity fields are read from the target and passed
       // explicitly. createUserMessage resolves `input.model ?? agent's model ??
       // session's current model` and falls back to the default agent when
       // `agent` is omitted, then writes the result back with setAgentModel — so
       // leaving any of them out rewrites and persists the target's identity.
+      // Both sender kinds resolve here: this block is the single owner of the
+      // rule that a delivered message never changes who the target is (I1).
       const agent = target.agent ?? (yield* agents.defaultInfo()).name
-      const model = target.model
-        ? { providerID: target.model.providerID, modelID: target.model.id }
-        : undefined
+      const model = target.model ? { providerID: target.model.providerID, modelID: target.model.id } : undefined
       // setAgentModel stores `variant ?? "default"`, so echoing "default" back
       // would turn "no variant chosen" into "default chosen" on the first round
       // trip.
       const variant = target.model?.variant === "default" ? undefined : target.model?.variant
 
-      // deliverAsync, not prompt: it does the fork *and* the switch to the
-      // target's instance. Doing the fork here instead left the target running
-      // inside the sender's instance, against the sender's directory, config
-      // and permissions.
+      // Step P3: only the rendered parts differ by sender kind. The agent
+      // header is built from model-sourced fields and goes through render()'s
+      // escaping; the user header is a fixed string — no fields, so no
+      // escaping, and no reply instruction, because the human is watching this
+      // transcript and the target answers in place.
+      const parts =
+        message.kind === "agent"
+          ? [{ type: "text" as const, text: render(message.message) }]
+          : [{ type: "text" as const, text: USER_MESSAGE_HEADER }, ...message.message.parts]
+
+      // Step P4: deliverAsync, not prompt — it does the fork *and* the switch
+      // to the target's instance. Doing the fork here instead left the target
+      // running inside the sender's instance, against the sender's directory,
+      // config and permissions.
       //
       // Forking is still required for the reason it always was — prompt returns
       // `loop(...)` unless noReply is set, so awaiting it blocks until the
       // target finishes its whole turn, and noReply is no escape either since it
       // persists the message without ever running the loop.
       yield* input.ops.deliverAsync({
-        sessionID: target.id,
+        sessionID: targetID,
         agent,
         model,
         variant,
-        parts: [{ type: "text", text: render(message) }],
+        parts,
       })
 
-      return { target: target.id }
+      return { target: targetID }
     })
 
     return Service.of({ deliver })
