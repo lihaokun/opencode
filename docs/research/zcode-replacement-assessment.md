@@ -141,7 +141,7 @@ fork open issues 中的 #36（取消无法打断挂起的 permission ask，事�
 | **B. 维持 fork，ZCode 作参照实现（倾向）** | issue #46 照常推进（P0 三修 → P1 设计）；ZCode 的好设计作为 P1/P2 各子计划的设计输入：副作用恢复锚点、语义退出码白名单（bash-semantics 白名单可直接用于决策 B③）、microcompact 默认开启的策略、统一任务注册表、artifact 预算协议 | 维持"能修 bug、修得比上游快"的定位；保持模型无关 |
 | C. 并行使用 | ZCode 作为 GLM 模型的日常工具直接用；fork 继续做通用 harness 与实验场 | 零迁移成本；代价是两套工具的配置与心智 |
 
-B 与 C 不互斥（一个是开发路线、一个是使用策略）；A 与 B/C 互斥。两条路线各自的"补全成本"量化对比见 §7：A 需在 ZCode 中补齐 §4.2 五项（约 2-4 周 + 永久 patch 税），B 需完成 issue #46（约 4-8 周，可裁剪、可外部化）。
+B 与 C 不互斥（一个是开发路线、一个是使用策略）；A 与 B/C 互斥。两条路线各自的"补全成本"量化对比见 §7：A 需在 ZCode 中补齐 §4.2 五项（约 2-4 周 + 永久 patch 税），B 需完成 issue #46（约 4-8 周，可裁剪、可外部化）。若选 C（并行使用 ZCode），其数据外发面与使用注意事项见 §8。
 
 ### 5.5 什么情况下应该反过来选 A
 
@@ -225,3 +225,45 @@ B 与 C 不互斥（一个是开发路线、一个是使用策略）；A 与 B/C
 2. **代价二更贵但每分钱花在增量上**：范围大是因为 issue #46 对齐的不只是 §4.2 五点，还包括 ZCode 的能力面（压缩分层、后台、搜索、预算协议）；置信度高、可裁剪（砍掉 P2 可选项即 4-6 周）、可外部化。
 3. **代价二的天花板要说明**：B 路线买不到 ZCode 的 GLM 专项适配、workflow 工具族、web/desktop 产品面与 formal-proof 包——issue #46 的目标是对齐模型无关的 runtime 能力，不是全面复刻；若这些重要，属 C 路线（并行使用）的份内事。
 4. 一句话：**代价一是"花小钱找回丢掉的旧资产，从此交税"；代价二是"花大钱购买新能力，且税款已含在预算里"**。这反过来印证 §5 的结论——A 路线的真实成本从来不是补全工程量，而是治理结构本身（§2.2 + §5.3 第 1 条）。
+
+---
+
+## 8. 数据外发面核查：本地文件相关的外传代码
+
+> 动机：评估本文原聚焦 runtime 健壮性与治理面，未审数据流。若走 C 路线把 ZCode 用作日常工具，需要知道"本地文件会不会被传到哪"。
+> 方法：先读厂商声明（NOTICE §二"上传接口、对外请求与业务用途"，共 16 类），再逐项到 v3.14.3 快照源码中核实。以下每条均给出代码位置；仅由声明支撑、未在代码中核验的点会显式标注。
+> 结论先行：**外传路径存在且共四类，接收方各不相同；未发现声明之外的隐藏上传通道。**
+
+### 8.1 四类外传路径
+
+| 类别 | 触发 | 接收方 | 代码证据 |
+|---|---|---|---|
+| ① 附件分块上传 | desktop/web 会话附件：仅**粘贴截图（dataBase64）与内联文本**走 begin/chunk/commit 分块上传；桌面主流路径 `localPath` 直接携带绝对路径、**零上传** | 执行主机的会话附件存储——本机模式即本机；web/远端模式为 SSH/WSL/容器主机，**不是 Z.ai 云** | `bootstrap/src/zcode-protocol-v4/attachment-upload-registry.ts`（三段协议、checksum、过期）；`packages/ui/src/v4/composer/attachmentUpload.ts`（分派规则注释：localPath 零上传 / dataBase64 走 put / 文本编码 put） |
+| ② 会话分享 | 用户主动分享；**UI 默认公开可导入**（浏览/导入不以发布者勾选为前提，仅 NOTICE 声明 + UI store 佐证，默认值未逐行核验） | 分享服务 `zcode.z.ai`；上传内容包括会话投影（用户文本、模型回复、**推理文本**、工具输入输出）与可物化附件；流程有披露确认，但**附件可在最终发布确认前已上传**（NOTICE 明示） | `packages/services/src/conversation-share/conversationShareService.ts`（`buildConversationSharePublicProjection` + artifacts 清单与并发附件检查）；服务域名见 §8.3 |
+| ③ 反馈/诊断上传 | 用户主动提交反馈工单；日志选项**默认不勾选** | 反馈服务申请上传凭证 → **对象存储直传**；正文与截图不保证脱敏（NOTICE 原话） | `packages/ui/src/feedback/feedbackSubmissionJob.ts`（建单→截图→日志上传状态机） |
+| ④ 模型请求（功能性） | agent 本职：代码/附件作为提示词发给所配 provider | 所配模型端点 | NOTICE §二首行；本表不展开 |
+
+**附加注意（④ 的子项）**：`adapters/src/model/official-coding-plan-gateway.ts:22-31` 对官方两个 Anthropic 端点（`https://api.z.ai/api/anthropic/v1/messages`、`https://open.bigmodel.cn/api/anthropic/v1/messages`）的请求**自动改发** `zcode.z.ai/api/v1/ultra*` 网关，保留方法、正文、查询参数及除 Host 外的请求头（**含认证信息**），无逐次用户确认（判定依据仅是请求 URL）。使用官方 Coding Plan 时，模型流量（含代码上下文）实际经过 ZCode 网关；网关侧内部处理不在客户端源码可核验范围（NOTICE 自认）。
+
+另有跨环境传递（SSH/WSL/容器首次上线时凭据与配置自动同步、无逐项确认）与技能/MCP/插件目录同步——仅 NOTICE 声明，本轮未逐行核验，与"本地文件上传"直接相关度较低，列出备查。
+
+### 8.2 两个"没有"（负面结论同样有证据）
+
+1. **telemetry 不是 phone-home**：`apps/zcode-cli/packages/telemetry` 有完整 OTLP trace/metrics exporter，但 `bootstrap.ts:75-85` 的 `resolveOtlpTraceEndpoint` **无硬编码默认端点**——只有用户自行配置 `OTEL_EXPORTER_OTLP_*` 环境变量才激活，且受 `ZCODE_MODEL_TELEMETRY_ENABLED` 显式开关控制（`:124`）。它是用户自建可观测性的出口，默认关闭。模型 I/O 日志默认写**本地**（NOTICE §三）。
+2. **无第三方分析 SDK**：posthog / sentry / mixpanel / segment / amplitude 全仓（非 node_modules）零命中。
+
+### 8.3 外部端点清单（CLI 侧硬编码 URL 全量去重）
+
+| URL | 用途 |
+|---|---|
+| `https://api.z.ai`、`https://api.z.ai/api/anthropic/v1/messages` | 模型 API（+ 被网关改发，见 §8.1） |
+| `https://open.bigmodel.cn/api/anthropic/v1/messages` | 模型 API（BigModel，+ 同上） |
+| `https://cdn-zcode.z.ai/zcode/official-plugin/assets` | 官方插件市场资源 |
+| `https://zcode.z.ai`、`https://zcode.z.ai/api/v1` | 业务服务：分享、反馈、Coding Plan 网关、OAuth、插件定义（消费方含 `conversationShareService.ts`、`official-coding-plan-gateway.ts`、`auth/cli-oauth.ts`、`services/src/oauth/providers/*` 等） |
+
+### 8.4 对路线评估的含义
+
+- **单机 CLI 模式**：本地文件"上传到外部"的实际路径只有模型请求本身 + 用户主动的分享/反馈——数据外发面小，与常规 coding agent 一致。
+- **web/desktop/远端模式**：附件预传输与跨环境同步生效，外发面显著变大；会话分享**默认公开**是其中误操作风险最高的一项。
+- **C 路线使用注意事项**（若日常使用 ZCode 跑 GLM）：① 分享功能当心默认公开——分享前确认选择范围，含推理文本与工具输出的投影是否合意；② 用官方 Coding Plan 时流量过 `zcode.z.ai` 网关且无逐次确认，对敏感代码库可改用自定义 provider 端点（三协议原生支持，不命中网关路由表即不转发）；③ 反馈表单的日志上传默认关闭，保持默认即可。
+- **方法边界**：本轮为静态源码核查（v3.14.3），`zcode.z.ai` 服务端行为不在可核验范围；默认公开可导入的 UI 默认值未逐行核验（以 NOTICE 声明为准）。ZCode 后续投放可能改变上述行为，复核时优先看 `official-coding-plan-gateway.ts` 的路由表与 `conversationShareService.ts` 的投影/确认流程。
