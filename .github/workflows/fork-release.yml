@@ -1,4 +1,17 @@
-# Publishes a fork build as a GitHub release on this fork.
+# Publishes a fork build as a GitHub release on this fork, driven by tags.
+#
+# Push a tag and the release follows. Which kind depends on where the tagged
+# commit lives:
+#
+#   on main            v1.18.31-fmv3           stable release, marked Latest
+#   on dev, not main   v1.18.31-fmv3-beta.2    pre-release
+#   anywhere else      refused
+#
+# The tag name has to match the branch -- a stable-looking tag on dev or a
+# beta-looking tag on main fails here rather than publishing under the wrong
+# label. Release notes come from the tag's annotation; a lightweight tag gets
+# GitHub's generated notes. Creating the release in the GitHub UI works too:
+# that pushes the tag, this run finds the release and only adds the assets.
 #
 # Not publish.yml: that one bumps the npm version and publishes `opencode-ai`
 # to the public registry, which is upstream's to do and is guarded by a
@@ -14,33 +27,24 @@
 name: fork-release
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
-      version:
-        description: "Fork version, no leading v (e.g. 1.18.25-fmv3)"
+      tag:
+        description: "Existing tag to build again (e.g. v1.18.31-fmv3). Rebuilds and replaces that release's assets."
         required: true
         type: string
-      prerelease:
-        description: "Publish as a pre-release"
-        required: false
-        type: boolean
-        default: false
-      assets:
-        description: "Space-separated build keys to publish"
-        required: false
-        type: string
-        default: >-
-          opencode-linux-x64 opencode-linux-arm64
-          opencode-darwin-x64 opencode-darwin-arm64
-          opencode-windows-x64
-      notes:
-        description: "Release notes (markdown). Left empty, the release is created with a placeholder to edit afterwards."
-        required: false
-        type: string
-        default: ""
 
 permissions:
   contents: write
+
+env:
+  ASSETS: >-
+    opencode-linux-x64 opencode-linux-arm64
+    opencode-darwin-x64 opencode-darwin-arm64
+    opencode-windows-x64
 
 jobs:
   release:
@@ -50,18 +54,62 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
           fetch-tags: true
+
+      # Resolves the tag to a commit, a channel and a version. The commit is
+      # taken from the tag itself rather than GITHUB_SHA, which for an annotated
+      # tag can be the tag object.
+      - name: Resolve the tag
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+          git fetch -q origin main dev
+          if git merge-base --is-ancestor "$SHA" origin/main; then
+            CHANNEL=stable
+            if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-fmv[0-9]+$ ]]; then
+              echo "::error::$TAG is on main, so it is a stable release and must be named like v1.18.31-fmv3 (no -beta suffix)"
+              exit 1
+            fi
+          elif git merge-base --is-ancestor "$SHA" origin/dev; then
+            CHANNEL=beta
+            if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-fmv[0-9]+-beta\.[0-9]+$ ]]; then
+              echo "::error::$TAG is on dev but not on main, so it is a beta and must be named like v1.18.31-fmv3-beta.1"
+              exit 1
+            fi
+          else
+            echo "::error::$TAG ($SHA) is on neither main nor dev; releases are cut only from those two branches"
+            exit 1
+          fi
+          # Notes: the annotation of an annotated tag. A lightweight tag points
+          # straight at the commit and has none, so notes.md stays empty and the
+          # publish step asks GitHub to generate them.
+          : > notes.md
+          if [ "$(git cat-file -t "refs/tags/$TAG")" = tag ]; then
+            git for-each-ref "refs/tags/$TAG" --format='%(contents:subject)%0a%0a%(contents:body)' \
+              | sed '/^-----BEGIN PGP SIGNATURE-----$/,$d' > notes.md
+          fi
+          echo "resolved $TAG -> $SHA ($CHANNEL)"
+          {
+            echo "tag=$TAG"
+            echo "sha=$SHA"
+            echo "channel=$CHANNEL"
+            echo "version=${TAG#v}"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/setup-bun
 
       # No OPENCODE_RELEASE: that flag makes build.ts package and upload every
-      # target itself. Building only is what is wanted here.
+      # target itself. Building only is what is wanted here. The version is the
+      # tag without its leading v; build.ts reads nothing else.
       - name: Build every target
         run: ./packages/opencode/script/build.ts
         env:
           OPENCODE_CHANNEL: dev
-          OPENCODE_VERSION: ${{ inputs.version }}
+          OPENCODE_VERSION: ${{ steps.tag.outputs.version }}
 
       # build.ts does not bundle ripgrep -- upstream declares it a package
       # dependency for AUR and Homebrew instead, which a downloaded archive has
@@ -76,7 +124,7 @@ jobs:
           set -euo pipefail
           RG=$(grep -oP 'const VERSION = "\K[^"]+' ../core/src/ripgrep/binary.ts)
           echo "bundling ripgrep $RG"
-          for key in ${{ inputs.assets }}; do
+          for key in $ASSETS; do
             case "$key" in
               *linux-x64)     triple=x86_64-unknown-linux-musl; ext=tar.gz ;;
               *linux-arm64)   triple=aarch64-unknown-linux-gnu; ext=tar.gz ;;
@@ -105,7 +153,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          for key in ${{ inputs.assets }}; do
+          for key in $ASSETS; do
             if [ ! -d "dist/$key/bin" ]; then
               echo "::error::build produced no dist/$key/bin -- is '$key' a real build key?"
               exit 1
@@ -123,23 +171,25 @@ jobs:
           (cd out && sha256sum opencode-* > sha256sums.txt)
           ls -l out
 
+      # A release that already exists (created in the UI, or a rebuild through
+      # workflow_dispatch) keeps its notes and its pre-release flag; only the
+      # assets are replaced.
       - name: Publish
-        working-directory: packages/opencode
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v${{ inputs.version }}
-          NOTES: ${{ inputs.notes }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          SHA: ${{ steps.tag.outputs.sha }}
+          CHANNEL: ${{ steps.tag.outputs.channel }}
+          VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG exists; replacing its assets"
           else
-            printf '%s' "${NOTES:-Fork build ${TAG}.}" > notes.md
-            gh release create "$TAG" \
-              --target "$GITHUB_SHA" \
-              --title "${{ inputs.version }}" \
-              --notes-file notes.md \
-              ${{ inputs.prerelease && '--prerelease' || '' }}
+            args=(--target "$SHA" --title "$VERSION")
+            if [ -s notes.md ]; then args+=(--notes-file notes.md); else args+=(--generate-notes); fi
+            if [ "$CHANNEL" = beta ]; then args+=(--prerelease); fi
+            gh release create "$TAG" "${args[@]}"
           fi
-          gh release upload "$TAG" out/* --clobber
-          gh release view "$TAG" --json assets --jq '.assets[].name'
+          gh release upload "$TAG" packages/opencode/out/* --clobber
+          gh release view "$TAG" --json isPrerelease,assets --jq '"prerelease=\(.isPrerelease)", .assets[].name'

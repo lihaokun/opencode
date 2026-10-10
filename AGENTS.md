@@ -1,8 +1,9 @@
 - To regenerate the legacy JavaScript SDK, run `./packages/sdk/js/script/build.ts`.
 - After changing the public Protocol or Server `HttpApi`, run `bun run generate` from `packages/client`. Do not edit `src/generated` or `src/generated-effect` directly.
 - Keep runtime dependencies directed from Schema to Core and Protocol, then from Core and Protocol to Server. Client runtime code may depend on Schema and Protocol but never Core or Server; `sdk-next` composes Client, Core, and Server.
-- Two long-lived branches. `dev` is the default and the experimental line: feature work, bug fixes and upstream syncs land here first. `main` is the stable line: it only moves by a pull request from `dev`, merged with a merge commit (never squash -- a squash would drop the upstream history and turn the next promotion into a wall of false conflicts), and releases are cut from it with `fork-release --ref main`.
-- Open pull requests against `dev` unless you are promoting `dev` to `main`. Use `dev` or `origin/dev` for diffs of in-progress work.
+- Two long-lived branches. `main` is the default branch and the stable line: it only moves by a pull request from `dev`, merged with a merge commit (never squash -- a squash would drop the upstream history and turn the next promotion into a wall of false conflicts). `dev` is the experimental line: feature work, bug fixes and upstream syncs land here first.
+- Releases are tag-driven (`.github/workflows/fork-release.yml`). A tag `v<upstream>-fmv<N>` on a `main` commit publishes a stable release; `v<upstream>-fmv<N>-beta.<k>` on a `dev` commit publishes a pre-release; a tag anywhere else, or named for the wrong branch, is refused. Annotate the tag to supply the release notes; a lightweight tag gets GitHub's generated notes.
+- Open pull requests against `dev` unless you are promoting `dev` to `main`. GitHub pre-selects `main` because it is the default, so set the base explicitly. Use `dev` or `origin/dev` for diffs of in-progress work.
 - `OPENCODE_CHANNEL` names the data directory, not the branch, and defaults to the current branch name when unset. Keep it `dev` on both branches so a build from `main` does not open a separate `opencode-main.db`.
 
 ## Branch Names
