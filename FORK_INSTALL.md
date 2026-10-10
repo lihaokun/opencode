@@ -1,7 +1,10 @@
 # Fork 安装说明
 
-> **分支**：`main` 是稳定线，发布版从它构建；`dev` 是实验线，改动先落这里跑一阵再晋升到 `main`。
-> 想要已发布的版本看 [Releases](https://github.com/lihaokun/opencode/releases)；想试最新改动就从 `dev` 构建。
+> **分支与版本**：`main`（默认分支）是正式线，`dev` 是测试线；改动先落 `dev`，再以 merge commit 晋升到 `main`。
+> 发版由 tag 驱动（`.github/workflows/fork-release.yml`）：在 `main` 的提交上打 `v1.18.31-fmv3` 这样的 tag 就发正式版；
+> 在 `dev` 的提交上打 `v1.18.31-fmv3-beta.1` 就发 Pre-release 测试版；其他分支上的 tag、或名字与分支不符的 tag 会被拒绝。
+> tag 用 `git tag -a` 加注释，注释就是 release notes。[Releases](https://github.com/lihaokun/opencode/releases) 里不带 Pre-release 标记的就是正式版；
+> 想试最新改动也可以从 `dev` 自己构建。
 > 无论在哪个分支构建，`OPENCODE_CHANNEL` 都保持 `dev`——它决定的是数据目录（`opencode-dev.db`），不是分支；
 > 不设时它会取当前分支名，在 `main` 上裸构建会得到一份空的 `opencode-main.db`。
 
@@ -41,7 +44,7 @@ install -m 0755 dist/opencode-linux-x64/bin/opencode ~/.opencode/bin/opencode
 **注意几个"不行"**:
 
 - ❌ **改 `package.json` 的 `version` 没用** —— 构建逻辑根本不读它(官方 package.json 由上游的 `sync release versions` 提交维护,当前是 `1.18.31`,实际发布版本仍走 npm+bump)。
-- ❌ **加 git tag 也没用** —— 版本逻辑不读任何 tag(`git describe`/`refs/tags` 都没用到)。
+- ❌ **加 git tag 也没用** —— 版本逻辑不读任何 tag(`git describe`/`refs/tags` 都没用到)。CI 发版时是 workflow 把 tag 名去掉前缀 `v` 后塞进 `OPENCODE_VERSION`，本地构建仍要自己传。
 - ℹ️ 唯一沾 git 的是**分支名 = channel**（`git branch --show-current`），只影响 preview 版本里的 `<channel>` 段,不是 tag。
 
 所以自定义版本**必须**在构建时传 `OPENCODE_VERSION`。
