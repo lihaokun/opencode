@@ -82,16 +82,29 @@ export interface AgentNeighborhood {
 /** Session metadata keys this feature owns. */
 export const METADATA_AGENT_NAME = "agentName"
 export const METADATA_AGENT_WORKDIR = "agentWorkdir"
+/**
+ * The description the creator gave. The session title carries it too, with a
+ * " (@type subagent)" suffix; the run-end notice needs it bare, since the
+ * summary built from it is what the TUI shows.
+ */
+export const METADATA_AGENT_DESCRIPTION = "agentDescription"
+/**
+ * Whether the parent is told each time this agent's run ends. Written at
+ * creation and never changed: it is the scope of one delegation, which is
+ * exactly one session. A command subtask's child is false — its creator waits
+ * on the job itself. Read by SessionPrompt, which owns the run loop.
+ */
+export const METADATA_AGENT_NOTIFY = "agentNotify"
 
 /**
- * TextPart.metadata.kind marking a delegation outcome notification — the
- * synthetic message inject() writes to the caller when a background
- * delegation settles. The TUI renders one line from `summary` and never
- * parses the model-facing text, so this literal is the only UI-facing
- * contract that notification carries. The TUI cannot import it (part
- * metadata is a free-form record on the SDK side, nothing is generated for
- * it), so it keeps its own copy; the two are held together by contract-audit
- * expectations §10 and fixture tests on both sides.
+ * TextPart.metadata.kind marking a run-end notification — the synthetic
+ * message SessionPrompt writes to the parent each time a subagent's run ends.
+ * The TUI renders one line from `summary` and never parses the model-facing
+ * text, so this literal is the only UI-facing contract that notification
+ * carries. The TUI cannot import it (part metadata is a free-form record on
+ * the SDK side, nothing is generated for it), so it keeps its own copy; the
+ * two are held together by contract-audit expectations §10 and fixture tests
+ * on both sides.
  */
 export const NOTIFICATION_METADATA_KIND = "agent_notification"
 

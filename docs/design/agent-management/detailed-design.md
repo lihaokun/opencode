@@ -353,7 +353,8 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
     **不蕴含**已持久化、已处理、将被处理或已回复（架构 §3 `Accepted`）。
     fork 内失败只发事件，调用方那时已返回，**模型拿不到投递失败反馈**（架构 §10 缺口 5）。
   - 副作用论证：（异步地）目标 Session 多一条 user message；因步骤 3 显式传三项，
-    目标的绑定值不变。**不注册 BackgroundJob、不注册 watcher、不产生结局。**
+    目标的绑定值不变。**不注册 BackgroundJob、不产生按消息计的结局**；目标若是子 Agent，
+    它这次 run 结束时按 §5.4.4 的 run-end notice 向**它的父**报告，与这条消息无关。
 
 ### 5.4 M4 AgentLifecycle
 
@@ -439,7 +440,7 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
     - 步骤 9 保持 parts 形态，使 `@file` 附件随初始任务送达。
     - 步骤 11 不填 status ⇒ 与"status 唯一来自 `SessionStatus`"一致，不存在
       "刚创建就自称 running、而 job 可能尚未开跑"的矛盾。
-  - 后置：新建子 Session，工作目录已 ready，初始委托已注册，结局将**至多一次**交付给创建者。
+  - 后置：新建子 Session，工作目录已 ready，初始委托已注册；每次 run 结束时结局交付给父（§5.4.4）。
   - 副作用论证：(1) 工作目录（含可能的 `info/exclude` 修改）—— 步骤 7；(2) 新 Session —— 步骤 8；
     (3) 一条 user message 与一个 BackgroundJob —— 步骤 10；(4) 不修改调用者 Session 的任何字段。
 
@@ -553,52 +554,52 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
 #### 5.4.4 `startDelegation({ session, agent, model, variant, parts, caller, notify = true }) -> Effect<void>`
 
-- **功能描述**：起初始委托的后台执行，并在结束后向**创建者**至多发起一次结局通知。
-  **这是本 feature 中唯一产生自动结局的地方。**
-- **内部参数 `notify`（不对模型暴露）**：`true`（默认）时注册结局 watcher；`false` 时**不注册**，
-  由调用方自行 `background.wait({ id: session.id })` 取同一个 job 的结果。
-  唯一使用者是 command-subtask（§5.4.9）。
+- **功能描述**：起初始委托的后台执行。**不再负责结局通知**——通知由 `SessionPrompt.reportRunEnd`
+  在子的**每次** run 结束时发出（见本节末"run-end notice"），初始委托那次与 `agent_send` 驱动的
+  每一次走同一条路。job 的存在是为了 `agent_list`（状态）、`agent_stop`（取消）与 command-subtask
+  （自己 `wait`）。
+- **内部参数 `notify`（不对模型暴露）**：`true`（默认）时同步发 `agent.delegation started`；
+  `false` 时不发。它同时由 `create` 落库为子 Session metadata `agentNotify`，`reportRunEnd` 据此
+  决定报不报。唯一的 `false` 使用者是 command-subtask（§5.4.9）。
 - **调用关系**：callers: M4 `create`；callees: `BackgroundJob.start`、`SessionPrompt.prompt`、
-  M4 `classify`、提取后的 `notify` / `inject`。
+  M4 `classify`。
 - **实现思路**：
   1. `BackgroundJob.start({ id: session.id, type, title, metadata, run })` ——
      **job id 即子 SessionID**，保留既有身份约定。
-     - 不再有 `onPromote`（前台废弃）、不再有 `background.extend` 分支
-       （run 边界而非 turn 边界，且排队期间消息不落库；新设计下后续消息走异步入口，天然是 turn 边界）。
   2. `run = runDelegation.pipe(Effect.onInterrupt(() => ops.cancel(session.id)))`。
-  3. `runDelegation`：
-     a. `prompt({ sessionID: session.id, agent, model, variant, parts })`，**在此等待**
-        —— 这是初始委托，它本来就该跑完；与 §5.3.2 的 fork 不同，两者语义不同。
-     b. 结果交给 `classify`（§5.4.5）得 `DelegationOutcome`。
-     c. 按架构 §3 的出口映射收敛：`completed` → 成功出口；`failed` → 失败出口；
-        `cancelled` → `Effect.interrupt`。
-        - **必须映射到三种不同的 Effect 出口**：BackgroundJob 的结算状态由 run 体的 exit 推出，
-          统一成功返回一个带 kind 的值会让每个 job 都结算成 `completed`。
-  4. **`notify === false` 时跳过本步**（不注册任何 watcher，直接结束）。否则注册
-     `notify(jobID)`：`background.wait` → `completed` 注入完成、`error` 注入失败、
-     **其余（含 `cancelled`）静默**。
-     - 投递经提取后的 `inject`，目标是 `caller`。初始委托的调用者**就是**父，故既有的
-       "恒向调用者投递"写法正确，无需改成从 parentID 解析。
-     - **`inject` 投递时必须重新读取父 Session 当前的 agent / model / variant**，
-       不能省略 model，也不能用创建子 Agent 时捕获的旧值——**父可能在子运行期间换过模型**，
-       用旧值会把它改回去并落库。这与 §5.3.2 步骤 3 是同一条规则。
-     - `cancelled` 保持静默：`agent_stop` 的取消通知由 M4 `stop` 产出（§5.4.7），二者互补；
-       补了会重复。若 job 因**非 `agent_stop`** 的原因结算 `cancelled`（例如用户在 TUI 取消了父，
-       连带取消了子的 job），则无人通知——此时父自己也已被取消，不存在仍在等待的主体。
-  5. 只在 `start` 时注册一次 `notify`。
+  3. `runDelegation`：`prompt({ sessionID: session.id, agent, model, variant, parts })`，**在此等待**；
+     结果交给 `classify` 得 `DelegationOutcome`，按出口映射收敛（`completed` → 成功出口；
+     `failed` → 失败出口；`cancelled` → `Effect.interrupt`）。
+     - **必须映射到三种不同的 Effect 出口**：BackgroundJob 的结算状态由 run 体的 exit 推出。
+  4. `notify` 时**在 `background.start` 之前同步**发 `started`：工具一返回父就可能 idle，
+     `opencode run` 在"全体 idle 且无欠账"时退出，账必须在那之前记上。
+- **run-end notice（`SessionPrompt.reportRunEnd`，`session/prompt.ts`）**：
+  - 挂在 `loop` 交给 runner 的 work 上：`runLoop(id).pipe(Effect.onExit(reportRunEnd))`，
+    仅当 Session 有 `parentID` 且 metadata `agentNotify === true`。runner 对一次 run 恰好执行一次
+    work（re-arm 是下一次 run；join 的调用方只共享结果），因此**每次 run 结束恰好一次**，
+    不依赖 idle 事件（processor 出错路径会多发 idle，`cancel` 对未在跑的会话也发）。
+  - exit → outcome：success 走 `classify`；只含 interrupt 的失败 → cancelled；其他失败（runLoop
+    内部 defect）→ failed，文本 `formatSubagentFailure(Cause.pretty)`。
+  - cancelled：只发 `settled`，不投递（`agent_stop` 自己发取消通知，补了会重复）。
+  - 子自己派出的 agent 还有在跑的（后代 busy，或 running job 的 parent 在后代集合里）：不报不结账；
+    那个后代结束必向子报告、唤醒子，子再次停下时报。与 Claude Code "stops with no live background
+    children of its own" 同一规则。
+  - completed / failed：**fork** 一条投递——重读父当前的 agent / model / variant（不能省略 model，
+    也不能用创建子时捕获的旧值，父可能在子运行期间换过模型；不回退到子的 agent 类型），
+    `prompt(父, synthetic text part)`，正文 `renderOutput`，metadata `{kind, summary}`；
+    summary `Agent completed|failed: <agentDescription>`。投递完成后 `ensuring` 发 `settled`；
+    投递失败只记日志，账照结。
+  - fork 而非在子的 fiber 里等：否则子在父跑完前一直 busy，花名册会把已停机的子列成 running。
+  - 为什么在 `session/prompt.ts`：通知要调 `SessionPrompt.prompt`，而 agent-management 不能依赖它
+    （`ops` 经 `ctx.extra` 注入正是为此）；`prompt.ts` 只多 import 纯模块 `AgentDelegation` 与常量。
 - **正确性论证**：
-  - **`notify` 必须是显式参数，不能是 Effect Context 值**：`BackgroundJob` 用 `Effect.forkIn`
-    起 job fiber，forked fiber 继承 `currentContext`。若 `notify` 走上下文，它会随子的执行 fiber
-    传遍整棵子树——**子再建孙时孙也读到 `false`，孙完成后不通知子**。
-    一个只该管本次委托的开关不得获得子树作用域。显式参数的作用域恰好是这一次调用。
-  - **单一 watcher、至多一次通知**：`notify` 只在步骤 5 注册一次，`background.wait` 对一个 job
-    只结算一次，故初始委托**至多发起一次**结局通知。
-    `notify === false` 时改由调用方等待同一个 job，**总数仍是一条**面向父的消息，不是两条。初始执行期间经 `agent_send` 追加的消息
-    进入同一个 loop 的消息序列，由这同一次执行消费，不产生第二个结局。
-  - **不保证送达**：`inject` 走 fork 且失败被吞（既有行为），且受 issue #32 影响。
-    可保证的是"至多发起一次"，不是"恰好收到一次"（架构 §6）。
-  - 后置：初始委托跑完后，创建者**至多**收到一条 completed 或 error 通知。
-  - 副作用论证：注册一个 BackgroundJob；执行结束后（异步地）向 `caller` 写入一条通知消息。
+  - **`notify` 落库而非 Effect Context**：forked fiber 继承 `currentContext`，走上下文会传遍整棵
+    子树——孙也读到 `false`。落在子 Session 上的作用域恰好是一次委派。
+  - **每次 run 至多一次通知**：`Effect.onExit` 随 work 恰好触发一次；初始委托与后续 run 不存在
+    第二条路径。command-subtask 的子 `agentNotify: false`，整体跳过，父仍只收 `wait` 的一份。
+  - **不保证送达**：投递走 fork，失败记日志；可保证"每次 run 至多发起一次"，不是"恰好收到一次"。
+  - 后置：子每次 run 结束后，父**至多**收到一条 completed 或 error 通知；cancelled 一条不发。
+  - 副作用论证：注册一个 BackgroundJob；每次 run 结束后（异步地）向父写入一条通知消息。
 
 #### 5.4.5 `classify(result) -> DelegationOutcome`
 
@@ -709,7 +710,8 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   1. `handleSubtask` 在调 `agent` 工具时，于 `Tool.Context.extra` 增加 `notifyOnFinish: false`
      （该处已在传 `bypassAgentCheck` / `promptOps`，本条只是多一个键）。
      **必须走 `extra` 而不是 Effect Context**，理由见 §5.4.4。
-  2. `agent` 工具读出它，**显式**传给 `create` → `startDelegation`，后者因此不注册结局 watcher。
+  2. `agent` 工具读出它，**显式**传给 `create`：子 Session 落库 `agentNotify: false`，`reportRunEnd`
+     整体跳过；`startDelegation` 也不发 `started`。
   3. **先判 `result.metadata?.sessionId` 是否存在**：
      - **不存在** ⇒ 创建本身失败（worktree 不可用 / agent 类型不存在 / 校验不过），
        此时既无子 Session 也无 BackgroundJob。直接把工具的失败结果写成 tool part error，
@@ -731,7 +733,7 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
      才会触发；父 fiber 被中断本身不会波及它。
 - **正确性论证**：
   - **父只收到一条消息**：`notifyOnFinish: false` 与 summary 构成互斥二选一，
-    watcher 未注册故不会有自动通知；这是本函数唯一的逻辑分支，须直接断言，
+    子 `agentNotify: false` 故 run 结束不报告；这是本函数唯一的逻辑分支，须直接断言，
     不能只由"端到端输出正确"间接证明。
   - **不改变公开契约**：等待只存在于这条内部路径上，`agent` 工具仍恒为异步、立即返回。
   - **不新增挂起状态**：等待在一次命令调用之内完成。

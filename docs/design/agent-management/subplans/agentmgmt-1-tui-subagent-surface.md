@@ -16,7 +16,7 @@
 
 | goal                                        | 模块                                                        | commit |
 | ------------------------------------------- | ----------------------------------------------------------- | ------ |
-| G1 委派结果在父会话转录中可见（一行提示）   | 服务端 `lifecycle.inject` + TUI `UserMessage`               | #39    |
+| G1 委派结果在父会话转录中可见（一行提示）   | 服务端 `SessionPrompt.reportRunEnd`（原 `lifecycle.inject`）+ TUI `UserMessage` | #39    |
 | G2 主界面 `down` 链式回退到 subagent 列表   | TUI `prompt/history` + `Prompt` + 新 `DialogSubagentList`   | #38    |
 | G3 人可直接给 subagent 发消息且不改写其身份 | 服务端 `AgentInbox` + HTTP 端点 + TUI `Prompt`/session 路由 | #37    |
 
@@ -78,9 +78,9 @@
   - kind: "agent_notification" — 识别键。UI 唯一安全依据；与 TUI 自有的
     metadata.kind === "editor_context" 同一命名空间。
   - summary: string — 一行提示的显示内容。预渲染字符串，措辞 owner 在服务端
-    （复用 inject() 已算好的 `Agent completed: <description>` / `Agent failed: <description>`）。
+    （复用通知写入方已算好的 `Agent completed: <description>` / `Agent failed: <description>`）。
 
-生命周期：一次性写入（inject()），不可变；旧转录无此字段，渲染器必须容忍缺失。
+生命周期：写入时一次性给定（原 `inject()`，现 `SessionPrompt.reportRunEnd`，子每次 run 结束一条），不可变；旧转录无此字段，渲染器必须容忍缺失。
 跨模块共享性：lifecycle.ts（写）↔ tui session/index.tsx UserMessage（读）。
 ```
 
@@ -160,6 +160,9 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
 ### 5.1 commit 1（#39）：通知可见
 
 #### 5.1.1 `lifecycle.ts inject()` — 附 metadata
+
+> 后记：`inject()` 已随 `agent-management-fix-run-end-notice` 迁入 `session/prompt.ts` 的 `reportRunEnd`，
+> part 的文本与 metadata 形状不变，本节论证照旧成立。
 
 - 在既有 `parts: [{type:"text", synthetic:true, text: renderOutput(...)}]` 上加
   `metadata: { kind: "agent_notification", summary }`，`summary` 即现有三元表达式结果。

@@ -44,7 +44,8 @@
          agent_stop      → M4 stop（自底向上无条件 cancel → 向 caller 发一条 cancelled）
 
      上下文注入：M5 roster —— 每轮比较，变化时落盘一条子 Agent 列表
-     自动结局交付：只有 agent 的初始委托有，复用既有 runTask 分类与 notify/inject
+     自动结局交付：子 Agent **每次 run 结束**向父报告一次（`SessionPrompt.reportRunEnd`，
+                   初始委托与 agent_send 驱动的 run 同一条路），复用既有 classify / renderOutput
 ```
 
 四条值得单独展开的路径：
@@ -284,11 +285,12 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
 ```
 数据结构：DelegationOutcome
 
-作用域：**只用于 `agent` 的初始委托**。`agent_send` 不产生本结构。
+作用域：子 Agent 的**每一次 run 结束**（初始委托那次与之后 `agent_send` 驱动的每一次相同）。
+`agent_send` 本身不产生本结构——结局按 run 计，不按消息计。
 
 字段：
-  - kind: "completed" | "failed" | "cancelled" — 初始委托的结局
-  - text: string — 交给创建者的正文
+  - kind: "completed" | "failed" | "cancelled" — 这次 run 的结局
+  - text: string — 交给父的正文
 
 语义与判定顺序（照既有 task 执行体逐条复制，不简化）：
   1. 返回的不是 assistant 消息                      ⇒ failed，正文说明协议异常
@@ -808,11 +810,11 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 | 决策 | 理由 |
 |---|---|
 | 唯一权威标识用 `session_id` | 调研 §4.2 已否决 `run_id`；Agent 的上下文、历史、父子关系本就存在 Session 上 |
-| `agent_send` 是消息，不是调用 | 不自动回复、不承诺结果、不建 BackgroundJob、不注册 watcher，调用方只收 `accepted`。一条消息的"结局"在语义上不存在——接收方可能只是把它读进上下文继续原任务 |
+| `agent_send` 是消息，不是调用 | 不自动回复、不承诺结果、不建 BackgroundJob，调用方只收 `accepted`。一条消息的"结局"在语义上不存在——接收方可能只是把它读进上下文继续原任务。但接收方若是调用方自己的子，它这次 run 结束时照常向父报告：那是 run 的事，不是这条消息的回复（见下一行） |
 | **投递必须 fork，不能 await `prompt()`** | `prompt.ts:1069-1070` 在 `noReply !== true` 时 `return yield* loop(...)`，直接 await 会阻塞到目标整轮结束，把单向消息变成 RPC。`noReply: true` 也不行——只落库不跑 loop，idle 目标永不启动。照 HTTP handler：`prompt(...).pipe(catchCause(...), forkIn(scope, {startImmediately: true}))`，**且必须在 fork 内 catch** |
 | **`Accepted` 只有 HTTP 204 的强度** | 承上：异步性在 fork 里，调用方返回时消息未必已落库。原 I2「Accepted ⇒ 已持久化」及一切依赖它的论证删除。代价：fork 内失败只发 `Session.Event.Error`，模型拿不到投递失败反馈（§10 缺口 5） |
 | **投递必须经含路由的完整入口** | 前一版据 `requireSession` 断言"V1 没有按 Session 的 workspace 路由"，**该判断是错的**：路由在 `middleware/workspace-routing.ts:222-232` —— 先按 URL 中的 sessionID 查出 Session，再由 `planRequest` 用 `session.workspaceID` / `session.directory` 规划目标 Instance。一个 handler 内的函数不能证明一整层不存在。故本 server 内的**跨 directory 投递做得到**，做法是 `AgentPromptOps.deliverAsync` 取完整 `PromptInput`，由它与 HTTP handler 共用同一实现。**寻址范围是当前 server 的 Session 命名空间**：`Session.get` 是本机 DB 的主键查询，其他 server 的 Session 本就不在表内，查不到即 `AgentNotFound`，不为此新增分支或错误类型 |
-| 只有 `agent` 的初始委托保留自动结局 | 初始委托是创建者交出去的一项任务，有明确完成含义。产生一处**不对称并需明说**：`agent` 自动回结果，`agent_send` 永不回 |
+| 子 Agent **每次 run 结束**都向父报告 | 最初只有初始委托报告（"初始委托是交出去的任务，后续消息不是"）。实测推翻：父用 `agent_send` 派后续任务是常态，子在某一轮耗尽输出预算后静默死亡，父无从得知（`docs/fixes/agent-management-fix-run-end-notice.md`）。改为按停机计：子真正停下（run 结束、不 re-arm、自己派的 agent 都不在跑）时 completed / failed 各一条，cancelled 由 `agent_stop` 自己发；钩在 `SessionPrompt.loop` 的 work 上，一次 run 恰好一次。"后代还在跑不算停"与 Claude Code 的 "stops with no live background children of its own" 同一规则。父收到的消息因此变多，接受：子回话是一次 tool use，之后通常还会继续干活，回话与停机不在同一轮 |
 | **通知强度只到"至多发起一次"** | 可保证：一个初始委托只注册一个 watcher，completed/error 时至多发起一次异步通知。不可保证：父恰好收到、消息必落库、必被消费。cancelled 同强度 |
 | 消息身份取自目标 Session 且必须显式传 | `createUserMessage` 的优先级是 `input.model ?? agent 定义 model ?? Session 当前 model`，不传 `agent` 回落默认 agent，且结果经 `setAgentModel` 落库。**同一规则覆盖三处**：`agent_send`、初始委托 completed/error 的 `inject`（投递时**重新读**父的当前身份，父可能在子运行期间换过模型）、以及新建子 Session 时就持久化已解析身份 |
 | **`task` 工具删除，不保留隐藏别名** | 推翻调研 §8。运行时 tool ID 只剩 `agent`；配置键迁移与历史展示兼容保留。代价是连带迁移：`registry.ts:268` 的 subagent type 过滤、内置 Agent allowlist、prompt 里的 agent part 判断与模型提示，以及 TUI/app/CLI 中约十余处按 `part.tool === "task"` 分支的渲染器——不迁移则 subagent 显示静默消失 |
@@ -835,7 +837,7 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 | 停止级联到整棵子树 | 避免"停了父、子变孤儿继续消耗"；是否改为只停目标本身列为 follow-up（issue #26） |
 | **创建不返回实时 status** | 在 BackgroundJob 启动后硬编码 `running` 与"status 唯一来自 `SessionStatus`"冲突。创建只表达"已创建并启动"；完整 `AgentInfo.status` 只在 `agent_list` 装配 |
 | **没有同步启动失败分支** | BackgroundJob 注册本身没有产品级"同步启动失败"：执行失败由 job 结算并走既有异步通知路径；内部 defect 不伪装成可恢复的模型错误 |
-| **初始委托代码只有一份** | `runTask`（`task.ts:333`）、`inject`（`:369`）、`notify`（`:398`）都是 `TaskTool.execute` 内的**闭包**，不是可直接调用的 helper。必须最小提取为共享内部实现、显式传窄数据，不复制第二套 |
+| **初始委托代码只有一份** | `runTask`（`task.ts:333`）、`inject`（`:369`）、`notify`（`:398`）都是 `TaskTool.execute` 内的**闭包**，不是可直接调用的 helper。必须最小提取为共享内部实现、显式传窄数据，不复制第二套。（后记：提取后的 `inject` 已再迁入 `SessionPrompt.reportRunEnd`，job 路径不再投递，仍只有一份） |
 | **工具可见性在工具列表生成期计算** | `SessionTools.resolve` 的入参有 `session: Session.Info`、**没有 `Tool.Context`**；后者只在工具真正执行时才存在，而模型看到的 schema 在那之前已确定。深度过滤必须用 `input.session.id` 在 resolve 处做；`agent` 内的深度检查保留为第二道防线 |
 | 触达深度上限时撤下工具 | 撤下 `agent` 与 `agent_stop`（到限者不能派生，也就不会有子可停），保留 `agent_send` 与 `agent_list`。**边角**：若 `subagent_depth` 被调低、或某深度 3 的 Session 是在上限更高时建的，它会有子却无 `agent_stop`；此时仍可由更上层停止其祖先 |
 | Agent 恒为异步，取消 `background` 参数与实验开关 | 前台路径以 `background.wait` 阻塞，父停在那次 tool call 里，管理面完全不可用 |
@@ -858,12 +860,12 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 - **有人忙但不出声** → 长上限；到点意味着有工作正在被丢掉，故 abort 并如实报告。该上限只在 root 已 idle 时武装，所以 abort 永远不会落在正在消费结果的 root 上。
 - **全体安静** → 看**还欠不欠结果**。不欠即树真的结束，立即干净退出；还欠说明有结果正处在"产出它的子"与"将读它的父"之间——`effect/runner.ts` 的 `finishRun` 里 `yield* idle` 排在 `complete(done, exit)` 之前，故 child idle 到达时 job 尚未结算、通知尚未投递，此刻全体 idle、无人在跑，与"真的结束"在事件流里**完全同形**（被取消的子也是这样安静的）。
 
-  **欠账由 server 直说**：`agent.delegation` 事件在委托注册时发 `started`、在结果**投递完成后**发 `settled`（不是 job 结算时——结算只是窗口的起点）。只为 `notify: true` 的委托发：调用方自己 await 的那条全程 busy，不产生这个窗口，发了就是一笔还不掉的账。
+  **欠账由 server 直说**：`agent.delegation` 事件在委托注册时**同步**发 `started`（工具一返回父就可能 idle，账要在那之前记上）、由 `SessionPrompt.reportRunEnd` 在结果**投递完成后**发 `settled`（不是 run 结束时——那只是窗口的起点）。子每次 run 结束都发一次 `settled`，故一个 `started` 之后可能跟多个 `settled`，第一个即结清；`run.ts` 用集合记账，多出的是 no-op。只为 `notify: true` 的委托发：调用方自己 await 的那条全程 busy，不产生这个窗口，发了就是一笔还不掉的账。
 
   **为什么不能用宽限期**：那是在猜一个时长，任何固定值都会被更慢的交接跑赢，而跑赢的后果是 exit 0 且结果丢失——恰是这套等待要防的事。Claude Code 的同一契约是「stays open until that work **completes**」，它能按"完成"判是因为 subagent 就跑在它自己进程里；我们把那个事实做成事件，客户端就拿到了同样的依据。退出按完成判、放弃按空闲判，各归各位。
 
 **退出条件不得锚在 root 的 idle 上**：depth 1 时 root 必然最后安静（每个子都向它汇报），depth ≥ 2 则不然——孙向自己的父汇报，root 根本不会被告知。等一个不会到来的 root idle,正是嵌套树跑完后永久挂死的原因。**放在 CLI 而非 `runLoop`**：放 loop 会让父在子跑着时一直 busy，交互模式下那是错的——你要父空闲好让用户继续打字，那正是异步委托的意义 |
-| 不引入 correlation ID、per-message output 槽或 `run_id` | `agent_send` 根本不产生结局，自然无需为消息编号 |
+| 不引入 correlation ID、per-message output 槽或 `run_id` | 结局按 run 计、由 run 自己报告，不按消息计，自然无需为消息编号 |
 
 ## 7. 架构正确性论证
 
@@ -924,7 +926,7 @@ H2: Session 的 parentID 链无环且深度有限。
 |---|---|---|
 | 旧 H2 | 至多一个活动执行 | §6 决策（概念定义）+ I3（机制维护） |
 | 旧 H4 | 终止通知接收方仍在运行 | 由 `StopPlan` 类型不变量直接给出（notify_boundary ∉ 停止集），不再是假设 |
-| 旧 H5 | 只交付一个最终结果 | `agent_send` 不产生结局，无需该假设 |
+| 旧 H5 | 只交付一个最终结果 | 结局按 run 计，每次 run 结束各交付一次；不存在"最终"一次 |
 | 旧 H6 | 拆解期间不会派生新成员 | §10 已知缺口 |
 | 旧 H3 | 同一 project 的创建在同进程内串行 | **删除**：名称降为弱别名后不再需要该前提（§6） |
 
@@ -1033,7 +1035,7 @@ Rely-Guarantee 条件：
 | 项 | Claude Code | 本方案 | 理由 |
 |---|---|---|---|
 | **消息是否带回复** | `SendMessage` 带回目标的回复（云会话例外条款反证常规会） | 单向：只回 `accepted` | 一条消息的"结局"在语义上不存在；强行配一个要维护 watcher 所有权、结局去重与取消竞态 |
-| **结局的不对称** | `Agent` 与 `SendMessage` 都能拿到结果 | `agent` 的初始委托自动回一次，`agent_send` 永不回 | 初始委托是交出去的一项任务，有明确完成含义；后续消息没有 |
+| **结局的不对称** | `Agent` 与 `SendMessage` 都能拿到结果 | 子每次 run 结束自动回一次；`agent_send` 这条消息本身永不回 | 我们的子是长驻的，"结束"按 run 计而非按 agent 计；回复按消息计则要维护消息到结局的配对，而子根本不必按消息回 |
 | **投递保证** | 未述 | 只到"已接受/已调度" | 复用既有异步入口的既有强度，不加强也不削弱 |
 | 寻址标识 | 名字即地址（来自 `subagent_type`），`ListAgents` 每行 `name [ref]`，重名用 `[ref]` 消歧或报错 | `session_id` 为权威标识，可选实例名作**弱**别名；重名时列出候选并拒绝 | CC 预期用户为具体任务定义具体类型，故类型名即实例名；我们把它做成一等参数，扇出时才不歧义 |
 | 模型选择 | `Agent` 有 `model` 参数 | 无，继承创建者当次的 model 与 variant | 首版不做 |

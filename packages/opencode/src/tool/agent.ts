@@ -82,7 +82,7 @@ const LIST_DESCRIPTION = [
 
 const SEND_DESCRIPTION = [
   "- Sends a message to another agent; also how you resume one that has gone idle, including one that was stopped",
-  "- This is a message, not a call. The recipient does not reply automatically and this does not wait for it",
+  "- This is a message, not a call: this does not wait for it. Your own subagent reports to you when it stops, as it does after any of its runs; anyone else does not reply automatically",
   "- What comes back means the message was accepted for delivery — not that it was processed, and not that an answer is coming",
   "- If you need an answer, ask for it in the message and carry on. The recipient replies by calling agent_send itself. Do not follow up asking where the result is",
   "- Reaches your parent, children and siblings by name or session_id, and any agent at all by session_id",
@@ -310,8 +310,8 @@ export const AgentSendTool = Tool.define(
           `Accepted for ${accepted.target}.`,
           // Spelled out because a model that reads this as a call will spend its
           // next turn asking where the answer is.
-          "This is a one-way message: the target will not reply automatically, this call did not wait for it, and delivery is not guaranteed to have been processed.",
-          "If you need a response, wait for the target to send one back.",
+          "This is a one-way message: this call did not wait for it, and delivery is not guaranteed to have been processed.",
+          "If the target is your own subagent, you will be told how it stopped; otherwise, if you need a response, wait for the target to send one back.",
         ].join("\n"),
       }
     })
