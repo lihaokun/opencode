@@ -1,6 +1,6 @@
 > **这是 [anomalyco/opencode](https://github.com/anomalyco/opencode) 的 fork。**
 > 在上游之上加了 Agent 管理能力（`agent` / `agent_list` / `agent_send` / `agent_stop` 四个工具，替代原 `task`）和一批 session 层修复。
-> **正式版在 `main`（默认分支），测试版在 `dev`。** [Releases](https://github.com/lihaokun/opencode/releases) 里不带 Pre-release 标记的是正式版（tag 形如 `v1.18.31-fmv3`，从 `main` 构建）；标 Pre-release 的 `-beta.N` 是从 `dev` 构建的测试版。安装见 [`FORK_INSTALL.md`](FORK_INSTALL.md)。
+> **正式版在 `main`（默认分支），测试版在 `dev`。** [Releases](https://github.com/lihaokun/opencode/releases) 里不带 Pre-release 标记的是正式版（tag 形如 `v1.18.31-fmv3`，从 `main` 构建）；标 Pre-release 的 `-beta.N` 是从 `dev` 构建的测试版。安装：到 Releases 下载对应平台的包，按 [`FORK_INSTALL.md`](FORK_INSTALL.md) 第一节解压、加 PATH、关掉官方自动更新，三步；每个 release 的说明里也有同样的步骤。
 > 上游原版 README 如下。
 
 <p align="center">
