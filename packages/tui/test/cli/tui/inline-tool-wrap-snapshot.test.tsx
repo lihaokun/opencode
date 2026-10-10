@@ -113,10 +113,10 @@ function TaskRowsFixture() {
         Grep "Task" (2 matches)
       </InlineToolRow>
       <InlineToolRow icon="⠙" complete={true} pending="" separate={true}>
-        Explore Task — Inspect active task spacing
+        Explore — Inspect active task spacing
       </InlineToolRow>
       <InlineToolRow icon="✓" complete={true} pending="" separate={true}>
-        {"General Task — Confirm completed task spacing\n↳ 1 toolcall · 501ms"}
+        {"General — Confirm completed task spacing\n↳ 1 toolcall · 501ms"}
       </InlineToolRow>
       <InlineToolRow icon="→" complete={true} pending="">
         Read src/cli/cmd/tui/routes/session/index.tsx
@@ -135,7 +135,7 @@ function LoadedReadBeforeTaskFixture() {
         <text paddingLeft={3}>↳ Loaded src/cli/cmd/tui/routes/session/tools.tsx</text>
       </box>
       <InlineToolRow icon="✓" complete={true} pending="" separate={true}>
-        {"Explore Task — Inspect active task spacing\n↳ 1 toolcall · 501ms"}
+        {"Explore — Inspect active task spacing\n↳ 1 toolcall · 501ms"}
       </InlineToolRow>
     </box>
   )
@@ -148,7 +148,7 @@ function AssistantSummaryBeforeInlineFixture() {
         <text>▣ Build · Little Frank · 53.1s</text>
       </box>
       <InlineToolRow icon="✓" complete={true} pending="">
-        {"Build Task — Review changes\n↳ 48 toolcalls · 1m 40s"}
+        {"Build — Review changes\n↳ 48 toolcalls · 1m 40s"}
       </InlineToolRow>
     </box>
   )
@@ -167,7 +167,7 @@ function AssistantErrorBeforeInlineFixture() {
         <text>Managed inference requires an active Member plan</text>
       </box>
       <InlineToolRow icon="✓" complete={true} pending="">
-        {"Build Task — Review changes\n↳ 48 toolcalls · 1m 40s"}
+        {"Build — Review changes\n↳ 48 toolcalls · 1m 40s"}
       </InlineToolRow>
     </box>
   )
@@ -282,9 +282,9 @@ describe("TUI inline tool wrapping", () => {
   })
 
   test("keeps background state attached to the subagent identity", () => {
-    expect(formatSubagentTitle("Explore", "Inspect renderer", false)).toBe("Explore Task — Inspect renderer")
+    expect(formatSubagentTitle("Explore", "Inspect renderer", false)).toBe("Explore — Inspect renderer")
     expect(formatSubagentTitle("Explore", "Inspect renderer", true)).toBe(
-      "Explore Task (background) — Inspect renderer",
+      "Explore (background) — Inspect renderer",
     )
   })
 

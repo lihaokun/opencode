@@ -1,5 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Effect, Layer, Context, Path, Scope } from "effect"
+import { Effect, Layer, Context, Path } from "effect"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { path } from "@opencode-ai/core/effect/app-node-platform"
 import { AppProcess } from "@opencode-ai/core/process"
@@ -76,10 +76,7 @@ export interface Interface {
     caller: SessionID
     target: SessionID
     ops: AgentManagement.AgentPromptOps
-  }) => Effect.Effect<
-    AgentManagement.StopOutcome,
-    AgentManagement.NotAChild | AgentManagement.AgentNotFound
-  >
+  }) => Effect.Effect<AgentManagement.StopOutcome, AgentManagement.NotAChild | AgentManagement.AgentNotFound>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/AgentLifecycle") {}
@@ -97,7 +94,6 @@ const layer = Layer.effect(
     const runState = yield* SessionRunState.Service
     const truncate = yield* Truncate.Service
     const events = yield* EventV2Bridge.Service
-    const scope = yield* Scope.Scope
     // Captured here so the closures below carry them; prepareWorkdir needs the
     // filesystem, process and worktree services and the returned Interface must
     // have no outstanding requirements.
@@ -233,9 +229,12 @@ const layer = Layer.effect(
           ].join("\n")
 
     /**
-     * The one place an outcome is delivered automatically. A delegation is a task
-     * the creator handed out and is waiting on; a later message is not, which is
-     * why agent_send produces nothing.
+     * Starts the initial delegation as a background job. The job exists for
+     * agent_list (status), agent_stop (cancel) and the command-subtask path,
+     * which waits on it; it does not report the outcome. That is done by
+     * SessionPrompt at the end of every run of the child — this first one and
+     * each one agent_send starts later — from the notify flag persisted on the
+     * child session, so the first run and the later ones go the same way.
      */
     const startDelegation = Effect.fn("AgentLifecycle.startDelegation")(function* (input: {
       session: Session.Info
@@ -267,8 +266,12 @@ const layer = Layer.effect(
       // A client watching the event stream cannot otherwise tell a finished tree
       // from one whose result is still on its way to the caller: the subagent
       // goes idle either way, and nothing else marks the difference. Published
-      // only for delegations that report back on their own — a caller awaiting
-      // the result itself never leaves that gap, and the pair would never close.
+      // here, synchronously, because the caller may go idle the moment this tool
+      // returns and a client must already see the debt by then. The matching
+      // `settled` comes from SessionPrompt once the run-end notice has been
+      // delivered. Only for delegations that report back on their own — a
+      // caller awaiting the result itself never leaves that gap, and the pair
+      // would never close.
       if (input.notify) {
         yield* events.publish(AgentEvent.Delegation, {
           sessionID: input.session.id,
@@ -285,75 +288,6 @@ const layer = Layer.effect(
         metadata: { parentSessionId: input.caller, sessionId: input.session.id, model: input.model },
         run,
       })
-
-
-      // Registered once, and only when this delegation reports for itself.
-      // Silent on cancelled, because a cancellation notice comes from stop;
-      // adding one here would produce two for a single agent_stop.
-      //
-      // Note that `notify` is a parameter rather than something read from the
-      // Effect context. A forked fiber inherits the context, and the job's fiber
-      // is forked from here, so a contextual flag would travel through the
-      // child's whole execution: when that child spawned one of its own, the
-      // grandchild would read `false` too and never report back to it. The scope
-      // of this switch has to be exactly one delegation.
-      if (!input.notify) return
-
-      yield* background
-        .wait({ id: input.session.id })
-        .pipe(
-          Effect.flatMap((result) =>
-            Effect.gen(function* () {
-              if (result.info?.status === "completed") yield* inject("completed", result.info.output ?? "")
-              else if (result.info?.status === "error") yield* inject("error", result.info.error ?? "")
-              yield* events.publish(AgentEvent.Delegation, {
-                sessionID: input.session.id,
-                caller: input.caller,
-                status: "settled",
-              })
-            }),
-          ),
-          Effect.forkIn(scope, { startImmediately: true }),
-        )
-
-      function inject(state: "completed" | "error", text: string) {
-        return Effect.gen(function* () {
-          // Re-read the parent's identity at delivery time. Passing no model lets
-          // the parent's agent definition override and persist over its current
-          // model, and a variant captured when the child was created would revert
-          // a parent that switched mid-flight.
-          const parent = yield* sessions.get(input.caller)
-          yield* input.ops.prompt({
-            sessionID: input.caller,
-            // Never fall back to the child's agent type. Doing so switches the
-            // parent to the subagent's definition and persists it — including
-            // that definition's model, which is how a subagent pinned to a
-            // broken model used to take its parent down. Omitting it lets
-            // createUserMessage pick the default agent, which is the right
-            // answer for a session that never bound one.
-            agent: parent.agent,
-            model: parent.model
-              ? { providerID: parent.model.providerID, modelID: parent.model.id }
-              : undefined,
-            variant: parent.model?.variant === "default" ? undefined : parent.model?.variant,
-            parts: [
-              {
-                type: "text",
-                synthetic: true,
-                text: AgentDelegation.renderOutput({
-                  sessionID: input.session.id,
-                  state,
-                  summary:
-                    state === "completed"
-                      ? `Agent completed: ${input.description}`
-                      : `Agent failed: ${input.description}`,
-                  text,
-                }),
-              },
-            ],
-          })
-        }).pipe(Effect.ignore)
-      }
     })
 
     const create = Effect.fn("AgentLifecycle.create")(function* (input: CreateInput) {
@@ -386,9 +320,7 @@ const layer = Layer.effect(
       // caller is using for this very turn. The variant is inherited only when
       // the subagent has not pinned a model — carrying a parent's variant onto a
       // different model is meaningless.
-      const model = next.model
-        ? { providerID: next.model.providerID, modelID: next.model.modelID }
-        : input.model
+      const model = next.model ? { providerID: next.model.providerID, modelID: next.model.modelID } : input.model
       const variant = next.model ? undefined : input.variant
 
       const workdir = yield* AgentWorkdir.prepareWorkdir({
@@ -418,6 +350,11 @@ const layer = Layer.effect(
         metadata: {
           ...(input.name ? { [AgentManagement.METADATA_AGENT_NAME]: input.name } : {}),
           [AgentManagement.METADATA_AGENT_WORKDIR]: workdir,
+          [AgentManagement.METADATA_AGENT_DESCRIPTION]: input.description,
+          // Persisted rather than carried by the delegation: the parent is told
+          // at the end of every run, and runs after the first are driven by
+          // agent_send, which never sees this call's arguments.
+          [AgentManagement.METADATA_AGENT_NOTIFY]: input.notify ?? true,
         },
       })
 
@@ -511,11 +448,14 @@ const layer = Layer.effect(
       yield* inbox
         .deliver({
           message: {
-            target: input.caller,
-            sender: input.target,
-            sender_name: info.metadata?.[AgentManagement.METADATA_AGENT_NAME],
-            sender_agent: info.agent,
-            body: renderTermination(info, stopped.length - 1),
+            kind: "agent",
+            message: {
+              target: input.caller,
+              sender: input.target,
+              sender_name: info.metadata?.[AgentManagement.METADATA_AGENT_NAME],
+              sender_agent: info.agent,
+              body: renderTermination(info, stopped.length - 1),
+            },
           },
           ops: input.ops,
         })

@@ -1,3 +1,5 @@
+> Base branch: `dev`. The default branch `main` only takes promotion PRs from `dev`.
+
 ### Issue for this PR
 
 Closes #

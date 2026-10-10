@@ -82,7 +82,7 @@ const LIST_DESCRIPTION = [
 
 const SEND_DESCRIPTION = [
   "- Sends a message to another agent; also how you resume one that has gone idle, including one that was stopped",
-  "- This is a message, not a call. The recipient does not reply automatically and this does not wait for it",
+  "- This is a message, not a call: this does not wait for it. Your own subagent reports to you when it stops, as it does after any of its runs; anyone else does not reply automatically",
   "- What comes back means the message was accepted for delivery — not that it was processed, and not that an answer is coming",
   "- If you need an answer, ask for it in the message and carry on. The recipient replies by calling agent_send itself. Do not follow up asking where the result is",
   "- Reaches your parent, children and siblings by name or session_id, and any agent at all by session_id",
@@ -104,9 +104,7 @@ function failed<M extends { [key: string]: unknown }>(title: string, output: str
 
 function requireOps(ctx: Tool.Context) {
   const ops = ctx.extra?.promptOps as AgentManagement.AgentPromptOps | undefined
-  return ops
-    ? Effect.succeed(ops)
-    : Effect.fail(new Error("The agent tools require promptOps in ctx.extra"))
+  return ops ? Effect.succeed(ops) : Effect.fail(new Error("The agent tools require promptOps in ctx.extra"))
 }
 
 export const AgentTool = Tool.define(
@@ -215,9 +213,7 @@ export const AgentListTool = Tool.define(
     const projection = yield* AgentStatusProjection.Service
 
     const run = Effect.fn("AgentListTool.execute")(function* (_params: unknown, ctx: Tool.Context) {
-      const result = yield* tree
-        .neighborhood(ctx.sessionID)
-        .pipe(Effect.catch((error) => Effect.succeed(error)))
+      const result = yield* tree.neighborhood(ctx.sessionID).pipe(Effect.catch((error) => Effect.succeed(error)))
       if ("_tag" in result) return failed<ListMeta>("agents", result.message)
 
       // Status is assembled here, not in the tree: it is a different observed
@@ -289,13 +285,16 @@ export const AgentSendTool = Tool.define(
       const accepted = yield* inbox
         .deliver({
           message: {
-            target,
-            // Taken from the execution context, never from the arguments, so a
-            // model cannot claim to be someone else.
-            sender: ctx.sessionID,
-            sender_name: self.metadata?.[AgentManagement.METADATA_AGENT_NAME],
-            sender_agent: self.agent ?? ctx.agent,
-            body: params.message,
+            kind: "agent",
+            message: {
+              target,
+              // Taken from the execution context, never from the arguments, so a
+              // model cannot claim to be someone else.
+              sender: ctx.sessionID,
+              sender_name: self.metadata?.[AgentManagement.METADATA_AGENT_NAME],
+              sender_agent: self.agent ?? ctx.agent,
+              body: params.message,
+            },
           },
           ops,
         })
@@ -311,8 +310,8 @@ export const AgentSendTool = Tool.define(
           `Accepted for ${accepted.target}.`,
           // Spelled out because a model that reads this as a call will spend its
           // next turn asking where the answer is.
-          "This is a one-way message: the target will not reply automatically, this call did not wait for it, and delivery is not guaranteed to have been processed.",
-          "If you need a response, wait for the target to send one back.",
+          "This is a one-way message: this call did not wait for it, and delivery is not guaranteed to have been processed.",
+          "If the target is your own subagent, you will be told how it stopped; otherwise, if you need a response, wait for the target to send one back.",
         ].join("\n"),
       }
     })
@@ -385,7 +384,9 @@ export const AgentStopTool = Tool.define(
  * Tool.Context, which does not exist until a tool actually runs, by which point
  * the schema the model sees has already been sent.
  */
-export const visibleAgentTools = Effect.fn("AgentTools.visible")(function* (sessionID: Parameters<AgentTree.Interface["callerDepth"]>[0]) {
+export const visibleAgentTools = Effect.fn("AgentTools.visible")(function* (
+  sessionID: Parameters<AgentTree.Interface["callerDepth"]>[0],
+) {
   const tree = yield* AgentTree.Service
   const config = yield* Config.Service
   const cfg = yield* config.get()

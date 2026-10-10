@@ -59,6 +59,8 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { Identifier } from "../../src/id/id"
+import { AgentManagement } from "@/agent-management/schema"
+import { AgentEvent } from "@opencode-ai/schema/agent-event"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -4367,4 +4369,318 @@ noLLMServer.instance(
       }
     }),
   30_000,
+)
+
+// Run-end notice. A subagent reports to its parent at the end of every run —
+// the first one, which the agent tool starts, and each later one, which
+// agent_send starts. The sessions are built directly here with the metadata
+// that AgentLifecycle.create persists, since the notice reads only that.
+
+const allowAll = [{ permission: "*", pattern: "*", action: "allow" as const }]
+const matching = (needle: string) => (hit: { body: Record<string, unknown> }) =>
+  JSON.stringify(hit.body).includes(needle)
+
+const subagent = Effect.fn("test.subagent")(function* (parentID: SessionID, opts?: { notify?: boolean }) {
+  const sessions = yield* Session.Service
+  return yield* sessions.create({
+    parentID,
+    title: "look around (@explore subagent)",
+    agent: "explore",
+    permission: allowAll,
+    metadata: {
+      [AgentManagement.METADATA_AGENT_DESCRIPTION]: "look around",
+      [AgentManagement.METADATA_AGENT_NOTIFY]: opts?.notify ?? true,
+    },
+  })
+})
+
+const notices = Effect.fn("test.notices")(function* (sessionID: SessionID) {
+  const sessions = yield* Session.Service
+  const messages = yield* sessions.messages({ sessionID })
+  return messages.flatMap((msg) =>
+    msg.parts
+      .filter(
+        (part): part is SessionV1.TextPart =>
+          part.type === "text" && part.metadata?.kind === AgentManagement.NOTIFICATION_METADATA_KIND,
+      )
+      .map((part) => ({ info: msg.info, part })),
+  )
+})
+
+const awaitNotices = (sessionID: SessionID, count: number) =>
+  pollWithTimeout(
+    Effect.gen(function* () {
+      const list = yield* notices(sessionID)
+      return list.length >= count ? list : undefined
+    }),
+    `the parent never received notice #${count}`,
+  )
+
+const delegations = Effect.fn("test.delegations")(function* () {
+  const events = yield* EventV2Bridge.Service
+  const seen: { sessionID: string; caller: string; status: string }[] = []
+  const off = yield* events.listen((event) => {
+    if (event.type === AgentEvent.Delegation.type) {
+      seen.push(event.data as { sessionID: string; caller: string; status: string })
+    }
+    return Effect.void
+  })
+  return { seen, off }
+})
+
+it.instance("reports a completed run to the parent without switching its agent", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    // A parent that has not bound an agent. The notice must not fill that in
+    // with the child's type: doing so adopts the subagent definition's model as
+    // well and persists it.
+    const parent = yield* sessions.create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    yield* user(child.id, "go")
+    yield* llm.textMatch(matching("go"), "child done")
+    yield* llm.textMatch(matching("Agent completed"), "ack")
+
+    yield* prompt.loop({ sessionID: child.id })
+
+    const [notice] = yield* awaitNotices(parent.id, 1)
+    expect(notice.part.metadata).toEqual({
+      kind: AgentManagement.NOTIFICATION_METADATA_KIND,
+      summary: "Agent completed: look around",
+    })
+    expect(notice.part.synthetic).toBe(true)
+    expect(notice.part.text).toContain(`<agent id="${child.id}" state="completed">`)
+    expect(notice.part.text).toContain("child done")
+    // The parent is woken on it.
+    yield* awaitWithTimeout(llm.wait(2), "the parent never ran on the notice", "5 seconds")
+    expect((yield* sessions.get(parent.id)).agent).not.toBe("explore")
+  }),
+)
+
+// The incident this guards: a worker driven by agent_send for many rounds ran
+// out of output budget on one of them and nobody told the parent. Only the
+// first run used to report.
+it.instance("a later run that dies of length still reports to the parent", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const parent = yield* (yield* Session.Service).create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    yield* user(child.id, "first task")
+    yield* llm.textMatch(matching("first task"), "first done")
+    yield* llm.textMatch(matching("Agent completed"), "ack")
+    yield* llm.textMatch(matching("Agent failed"), "ack again")
+    yield* prompt.loop({ sessionID: child.id })
+    yield* awaitNotices(parent.id, 1)
+
+    // The next run, as agent_send would start it.
+    yield* user(child.id, "second task")
+    yield* llm.pushMatch(matching("second task"), reply().usage({ input: 10, output: 10 }).length())
+    yield* prompt.loop({ sessionID: child.id })
+
+    const list = yield* awaitNotices(parent.id, 2)
+    expect(list[1].part.metadata).toEqual({
+      kind: AgentManagement.NOTIFICATION_METADATA_KIND,
+      summary: "Agent failed: look around",
+    })
+    expect(list[1].part.text).toContain(`<agent id="${child.id}" state="error">`)
+    expect(list[1].part.text).toContain("MessageOutputLengthError")
+    yield* awaitWithTimeout(llm.wait(4), "the parent never ran on the second notice", "5 seconds")
+  }),
+)
+
+it.instance("every run end reports, not only the first", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const parent = yield* (yield* Session.Service).create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    yield* llm.textMatch(matching("first task"), "first done")
+    yield* llm.textMatch(matching("second task"), "second done")
+    yield* llm.textMatch(matching("first done"), "ack")
+    yield* llm.textMatch(matching("second done"), "ack again")
+
+    yield* user(child.id, "first task")
+    yield* prompt.loop({ sessionID: child.id })
+    yield* awaitNotices(parent.id, 1)
+    yield* user(child.id, "second task")
+    yield* prompt.loop({ sessionID: child.id })
+
+    const list = yield* awaitNotices(parent.id, 2)
+    expect(list.map((item) => item.part.metadata?.summary)).toEqual([
+      "Agent completed: look around",
+      "Agent completed: look around",
+    ])
+    expect(list[1].part.text).toContain("second done")
+    yield* awaitWithTimeout(llm.wait(4), "the parent never ran on the second notice", "5 seconds")
+  }),
+)
+
+it.instance("reads the parent's identity when it delivers, not when the child started", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({
+      title: "root",
+      agent: "build",
+      model: { providerID: ref.providerID, id: ref.modelID, variant: "default" },
+      permission: allowAll,
+    })
+    const child = yield* subagent(parent.id)
+    yield* user(child.id, "go")
+    // Hold the child inside its run so the parent can switch while it is
+    // still running; otherwise the notice goes out first and this proves nothing.
+    const gate = yield* Deferred.make<void>()
+    yield* llm.pushMatch(matching("go"), reply().wait(deferredAsPromise(gate)).text("child done").stop())
+    yield* llm.textMatch(matching("Agent completed"), "ack")
+
+    const run = yield* prompt.loop({ sessionID: child.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "the child never called the model", "5 seconds")
+    yield* sessions.setAgentModel({
+      sessionID: parent.id,
+      agent: "build",
+      model: { providerID: ref.providerID, id: ref.modelID, variant: "turbo" },
+      time: Date.now(),
+    })
+    yield* Deferred.succeed(gate, undefined)
+    yield* Fiber.join(run)
+
+    const [notice] = yield* awaitNotices(parent.id, 1)
+    expect(notice.info.role).toBe("user")
+    if (notice.info.role === "user") expect(notice.info.model.variant).toBe("turbo")
+    yield* awaitWithTimeout(llm.wait(2), "the parent never ran on the notice", "5 seconds")
+  }),
+)
+
+it.instance("a cancelled run says nothing to the parent but settles the ledger", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const parent = yield* (yield* Session.Service).create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    const { seen, off } = yield* delegations()
+    yield* user(child.id, "go")
+    yield* llm.hang
+
+    const run = yield* prompt.loop({ sessionID: child.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "the child never called the model", "5 seconds")
+    yield* prompt.cancel(child.id)
+    yield* Fiber.await(run)
+
+    yield* pollWithTimeout(
+      Effect.sync(() => (seen.some((event) => event.status === "settled") ? true : undefined)),
+      "the delegation never settled",
+    )
+    yield* off
+    expect(seen).toEqual([{ sessionID: child.id, caller: parent.id, status: "settled" }])
+    expect(yield* notices(parent.id)).toEqual([])
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+// A command subtask's child, and any session from before the flag existed: the
+// creator waits on the job itself, and a notice on top would be a second message.
+it.instance("a child without the notify flag reports nothing", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const parent = yield* (yield* Session.Service).create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id, { notify: false })
+    const { seen, off } = yield* delegations()
+    yield* user(child.id, "go")
+    yield* llm.textMatch(matching("go"), "child done")
+
+    yield* prompt.loop({ sessionID: child.id })
+    // Long enough for a notice that was going to be written to have been.
+    yield* Effect.sleep("200 millis")
+    yield* off
+
+    expect(yield* notices(parent.id)).toEqual([])
+    expect(seen).toEqual([])
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+// Message landing inside the run's last iteration: the runner re-arms and the
+// child keeps going, so the parent hears once, when it actually stops.
+it.instance("says nothing when the child is about to run again", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const status = yield* SessionStatus.Service
+    const parent = yield* (yield* Session.Service).create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    yield* user(child.id, "first task")
+    // Same shape as the #32 test: an in-iteration break so the loop exits
+    // without re-reading, and the injected message lands in that window.
+    const release = defer<void>()
+    yield* llm.pushMatch(matching("first task"), reply().wait(release.promise).text("partial").contentFilter().item())
+    yield* llm.textMatch(matching("injected"), "second done")
+    yield* llm.textMatch(matching("Agent"), "ack")
+
+    const run = yield* prompt.loop({ sessionID: child.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "the child never called the model", "5 seconds")
+    yield* user(child.id, "injected while finishing")
+    release.resolve()
+    yield* awaitWithTimeout(Fiber.await(run), "first run never finished", "10 seconds")
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const s = yield* status.get(child.id)
+        return s.type === "idle" ? (true as const) : undefined
+      }),
+      "the child never went idle",
+      "10 seconds",
+    )
+
+    const list = yield* awaitNotices(parent.id, 1)
+    expect(list.map((item) => item.part.metadata?.summary)).toEqual(["Agent completed: look around"])
+    expect(list[0].part.text).toContain("second done")
+    yield* awaitWithTimeout(llm.wait(3), "the parent never ran on the notice", "5 seconds")
+    // Still one: the first run's end was not reported on its own.
+    expect(yield* notices(parent.id)).toHaveLength(1)
+  }),
+)
+
+// A stop with one of the child's own agents still running is not a stop: that
+// agent reports to the child and wakes it. The parent hears once the subtree
+// is quiet.
+it.instance("waits for the child's own agents before reporting", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const status = yield* SessionStatus.Service
+    const parent = yield* sessions.create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    const grandchild = yield* sessions.create({ parentID: child.id, title: "grandchild" })
+    const { seen, off } = yield* delegations()
+    yield* status.set(grandchild.id, { type: "busy" })
+    yield* user(child.id, "go")
+    yield* llm.textMatch(matching("go"), "child done")
+    yield* llm.textMatch(matching("grandchild reported"), "child done again")
+    yield* llm.textMatch(matching("Agent completed"), "ack")
+
+    yield* prompt.loop({ sessionID: child.id })
+    yield* Effect.sleep("200 millis")
+    expect(yield* notices(parent.id)).toEqual([])
+    expect(seen).toEqual([])
+
+    // The grandchild finishes and its report wakes the child, as it would.
+    yield* status.set(grandchild.id, { type: "idle" })
+    yield* user(child.id, "grandchild reported")
+    yield* prompt.loop({ sessionID: child.id })
+
+    const list = yield* awaitNotices(parent.id, 1)
+    expect(list[0].part.text).toContain("child done again")
+    // Settled only once the parent has read it, so wait for that, not for the
+    // parent's request alone.
+    yield* pollWithTimeout(
+      Effect.sync(() => (seen.some((event) => event.status === "settled") ? true : undefined)),
+      "the delegation never settled",
+    )
+    yield* off
+    expect(seen).toEqual([{ sessionID: child.id, caller: parent.id, status: "settled" }])
+  }),
 )

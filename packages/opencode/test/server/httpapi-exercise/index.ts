@@ -1488,6 +1488,41 @@ const scenarios: Scenario[] = [
         yield* ctx.llmWait(1)
       }),
     ),
+  // The payload carries parts only: identity is resolved from the target
+  // session on the server (agent, model, variant), so a session seeded with
+  // none resolves to the exerciser's default fake model. The run is forked,
+  // and the 204 arrives before it, so the follow-up waits for the one provider
+  // call that run makes.
+  http.protected
+    .post("/session/{sessionID}/agent-message", "session.agent_message")
+    .preserveDatabase()
+    .withLlm()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Agent message session" })
+        yield* ctx.llmText("fake agent-message assistant")
+        yield* ctx.llmText("fake agent-message assistant")
+        return session
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/agent-message", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { parts: [{ type: "text", text: "hello from the human" }] },
+    }))
+    .status(204, (ctx) =>
+      Effect.gen(function* () {
+        yield* ctx.llmWait(1)
+      }),
+    ),
+  http.protected
+    .post("/session/{sessionID}/agent-message", "session.agent_message.missing")
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/agent-message", { sessionID: "ses_httpapi_missing" }),
+      headers: ctx.headers(),
+      body: { parts: [{ type: "text", text: "nobody home" }] },
+    }))
+    .status(404),
   http.protected
     .post("/session/{sessionID}/command", "session.command")
     .preserveDatabase()
@@ -1736,6 +1771,7 @@ const llmScenarios = new Set([
   "session.init",
   "session.prompt",
   "session.prompt_async",
+  "session.agent_message",
   "session.command",
   "session.summarize",
 ])
