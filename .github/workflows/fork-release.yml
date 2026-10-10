@@ -9,8 +9,8 @@
 #
 # The tag name has to match the branch -- a stable-looking tag on dev or a
 # beta-looking tag on main fails here rather than publishing under the wrong
-# label. Release notes come from the tag's annotation; a lightweight tag gets
-# GitHub's generated notes. Creating the release in the GitHub UI works too:
+# label. Release notes come from the tag's annotation (a lightweight tag gets
+# GitHub's generated notes), followed by install instructions. Creating the release in the GitHub UI works too:
 # that pushes the tag, this run finds the release and only adds the assets.
 #
 # Not publish.yml: that one bumps the npm version and publishes `opencode-ai`
@@ -63,6 +63,8 @@ jobs:
       # tag can be the tag object.
       - name: Resolve the tag
         id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           TAG="${{ inputs.tag || github.ref_name }}"
@@ -84,14 +86,62 @@ jobs:
             echo "::error::$TAG ($SHA) is on neither main nor dev; releases are cut only from those two branches"
             exit 1
           fi
-          # Notes: the annotation of an annotated tag. A lightweight tag points
-          # straight at the commit and has none, so notes.md stays empty and the
-          # publish step asks GitHub to generate them.
-          : > notes.md
+          # Notes: the annotation of an annotated tag, or GitHub's generated
+          # notes for a lightweight tag, followed by the install instructions
+          # every release carries. The install block is a quoted heredoc: it
+          # holds PowerShell `$env:` and bash `$HOME` that must stay literal.
           if [ "$(git cat-file -t "refs/tags/$TAG")" = tag ]; then
             git for-each-ref "refs/tags/$TAG" --format='%(contents:subject)%0a%0a%(contents:body)' \
               | sed '/^-----BEGIN PGP SIGNATURE-----$/,$d' > notes.md
+          else
+            gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+              -f tag_name="$TAG" -f target_commitish="$SHA" --jq .body > notes.md
           fi
+          DOCS_BRANCH=$([ "$CHANNEL" = stable ] && echo main || echo dev)
+          printf '\n' >> notes.md
+          sed "s/__DOCS_BRANCH__/$DOCS_BRANCH/" >> notes.md <<'INSTALL'
+          ## 安装
+
+          选对应平台的包。解压后 `bin/` 里有 `opencode` 和 `rg`（ripgrep），**两个文件放在同一目录并把该目录加入 PATH**：程序按 PATH 找 `rg`，找不到会去 GitHub 下载。
+
+          | 平台 | 资产 |
+          |---|---|
+          | Windows x64 | `opencode-windows-x64.zip` |
+          | macOS Apple Silicon | `opencode-darwin-arm64.tar.gz` |
+          | macOS Intel | `opencode-darwin-x64.tar.gz` |
+          | Linux x64 | `opencode-linux-x64.tar.gz` |
+          | Linux arm64 | `opencode-linux-arm64.tar.gz` |
+
+          **Windows**（PowerShell，在下载目录执行）：
+
+          ```powershell
+          Expand-Archive .\opencode-windows-x64.zip -DestinationPath $env:TEMP\opencode -Force
+          New-Item -ItemType Directory -Force "$env:USERPROFILE\.opencode\bin" | Out-Null
+          Copy-Item "$env:TEMP\opencode\opencode-windows-x64\bin\*" "$env:USERPROFILE\.opencode\bin" -Force
+          [Environment]::SetEnvironmentVariable("Path", "$env:USERPROFILE\.opencode\bin;" + [Environment]::GetEnvironmentVariable("Path", "User"), "User")
+          ```
+
+          重开终端后 `opencode --version` 应显示本版本号。二进制未签名，SmartScreen 若拦截选"仍要运行"。
+
+          **macOS / Linux**（把 `darwin-arm64` 换成你的包名；bash 用户把 `~/.zshrc` 换成 `~/.bashrc`）：
+
+          ```bash
+          tar -xzf opencode-darwin-arm64.tar.gz
+          mkdir -p ~/.opencode/bin && cp opencode-darwin-arm64/bin/* ~/.opencode/bin/
+          echo 'export PATH="$HOME/.opencode/bin:$PATH"' >> ~/.zshrc
+          ```
+
+          macOS 若提示"无法打开"（未签名、未公证）：`xattr -dr com.apple.quarantine ~/.opencode/bin`。
+
+          **关闭官方自动更新（必须）**：官方更新器会把这个 fork 版本换回官方 1.18.x。在 `~/.config/opencode/opencode.json`（Windows 是 `%USERPROFILE%\.config\opencode\opencode.json`）里加：
+
+          ```json
+          { "autoupdate": false }
+          ```
+
+          校验：`sha256sum -c sha256sums.txt --ignore-missing`；Windows 用 `Get-FileHash .\opencode-windows-x64.zip` 与 `sha256sums.txt` 对照。
+          更多说明见 [FORK_INSTALL.md](https://github.com/lihaokun/opencode/blob/__DOCS_BRANCH__/FORK_INSTALL.md)。
+          INSTALL
           echo "resolved $TAG -> $SHA ($CHANNEL)"
           {
             echo "tag=$TAG"
@@ -186,8 +236,7 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG exists; replacing its assets"
           else
-            args=(--target "$SHA" --title "$VERSION")
-            if [ -s notes.md ]; then args+=(--notes-file notes.md); else args+=(--generate-notes); fi
+            args=(--target "$SHA" --title "$VERSION" --notes-file notes.md)
             if [ "$CHANNEL" = beta ]; then args+=(--prerelease); fi
             gh release create "$TAG" "${args[@]}"
           fi
