@@ -2814,7 +2814,10 @@ export function formatAgentRow(input: {
   const fromTitle = info?.title?.match(/@(\w+) subagent/)?.[1]
   const label = input.isRoot
     ? "Main"
-    : (subagentDescription(info?.title) ?? name ?? info?.agent ?? (fromTitle ? Locale.titlecase(fromTitle) : "Subagent"))
+    : (subagentDescription(info?.title) ??
+      name ??
+      info?.agent ??
+      (fromTitle ? Locale.titlecase(fromTitle) : "Subagent"))
   const usage = contextUsage({ messages: input.messages, providers: [] })
   const footer = [
     agentStatusWord(input.statusType),
@@ -2860,12 +2863,15 @@ export type AgentListRow =
 /**
  * Rows of the Agents list: the tree under rootID, children by creation time,
  * each indented under its parent. A parent's children that are all finished —
- * nothing running anywhere beneath them — and did not just finish fold into
- * one "N finished" row; `open` names the parents whose fold is expanded, and an
- * expanded fold shows its subtree in full. A subtree with anything running is
- * never folded, nor is the root, nor the `pinned` session (the one being
- * viewed) and its ancestors — a fold must not hide where the viewer sits.
- * `seen` is defensive, like collectSubtree: a parentID chain cannot cycle.
+ * nothing running anywhere beneath them, nothing beneath them finished within
+ * the recent window — fold into one "N finished" row; `open` names the parents
+ * whose fold is expanded, and an expanded fold shows its subtree in full. A
+ * subtree with anything running or just finished is never folded, nor is the
+ * root, nor the `pinned` session (the one being viewed) and its ancestors — a
+ * fold must not hide where the viewer sits. `fold: false` lists every agent
+ * with no folds at all; the dialog does this while a filter query is typed, so
+ * a folded agent can be found by its title. `seen` is defensive, like
+ * collectSubtree: a parentID chain cannot cycle.
  */
 export function agentListRows(input: {
   sessions: { id: string; parentID?: string; time: { created: number; updated: number } }[]
@@ -2875,6 +2881,7 @@ export function agentListRows(input: {
   now: number
   recentMs: number
   open: ReadonlySet<string>
+  fold?: boolean
 }): AgentListRow[] {
   const byParent = new Map<string, typeof input.sessions>()
   for (const item of input.sessions) {
@@ -2884,8 +2891,13 @@ export function agentListRows(input: {
     if (!list) byParent.set(key, [item])
   }
   const kids = (id: string) => (byParent.get(id) ?? []).toSorted((a, b) => a.time.created - b.time.created)
-  const live = (id: string): boolean =>
-    input.running(id) || id === input.pinned || kids(id).some((kid) => live(kid.id))
+  // Recency propagates like running: a grandchild that just finished keeps its
+  // long-finished parent listed, so the recent window holds at every depth.
+  const live = (item: (typeof input.sessions)[number]): boolean =>
+    input.running(item.id) ||
+    item.id === input.pinned ||
+    input.now - item.time.updated < input.recentMs ||
+    kids(item.id).some(live)
   const rows: AgentListRow[] = []
   const seen = new Set<string>()
   const walk = (id: string, depth: number, revealed: boolean) => {
@@ -2897,14 +2909,14 @@ export function agentListRows(input: {
       for (const kid of list) walk(kid.id, depth + 1, true)
       return
     }
-    const shown = list.filter((kid) => live(kid.id) || input.now - kid.time.updated < input.recentMs)
+    const shown = list.filter(live)
     const folded = list.filter((kid) => !shown.includes(kid))
     for (const kid of shown) walk(kid.id, depth + 1, false)
     if (!folded.length) return
     rows.push({ kind: "bucket", parentID: id, count: folded.length, depth: depth + 1 })
     if (input.open.has(id)) for (const kid of folded) walk(kid.id, depth + 1, true)
   }
-  if (input.sessions.some((item) => item.id === input.rootID)) walk(input.rootID, 0, false)
+  if (input.sessions.some((item) => item.id === input.rootID)) walk(input.rootID, 0, input.fold === false)
   return rows
 }
 

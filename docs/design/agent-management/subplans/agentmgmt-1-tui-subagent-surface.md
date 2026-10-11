@@ -231,9 +231,15 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
     小于真实上下文时百分比会读成 243%，数字本身足够。
   纯函数 `agentStatusWord` / `lastCompleted` / `formatListElapsed` / `formatAgentRow` 可无渲染测试。
 - 折叠【#59 新增，对齐 fsm-status 侧栏 `已结束 N 个`】：`agentListRows` 产出行序——root 起，
-  子按创建时间、按深度缩进；某父节点下**整棵子树无一在跑**且 `updated` 距今超过 45 s 的孩子
-  折成一行 `N finished`（深度 +1），选中该行原地展开/收起、对话框不关；有在跑后代的子树
-  与刚结束的子树不折；root 不折。
+  子按创建时间、按深度缩进；某父节点下**整棵子树无一在跑、也无一在 45 s 内结束**的孩子
+  折成一行 `N finished`（深度 +1），选中该行原地展开/收起、对话框不关；有在跑或刚结束后代的
+  子树不折——"刚结束"与"在跑"一样沿祖先向上传播（#59 第二轮审核：fsm 侧栏只看孩子自身的
+  `updated`，刚结束 1 s 的孙子会随早已结束的父亲一起被折掉，这里有意偏离）；root 与当前会话
+  及其祖先不折。
+- 过滤与折叠【#59 第二轮审核】：DialogSelect 只在交给它的选项里做模糊匹配，折起来的 agent 不在
+  选项里就搜不到。查询非空时 `agentListRows({ fold: false })` 全部列出、不出折叠行；清空查询后按
+  原 `open` 状态恢复——打字不改 `open`。选项由纯函数 `agentListOptions`（`dialog-subagent-list.tsx`
+  导出）产出，"旧任务已折叠，输入其标题仍能定位并进入"可无渲染断言。
 - 输入框下方【#59 修订，用户裁决】：常驻 Agents 面板**撤销**（`agents-panel.tsx` 删除），
   换成一行 `N agent(s) running · down opens the list`（`formatAgentsLine`），N 为树内除 root 外
   状态为 busy/retry 的成员数；树内 ≥2 成员时显示。对话框仍是过滤/键盘导航面。

@@ -5,7 +5,61 @@ import { useSync } from "../context/sync"
 import { agentListRows, formatAgentRow } from "../routes/session/index"
 
 /** A just-finished subagent stays listed this long before folding into its parent's "N finished" row. */
-const RECENT_MS = 45_000
+export const RECENT_MS = 45_000
+
+/**
+ * The dialog's options from the live projection — pure, so the filter path is
+ * testable without rendering. DialogSelect filters only the options it is
+ * given, so while a query is typed every agent is listed and nothing folds;
+ * otherwise an agent inside a fold could not be found by its title. Clearing
+ * the query brings the folds back as they were: typing never touches `open`.
+ */
+export function agentListOptions(input: {
+  sessions: Parameters<typeof agentListRows>[0]["sessions"]
+  rootID: string
+  currentID: string
+  running: (id: string) => boolean
+  now: number
+  open: ReadonlySet<string>
+  query: string
+  info: (id: string) => Parameters<typeof formatAgentRow>[0]["info"]
+  messages: (id: string) => Parameters<typeof formatAgentRow>[0]["messages"]
+  statusType: (id: string) => Parameters<typeof formatAgentRow>[0]["statusType"]
+}) {
+  const rows = agentListRows({
+    sessions: input.sessions,
+    rootID: input.rootID,
+    running: input.running,
+    pinned: input.currentID,
+    now: input.now,
+    recentMs: RECENT_MS,
+    open: input.open,
+    fold: input.query.length === 0,
+  })
+  return rows.map((row) => {
+    // pl 0 and no dot: scrollbox(1) + Option's internal 3 puts the titles on
+    // the Filter "F" column and the meters on the esc-tail column; the tree
+    // indent travels inside the title, and the primary title marks current.
+    if (row.kind === "bucket") {
+      const mark = input.open.has(row.parentID) ? "▾" : "▸"
+      return {
+        title: `${"  ".repeat(row.depth)}${mark} ${row.count} finished`,
+        value: `fold:${row.parentID}`,
+        dot: false,
+        pl: 0,
+      }
+    }
+    const formatted = formatAgentRow({
+      member: { id: row.id, depth: row.depth },
+      isRoot: row.id === input.rootID,
+      info: input.info(row.id),
+      messages: input.messages(row.id),
+      statusType: input.statusType(row.id),
+      now: input.now,
+    })
+    return { title: formatted.indent + formatted.label, footer: formatted.footer, value: row.id, dot: false, pl: 0 }
+  })
+}
 
 /**
  * The Agents list opened by down at the end of the prompt history. One line
@@ -24,45 +78,23 @@ export function DialogSubagentList(props: { rootID: string; currentID: string; o
   const timer = setInterval(() => setNow(Date.now()), 1000)
   onCleanup(() => clearInterval(timer))
   const [open, setOpen] = createSignal<ReadonlySet<string>>(new Set())
+  const [query, setQuery] = createSignal("")
 
-  const running = (id: string) => {
-    const type = sync.data.session_status[id]?.type
-    return type === "busy" || type === "retry"
-  }
-  const rows = createMemo(() =>
-    agentListRows({
+  const options = createMemo(() =>
+    agentListOptions({
       sessions: sync.data.session,
       rootID: props.rootID,
-      running,
-      pinned: props.currentID,
+      currentID: props.currentID,
+      running: (id) => {
+        const type = sync.data.session_status[id]?.type
+        return type === "busy" || type === "retry"
+      },
       now: now(),
-      recentMs: RECENT_MS,
       open: open(),
-    }),
-  )
-  const options = createMemo(() =>
-    rows().map((row) => {
-      // pl 0 and no dot: scrollbox(1) + Option's internal 3 puts the titles on
-      // the Filter "F" column and the meters on the esc-tail column; the tree
-      // indent travels inside the title, and the primary title marks current.
-      if (row.kind === "bucket") {
-        const mark = open().has(row.parentID) ? "▾" : "▸"
-        return {
-          title: `${"  ".repeat(row.depth)}${mark} ${row.count} finished`,
-          value: `fold:${row.parentID}`,
-          dot: false,
-          pl: 0,
-        }
-      }
-      const formatted = formatAgentRow({
-        member: { id: row.id, depth: row.depth },
-        isRoot: row.id === props.rootID,
-        info: sync.session.get(row.id),
-        messages: sync.data.message[row.id] ?? [],
-        statusType: sync.data.session_status[row.id]?.type,
-        now: now(),
-      })
-      return { title: formatted.indent + formatted.label, footer: formatted.footer, value: row.id, dot: false, pl: 0 }
+      query: query(),
+      info: (id) => sync.session.get(id),
+      messages: (id) => sync.data.message[id] ?? [],
+      statusType: (id) => sync.data.session_status[id]?.type,
     }),
   )
 
@@ -73,6 +105,7 @@ export function DialogSubagentList(props: { rootID: string; currentID: string; o
       options={options()}
       current={props.currentID}
       preserveSelection={true}
+      onFilter={setQuery}
       onSelect={(option) => {
         if (typeof option.value !== "string") return
         // A fold toggles in place; the dialog stays open.

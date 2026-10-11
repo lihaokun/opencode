@@ -13,11 +13,18 @@ import {
   subagentListMembers,
   treeRoot,
 } from "../src/routes/session/index"
+import { agentListOptions } from "../src/component/dialog-subagent-list"
 
 const session = (id: string, parentID?: string, created = 0) => ({
   id,
   parentID,
   time: { created },
+})
+
+const timed = (id: string, parentID: string | undefined, created: number, updated: number) => ({
+  id,
+  parentID,
+  time: { created, updated },
 })
 
 const info = (over: Record<string, unknown> = {}) => ({
@@ -153,7 +160,10 @@ describe("lastCompleted", () => {
   })
 })
 
-const assistantAt = (completed: number, tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }) => ({
+const assistantAt = (
+  completed: number,
+  tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } },
+) => ({
   role: "assistant",
   time: { created: completed - 1, completed },
   tokens,
@@ -235,7 +245,9 @@ describe("formatAgentsLine", () => {
   })
 
   test("inside a subagent it opens with where you are", () => {
-    expect(formatAgentsLine(2, "cw-b177 (general)")).toBe("in cw-b177 (general) · 2 agents running · down opens the list")
+    expect(formatAgentsLine(2, "cw-b177 (general)")).toBe(
+      "in cw-b177 (general) · 2 agents running · down opens the list",
+    )
   })
 })
 
@@ -252,15 +264,9 @@ describe("agentAt", () => {
 })
 
 // Folding: a parent's children that are all finished and did not just finish
-// collapse into one "N finished" row; anything with a running descendant, or
-// finished within the recent window, stays listed. Expanding a fold shows its
-// subtree in full.
+// collapse into one "N finished" row; anything with a running or just-finished
+// descendant stays listed. Expanding a fold shows its subtree in full.
 describe("agentListRows", () => {
-  const timed = (id: string, parentID: string | undefined, created: number, updated: number) => ({
-    id,
-    parentID,
-    time: { created, updated },
-  })
   const sessions = [
     timed("root", undefined, 0, 100),
     timed("busy", "root", 10, 100),
@@ -315,6 +321,83 @@ describe("agentListRows", () => {
       { kind: "agent", id: "root", depth: 0 },
     ])
     expect(agentListRows({ ...base, rootID: "missing", open: new Set() })).toEqual([])
+  })
+
+  // Review finding (round 2): recency was checked on the child alone, so a
+  // parent that finished long ago folded away together with the grandchild
+  // that had finished a second earlier — the recent window was lost at depth 2.
+  test("a just-finished grandchild keeps its long-finished parent listed", () => {
+    const three = [
+      timed("root", undefined, 0, 100),
+      timed("parent", "root", 10, 1000),
+      timed("grandchild", "parent", 20, 99_000),
+    ]
+    const rows = agentListRows({ ...base, sessions: three, running: () => false, pinned: "root", open: new Set() })
+    expect(rows).toEqual([
+      { kind: "agent", id: "root", depth: 0 },
+      { kind: "agent", id: "parent", depth: 1 },
+      { kind: "agent", id: "grandchild", depth: 2 },
+    ])
+  })
+
+  test("fold: false lists every agent in tree order with no fold rows, whatever is open", () => {
+    const all = ["root", "busy", "fresh", "old", "grandchild", "older", "quiet-parent", "busy-grandchild"]
+    for (const open of [new Set<string>(), new Set(["root", "old"])]) {
+      const rows = agentListRows({ ...base, open, fold: false })
+      expect(rows.map((row) => (row.kind === "agent" ? row.id : "fold"))).toEqual(all)
+    }
+  })
+})
+
+// The dialog's options. Review finding (round 2): DialogSelect filters only
+// the options it is given, so an agent inside a fold could not be found by
+// typing its title — the query had to be cleared and the fold opened by hand.
+describe("agentListOptions", () => {
+  const titles: Record<string, string> = {
+    root: "New session",
+    busy: "Review the tests (@general subagent)",
+    old: "Rewrite the parser (@general subagent)",
+  }
+  const base = {
+    sessions: [timed("root", undefined, 0, 100), timed("busy", "root", 10, 100), timed("old", "root", 20, 1000)],
+    rootID: "root",
+    currentID: "root",
+    running: (id: string) => id === "busy",
+    now: 100_000,
+    open: new Set<string>(),
+    info: (id: string) => ({ title: titles[id], metadata: {}, time: { created: 0, updated: 0 } }),
+    messages: () => [],
+    statusType: (id: string) => (id === "busy" ? "busy" : "idle"),
+  }
+
+  test("an old task is folded until its title is typed; the match is the task itself, not the fold", () => {
+    const folded = agentListOptions({ ...base, query: "" })
+    expect(folded.map((option) => option.value)).toEqual(["root", "busy", "fold:root"])
+    expect(folded[2]!.title).toBe("  ▸ 1 finished")
+
+    // Typing lists everything, so DialogSelect's fuzzy filter can see the old
+    // task; its title carries the description the user types, and selecting
+    // the option hands the dialog that session's id to enter.
+    const typed = agentListOptions({ ...base, query: "parser" })
+    expect(typed.map((option) => option.value)).toEqual(["root", "busy", "old"])
+    expect(typed[2]!.title).toBe("  Rewrite the parser")
+    expect(typed[2]!.footer).toBe("idle")
+
+    // Clearing the query restores the fold exactly: `open` is never touched by typing.
+    expect(agentListOptions({ ...base, query: "" })).toEqual(folded)
+  })
+
+  test("an open fold stays open through typing and is shown open again once the query clears", () => {
+    const open = new Set(["root"])
+    const before = agentListOptions({ ...base, open, query: "" })
+    expect(before.map((option) => option.value)).toEqual(["root", "busy", "fold:root", "old"])
+    expect(before[2]!.title).toBe("  ▾ 1 finished")
+    expect(agentListOptions({ ...base, open, query: "x" }).map((option) => option.value)).toEqual([
+      "root",
+      "busy",
+      "old",
+    ])
+    expect(agentListOptions({ ...base, open, query: "" })).toEqual(before)
   })
 })
 
@@ -374,7 +457,7 @@ function rng(seed: number) {
 }
 
 describe("agentListRows on random trees", () => {
-  test("running nodes and their ancestors are always rows; folds count exactly the quiet, stale children", () => {
+  test("running or recent nodes and their ancestors are always rows; folds count exactly the quiet, stale children", () => {
     for (let n = 0; n < 60; n++) {
       const next = rng(5000 + n)
       const label = `seed ${5000 + n}`
@@ -395,30 +478,35 @@ describe("agentListRows on random trees", () => {
 
       const byId = new Map(sessions.map((item) => [item.id, item]))
       const children = (id: string) => sessions.filter((item) => item.parentID === id)
-      const live = (id: string): boolean => running(id) || children(id).some((kid) => live(kid.id))
+      // Live: running, or finished within the recent window, or above a node
+      // that is — recency climbs the tree exactly as running does (round 2).
+      const live = (item: (typeof sessions)[number]): boolean =>
+        running(item.id) || now - item.time.updated < recentMs || children(item.id).some(live)
       const agents = rows.flatMap((row) => (row.kind === "agent" ? [row] : []))
       const ids = agents.map((row) => row.id)
 
       // Root first, no duplicates.
       expect(ids[0], label).toBe("s0")
       expect(new Set(ids).size, label).toBe(ids.length)
-      // Every running node, and every ancestor of one, is a row.
+      // Every live node — running or recent, at any depth — and every ancestor
+      // of one is a row.
       for (const item of sessions) {
-        if (!live(item.id)) continue
+        if (!live(item)) continue
         expect(ids, `${label} live ${item.id}`).toContain(item.id)
       }
-      // A node is a row iff its parent is a row and it is live, recent, or
-      // inside a revealed fold — an expanded fold shows its subtree in full.
+      // A node is a row iff its parent is a row and it is live or inside a
+      // revealed fold — an expanded fold shows its subtree in full.
       for (const item of sessions) {
         if (item.id === "s0") continue
         const parentShown = ids.includes(item.parentID!)
-        const direct = live(item.id) || now - item.time.updated < recentMs
-        expect(ids.includes(item.id), `${label} row ${item.id}`).toBe(parentShown && (direct || revealedThrough(item.id)))
+        expect(ids.includes(item.id), `${label} row ${item.id}`).toBe(
+          parentShown && (live(item) || revealedThrough(item.id)),
+        )
       }
-      // Each fold counts exactly its parent's children that are quiet and stale.
+      // Each fold counts exactly its parent's children that are not live.
       for (const row of rows) {
         if (row.kind !== "bucket") continue
-        const quiet = children(row.parentID).filter((kid) => !live(kid.id) && now - kid.time.updated >= recentMs)
+        const quiet = children(row.parentID).filter((kid) => !live(kid))
         expect(row.count, `${label} fold under ${row.parentID}`).toBe(quiet.length)
         expect(row.depth, label).toBe((agents.find((a) => a.id === row.parentID)?.depth ?? -2) + 1)
       }
@@ -428,14 +516,26 @@ describe("agentListRows on random trees", () => {
         for (let cursor = byId.get(row.id); cursor?.parentID; cursor = byId.get(cursor.parentID)) depth += 1
         expect(row.depth, `${label} depth ${row.id}`).toBe(depth)
       }
+      // With folding off there are no fold rows and every session is a row, in
+      // tree order: depth first, siblings by creation time.
+      const unfolded = agentListRows({ sessions, rootID: "s0", running, now, recentMs, open, fold: false })
+      const treeOrder = (id: string): string[] => [
+        id,
+        ...children(id)
+          .toSorted((a, b) => a.time.created - b.time.created)
+          .flatMap((kid) => treeOrder(kid.id)),
+      ]
+      expect(
+        unfolded.map((row) => (row.kind === "agent" ? row.id : "fold")),
+        label,
+      ).toEqual(treeOrder("s0"))
 
-      // Some ancestor (or the node itself) is a quiet, stale child of a parent
-      // whose fold is open and who is itself a row.
+      // Some ancestor (or the node itself) is a quiet child of a parent whose
+      // fold is open and who is itself a row.
       function revealedThrough(id: string): boolean {
         for (let cursor = byId.get(id); cursor?.parentID; cursor = byId.get(cursor.parentID)) {
           const parent = byId.get(cursor.parentID)!
-          const folded = !live(cursor.id) && now - cursor.time.updated >= recentMs
-          if (folded && open.has(parent.id) && ids.includes(parent.id)) return true
+          if (!live(cursor) && open.has(parent.id) && ids.includes(parent.id)) return true
         }
         return false
       }
