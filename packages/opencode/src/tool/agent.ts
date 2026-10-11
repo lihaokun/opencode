@@ -61,10 +61,9 @@ type SendMeta = { target?: string }
 type StopMeta = { stopped?: number; failed?: number }
 
 const AGENT_DESCRIPTION = [
-  "- Launches a subagent to handle a complex, multi-step task",
-  "- Always asynchronous: this returns once the subagent has started, not when it finishes. Its result arrives later as a message in your conversation",
-  "- Do not sleep, poll, or message a subagent to ask whether it is done — you will be told",
-  "- Launch several in one response when the work is genuinely independent",
+  "- Starts a subagent: a session of its own, with its own working directory, that outlives the run it starts with. Its lifecycle is this tool to start it, agent_send to talk to it — more work, a correction, a question, or waking an old one that went idle, was stopped, or was cut off mid-work, so it picks up where it left off — and agent_stop to end it",
+  "- Always asynchronous: this returns once the subagent has started. Every run it does ends with a report to you as a message in your conversation; there is nothing to poll",
+  "- Several can run at the same time",
   "- Each subagent gets its own working directory and is told to use it, so parallel work does not collide. This is a convention, not a sandbox: it can still reach the rest of the project by absolute path",
   "- To continue work in an existing directory or worktree, pass it as `cwd`. Naming it only in the prompt is not enough: a fresh directory is created regardless and the Agent is told to use that one, so the two instructions conflict",
   "- The returned `session_id` always works as a target for agent_send and agent_stop",
@@ -76,12 +75,12 @@ const LIST_DESCRIPTION = [
   "- Lists the agents you can address: yourself, your parent, your direct children and your siblings",
   "- Does not list grandchildren, or agents belonging to an unrelated conversation",
   "- Every row carries a session_id, which always works as a target; a row may also carry a name, which is shorter but only unique by convention — when two rows share one, use the session_id",
-  "- Status is `running` or `idle`, read at this instant. It is a snapshot, not a promise: one shown as running may finish immediately after",
+  "- Status is `running` or `idle`, read at this instant. `idle` is a subagent between runs: it keeps its session, context and directory, and a message to it starts its next run. It is a snapshot, not a promise: one shown as running may finish immediately after",
   "- Status never says how an agent finished; that arrives as a message",
 ].join("\n")
 
 const SEND_DESCRIPTION = [
-  "- Sends a message to another agent; also how you resume one that has gone idle, including one that was stopped",
+  "- Sends a message to another agent: more work, a correction, a question. A subagent that went idle, was stopped, or was cut off mid-work picks it up with its context intact and resumes where it left off — this is how an old one is woken",
   "- This is a message, not a call: this does not wait for it. Your own subagent reports to you when it stops, as it does after any of its runs; anyone else does not reply automatically",
   "- What comes back means the message was accepted for delivery — not that it was processed, and not that an answer is coming",
   "- If you need an answer, ask for it in the message and carry on. The recipient replies by calling agent_send itself. Do not follow up asking where the result is",
