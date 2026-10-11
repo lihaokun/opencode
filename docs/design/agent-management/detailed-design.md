@@ -905,7 +905,7 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
      - 每行：session_id、name（若有）、title。title 是创建时的 description 加
        `(@<type> subagent)` 后缀，自带类型，故不另列；不含 status——列出者皆 running。
-     - 有子但无一 running 时渲染一行占位：`Your subagents working right now: none (N finished).`
+     - 有子但无一 running 时渲染一行占位：`Your subagents working right now: none (N idle).`
      - **只陈述事实，不指挥工具**：不写"use agent_list"。模型持有工具描述，
        这段话又在每轮开头出现，提醒是纯噪音。
      - 为何只列 running：旧版列全部历史孩子，由标题"at this point"的完整性承诺所迫而无界增长，

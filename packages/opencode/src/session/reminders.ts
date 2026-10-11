@@ -129,7 +129,7 @@ export const applyAgentRoster = Effect.fn("SessionReminders.applyAgentRoster")(f
   const text = [
     AGENT_ROSTER_SENTINEL,
     rows.length === 0
-      ? `Your subagents working right now: none (${finished} finished).`
+      ? `Your subagents working right now: none (${finished} idle).`
       : "Your subagents working right now:",
     ...rows,
     ...(omitted > 0 ? [`  ${omitted} more are running.`] : []),
