@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import { Locale } from "../src/util/locale"
 import {
+  agentListRows,
+  agentStatusWord,
   contextUsage,
   formatAgentRow,
+  formatAgentsLine,
   formatListElapsed,
+  lastCompleted,
   subagentDescription,
   subagentListMembers,
   treeRoot,
@@ -110,7 +114,12 @@ describe("formatListElapsed", () => {
     expect(formatListElapsed({ ...input, statusType: "retry" })).toBe(Locale.duration(60_000))
   })
 
-  test("freezes to the work duration when done", () => {
+  test("idle freezes at the last assistant completion when known", () => {
+    const input = { statusType: "idle", created: 1000, updated: 90_000, completed: 21_000, now: 900_000 }
+    expect(formatListElapsed(input)).toBe(Locale.duration(20_000))
+  })
+
+  test("idle falls back to the session's updated time without a message time", () => {
     const input = { statusType: "idle", created: 1000, updated: 21_000, now: 900_000 }
     expect(formatListElapsed(input)).toBe(Locale.duration(20_000))
   })
@@ -120,68 +129,161 @@ describe("formatListElapsed", () => {
   })
 })
 
-// Verification finding P4: the persistent panel shares the dialog's row
-// anatomy through one owner. P5: meters use the shared context-usage
-// convention (last assistant message, % of limit), no "tok" unit, and the
-// "current" text marker is gone — highlighting is each surface's job.
+describe("agentStatusWord", () => {
+  test("maps the status types and is never blank", () => {
+    expect(agentStatusWord("busy")).toBe("running")
+    expect(agentStatusWord("retry")).toBe("retrying")
+    expect(agentStatusWord("idle")).toBe("idle")
+    expect(agentStatusWord(undefined)).toBe("idle")
+  })
+})
+
+describe("lastCompleted", () => {
+  test("is the newest completed assistant message, ignoring users and unfinished turns", () => {
+    expect(
+      lastCompleted([
+        { role: "user", time: { created: 1 } },
+        { role: "assistant", time: { created: 2, completed: 10 } },
+        { role: "assistant", time: { created: 3, completed: 30 } },
+        { role: "assistant", time: { created: 4 } },
+      ]),
+    ).toBe(30)
+    expect(lastCompleted([{ role: "user", time: { created: 1 } }])).toBeUndefined()
+  })
+})
+
+const assistantAt = (completed: number, tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }) => ({
+  role: "assistant",
+  time: { created: completed - 1, completed },
+  tokens,
+})
+
+// One line per row: the creator's description at the left; status, elapsed
+// and context tokens at the right. No percentage — a wrong configured limit
+// used to read as 243%, and the number carries the meaning on its own.
 describe("formatAgentRow", () => {
-  test("subagent row: indent, name, blurb, type/status, context meter", () => {
+  test("subagent row: indent, description, status · elapsed · tokens", () => {
     const row = formatAgentRow({
       member: { id: "a", depth: 1 },
       isRoot: false,
       info: info(),
-      usage: { tokens: 1000, pct: "12%" },
+      messages: [assistantAt(20_000, { input: 900, output: 60, reasoning: 20, cache: { read: 20, write: 0 } })],
       statusType: "busy",
       now: 61_000,
     })
     expect(row.indent).toBe("  ")
-    expect(row.label).toBe("alpha")
-    expect(row.description).toBe("反方辩手立论 · explore · busy")
-    expect(row.footer).toBe(`1.0K (12%) · ${Locale.duration(60_000)}`)
+    expect(row.label).toBe("反方辩手立论")
+    expect(row.footer).toBe(`running · ${Locale.duration(60_000)} · 1.0K`)
   })
 
-  test("Main row: fixed label, no blurb, own meter", () => {
+  test("Main row: fixed label; idle freezes at the last completion", () => {
     const row = formatAgentRow({
       member: { id: "root", depth: 0 },
       isRoot: true,
-      info: info({ agent: "build", title: "New session", metadata: {} }),
-      usage: { tokens: 12_345, pct: undefined },
+      info: info({ agent: "build", title: "New session", metadata: {}, time: { created: 1000, updated: 90_000 } }),
+      messages: [assistantAt(21_000, { input: 12_000, output: 300, reasoning: 0, cache: { read: 45, write: 0 } })],
       statusType: "idle",
       now: 900_000,
     })
     expect(row.indent).toBe("")
     expect(row.label).toBe("Main")
-    expect(row.description).toBe("build · idle")
-    expect(row.footer).toBe(`12.3K · ${Locale.duration(20_000)}`)
+    expect(row.footer).toBe(`idle · ${Locale.duration(20_000)} · 12.3K`)
   })
 
-  test("nameless subagent falls through type to title parse", () => {
-    const row = formatAgentRow({
+  test("no description falls through name, then type, then the title's type", () => {
+    const named = formatAgentRow({
       member: { id: "x", depth: 2 },
       isRoot: false,
-      info: info({ metadata: {}, agent: undefined, title: "inspect (@explore subagent)" }),
-      usage: undefined,
-      statusType: "idle",
+      info: info({ title: "New session", metadata: { agentName: "alpha" } }),
+      messages: [],
+      statusType: undefined,
       now: 1,
     })
-    expect(row.indent).toBe("    ")
-    expect(row.label).toBe("Explore")
-    expect(row.description).toBe("inspect · idle")
+    expect(named.indent).toBe("    ")
+    expect(named.label).toBe("alpha")
+    const typed = formatAgentRow({
+      member: { id: "x", depth: 2 },
+      isRoot: false,
+      info: info({ title: "(@explore subagent)", metadata: {}, agent: undefined }),
+      messages: [],
+      statusType: undefined,
+      now: 1,
+    })
+    expect(typed.label).toBe("Explore")
   })
 
-  test("no info at all — placeholder label, no meters", () => {
+  test("no info at all — placeholder label, status only", () => {
     const row = formatAgentRow({
       member: { id: "y", depth: 1 },
       isRoot: false,
       info: undefined,
-      usage: undefined,
+      messages: [],
       statusType: undefined,
       now: 1,
     })
-    expect(row.indent).toBe("  ")
     expect(row.label).toBe("Subagent")
-    expect(row.description).toBeUndefined()
-    expect(row.footer).toBeUndefined()
+    expect(row.footer).toBe("idle")
+  })
+})
+
+describe("formatAgentsLine", () => {
+  test("counts running agents and points at the list", () => {
+    expect(formatAgentsLine(0)).toBe("0 agents running · down opens the list")
+    expect(formatAgentsLine(1)).toBe("1 agent running · down opens the list")
+    expect(formatAgentsLine(3)).toBe("3 agents running · down opens the list")
+  })
+})
+
+// Folding: a parent's children that are all finished and did not just finish
+// collapse into one "N finished" row; anything with a running descendant, or
+// finished within the recent window, stays listed. Expanding a fold shows its
+// subtree in full.
+describe("agentListRows", () => {
+  const timed = (id: string, parentID: string | undefined, created: number, updated: number) => ({
+    id,
+    parentID,
+    time: { created, updated },
+  })
+  const sessions = [
+    timed("root", undefined, 0, 100),
+    timed("busy", "root", 10, 100),
+    timed("fresh", "root", 20, 95_000),
+    timed("old", "root", 30, 1000),
+    timed("older", "root", 40, 2000),
+    timed("grandchild", "old", 50, 1000),
+    timed("quiet-parent", "root", 60, 1000),
+    timed("busy-grandchild", "quiet-parent", 70, 1000),
+  ]
+  const running = (id: string) => id === "busy" || id === "busy-grandchild"
+  const base = { sessions, rootID: "root", running, now: 100_000, recentMs: 45_000 }
+
+  test("lists running, recent and parents of running; folds the rest", () => {
+    const rows = agentListRows({ ...base, open: new Set() })
+    expect(rows).toEqual([
+      { kind: "agent", id: "root", depth: 0 },
+      { kind: "agent", id: "busy", depth: 1 },
+      { kind: "agent", id: "fresh", depth: 1 },
+      { kind: "agent", id: "quiet-parent", depth: 1 },
+      { kind: "agent", id: "busy-grandchild", depth: 2 },
+      { kind: "bucket", parentID: "root", count: 2, depth: 1 },
+    ])
+  })
+
+  test("an open fold reveals its subtree in full, grandchildren included", () => {
+    const rows = agentListRows({ ...base, open: new Set(["root"]) })
+    expect(rows.slice(5)).toEqual([
+      { kind: "bucket", parentID: "root", count: 2, depth: 1 },
+      { kind: "agent", id: "old", depth: 1 },
+      { kind: "agent", id: "grandchild", depth: 2 },
+      { kind: "agent", id: "older", depth: 1 },
+    ])
+  })
+
+  test("nothing to fold when everything is live; the root alone is one row", () => {
+    expect(agentListRows({ ...base, sessions: [sessions[0]!], open: new Set() })).toEqual([
+      { kind: "agent", id: "root", depth: 0 },
+    ])
+    expect(agentListRows({ ...base, rootID: "missing", open: new Set() })).toEqual([])
   })
 })
 

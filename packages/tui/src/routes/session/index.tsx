@@ -53,7 +53,6 @@ import { DialogTimeline } from "./dialog-timeline"
 import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { DialogSubagentList } from "../../component/dialog-subagent-list"
-import { AgentsPanel } from "../../component/agents-panel"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
 import { filetype } from "../../util/filetype"
@@ -438,9 +437,9 @@ export function Session() {
       })
   }
 
-  // The persistent Agents panel (finding P4): same rows as the down dialog,
-  // always on screen below the input. Shown from two members up — a lone
-  // current session would be a one-row "Main" noise strip.
+  // The line under the input: how many agents of this tree are running, and
+  // that down opens the list. Shown from two members up — a lone current
+  // session has nothing to count.
   const agentsPanelRootID = createMemo(() => {
     if (!session()) return undefined
     return treeRoot(sync.data.session, route.sessionID)
@@ -449,6 +448,14 @@ export function Session() {
     const rootID = agentsPanelRootID()
     return rootID ? subagentListMembers(sync.data.session, rootID) : []
   })
+  const agentsRunning = createMemo(
+    () =>
+      agentsPanelMembers().filter((member) => {
+        if (member.id === agentsPanelRootID()) return false
+        const type = sync.data.session_status[member.id]?.type
+        return type === "busy" || type === "retry"
+      }).length,
+  )
 
   // Step P10 consumer: down at the exhausted prompt history opens the Agents
   // list. Returning false hands the keystroke back to the editor (only when a
@@ -460,10 +467,7 @@ export function Session() {
     // `parentID ?? id` yields the middle node and shrank the list to two rows
     // with "Main" on the parent (P1 regression).
     const rootID = treeRoot(sync.data.session, route.sessionID)
-    const members = subagentListMembers(sync.data.session, rootID)
-    dialog.replace(() => (
-      <DialogSubagentList members={members} rootID={rootID} currentID={route.sessionID} onPick={enterChild} />
-    ))
+    dialog.replace(() => <DialogSubagentList rootID={rootID} currentID={route.sessionID} onPick={enterChild} />)
     return true
   }
 
@@ -1274,17 +1278,10 @@ export function Session() {
                     />
                   </pluginRuntime.Slot>
                 </Show>
-                <Show when={visible() ? agentsPanelRootID() : undefined} keyed>
-                  {(rootID) => (
-                    <Show when={agentsPanelMembers().length >= 2}>
-                      <AgentsPanel
-                        members={agentsPanelMembers()}
-                        rootID={rootID}
-                        currentID={route.sessionID}
-                        onPick={enterChild}
-                      />
-                    </Show>
-                  )}
+                <Show when={visible() && agentsPanelMembers().length >= 2}>
+                  <box flexShrink={0} marginTop={1} paddingLeft={1}>
+                    <text fg={theme.textMuted}>{formatAgentsLine(agentsRunning())}</text>
+                  </box>
                 </Show>
               </box>
             </Show>
@@ -2727,12 +2724,34 @@ export function formatListElapsed(input: {
   statusType: string | undefined
   created: number
   updated: number
+  /** When the session's newest assistant message completed, if known. */
+  completed?: number
   now: number
 }): string | undefined {
   if (!input.created) return undefined
   const running = input.statusType === "busy" || input.statusType === "retry"
-  const ms = running ? Math.max(0, input.now - input.created) : Math.max(0, input.updated - input.created)
+  // Idle freezes at the last assistant message's completion, which is precise;
+  // the session's `updated` moves on any write (title, summary) and only
+  // stands in when no message time is known.
+  const end = running ? input.now : input.completed || input.updated
+  const ms = Math.max(0, end - input.created)
   return ms > 0 ? Locale.duration(ms) : undefined
+}
+
+/** The Agents list's status word. Never blank: an agent the TUI holds no event for reads as idle. */
+export function agentStatusWord(statusType: string | undefined) {
+  if (statusType === "busy") return "running"
+  if (statusType === "retry") return "retrying"
+  return "idle"
+}
+
+/** When the newest completed assistant message finished, or undefined when none has. */
+export function lastCompleted(messages: { role: string; time: { created: number; completed?: number } }[]) {
+  const end = messages.reduce(
+    (max, item) => (item.role === "assistant" && item.time.completed ? Math.max(max, item.time.completed) : max),
+    0,
+  )
+  return end || undefined
 }
 
 /**
@@ -2766,10 +2785,11 @@ export function contextUsage(input: {
 }
 
 /**
- * One Agents-list row, shared by the down dialog and the persistent panel
- * (verification finding P4) — a single owner for the row anatomy: indent +
- * label, the muted work blurb, then type/status/current, with token spend and
- * elapsed meters at the far right.
+ * One Agents-list row, on one line: the agent's title at the left, the meters
+ * at the right — status word, elapsed, context tokens. The dialog is wide
+ * enough for that, unlike a sidebar. The tree's root reads "Main"; a subagent
+ * reads by the description its creator gave (its title without the
+ * "(@type subagent)" suffix), falling back to its name, type, or "Subagent".
  */
 export function formatAgentRow(input: {
   member: SubagentListMember
@@ -2782,42 +2802,87 @@ export function formatAgentRow(input: {
         time: { created: number; updated: number }
       }
     | undefined
-  usage: { tokens: number; pct: string | undefined } | undefined
+  messages: {
+    role: string
+    tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+    time: { created: number; completed?: number }
+  }[]
   statusType: string | undefined
   now: number
-}): { indent: string; label: string; description: string | undefined; footer: string | undefined } {
-  const { member, isRoot, info, usage, statusType, now } = input
-  const name = isRoot ? "Main" : typeof info?.metadata?.agentName === "string" ? info.metadata.agentName : undefined
-  const type = info?.agent
+}): { indent: string; label: string; footer: string } {
+  const { member, isRoot, info, messages, statusType, now } = input
+  const name = typeof info?.metadata?.agentName === "string" ? info.metadata.agentName : undefined
   const fromTitle = info?.title?.match(/@(\w+) subagent/)?.[1]
-  const label = name ?? type ?? (fromTitle ? Locale.titlecase(fromTitle) : isRoot ? "Main" : "Subagent")
-  const description = [
-    isRoot ? undefined : subagentDescription(info?.title),
-    type,
-    statusType,
-  ]
-    .filter(Boolean)
-    .join(" · ")
-  // P5-4 ruling: one readout everywhere — the context-usage convention, no
-  // "tok" unit, the percentage carrying the meaning.
-  const meter = usage ? `${Locale.number(usage.tokens)}${usage.pct ? ` (${usage.pct})` : ""}` : undefined
+  const label = isRoot
+    ? "Main"
+    : (subagentDescription(info?.title) ?? name ?? info?.agent ?? (fromTitle ? Locale.titlecase(fromTitle) : "Subagent"))
+  const usage = contextUsage({ messages, providers: [] })
   const footer = [
-    meter,
+    agentStatusWord(statusType),
     formatListElapsed({
       statusType,
       created: info?.time.created ?? 0,
       updated: info?.time.updated ?? 0,
+      completed: lastCompleted(messages),
       now,
     }),
+    usage ? Locale.number(usage.tokens) : undefined,
   ]
     .filter(Boolean)
     .join(" · ")
-  return {
-    indent: "  ".repeat(member.depth),
-    label,
-    description: description || undefined,
-    footer: footer || undefined,
+  return { indent: "  ".repeat(member.depth), label, footer }
+}
+
+/** The one line under the input that replaced the Agents panel. */
+export function formatAgentsLine(running: number) {
+  return `${running} agent${running === 1 ? "" : "s"} running · down opens the list`
+}
+
+export type AgentListRow =
+  | { kind: "agent"; id: string; depth: number }
+  | { kind: "bucket"; parentID: string; count: number; depth: number }
+
+/**
+ * Rows of the Agents list: the tree under rootID, children by creation time,
+ * each indented under its parent. A parent's children that are all finished —
+ * nothing running anywhere beneath them — and did not just finish fold into
+ * one "N finished" row; `open` names the parents whose fold is expanded, and an
+ * expanded fold shows its subtree in full. A subtree with anything running is
+ * never folded, nor is the root. Terminates like collectSubtree: a parentID
+ * chain cannot cycle.
+ */
+export function agentListRows(input: {
+  sessions: { id: string; parentID?: string; time: { created: number; updated: number } }[]
+  rootID: string
+  running: (id: string) => boolean
+  now: number
+  recentMs: number
+  open: ReadonlySet<string>
+}): AgentListRow[] {
+  const byParent = new Map<string, typeof input.sessions>()
+  for (const item of input.sessions) {
+    const key = item.parentID ?? ""
+    byParent.set(key, [...(byParent.get(key) ?? []), item])
   }
+  const kids = (id: string) => (byParent.get(id) ?? []).toSorted((a, b) => a.time.created - b.time.created)
+  const live = (id: string): boolean => input.running(id) || kids(id).some((kid) => live(kid.id))
+  const rows: AgentListRow[] = []
+  const walk = (id: string, depth: number, revealed: boolean) => {
+    rows.push({ kind: "agent", id, depth })
+    const list = kids(id)
+    if (revealed) {
+      for (const kid of list) walk(kid.id, depth + 1, true)
+      return
+    }
+    const shown = list.filter((kid) => live(kid.id) || input.now - kid.time.updated < input.recentMs)
+    const folded = list.filter((kid) => !shown.includes(kid))
+    for (const kid of shown) walk(kid.id, depth + 1, false)
+    if (!folded.length) return
+    rows.push({ kind: "bucket", parentID: id, count: folded.length, depth: depth + 1 })
+    if (input.open.has(id)) for (const kid of folded) walk(kid.id, depth + 1, true)
+  }
+  if (input.sessions.some((item) => item.id === input.rootID)) walk(input.rootID, 0, false)
+  return rows
 }
 
 export type SubagentListMember = {
