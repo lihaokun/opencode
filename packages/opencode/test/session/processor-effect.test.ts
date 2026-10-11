@@ -394,6 +394,7 @@ const failingSnapshot = Layer.effect(
       revert: () => Effect.void,
       diff: () => Effect.succeed(""),
       diffFull: () => Effect.succeed([]),
+      diffStat: () => Effect.succeed([]),
     })
   }),
 )
