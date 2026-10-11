@@ -83,7 +83,7 @@ const LIST_DESCRIPTION = [
 ].join("\n")
 
 const SEND_DESCRIPTION = [
-  "- Sends a message to another agent: more work, a correction, a question. A subagent that went idle, was stopped, or was cut off mid-work picks it up with its context intact and resumes where it left off — this is how an old one is woken",
+  "- Sends a message to another agent: more work, a correction, a question. A subagent that went idle, was stopped, or was cut off mid-work picks it up with its context intact and resumes where it left off — this is how an old one is woken; a busy one reads it at its next step, inside the run it is in",
   "- This is a message, not a call: it does not wait for anything",
   "- Your own subagent reports to you automatically when its run ends. To hear from it before that, ask it in the message to send one",
   "- Your parent, your siblings and anyone else do not reply automatically. If you need an answer, ask for it in the message; it arrives, if at all, as a message they send",

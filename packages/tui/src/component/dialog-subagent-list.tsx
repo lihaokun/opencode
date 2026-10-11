@@ -34,6 +34,7 @@ export function DialogSubagentList(props: { rootID: string; currentID: string; o
       sessions: sync.data.session,
       rootID: props.rootID,
       running,
+      pinned: props.currentID,
       now: now(),
       recentMs: RECENT_MS,
       open: open(),
@@ -45,7 +46,13 @@ export function DialogSubagentList(props: { rootID: string; currentID: string; o
       // the Filter "F" column and the meters on the esc-tail column; the tree
       // indent travels inside the title, and the primary title marks current.
       if (row.kind === "bucket") {
-        return { title: `${"  ".repeat(row.depth)}${row.count} finished`, value: `fold:${row.parentID}`, dot: false, pl: 0 }
+        const mark = open().has(row.parentID) ? "▾" : "▸"
+        return {
+          title: `${"  ".repeat(row.depth)}${mark} ${row.count} finished`,
+          value: `fold:${row.parentID}`,
+          dot: false,
+          pl: 0,
+        }
       }
       const formatted = formatAgentRow({
         member: { id: row.id, depth: row.depth },
@@ -65,6 +72,7 @@ export function DialogSubagentList(props: { rootID: string; currentID: string; o
       placeholder="Filter agents"
       options={options()}
       current={props.currentID}
+      preserveSelection={true}
       onSelect={(option) => {
         if (typeof option.value !== "string") return
         // A fold toggles in place; the dialog stays open.
@@ -72,8 +80,7 @@ export function DialogSubagentList(props: { rootID: string; currentID: string; o
           const parent = option.value.slice("fold:".length)
           setOpen((prev) => {
             const next = new Set(prev)
-            if (next.has(parent)) next.delete(parent)
-            else next.add(parent)
+            if (!next.delete(parent)) next.add(parent)
             return next
           })
           return

@@ -217,7 +217,7 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   原裁决（排除 root、回根交给 up）连同 up/left/right/<leader>down 键位一并废止。
 - 行内容：root 行固定标签 **`Main`**；其余 = `metadata.agentName` → `session.agent` 类型 →
   title 的 `@type subagent` 段 → 占位 `"Subagent"`；描述 = `[类型, 状态, current?]` 拼接；
-  当前会话经 DialogSelect `current` 属性预选 + 描述列 `current` 标记；缩进 = 子树深度
+  当前会话经 DialogSelect `current` 属性预选（#59：当前会话及其祖先永不折叠，预选因此总能命中；选中按值跟随行数变化）；缩进 = 子树深度
   （root 0 不缩进）；排序 =（深度，创建时间）。状态 = `sync.data.session_status[id]?.type`。
 - 标题/占位：`Agents` / `Filter agents`。
 - 行解剖【#59 修订，用户裁决：对齐 fsm-status 侧栏，单行，英文】：每个 agent **一行**——左侧
@@ -271,7 +271,7 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
 
 #### 5.3.3 TUI session 路由 — `visible()` 放开 + 提供接管回调
 
-- `visible()`：去掉 `!session()?.parentID` 合取项 → 子会话视图渲染 `Prompt`；`SubagentFooter` 保留（footer 在上、输入框在下，并列 `<Show>` 天然共存）。
+- `visible()`：去掉 `!session()?.parentID` 合取项 → 子会话视图渲染 `Prompt`；`SubagentFooter` 已于 #59 删除（见 §5.2.3 末段，子会话视图共用主视图 chrome）（原文：footer 在上、输入框在下，并列 `<Show>` 天然共存）。
 - 提供 `onSubmitUserMessage`（仅当 `session()?.parentID`）：调 `sdk.client.session.agentMessage({sessionID, parts})`，catch → toast。
 - 已知限制（记录，不做 UI）：子会话视图内子 agent 发起权限/提问时，请求归根会话视图处理（H3）——用户需 `up` 回根会话；footer 不提示。
 - 已知限制（记录，不修）：子会话视图 undo 会把 `[Message from user]` 头行与正文一并召回输入框（多 text part 无分隔符拼接，既有聚合行为 `:625`），原样重发会产生双头行。v1 接受。再引入条件：若需从头行召回中排除，现有 `synthetic` 标记不可复用（它同时把转录渲染也排除，§5.1 依赖其可见性），需引入"仅召回排除"的独立标记。

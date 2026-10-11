@@ -296,6 +296,20 @@ describe("agentListRows", () => {
     ])
   })
 
+  test("the viewed session and its ancestors never fold, however old", () => {
+    const rows = agentListRows({ ...base, pinned: "grandchild", open: new Set() })
+    expect(rows.map((row) => (row.kind === "agent" ? row.id : `fold:${row.count}`))).toEqual([
+      "root",
+      "busy",
+      "fresh",
+      "old",
+      "grandchild",
+      "quiet-parent",
+      "busy-grandchild",
+      "fold:1",
+    ])
+  })
+
   test("nothing to fold when everything is live; the root alone is one row", () => {
     expect(agentListRows({ ...base, sessions: [sessions[0]!], open: new Set() })).toEqual([
       { kind: "agent", id: "root", depth: 0 },
@@ -342,5 +356,89 @@ describe("contextUsage", () => {
       providers: [],
     })
     expect(readout).toEqual({ tokens: 101, pct: undefined })
+  })
+})
+
+// §5.3 layer 3: random trees. Seeded, so a failure names its case. Checked
+// against the rules the folding is defined by rather than against a copy of
+// the implementation.
+function rng(seed: number) {
+  let state = seed >>> 0
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0
+    let t = state
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+describe("agentListRows on random trees", () => {
+  test("running nodes and their ancestors are always rows; folds count exactly the quiet, stale children", () => {
+    for (let n = 0; n < 60; n++) {
+      const next = rng(5000 + n)
+      const label = `seed ${5000 + n}`
+      const now = 1_000_000
+      const recentMs = 45_000
+      const count = 1 + Math.floor(next() * 14)
+      const sessions = [{ id: "s0", parentID: undefined as string | undefined, time: { created: 0, updated: 0 } }]
+      for (let i = 1; i < count; i++) {
+        const parent = sessions[Math.floor(next() * i)]!.id
+        const created = i * 10
+        const updated = next() < 0.4 ? now - Math.floor(next() * 30_000) : Math.floor(next() * 500_000)
+        sessions.push({ id: `s${i}`, parentID: parent, time: { created, updated } })
+      }
+      const busy = new Set(sessions.filter(() => next() < 0.25).map((item) => item.id))
+      const running = (id: string) => busy.has(id)
+      const open = new Set(sessions.filter(() => next() < 0.3).map((item) => item.id))
+      const rows = agentListRows({ sessions, rootID: "s0", running, now, recentMs, open })
+
+      const byId = new Map(sessions.map((item) => [item.id, item]))
+      const children = (id: string) => sessions.filter((item) => item.parentID === id)
+      const live = (id: string): boolean => running(id) || children(id).some((kid) => live(kid.id))
+      const agents = rows.flatMap((row) => (row.kind === "agent" ? [row] : []))
+      const ids = agents.map((row) => row.id)
+
+      // Root first, no duplicates.
+      expect(ids[0], label).toBe("s0")
+      expect(new Set(ids).size, label).toBe(ids.length)
+      // Every running node, and every ancestor of one, is a row.
+      for (const item of sessions) {
+        if (!live(item.id)) continue
+        expect(ids, `${label} live ${item.id}`).toContain(item.id)
+      }
+      // A node is a row iff its parent is a row and it is live, recent, or
+      // inside a revealed fold — an expanded fold shows its subtree in full.
+      for (const item of sessions) {
+        if (item.id === "s0") continue
+        const parentShown = ids.includes(item.parentID!)
+        const direct = live(item.id) || now - item.time.updated < recentMs
+        expect(ids.includes(item.id), `${label} row ${item.id}`).toBe(parentShown && (direct || revealedThrough(item.id)))
+      }
+      // Each fold counts exactly its parent's children that are quiet and stale.
+      for (const row of rows) {
+        if (row.kind !== "bucket") continue
+        const quiet = children(row.parentID).filter((kid) => !live(kid.id) && now - kid.time.updated >= recentMs)
+        expect(row.count, `${label} fold under ${row.parentID}`).toBe(quiet.length)
+        expect(row.depth, label).toBe((agents.find((a) => a.id === row.parentID)?.depth ?? -2) + 1)
+      }
+      // Depth is the distance from the root.
+      for (const row of agents) {
+        let depth = 0
+        for (let cursor = byId.get(row.id); cursor?.parentID; cursor = byId.get(cursor.parentID)) depth += 1
+        expect(row.depth, `${label} depth ${row.id}`).toBe(depth)
+      }
+
+      // Some ancestor (or the node itself) is a quiet, stale child of a parent
+      // whose fold is open and who is itself a row.
+      function revealedThrough(id: string): boolean {
+        for (let cursor = byId.get(id); cursor?.parentID; cursor = byId.get(cursor.parentID)) {
+          const parent = byId.get(cursor.parentID)!
+          const folded = !live(cursor.id) && now - cursor.time.updated >= recentMs
+          if (folded && open.has(parent.id) && ids.includes(parent.id)) return true
+        }
+        return false
+      }
+    }
   })
 })
