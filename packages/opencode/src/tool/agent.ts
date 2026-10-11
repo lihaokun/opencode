@@ -63,7 +63,7 @@ type StopMeta = { stopped?: number; failed?: number }
 const AGENT_DESCRIPTION = [
   "- Starts a subagent: a session of its own that runs the task you give it",
   "- The session outlives the run. When the run ends the subagent is idle, with its context and working directory kept",
-  "- agent_send talks to it — more work, a correction, a question — and starts its next run. This is also how an old one is woken, whether it went idle, was stopped, or was cut off mid-work: it picks up where it left off",
+  "- agent_send talks to it — more work, a correction, a question. While it is idle the message starts its next run; while it is busy it reads the message at its next step, inside the run it is in. This is also how an old one is woken, whether it went idle, was stopped, or was cut off mid-work: it picks up where it left off",
   "- agent_stop stops its current run and those of its descendants. The session stays, and agent_send resumes it",
   "- Always asynchronous: this returns once the subagent has started. Every run ends with a report to you as a message in your conversation; there is nothing to poll",
   "- Several can run at the same time",
@@ -78,7 +78,7 @@ const LIST_DESCRIPTION = [
   "- Lists the agents you can address: yourself, your parent, your direct children and your siblings",
   "- Does not list grandchildren, or agents belonging to an unrelated conversation",
   "- Every row carries a session_id, which always works as a target; a row may also carry a name, which is shorter but only unique by convention — when two rows share one, use the session_id",
-  "- Status is `running` or `idle`, read at this instant. `idle` is a subagent between runs: it keeps its session, context and directory, and a message to it starts its next run. It is a snapshot, not a promise: one shown as running may finish immediately after",
+  "- Status is `running` or `idle`, read at this instant. `idle` is a subagent between runs: it keeps its session, context and directory, and a message to it starts its next run; a message to a `running` one is read at its next step. It is a snapshot, not a promise: one shown as running may finish immediately after",
   "- Status never says how an agent finished; that arrives as a message",
 ].join("\n")
 
