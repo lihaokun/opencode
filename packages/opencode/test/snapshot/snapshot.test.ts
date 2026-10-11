@@ -1216,3 +1216,160 @@ it.instance(
   }),
   { git: true },
 )
+
+it.instance(
+  "diffStat reports names and counts without reading content",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    yield* write(`${tmp.path}/grow.txt`, "one\n")
+    yield* write(`${tmp.path}/delete.txt`, "gone")
+    const before = yield* snapshot.track()
+    yield* write(`${tmp.path}/grow.txt`, "one\ntwo\n")
+    yield* rm(`${tmp.path}/delete.txt`)
+    yield* write(`${tmp.path}/added.txt`, "new")
+    const after = yield* snapshot.track()
+    const stat = yield* snapshot.diffStat(before!, after!)
+    const full = yield* snapshot.diffFull(before!, after!)
+    // Same rows as the full diff, same counts and statuses, minus the patch.
+    expect(stat.map((d) => d.file).sort()).toEqual(full.map((d) => d.file).sort())
+    for (const row of stat) {
+      expect("patch" in row).toBe(false)
+      const same = full.find((d) => d.file === row.file)!
+      expect([row.additions, row.deletions, row.status]).toEqual([same.additions, same.deletions, same.status])
+    }
+    expect(stat.find((d) => d.file === "added.txt")!.status).toBe("added")
+    expect(stat.find((d) => d.file === "delete.txt")!.status).toBe("deleted")
+    expect(stat.find((d) => d.file === "grow.txt")!.additions).toBe(1)
+  }),
+  { git: true },
+)
+
+// The reason the cap exists: one generated log in a turn used to put its whole
+// text into the turn's summary. Counts still come from git; only the patch is
+// withheld.
+it.instance(
+  "diffFull withholds the patch of a file over the size cap and keeps its counts",
+  withTrackedSnapshot(({ tmp, snapshot, before }) =>
+    Effect.gen(function* () {
+      const lines = 20_000
+      yield* write(`${tmp.path}/big.log`, `${"x".repeat(60)}\n`.repeat(lines))
+      yield* write(`${tmp.path}/small.txt`, "small content\n")
+      const after = yield* snapshot.track()
+      const diffs = yield* snapshot.diffFull(before, after!)
+      const big = diffs.find((d) => d.file === "big.log")!
+      expect(big.patch).toBe("")
+      expect(big.additions).toBe(lines)
+      expect(big.status).toBe("added")
+      const small = diffs.find((d) => d.file === "small.txt")!
+      expect(small.patch).toContain("+small content")
+      expect(small.additions).toBe(1)
+    }),
+  ),
+  { git: true },
+)
+
+// §5.3 layer 3: random change sets, cross-checked against git's own numbers.
+// Seeded so a failure names the case that produced it.
+function rng(seed: number) {
+  let state = seed >>> 0
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0
+    let t = state
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+const lineOf = (next: () => number, width: number) => `${Math.floor(next() * 1e9)} ${"x".repeat(width)}\n`
+const textOf = (next: () => number, lines: number, width: number) =>
+  Array.from({ length: lines }, () => lineOf(next, width)).join("")
+const added = (patch: string) => patch.split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++")).length
+const removed = (patch: string) => patch.split("\n").filter((l) => l.startsWith("-") && !l.startsWith("---")).length
+
+it.instance(
+  "random change sets: diffStat is diffFull without the patch, and patches agree with numstat",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    for (let n = 0; n < 12; n++) {
+      const seed = 4000 + n
+      const next = rng(seed)
+      const files = Array.from({ length: 1 + Math.floor(next() * 6) }, (_, i) => `r${n}/f${i}.txt`)
+      const size = new Map<string, { before: number; after: number }>()
+      for (const file of files) {
+        const text = next() < 0.65 ? textOf(next, 1 + Math.floor(next() * 40), 20) : ""
+        if (text) yield* write(`${tmp.path}/${file}`, text)
+        size.set(file, { before: text.length, after: text.length })
+      }
+      const before = yield* snapshot.track()
+      for (const file of files) {
+        const r = next()
+        const had = size.get(file)!.before > 0
+        if (r < 0.25 && had) {
+          yield* rm(`${tmp.path}/${file}`)
+          size.get(file)!.after = 0
+          continue
+        }
+        if (r < 0.85) {
+          // One case in ten crosses the patch cap on purpose.
+          const text = next() < 0.1 ? textOf(next, 18_000, 60) : textOf(next, 1 + Math.floor(next() * 40), 20)
+          yield* write(`${tmp.path}/${file}`, text)
+          size.get(file)!.after = text.length
+        }
+      }
+      const after = yield* snapshot.track()
+      if (!before || !after) continue
+      const stat = yield* snapshot.diffStat(before, after)
+      const full = yield* snapshot.diffFull(before, after)
+      const label = `seed ${seed}`
+      // P1: same rows, same order, same counts and statuses; no patch.
+      expect(stat, label).toEqual(
+        full.map((d) => ({ file: d.file, additions: d.additions, deletions: d.deletions, status: d.status })),
+      )
+      for (const row of full) {
+        const sizes = size.get(row.file!)!
+        const capped = sizes.before > Snapshot.patchFileLimit || sizes.after > Snapshot.patchFileLimit
+        // P2: the patch is withheld exactly for files over the cap on either side.
+        expect(row.patch === "", `${label} ${row.file} capped=${capped}`).toBe(capped)
+        // P3: a produced patch carries exactly the lines git counted.
+        if (!capped) {
+          expect(added(row.patch!), `${label} ${row.file} additions`).toBe(row.additions)
+          expect(removed(row.patch!), `${label} ${row.file} deletions`).toBe(row.deletions)
+        }
+      }
+    }
+  }),
+  { git: true },
+  120_000,
+)
+
+// Files each under the per-file cap still add up: a turn that touched a
+// thousand 200 KB files used to come back as a 200 MB response. Past the total
+// limit the remaining rows carry counts only.
+it.instance(
+  "diffFull stops producing patches once one diff's patches reach the total limit",
+  withTrackedSnapshot(({ tmp, snapshot, before }) =>
+    Effect.gen(function* () {
+      const files = 12
+      for (let i = 0; i < files; i++) {
+        yield* write(`${tmp.path}/part-${i.toString().padStart(2, "0")}.txt`, `${"y".repeat(79)}\n`.repeat(10_000))
+      }
+      const after = yield* snapshot.track()
+      const diffs = yield* snapshot.diffFull(before, after!)
+      expect(diffs).toHaveLength(files)
+      const withPatch = diffs.filter((d) => d.patch !== "")
+      const withoutPatch = diffs.filter((d) => d.patch === "")
+      expect(withPatch.length).toBeGreaterThan(0)
+      expect(withoutPatch.length).toBeGreaterThan(0)
+      // Counts never depend on whether the patch was produced.
+      for (const d of diffs) expect(d.additions).toBe(10_000)
+      // One row of overshoot at most: the row that crossed the line.
+      const spent = withPatch.reduce((sum, d) => sum + d.patch!.length, 0)
+      expect(spent).toBeLessThan(Snapshot.patchTotalLimit + 1_000_000)
+    }),
+  ),
+  { git: true },
+  60_000,
+)
