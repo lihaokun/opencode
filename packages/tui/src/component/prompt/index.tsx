@@ -226,6 +226,21 @@ export function Prompt(props: PromptProps) {
   const move = usePromptMove({ projectID: project.project, sessionID: () => props.sessionID })
   const [cursorVersion, setCursorVersion] = createSignal(0)
   const currentProviderLabel = createMemo(() => local.model.parsed().provider)
+  // The subagent view's identity line: the target session's own agent and
+  // model, read-only — identity is resolved from the target, never chosen here,
+  // so the switch keys stay off and the line only says what it is.
+  const identity = createMemo(() => {
+    if (!props.onSubmitUserMessage || !props.sessionID) return
+    const target = sync.session.get(props.sessionID)
+    if (!target) return
+    const agent = target.agent ? Locale.titlecase(target.agent) : undefined
+    const model = target.model?.id
+    const provider = target.model
+      ? (sync.data.provider.find((item) => item.id === target.model?.providerID)?.name ?? target.model.providerID)
+      : undefined
+    if (!agent && !model) return
+    return { agent, model, provider }
+  })
   const hasRightContent = createMemo(() => Boolean(props.right))
 
   function promptModelWarning() {
@@ -1474,7 +1489,29 @@ export function Prompt(props: PromptProps) {
             />
             <box flexDirection="row" flexShrink={0} paddingTop={1} gap={1} justifyContent="space-between">
               <box flexDirection="row" gap={1}>
-                <Show when={!props.onSubmitUserMessage} fallback={<box height={1} />}>
+                <Show
+                  when={!props.onSubmitUserMessage}
+                  fallback={
+                    <Show when={identity()} fallback={<box height={1} />}>
+                      {(item) => (
+                        <box flexDirection="row" gap={1}>
+                          <Show when={item().agent}>
+                            <text fg={theme.textMuted}>{item().agent}</text>
+                          </Show>
+                          <Show when={item().model}>
+                            <Show when={item().agent}>
+                              <text fg={theme.textMuted}>·</text>
+                            </Show>
+                            <text fg={theme.textMuted} flexShrink={0}>
+                              {item().model}
+                            </text>
+                            <text fg={theme.textMuted}>{item().provider}</text>
+                          </Show>
+                        </box>
+                      )}
+                    </Show>
+                  }
+                >
                   <Show when={local.agent.current()} fallback={<box height={1} />}>
                     {(agent) => (
                       <>

@@ -54,7 +54,6 @@ import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { DialogSubagentList } from "../../component/dialog-subagent-list"
 import { Sidebar } from "./sidebar"
-import { SubagentFooter } from "./subagent-footer.tsx"
 import { filetype } from "../../util/filetype"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
@@ -249,7 +248,6 @@ export function Session() {
 
   const wide = createMemo(() => dimensions().width > 120)
   const sidebarVisible = createMemo(() => {
-    if (session()?.parentID) return false
     if (sidebarOpen()) return true
     if (sidebar() === "auto" && wide()) return true
     return false
@@ -456,6 +454,11 @@ export function Session() {
         return type === "busy" || type === "retry"
       }).length,
   )
+  // In a subagent's view the line also says which agent this is.
+  const agentsAt = createMemo(() => {
+    const info = session()
+    return info?.parentID ? agentAt(info) : undefined
+  })
 
   // Step P10 consumer: down at the exhausted prompt history opens the Agents
   // list. Returning false hands the keystroke back to the editor (only when a
@@ -1251,9 +1254,6 @@ export function Session() {
                     directory={sync.session.get(questions()[0].sessionID)?.directory}
                   />
                 </Show>
-                <Show when={session()?.parentID}>
-                  <SubagentFooter />
-                </Show>
                 <Show when={visible()}>
                   <pluginRuntime.Slot
                     name="session_prompt"
@@ -1280,7 +1280,7 @@ export function Session() {
                 </Show>
                 <Show when={visible() && agentsPanelMembers().length >= 2}>
                   <box flexShrink={0} marginTop={1} paddingLeft={1}>
-                    <text fg={theme.textMuted}>{formatAgentsLine(agentsRunning())}</text>
+                    <text fg={theme.textMuted}>{formatAgentsLine(agentsRunning(), agentsAt())}</text>
                   </box>
                 </Show>
               </box>
@@ -2755,7 +2755,7 @@ export function lastCompleted(messages: { role: string; time: { created: number;
 }
 
 /**
- * The context-usage readout shared by the SubagentFooter, the Agents dialog
+ * The context-usage readout shared by the Agents dialog
  * and the persistent panel (verification finding P5-4): the last assistant
  * message's token aggregate — what the conversation currently occupies — plus
  * its percentage of the model's context limit. Sessions without a scoring
@@ -2833,9 +2833,25 @@ export function formatAgentRow(input: {
   return { indent: "  ".repeat(member.depth), label, footer }
 }
 
-/** The one line under the input that replaced the Agents panel. */
-export function formatAgentsLine(running: number) {
-  return `${running} agent${running === 1 ? "" : "s"} running · down opens the list`
+/**
+ * The one line under the input that replaced the Agents panel. In a subagent's
+ * view it opens with which agent this is.
+ */
+export function formatAgentsLine(running: number, at?: string) {
+  const count = `${running} agent${running === 1 ? "" : "s"} running · down opens the list`
+  return at ? `in ${at} · ${count}` : count
+}
+
+/**
+ * How a subagent is named when the view is inside it: its instance name, else
+ * the description its creator gave, else its type; the type follows in
+ * parentheses when the name is something else.
+ */
+export function agentAt(info: { agent?: string; title?: string; metadata?: Record<string, unknown> }) {
+  const name = typeof info.metadata?.agentName === "string" ? info.metadata.agentName : undefined
+  const type = info.agent ?? info.title?.match(/@(\w+) subagent/)?.[1]
+  const label = name ?? subagentDescription(info.title) ?? type ?? "subagent"
+  return type && label !== type ? `${label} (${type})` : label
 }
 
 export type AgentListRow =

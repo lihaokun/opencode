@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Locale } from "../src/util/locale"
 import {
+  agentAt,
   agentListRows,
   agentStatusWord,
   contextUsage,
@@ -231,6 +232,22 @@ describe("formatAgentsLine", () => {
     expect(formatAgentsLine(0)).toBe("0 agents running · down opens the list")
     expect(formatAgentsLine(1)).toBe("1 agent running · down opens the list")
     expect(formatAgentsLine(3)).toBe("3 agents running · down opens the list")
+  })
+
+  test("inside a subagent it opens with where you are", () => {
+    expect(formatAgentsLine(2, "cw-b177 (general)")).toBe("in cw-b177 (general) · 2 agents running · down opens the list")
+  })
+})
+
+describe("agentAt", () => {
+  test("name first, with the type in parentheses", () => {
+    expect(agentAt(info())).toBe("alpha (explore)")
+  })
+
+  test("falls back to the description, then the type, then a placeholder", () => {
+    expect(agentAt(info({ metadata: {} }))).toBe("反方辩手立论 (explore)")
+    expect(agentAt({ agent: "general", title: "(@general subagent)", metadata: {} })).toBe("general")
+    expect(agentAt({ title: "New session" })).toBe("subagent")
   })
 })
 

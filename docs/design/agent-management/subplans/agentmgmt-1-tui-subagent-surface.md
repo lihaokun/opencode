@@ -237,6 +237,12 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
 - 输入框下方【#59 修订，用户裁决】：常驻 Agents 面板**撤销**（`agents-panel.tsx` 删除），
   换成一行 `N agent(s) running · down opens the list`（`formatAgentsLine`），N 为树内除 root 外
   状态为 busy/retry 的成员数；树内 ≥2 成员时显示。对话框仍是过滤/键盘导航面。
+- 子会话视图与主视图同一套界面【#59 修订，用户裁决】：`SubagentFooter`（输入框上方的带边框面板，
+  含 "类型 (i of n) · 上下文 · 费用"）**删除**，上下文与费用照主视图在输入框右下角显示；输入框左下角的
+  身份行不再留空，而是**只读**显示该子会话自己的 agent · model · provider（身份来自目标会话，切换键
+  仍不作用）；sidebar 不再因 `parentID` 强制隐藏，与主视图同一条规则。子会话视图里输入框下方那一行
+  以 `in <实例名|描述|类型> (<类型>) · ` 开头（`agentAt`）。提交路径不变：仍经 `agent-message`
+  端点、带 `[Message from user]` 身份；权限/提问面板仍只在 root 视图出现。
 
 #### 5.2.4 测试
 
