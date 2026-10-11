@@ -61,10 +61,13 @@ type SendMeta = { target?: string }
 type StopMeta = { stopped?: number; failed?: number }
 
 const AGENT_DESCRIPTION = [
-  "- Starts a subagent: a session of its own, with its own working directory, that outlives the run it starts with. Its lifecycle is this tool to start it, agent_send to talk to it — more work, a correction, a question, or waking an old one that went idle, was stopped, or was cut off mid-work, so it picks up where it left off — and agent_stop to end it",
-  "- Always asynchronous: this returns once the subagent has started. Every run it does ends with a report to you as a message in your conversation; there is nothing to poll",
+  "- Starts a subagent: a session of its own that runs the task you give it",
+  "- The session outlives the run. When the run ends the subagent is idle, with its context and working directory kept",
+  "- agent_send talks to it — more work, a correction, a question — and starts its next run. This is also how an old one is woken, whether it went idle, was stopped, or was cut off mid-work: it picks up where it left off",
+  "- agent_stop stops its current run and those of its descendants. The session stays, and agent_send resumes it",
+  "- Always asynchronous: this returns once the subagent has started. Every run ends with a report to you as a message in your conversation; there is nothing to poll",
   "- Several can run at the same time",
-  "- Each subagent gets its own working directory and is told to use it, so parallel work does not collide. This is a convention, not a sandbox: it can still reach the rest of the project by absolute path",
+  "- When `cwd` is omitted a new working directory is created and the subagent is told to use it, which keeps parallel edits apart. This is a convention, not a sandbox: a shared `cwd`, or an absolute path into the rest of the project, can still collide",
   "- To continue work in an existing directory or worktree, pass it as `cwd`. Naming it only in the prompt is not enough: a fresh directory is created regardless and the Agent is told to use that one, so the two instructions conflict",
   "- The returned `session_id` always works as a target for agent_send and agent_stop",
   "- `name` is optional and shorter to use, but is not guaranteed unique; if two subagents share one, that name is refused and you must use the session_id",
@@ -81,16 +84,17 @@ const LIST_DESCRIPTION = [
 
 const SEND_DESCRIPTION = [
   "- Sends a message to another agent: more work, a correction, a question. A subagent that went idle, was stopped, or was cut off mid-work picks it up with its context intact and resumes where it left off — this is how an old one is woken",
-  "- This is a message, not a call: this does not wait for it. Your own subagent reports to you when it stops, as it does after any of its runs; anyone else does not reply automatically",
+  "- This is a message, not a call: it does not wait for anything",
+  "- Your own subagent reports to you automatically when its run ends. To hear from it before that, ask it in the message to send one",
+  "- Your parent, your siblings and anyone else do not reply automatically. If you need an answer, ask for it in the message; it arrives, if at all, as a message they send",
   "- What comes back means the message was accepted for delivery — not that it was processed, and not that an answer is coming",
-  "- If you need an answer, ask for it in the message and carry on. The recipient replies by calling agent_send itself. Do not follow up asking where the result is",
   "- Reaches your parent, children and siblings by name or session_id, and any agent at all by session_id",
   "- The recipient acts under its own permissions: this is not a way to have work done that you are not allowed to do yourself",
   "- Your identity is attached automatically and cannot be set from here",
 ].join("\n")
 
 const STOP_DESCRIPTION = [
-  "- Stops an agent you launched, along with everything it launched in turn",
+  "- Stops the current run of an agent you launched, and the runs of everything it launched in turn",
   "- Only your own direct children can be named as the target; the cascade to their descendants follows automatically",
   "- Nothing is deleted. The session and its history survive, so a stopped agent can be picked up again with agent_send",
   "- The result says which agents a stop was performed on. That is not a claim that each was busy — stopping an idle one is harmless, reported the same way, and repeating the call is safe",
