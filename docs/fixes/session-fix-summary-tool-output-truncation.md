@@ -1,6 +1,6 @@
 # 修正方案 — 摘要输入的头尾保留与退出码（P0-3 / issue #46）
 
-> 流程：workflow §7。状态：**待确认**。
+> 流程：workflow §7。状态：**已实施**（commit `fc071384f2`，2026-10-12）。
 > 关联：`docs/research/runtime-alignment-research.md` §3.3 / §4.3 / §7 决议 #6（D① 抽 core helper）；复用 P0-1 的 `formatExitCodeLine`（`packages/core/src/session/tool-result-projection.ts`）。
 
 ## 第一部分：现象与复现
@@ -67,13 +67,13 @@ ZCode 摘要输入**无字符截断**（完整 provider messages 直接进摘要
 
 | 类型 | 用例 | 状态（修复后回填） |
 |------|------|------|
-| 回归 | >2,000 字符 + 尾部 `Full output saved to:` hint → 摘要文本含头部、标记、尾部与路径行（最小复现固化） | 待加 |
-| 新增 | ≤2,000 字符 → 输出逐字节不变 | 待加 |
-| 新增 | 截断标记包含省略字符数；头 1,400 / 尾 600 精确切片 | 待加 |
-| 新增 | exit 非零 → 摘要文本含 `[exit code: N]`；exit 0/null → 不含（V1 调用点组合行为） | 待加 |
-| 新增 | compacted → `[Old tool result content cleared]` 不变 | 待加 |
-| 新增 | attachments join 后整体参与头尾切分 | 待加 |
-| 已有 | core `session-compaction.test.ts`（含 :45 格式固化）+ `session-runner.test.ts` 压缩集成 + opencode `compaction.test.ts` 全量复跑 + 双包 typecheck | 待复跑 |
+| 回归 | >2,000 字符 + 尾部 `Full output saved to:` hint → 摘要文本含头部、标记、尾部与路径行（最小复现固化） | 已加: `summarizeToolText keeps a trailing full-output hint inside the tail window` @ `fc071384f2` |
+| 新增 | ≤2,000 字符 → 输出逐字节不变 | 已加: `results within budget byte-identical`（1,999/2,000 两档）@ `fc071384f2` |
+| 新增 | 截断标记包含省略字符数；头 1,400 / 尾 600 精确切片 | 已加: `retains head and tail with an omission marker` @ `fc071384f2` |
+| 新增 | exit 非零 → 摘要文本含 `[exit code: N]`；exit 0/null → 不含（V1 调用点组合行为） | 已加: `formatExitCodeLine renders only finite non-zero exits`（helper 直测）+ V1 调用点两行胶水（组合行为经 message-v2 既有用例覆盖 helper 语义）@ `fc071384f2` |
+| 新增 | compacted → `[Old tool result content cleared]` 不变 | 已加: V1 调用点分支保持原 ternary，compaction/prompt 套件回归通过 @ `fc071384f2` |
+| 新增 | attachments join 后整体参与头尾切分 | 已加: 调用点 `[output, ...attachments].join` 后整体进 helper（切片测试以合成文本覆盖等价行为）@ `fc071384f2` |
+| 已有 | core `session-compaction.test.ts`（含 :45 格式固化）+ `session-runner.test.ts` 压缩集成 + opencode `compaction.test.ts` 全量复跑 + 双包 typecheck | 已复跑: core 1102/1102（含格式固化与 runner 集成）、opencode session 目录 619/619、双包 typecheck 干净 |
 
 V1 serialize 的 completed 分支是 layer 闭包内联代码，组合行为（exit + compacted + attachments）以"helper 单元测试 + 调用点两行胶水"覆盖，不为胶水单独搭 layer harness（与 P0-1/P0-2 的覆盖口径一致）。
 
@@ -81,17 +81,17 @@ V1 serialize 的 completed 分支是 layer 闭包内联代码，组合行为（e
 
 | 文件 | 函数 / 位置 | 改动概述 | 状态（修复后回填） |
 |------|------------|---------|------|
-| `packages/core/src/session/tool-result-projection.ts` | 新增 `summarizeToolText` + `TOOL_RESULT_SUMMARY_MAX_CHARS` | 头尾双侧保留（头 1,400 / 尾 600 / 标记） | 待改 |
-| `packages/opencode/src/session/compaction.ts` | serialize completed 分支（:66-83） | 改用 helper + 追加 exit 行；清理本地 truncate/常量 | 待改 |
-| `packages/core/src/session/compaction.ts` | 工具分支与 `[Shell]` 行 | `truncate` → `summarizeToolText`；清理本地 truncate/常量 | 待改 |
-| `packages/core/test/session-compaction.test.ts` | 新增 helper 单元测试 | 第六部分清单落地 | 待加 |
+| `packages/core/src/session/tool-result-projection.ts` | 新增 `summarizeToolText` + `TOOL_RESULT_SUMMARY_MAX_CHARS` | 头尾双侧保留（头 1,400 / 尾 600 / 标记） | 已改: `fc071384f2` |
+| `packages/opencode/src/session/compaction.ts` | serialize completed 分支（:66-83） | 改用 helper + 追加 exit 行；清理本地 truncate/常量 | 已改: `fc071384f2` |
+| `packages/core/src/session/compaction.ts` | 工具分支与 `[Shell]` 行 | `truncate` → `summarizeToolText`；清理本地 truncate/常量 | 已改: `fc071384f2` |
+| `packages/core/test/session-compaction.test.ts` | 新增 helper 单元测试 | 第六部分清单落地 | 已加: `fc071384f2` |
 
 ## 第八部分：文档更新清单
 
 | 文档路径 | 要改什么 | 状态（修复后回填） |
 |---------|---------|------|
-| `docs/research/runtime-alignment-research.md` | §7 决议 #6 实施回填 | 待改 |
-| `docs/devlog/` | P0-3 实施日志（含度量） | 待加 |
+| `docs/research/runtime-alignment-research.md` | §7 决议 #6 实施回填 | 已改: 实施记录见 devlog `docs/devlog/2026-10-12-session-fix-summary-tool-output-truncation.md` |
+| `docs/devlog/` | P0-3 实施日志（含度量） | 已加: `docs/devlog/2026-10-12-session-fix-summary-tool-output-truncation.md` |
 | 无 schema/枚举/接口契约文档 | 新契约（头尾保留比例、截断标记格式）权威记录为本文第四部分 | 无（+理由） |
 
 **实施中发现的新问题（记录，不在本修复内）**：core V2 的模型回放（`to-llm-message.ts:46`）包含 `state.structured` 通道，但其 serialize 只序列化 `state.content` 块——V2 摘要输入丢失 `structured` 数据，与 P0-2 同族。需先核实 V2 工具状态中 structured 的填充方与 bash 的 exit 落点，单独立项处理。
