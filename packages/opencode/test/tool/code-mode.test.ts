@@ -358,6 +358,17 @@ describe("code mode execute", () => {
     expect(output.output).toBe("caught: server exploded")
   })
 
+  test("an MCP error carrying only structuredContent surfaces the JSON in the message", async () => {
+    const structuredContent = { code: 3007, detail: "quota exceeded" }
+    const tool = await build({
+      bad_tool: mcpTool("tool", () => ({ isError: true, content: [], structuredContent })),
+    })
+    const output = await Effect.runPromise(
+      tool.execute({ code: "try { await tools.bad.tool({}) } catch (e) { return 'caught: ' + e.message }" }, ctx),
+    )
+    expect(output.output).toBe(`caught: ${JSON.stringify(structuredContent)}`)
+  })
+
   test("asks permission before each child tool call", async () => {
     const asked: unknown[] = []
     const permissionCtx: Tool.Context = { ...ctx, ask: (req) => Effect.sync(() => void asked.push(req)) }
