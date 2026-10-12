@@ -1,7 +1,49 @@
-> **这是 [anomalyco/opencode](https://github.com/anomalyco/opencode) 的 fork。**
-> 在上游之上加了 Agent 管理能力（`agent` / `agent_list` / `agent_send` / `agent_stop` 四个工具，替代原 `task`）和一批 session 层修复。
-> **正式版在 `main`（默认分支），测试版在 `dev`。** [Releases](https://github.com/lihaokun/opencode/releases) 里不带 Pre-release 标记的是正式版（tag 形如 `v1.18.31-fmv3`，从 `main` 构建）；标 Pre-release 的 `-beta.N` 是从 `dev` 构建的测试版。安装见 [`FORK_INSTALL.md`](FORK_INSTALL.md)。
-> 上游原版 README 如下。
+# opencode（lihaokun fork）
+
+基于 [anomalyco/opencode](https://github.com/anomalyco/opencode) 的独立分支。功能面和运行时行为已与上游分化，
+**不再向上游提交改动**；上游的更新按需择优合入 `dev`。下方保留上游原版 README 作为通用使用说明。
+
+## 与上游的差别
+
+### 多 Agent 协作
+
+上游的 `task` 工具换成了一组 Agent 管理工具，子 agent 成为可寻址、可恢复、可对话的会话：
+
+- **`agent`**：异步委派。每个子 agent 在**独立的 git worktree** 里工作，互不踩脚；可以起名、可以指定目录接续已有 worktree；
+  有嵌套深度上限，权限从父会话派生。
+- **`agent_list` / `agent_send` / `agent_stop`**：查看整棵 Agent 树和各成员状态；父、子、兄弟之间**任意方向直接发消息**，
+  人也可以在 TUI 里直接给某个子 agent 输入；按需停止一个 agent 并保留它的上下文，之后还能用 `agent_send` 唤醒。
+- **停机即报告**：子 agent 每次 run 结束（完成或失败，包括输出超长、provider 报错）都自动向父报告；父会话每轮只看到
+  **正在运行**的子 agent 名单，不被历史条目淹没。
+- **TUI 操作面**：输入框底部常驻 Agents 面板；输入为空时按 `down` 打开 Agents 对话框跳转；委派结果在父转录里显示为一行提示；
+  进入子会话视图可以直接输入。
+
+### 稳定性
+
+面向长会话、多 agent 并行、大输出的场景做了一批 session 层修复，每一项都有 `docs/fixes/` 下的根因文档与回归测试：
+
+- 上下文溢出的恢复与压缩边界；provider 流中断、不完整响应、碎片化推理块的收口；
+- 消息 id 跨 36 位回绕后的时序；runner 空闲竞态；周期性重复的死循环检测；
+- 每轮改动摘要只记录文件名与增删行数，patch 按需从快照重算——消息体量、事件表和内存不再随工作区变动文件的大小增长；
+- 子 agent 输出超长时父会话能收到明确的失败通知；无提交的 git 仓库也能为子 agent 建 worktree。
+
+### 发布与分支
+
+- `main` 是正式线（默认分支），`dev` 是测试线；改动先进 `dev`，稳定后以 merge commit 晋升到 `main`。
+- 发版由 tag 驱动：`main` 上的 `v1.18.31-fmv3` 是正式版，`dev` 上的 `v1.18.31-fmv3-beta.1` 是 Pre-release。
+- [Releases](https://github.com/lihaokun/opencode/releases) 提供 Linux / macOS / Windows 五个平台的预编译包，内含 ripgrep；
+  安装三步（解压、加 PATH、关掉官方自动更新）见 [`FORK_INSTALL.md`](FORK_INSTALL.md)，每个 release 的说明里也有同样的步骤。
+
+### 开发流程
+
+本分支按 [`docs/workflow.md`](docs/workflow.md) 的半形式化流程开发：新能力先有调研与架构文档
+（见 [`docs/design/`](docs/design/)），缺陷修复先有八部分修正方案文档（见 [`docs/fixes/`](docs/fixes/)），
+修复附带独立审核与分层测试（基本 / 边缘 / 随机）。
+
+---
+
+> 以下为上游原版 README。
+
 
 <p align="center">
   <a href="https://opencode.ai">

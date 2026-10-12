@@ -159,7 +159,7 @@ describe("SessionReminders.applyAgentRoster", () => {
       const written = rosterParts(out)
       expect(written).toHaveLength(1)
       const text = written[0].type === "text" ? written[0].text : ""
-      expect(text).toContain("none (2 finished)")
+      expect(text).toContain("none (2 idle)")
       expect(text.split("\n").filter((line) => line.startsWith("  ses_"))).toHaveLength(0)
       expect(text).not.toContain("agent_list")
     }),

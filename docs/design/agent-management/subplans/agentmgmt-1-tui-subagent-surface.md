@@ -217,47 +217,38 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
   原裁决（排除 root、回根交给 up）连同 up/left/right/<leader>down 键位一并废止。
 - 行内容：root 行固定标签 **`Main`**；其余 = `metadata.agentName` → `session.agent` 类型 →
   title 的 `@type subagent` 段 → 占位 `"Subagent"`；描述 = `[类型, 状态, current?]` 拼接；
-  当前会话经 DialogSelect `current` 属性预选 + 描述列 `current` 标记；缩进 = 子树深度
+  当前会话经 DialogSelect `current` 属性预选（#59：当前会话及其祖先永不折叠，预选因此总能命中；选中按值跟随行数变化）；缩进 = 子树深度
   （root 0 不缩进）；排序 =（深度，创建时间）。状态 = `sync.data.session_status[id]?.type`。
 - 标题/占位：`Agents` / `Filter agents`。
-- 行解剖【P3 修订，验证反馈】：名称（Main / 解析链）→ muted 简述（子会话标题剥去
-  `(@type subagent)` 后缀，Main 不加）→ 最右侧 footer 槽（flexShrink 0）显示
-  `tokens · 时长`——token 为 `session.tokens` 聚合的紧凑格式，时长 busy/retry 时
-  `now − created` 随对话框 1s tick 实时、完成后定格 `updated − created`；
-  纯函数 `subagentDescription`/`formatListElapsed`/`contextUsage`/`formatAgentRow`
-  可无渲染测试。
-- 面板修正【P5 修订，验证反馈】：容器对齐转录文本列（左 5）与输入框内边右缘（右 3）；
-  当前行 `●` + primary 高亮（`current` 文字标记删除）；输入框右上角 `down view agents`
-  提示删除（面板常驻后冗余）；**计量口径统一**——共享纯函数 `contextUsage`（最后一条
-  assistant 消息聚合 + % of limit）为 footer/对话框/面板三处的唯一 owner，
-  `session.tokens` 累计口径与 `formatListTokens`（"tok" 单位）删除（用户裁决选项 1）。
-- 常驻面板【P4 修订，验证反馈】：同源行解剖（`formatAgentRow` 单一 owner）以面板形态
-  常驻输入框底部（权限/提问面板之下顺位、SubagentFooter 之上），行可点击跳转、
-  1s tick 实时；树内 ≥2 成员显示；>5 行截断为 `+N more — down opens the list`
-  （原确认的"面板内滚动区"改为截断+指向对话框：非聚焦 scroll 区滚轮行为不可验证，
-  截断不吞行）；down 对话框保留为过滤/键盘导航面，两者并存。
-- 面板行渲染【P5 二度回归修订，验证反馈】：面板**复用 DialogSelect 导出的 `Option`
-  组件与同一行容器**（条件 padding 1/3、gap 1、paddingRight 3、scrollbox padding
-  1/1），缩进与当前圆点同在 gutter——面板缩进与对话框"由构造相同"；此前手搓行布局
-  两度漂移的教训：**同一视觉行不允许存在两份渲染代码**。
-- 面板布局定稿【P5 三修，验证反馈最终版】：面板**不再复用 Option**——用户要求无圆点
-  （primary 高亮已表达当前会话）、左缘对齐上一行目录路径的字形列（容器+1，Option 内置
-  paddingLeft 3 无法达到）与行距拉开。定稿为刻意独立的紧凑布局：`marginTop 1` +
-  `paddingLeft 1` + 极简行（indent+label+blurb 左 / 仪表右）+ 行点击跳转；"复用 Option"
-  的上一版表述废止。规则修订：**同一观感的行不允许两份渲染代码**——面板与对话框现为
-  刻意不同的观感，各自一份是合法的。
-- 对话框行对齐【P6 修订，验证反馈】：圆点删除（primary 高亮表达当前行）、行标签列
-  与 Filter 占位符 "F" 对齐（容器+4）、仪表右缘与 "esc" 尾对齐（width−4）。实现为
-  `DialogSelectOption` 的两个 additive 选项 `dot?: boolean` / `pl?: number`
-  （默认维持原行为，其他对话框零影响）。
-- 导航唯一化【P1 修订】：删除 footer 的 Parent/Prev/Next 按钮区（左侧信息保留）与键位
-  `session_parent`/`session_child_cycle`/`session_child_cycle_reverse`/`session_child_first`
-  （up/left/right/<leader>down 归还编辑器），连带 `moveFirstChild`/`moveChild`/
-  `childSessionHandler` 与四个隐藏命令；列表 action 仍是 `enterChild` → `dialog.clear()`。
-  转录尾部提示改挂 `prompt.history.next`（"view agents"）。
-- action：选中 → `enterChild(id)`（复用，含 retry 弹窗行为）→ `dialog.clear()`。
-- **论证**：action 与既有跳转逻辑等价（enterChild）；终止性 trivial（collectSubtree 已证）。
-- 删除 4 个既有导航键位，不新增任何键（down 既有）。
+- 行解剖【#59 修订，用户裁决：对齐 fsm-status 侧栏，单行，英文】：每个 agent **一行**——左侧
+  `缩进 + 标题`（root 固定 `Main`；subagent 用创建者给的描述，即 title 剥去 `(@type subagent)`，
+  退回实例名 → 类型 → `Subagent`），右侧 footer `status · elapsed · tokens`：
+  - status 永远有词：`busy → running`、`retry → retrying`、其余（含没收到过事件）→ `idle`；
+  - elapsed：在跑为 `now − created` 随 1s tick 实时；idle 定格在**最后一条 assistant 消息的
+    `time.completed` − created**，拿不到才退回 `updated − created`（会话的 updated 会被写
+    summary 统计、改标题碰到，太粗）；
+  - tokens：`contextUsage` 的数字（与 footer 同口径），**不显示百分比**——配置的 context 上限
+    小于真实上下文时百分比会读成 243%，数字本身足够。
+  纯函数 `agentStatusWord` / `lastCompleted` / `formatListElapsed` / `formatAgentRow` 可无渲染测试。
+- 折叠【#59 新增，对齐 fsm-status 侧栏 `已结束 N 个`】：`agentListRows` 产出行序——root 起，
+  子按创建时间、按深度缩进；某父节点下**整棵子树无一在跑、也无一在 45 s 内结束**的孩子
+  折成一行 `N finished`（深度 +1），选中该行原地展开/收起、对话框不关；有在跑或刚结束后代的
+  子树不折——"刚结束"与"在跑"一样沿祖先向上传播（#59 第二轮审核：fsm 侧栏只看孩子自身的
+  `updated`，刚结束 1 s 的孙子会随早已结束的父亲一起被折掉，这里有意偏离）；root 与当前会话
+  及其祖先不折。
+- 过滤与折叠【#59 第二轮审核】：DialogSelect 只在交给它的选项里做模糊匹配，折起来的 agent 不在
+  选项里就搜不到。查询非空时 `agentListRows({ fold: false })` 全部列出、不出折叠行；清空查询后按
+  原 `open` 状态恢复——打字不改 `open`。选项由纯函数 `agentListOptions`（`dialog-subagent-list.tsx`
+  导出）产出，"旧任务已折叠，输入其标题仍能定位并进入"可无渲染断言。
+- 输入框下方【#59 修订，用户裁决】：常驻 Agents 面板**撤销**（`agents-panel.tsx` 删除），
+  换成一行 `N agent(s) running · down opens the list`（`formatAgentsLine`），N 为树内除 root 外
+  状态为 busy/retry 的成员数；树内 ≥2 成员时显示。对话框仍是过滤/键盘导航面。
+- 子会话视图与主视图同一套界面【#59 修订，用户裁决】：`SubagentFooter`（输入框上方的带边框面板，
+  含 "类型 (i of n) · 上下文 · 费用"）**删除**，上下文与费用照主视图在输入框右下角显示；输入框左下角的
+  身份行不再留空，而是**只读**显示该子会话自己的 agent · model · provider（身份来自目标会话，切换键
+  仍不作用）；sidebar 不再因 `parentID` 强制隐藏，与主视图同一条规则。子会话视图里输入框下方那一行
+  以 `in <实例名|描述|类型> (<类型>) · ` 开头（`agentAt`）。提交路径不变：仍经 `agent-message`
+  端点、带 `[Message from user]` 身份；权限/提问面板仍只在 root 视图出现。
 
 #### 5.2.4 测试
 
@@ -286,7 +277,7 @@ I1 不受读取影响：读取值不进入接管分支的任何构造，payload 
 
 #### 5.3.3 TUI session 路由 — `visible()` 放开 + 提供接管回调
 
-- `visible()`：去掉 `!session()?.parentID` 合取项 → 子会话视图渲染 `Prompt`；`SubagentFooter` 保留（footer 在上、输入框在下，并列 `<Show>` 天然共存）。
+- `visible()`：去掉 `!session()?.parentID` 合取项 → 子会话视图渲染 `Prompt`；`SubagentFooter` 已于 #59 删除（见 §5.2.3 末段，子会话视图共用主视图 chrome）（原文：footer 在上、输入框在下，并列 `<Show>` 天然共存）。
 - 提供 `onSubmitUserMessage`（仅当 `session()?.parentID`）：调 `sdk.client.session.agentMessage({sessionID, parts})`，catch → toast。
 - 已知限制（记录，不做 UI）：子会话视图内子 agent 发起权限/提问时，请求归根会话视图处理（H3）——用户需 `up` 回根会话；footer 不提示。
 - 已知限制（记录，不修）：子会话视图 undo 会把 `[Message from user]` 头行与正文一并召回输入框（多 text part 无分隔符拼接，既有聚合行为 `:625`），原样重发会产生双头行。v1 接受。再引入条件：若需从头行召回中排除，现有 `synthetic` 标记不可复用（它同时把转录渲染也排除，§5.1 依赖其可见性），需引入"仅召回排除"的独立标记。

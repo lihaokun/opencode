@@ -400,7 +400,7 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
   - **上限 `ROSTER_MAX_ROWS`（10）行**，按 time_created 取最近；超出时附一行剩余计数，
     上限不静默
   - 从未有过直接子时不产出本结构；有子但**全部不在运行**时产出**一行占位**
-    `Your subagents working right now: none (N finished).`——保留"我有过孩子"这一事实
+    `Your subagents working right now: none (N idle).`——保留"我有过孩子"这一事实
   - **只陈述事实，不指挥工具**：不写"use agent_list"之类——模型持有工具描述，
     而这段话每轮开头都会出现
   - 带一个固定前缀行作为识别标记，使下一轮能在历史中定位最近一条
