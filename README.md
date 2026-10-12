@@ -30,7 +30,10 @@
 ### 发布与分支
 
 - `main` 是正式线（默认分支），`dev` 是测试线；改动先进 `dev`，稳定后以 merge commit 晋升到 `main`。
-- 发版由 tag 驱动：`main` 上的 `v1.18.31-fmv3` 是正式版，`dev` 上的 `v1.18.31-fmv3-beta.1` 是 Pre-release。
+  晋升可以直接从 `dev`，也可以从 `dev` 切出的发布分支，后者把一次正式版的内容固定下来，`dev` 照常合新改动。
+- 发版由 tag 驱动：`main` 上的 `v1.18.31-fmv2.1` 是正式版，`dev` 上的 `v1.18.31-fmv3-beta.1` 是 Pre-release。
+  `fmv` 后的大号是 fork 的功能代际，小号是同一代里的正式版（`fmv2`、`fmv2.1`、`fmv2.2`…）；
+  beta 带它通向的版本：下一代是 `fmv3-beta.N`，同一代的下一个正式版是 `fmv2.2-beta.N`。
 - [Releases](https://github.com/lihaokun/opencode/releases) 提供 Linux / macOS / Windows 五个平台的预编译包，内含 ripgrep；
   安装三步（解压、加 PATH、关掉官方自动更新）见 [`FORK_INSTALL.md`](FORK_INSTALL.md)，每个 release 的说明里也有同样的步骤。
 
