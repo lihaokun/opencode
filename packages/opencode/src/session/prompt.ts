@@ -5,6 +5,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import os from "os"
 import { SessionID, MessageID, PartID } from "./schema"
 import { MessageV2 } from "./message-v2"
+import { SessionRestoration } from "./restoration"
 import { SessionRevert } from "./revert"
 import { Session } from "./session"
 import { Agent } from "../agent/agent"
@@ -1335,6 +1336,10 @@ const layer = Layer.effect(
             Effect.provideService(Session.Service, sessions),
             Effect.provideService(AgentTree.Service, agentTree),
             Effect.provideService(AgentStatusProjection.Service, agentStatus),
+          )
+          yield* SessionRestoration.apply({ sessionID }).pipe(
+            Effect.provideService(Session.Service, sessions),
+            Effect.provideService(FSUtil.Service, fsys),
           )
 
           const msg: SessionV1.Assistant = {
