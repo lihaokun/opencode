@@ -827,6 +827,62 @@ it.instance("loop calls LLM and returns assistant message", () =>
   }),
 )
 
+it.instance("loop replays a non-zero bash exit code into the next model request", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Exit code e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "run it" }],
+    })
+    yield* llm.tool("bash", { command: `bun -e "process.exit(7)"` })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    const toolMessage = (replay!.messages as { role: string; content: unknown }[]).find((m) => m.role === "tool")
+    expect(JSON.stringify(toolMessage)).toContain("(no output)")
+    expect(JSON.stringify(toolMessage)).toContain("[exit code: 7]")
+  }),
+)
+
+it.instance("loop stays silent for a zero bash exit code", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Exit zero e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "run it" }],
+    })
+    yield* llm.tool("bash", { command: `bun -e "process.exit(0)"` })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    expect(JSON.stringify(replay)).not.toContain("[exit code:")
+  }),
+)
+
 withMcpInstructions.instance(
   "loop includes MCP instructions in model system context",
   () =>

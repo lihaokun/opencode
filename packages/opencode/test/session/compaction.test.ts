@@ -1280,6 +1280,51 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
+    "summary input keeps head, tail hint and non-zero exit for a long tool result",
+    () => {
+      const stub = llm()
+      let captured = ""
+      stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const first = yield* createUserMessage(session.id, "first")
+        const assistant = yield* createAssistantMessage(session.id, first.id, "/tmp")
+        const longOutput = `${"HEAD_MARKER\n"}${"a".repeat(3_000)}${"TAIL_MARKER\n(Results are truncated...)\nFull output saved to: /tmp/tool_x"}`
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "tool",
+          tool: "bash",
+          callID: "call_exit_e2e",
+          state: {
+            status: "completed",
+            input: { command: "deploy --quiet" },
+            output: longOutput,
+            title: "deploy",
+            metadata: { exit: 7 },
+            time: { start: 0, end: 1 },
+          },
+        })
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+        yield* SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
+
+        expect(captured).toContain("HEAD_MARKER")
+        expect(captured).toContain("[... 1084 chars truncated ...]")
+        expect(captured).toContain("Full output saved to: /tmp/tool_x")
+        expect(captured).toContain("[exit code: 7]")
+        expect(captured).not.toContain("a".repeat(1_500))
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 20 }) }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
     "falls back to full summary when retained tail media exceeds preserve token budget",
     () => {
       const stub = llm()
