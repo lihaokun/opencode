@@ -3632,6 +3632,28 @@ unixNoLLMServer(
   30_000,
 )
 
+it.instance(
+  "shell records non-zero exit code in completed metadata",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        const { prompt, chat } = yield* boot()
+
+        const exit = yield* prompt
+          .shell({ sessionID: chat.id, agent: "build", command: `bun -e "process.exit(7)"` })
+          .pipe(Effect.exit)
+        expect(Exit.isSuccess(exit)).toBe(true)
+
+        const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+        const tool = msgs.flatMap((m) => toolPart(m.parts)).find((p) => p?.state.status === "completed")
+        expect(tool).toBeDefined()
+        expect((tool!.state as SessionV1.ToolStateCompleted).metadata?.exit).toBe(7)
+      }),
+    ),
+  { config: cfg },
+  30_000,
+)
+
 // bun rather than sleep for the command that has to take a moment: the shell
 // behind this brings its own builtins and sleep is not among them, so on Windows
 // the command failed and the test sat waiting for a shell run that was never

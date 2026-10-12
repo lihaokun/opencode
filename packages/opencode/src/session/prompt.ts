@@ -654,6 +654,7 @@ const layer = Layer.effect(
           const args = Shell.args(sh, input.command, cwd)
           let output = ""
           let aborted = false
+          let exitCode: number | undefined
 
           const finish = Effect.uninterruptible(
             Effect.gen(function* () {
@@ -671,7 +672,7 @@ const layer = Layer.effect(
                   time: { ...part.state.time, end: completed },
                   input: part.state.input,
                   title: "",
-                  metadata: { output },
+                  metadata: { output, ...(exitCode !== undefined ? { exit: exitCode } : {}) },
                   output,
                 }
                 yield* sessions.updatePart(part)
@@ -703,13 +704,16 @@ const layer = Layer.effect(
                   }
                 }),
               )
-              yield* handle.exitCode
+              return yield* handle.exitCode
             }).pipe(Effect.scoped, Effect.orDie),
           ).pipe(Effect.exit)
 
           if (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause) && !Cause.hasDies(exit.cause)) {
             aborted = true
           }
+          // Record the process exit code so the replay projection can surface
+          // non-zero exits for `!` commands the same way it does for the bash tool.
+          if (Exit.isSuccess(exit)) exitCode = exit.value
           yield* finish
 
           if (Exit.isFailure(exit) && !aborted && !Cause.hasInterruptsOnly(exit.cause)) {
