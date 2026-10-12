@@ -1,8 +1,11 @@
 # Fork 安装说明
 
-> **分支与版本**：`main`（默认分支）是正式线，`dev` 是测试线；改动先落 `dev`，再以 merge commit 晋升到 `main`。
-> 发版由 tag 驱动（`.github/workflows/fork-release.yml`）：在 `main` 的提交上打 `v1.18.31-fmv3` 这样的 tag 就发正式版；
+> **分支与版本**：`main`（默认分支）是正式线，`dev` 是测试线；改动先落 `dev`，再以 merge commit 晋升到 `main`
+> （直接从 `dev`，或从 `dev` 切出的发布分支）。
+> 发版由 tag 驱动（`.github/workflows/fork-release.yml`）：在 `main` 的提交上打 `v1.18.31-fmv2.1` 这样的 tag 就发正式版；
 > 在 `dev` 的提交上打 `v1.18.31-fmv3-beta.1` 就发 Pre-release 测试版；其他分支上的 tag、或名字与分支不符的 tag 会被拒绝。
+> 版本后缀是 `fmv<代际>` 或 `fmv<代际>.<序号>`：代际很少变，序号是同一代里的第几个正式版；beta 带它通向的版本
+> （`fmv3-beta.N`、`fmv2.2-beta.N`）。序号和 beta 号不写前导零：`fmv2.01` 不是合法的 semver。
 > tag 用 `git tag -a` 加注释，注释就是 release notes。[Releases](https://github.com/lihaokun/opencode/releases) 里不带 Pre-release 标记的就是正式版；
 > 想试最新改动也可以从 `dev` 自己构建。
 > 无论在哪个分支构建，`OPENCODE_CHANNEL` 都保持 `dev`——它决定的是数据目录（`opencode-dev.db`），不是分支；
@@ -64,7 +67,7 @@ macOS 若提示"无法打开"（未签名、未公证）：`xattr -dr com.apple.
 # 1) 构建(版本号 + channel 都用环境变量)
 bun install                                   # 会应用 patches(如 openai-compatible 修复)
 cd packages/opencode
-OPENCODE_CHANNEL=dev OPENCODE_VERSION=1.18.31-fmv2 bun run script/build.ts --single
+OPENCODE_CHANNEL=dev OPENCODE_VERSION=1.18.31-fmv2.1 bun run script/build.ts --single
 
 # 2) 安装到 PATH 生效位置(官方安装器/更新器用的就是这里)
 install -m 0755 dist/opencode-linux-x64/bin/opencode ~/.opencode/bin/opencode
@@ -72,7 +75,7 @@ install -m 0755 dist/opencode-linux-x64/bin/opencode ~/.opencode/bin/opencode
 # 3) 关闭自动更新(二选一,均无需改代码)——见下文
 ```
 
-验证:`opencode --version` 应显示 `1.18.31-fmv2`。
+验证:`opencode --version` 应显示 `1.18.31-fmv2.1`。
 
 ---
 
@@ -80,7 +83,7 @@ install -m 0755 dist/opencode-linux-x64/bin/opencode ~/.opencode/bin/opencode
 
 版本号由 `packages/script/src/index.ts` 决定,优先级:
 
-1. **`OPENCODE_VERSION` 环境变量** → 逐字采用(我们就用这个:`1.18.31-fmv2`)；
+1. **`OPENCODE_VERSION` 环境变量** → 逐字采用(我们就用这个:`1.18.31-fmv2.1`)；
 2. 否则是 preview 构建 → `0.0.0-<channel>-<时间戳>`（例：`0.0.0-dev-202608161430`）；
 3. 否则(官方发布)→ 从 npm 拉 `opencode-ai/latest` 再 bump。
 
