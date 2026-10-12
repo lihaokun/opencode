@@ -1,6 +1,6 @@
 # 修正方案 — 工具退出码投影进模型可见文本（P0-1 / issue #46）
 
-> 流程：workflow §7。状态：**待确认**（确认后编码）。
+> 流程：workflow §7。状态：**已实施**（commit `896e093b4e`，2026-10-12）。
 > 关联：`docs/research/runtime-alignment-research.md` §3.1 / §4.1 / §7 决议 #1-3（B2 读方投影、只标非零、保持成功语义）。
 
 ## 第一部分：现象与复现
@@ -66,26 +66,26 @@ ZCode `apps/zcode-cli/packages/core/src/tool/handlers/bash-model-content.ts:50-6
 
 | 类型 | 用例 | 状态（修复后回填） |
 |------|------|------|
-| 回归 | completed part（`exit:7`, `(no output)`）→ 模型文本含 `[exit code: 7]`；`exit:0` 对照不含（最小复现固化） | 待加 |
-| 新增 | `exit:null`（超时/取消）不加状态行 | 待加 |
-| 新增 | `metadata.exit` 缺失 / 非数字 → 不加状态行、不抛错 | 待加 |
-| 新增 | `!cmd` 路径 exitCode 进入 metadata（`prompt.ts` 补记） | 待加 |
-| 新增 | compacted part（`[Old tool result content cleared]`）不加状态行 | 待加 |
-| 新增 | 附件共存时状态行位于 outputText 内、附件不受影响 | 待加 |
-| 已有 | message-v2 全量（45 项）+ shell/prompt 相关套件复跑 | 待复跑 |
+| 回归 | completed part（`exit:7`, `(no output)`）→ 模型文本含 `[exit code: 7]`；`exit:0` 对照不含（最小复现固化） | 已加: `message-v2.test.ts > tool exit code projection > regression...` @ `896e093b4e` |
+| 新增 | `exit:null`（超时/取消）不加状态行 | 已加: 同 describe `null exit...` @ `896e093b4e` |
+| 新增 | `metadata.exit` 缺失 / 非数字 → 不加状态行、不抛错 | 已加: 同 describe `missing or non-numeric...` @ `896e093b4e` |
+| 新增 | `!cmd` 路径 exitCode 进入 metadata（`prompt.ts` 补记） | 已加: `prompt.test.ts > shell records non-zero exit code in completed metadata` @ `896e093b4e`（该用例同时抓住了实施中"生成器补全值丢弃"的实现 bug，见 devlog） |
+| 新增 | compacted part（`[Old tool result content cleared]`）不加状态行 | 已加: 同 describe `compacted parts...` @ `896e093b4e` |
+| 新增 | 附件共存时状态行位于 outputText 内、附件不受影响 | 已加: 同 describe `exit line rides in the text...` @ `896e093b4e` |
+| 已有 | message-v2 全量（45 项）+ shell/prompt 相关套件复跑 | 已复跑: message-v2 50/50、prompt.test.ts 99 pass+1 pre-existing skip、test/session/ 610 全过、core 1098 全过、双包 typecheck 干净 |
 
 ## 第七部分：代码更新清单
 
 | 文件 | 函数 / 位置 | 改动概述 | 状态（修复后回填） |
 |------|------------|---------|------|
-| `packages/core/src/session/tool-result-projection.ts` | 新文件 | `formatExitCodeLine` helper | 待改 |
-| `packages/opencode/src/session/message-v2.ts` | completed 分支（:297-328） | 条件追加状态行 | 待改 |
-| `packages/opencode/src/session/prompt.ts` | `!cmd` 组装处（:684 附近） | metadata 补记 `exit` | 待改 |
+| `packages/core/src/session/tool-result-projection.ts` | 新文件 | `formatExitCodeLine` helper | 已改: `896e093b4e` |
+| `packages/opencode/src/session/message-v2.ts` | completed 分支（:297-328） | 条件追加状态行 | 已改: `896e093b4e` |
+| `packages/opencode/src/session/prompt.ts` | `!cmd` 组装处（:684 附近） | metadata 补记 `exit`（实施中修正：gen 须 `return yield* handle.exitCode`，裸 `yield*` 的补全值会被丢弃） | 已改: `896e093b4e` |
 
 ## 第八部分：文档更新清单
 
 | 文档路径 | 要改什么 | 状态（修复后回填） |
 |---------|---------|------|
-| `docs/research/runtime-alignment-research.md` | §7 决议 #1-3 已于决策轮更新（commit 待填）；实施后补 PR hash | 待改 |
-| `docs/devlog/` | 新增 P0-1 实施日志（含度量） | 待加 |
+| `docs/research/runtime-alignment-research.md` | §7 决议 #1-3 记录（含决策轮 commit `2b0369e367`）；实施 hash 回填 | 已改: 决议 `2b0369e367` + 实施 `896e093b4e` |
+| `docs/devlog/` | 新增 P0-1 实施日志（含度量） | 已加: `docs/devlog/2026-10-12-session-fix-tool-exit-code-projection.md` |
 | 无 schema/枚举/接口契约文档 | 新契约即"模型可见文本追加 `[exit code: N]` 行"，权威记录为本文件第四部分；无独立契约文档需要同步 | 无（+理由） |
