@@ -32,7 +32,7 @@
 
 | 维度 | 仓库内 code-mode（`code-mode.ts:75-116`） | ZCode（`mcp/index.ts:362-383, 420-427`） | 本修复 | 理由 |
 |---|---|---|---|---|
-| sc 进正文 | **替代**（sc 胜出，`:109`） | **追加**（非空即追加 `Structured content:` 块，与 content 是否非空无关） | **追加 + 严格相等判等** | code-mode 的消费者是 JSON 解释器（替代成立）；默认路径消费者是模型正文（追加保住自然语言上下文，决议 C①）；判等覆盖"服务器把同一数据双通道重复"的防双倍灌入（issue 验收原话），ZCode 无判等 |
+| sc 进正文 | **替代**（sc 胜出，`:109`） | **追加**（非空即追加 `Structured content:` 块，与 content 是否非空无关） | **追加 + 语义判等**（parse + 深相等） | code-mode 的消费者是 JSON 解释器（替代成立）；默认路径消费者是模型正文（追加保住自然语言上下文，决议 C①）；语义判等严格覆盖严格相等（含 catalog 路径与紧凑回显），额外拦住格式/键序变体的重复，ZCode 无判等 |
 | resource_link | `${name}: ${uri}` 文本行（`:102-105`） | 兜底 JSON stringify（`:427`） | **`${name}: ${uri}`** | 仓库内先例更可读 |
 | audio | 走附件通道（dataUrl） | 占位文本 `[MCP audio content omitted: <mime>]` | **占位文本**（同 ZCode 格式） | 默认路径附件通道不给音频（部分 provider 不支持工具结果带音频），不为它做 provider 适配 |
 | 错误 message | 与 catalog 逐字镜像（`:161-167`） | 错误走包装文本 + part 级 isError | **两处 throw 同步修**，抽一个共享的 message 组装函数 | 决议 C③ 合并修；共享函数消掉"故意镜像"的漂移隐患 |
@@ -44,7 +44,7 @@
 1. **`session/tools.ts` 投影循环（:429-465）**：
    - 新增 `resource_link` 分支：`textParts.push(`${contentItem.name}: ${contentItem.uri}`)`
    - 新增 `audio` 分支：`textParts.push(`[MCP audio content omitted: ${contentItem.mimeType}]`)`
-   - 循环后、`truncate.output` 之前：若 `result.structuredContent != null` → `const sc = JSON.stringify(result.structuredContent)`；当 `!textParts.includes(sc)` 时 `textParts.push(sc)`（裸 JSON 追加，**与 catalog 空 content 兜底的裸 stringify 格式一致**）。合并文本继续走既有 `truncate.output` 单次调用（决议：不单独设预算）。
+   - 循环后、`truncate.output` 之前：若 `result.structuredContent != null` → `serialized = JSON.stringify(sc)`；当 `textParts` 中**没有一项与 sc 语义相等**时 `textParts.push(serialized)`。语义判等 = `item === serialized`（快路径）或 `parsesTo(item, sc)`：`try { return Bun.deepEquals(JSON.parse(item), sc) } catch { return false }`——非 JSON 的 prose 项解析即失败、按不等处理；深相等键序不敏感。裸 JSON 追加（**与 catalog 空 content 兜底的裸 stringify 格式一致**）。合并文本继续走既有 `truncate.output` 单次调用（决议：不单独设预算）。`parsesTo` 为 `tools.ts` 模块局部函数（单一消费点，不进 core）。
 2. **`mcp/catalog.ts`（:68-74）**：抽导出小函数 `callToolErrorMessage(result: CallToolResult): string` — `[...contentTextItems, structuredContent?.stringify].filter(非空).join("\n\n") || "MCP tool returned an error"`；isError 分支改用它。兜底文案与现状一致。
 3. **`tool/code-mode.ts`（:161-167）**：镜像 throw 改调 `McpCatalog.callToolErrorMessage`（`code-mode.ts:148` "Deliberately mirrors" 注释同步更新为指向共享函数）。
 4. **`tools.ts` 的 `output.metadata` 不复制 sc**——sc 已进正文，避免持久化双份。
@@ -52,8 +52,9 @@
 **修复后复现走查。**
 
 - content 非空 + sc → 正文 = text + `\n\n` + sc JSON ✓（最小复现转绿）
-- content 为空 + sc → catalog 已把 sc 转成唯一 text 项 → textParts 恰含 sc 字符串 → **判等命中跳过** → 输出与现状完全一致 ✓（判等同时保证两条路径一致性）
-- sc 与某 text 项完全相同（服务器双通道重复）→ 跳过，无双倍灌入 ✓
+- content 为空 + sc → catalog 已把 sc 转成唯一 text 项 → 快路径 `item === serialized` 命中 → 跳过 → 输出与现状完全一致 ✓
+- sc 与某 text 项完全相同（紧凑回显）→ 快路径命中 ✓；pretty-print / 键序变体的同一数据 → `parsesTo` 深相等命中 ✓
+- text 为任意 prose → parse 失败 → 追加 ✓
 - resource_link → `${name}: ${uri}` 行；audio → 占位行 ✓
 - isError + 仅 sc → throw message = sc JSON；isError + 仅 text → 兜底文案与现状一致 ✓
 
@@ -69,7 +70,9 @@
 | 类型 | 用例 | 状态（修复后回填） |
 |------|------|------|
 | 回归 | content 非空 + sc → output 含 text 与 sc（最小复现固化） | 待加 |
-| 新增 | sc 与 text 项完全相同 → 不双倍（判等命中） | 待加 |
+| 新增 | sc 与 text 项完全相同 → 不双倍（快路径判等命中；同时保护 content 为空路径） | 待加 |
+| 新增 | sc 的 pretty-print / 键序变体出现在 text → 不双倍（语义判等命中） | 待加 |
+| 新增 | text 为非 JSON prose → sc 正常追加 | 待加 |
 | 新增 | content 为空 + sc（经 catalog 转换）→ 输出与现状一致（判等命中，保护既有行为） | 待加 |
 | 新增 | `resource_link` → `${name}: ${uri}` 行 | 待加 |
 | 新增 | `audio` → `[MCP audio content omitted: <mime>]` 行 | 待加 |
