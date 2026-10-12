@@ -1,6 +1,6 @@
 # 调研报告 — 通用 Agent runtime 对齐（issue #46）
 
-> 状态：**讨论稿**。决策点均为"倾向"而非决定，待逐项确认后进入对应流程（§7 修复 / §4 设计）。
+> 状态：**已定稿**。§7 的 10 个决策点已于 2026-10-12 逐条拍板（其中 C③ / E① / E①' 三条推翻本文原倾向，见 §7 决议记录；§5.1 的共享段位置分析已同步修正）。P0 各项进入 §7 修复流程，P1 两项进入 §4 设计流程。
 > 关联：lihaokun/opencode#46（系统提示词、上下文压缩恢复、tool call / tool result 的三方对照）；`docs/research/zcode-replacement-assessment.md`（ZCode 全面对照与替换决策评估）。
 > 核验基线：fork `dev@1343833857`。本文所有 file:line 均以该基线为准，全部为只读核实结论，未修改任何代码。
 > 阅读方式：§2 讲清楚系统的两条数据流（这是理解一切的前提），§3 沿数据流逐站追踪三个 P0 问题，§4/§5 从事实推导出决策选项与倾向。只想要结论可看 §4.0 概览与 §7 清单，但建议至少读完 §2。
@@ -225,7 +225,7 @@ P1 两项是**新能力/新契约**，走完整设计流程；本节只把"设�
 
 **背景：一次请求的 system 是怎么拼出来的。** 收口在 `session/llm/request.ts::preparePayload`，按顺序：① 模型行为模板——`system.ts::provider(model)` 按 model id 从 10 份 `.txt` 里选一份；但这里有一个**三元互斥**（`request.ts:195`）：如果当前 agent 配置了显式 `prompt`，则**整体替换**模型模板。② 环境信息（cwd、git、日期）。③ 项目指令（AGENTS.md / CLAUDE.md）。④ MCP instructions。⑤ skills 清单。最后全部 join 成**一个字符串**。
 
-**替换语义的后果（这是统一方案的第一个约束）。** 内置子代理 `general` / `build` / `plan` 没有显式 prompt，继承父会话的模型模板；而 `explore` / `compaction` / `title` / `summary` 和用户自定义 agent 都有显式 prompt——它们**拿不到模型模板里的任何行为规则**。由此直接推出：如果做一段"所有 agent 都该有的共享行为段"，把它放进 `system.ts::provider`（模型模板）是**结构性错误**——显式 prompt 的三元会把连它一起换掉。唯一结构正确的位置是 `request.ts:195` 三元**之后**：所有模型、所有子代理必然带上，天然利用"后置覆盖"压平模板间冲突，且位于缓存前缀稳定的区间。这条结论基本没有反方案，剩下的是产品问题。
+**替换语义的后果（这是统一方案的第一个约束；2026-10-12 决策讨论中修正）。** 内置子代理 `general` / `build` / `plan` 没有显式 prompt，继承父会话的模型模板；而 `explore` / `compaction` / `title` / `summary` 和用户自定义 agent 都有显式 prompt——它们**拿不到模型模板里的任何行为规则**。初稿曾据此把 provider() 内放置判定为"结构性陷阱"、主张共享段放 `request.ts:195` 三元之后（全员强制）。决策讨论中修正：逐一审视被三元覆盖的 agent 后发现，给 `compaction` / `title` / `summary` 等工具型 agent 注入"持续执行、需要时委派"类规则是噪音甚至有害；`explore` 自带完整行为规范；用户自定义 agent 的 prompt 就是作者的行为契约。**三元替换语义实为正确的 opt-out 机制**——共享段放 `provider()` 内（返回 `[template, SHARED]`）即达成"10 份模型模板规则一致"这一真实目标，工具型与自定义 agent 自然豁免。残余缺口（用户自定义任务型 agent 拿不到共享规则）记为引入条件：出现真实需求时再加 agent 级开关（如 `inheritSharedBehavior`），现在不加。此位置同时把改动限制在 `system.ts`（fork 稳定区），避免触碰上游热点的 `request.ts`。
 
 **现状有多不一致。** 对五类行为规则逐一核对 10 份模板（附录 A.3 矩阵）：default 与 trinity 几乎是同一份的两个副本；"修改后是否解释"在 gpt / gpt-astra / codex 与 default / trinity 之间**方向完全相反**；只有 default / trinity 绝对禁注释（L68/L70），其余是条件允许；持续执行与完成判据只在部分模板存在。**委派策略**更是横跨整个光谱：anthropic 最强鼓励（"proactively / CRITICAL"）、default 仅检索鼓励、gpt-astra 明文禁止（除非用户明确要求）。不先解决覆盖优先级，模板内部就自相矛盾。
 
@@ -277,20 +277,23 @@ P1 两项是**新能力/新契约**，走完整设计流程；本节只把"设�
 
 ---
 
-## 7. 待拍板问题清单
+## 7. 决策记录（2026-10-12 逐条拍板定案）
 
-| # | 问题 | 倾向 | 详见 |
+| # | 问题 | 本文原倾向 | **最终决议** |
 |---|---|---|---|
-| 1 | B① exit 投影位置：写方（B1）vs 读方（B2） | B2 | §4.1 |
-| 2 | B② 标注范围：只标非零 vs 全标 | 只标非零 | §4.1 |
-| 3 | B③ 非零不渲染成 error 语义 | 确认 | §4.1 |
-| 4 | C① structuredContent 追加 vs 替代 | 追加 + 判等去重 | §4.2 |
-| 5 | C③ 错误路径是否拆独立 PR | 拆 | §4.2 |
-| 6 | D① 头尾截断抽 core helper vs 两处复制 | 抽 helper | §4.3 |
-| 7 | E① 委派策略方向 | 跟 fork 特性走（default 式） | §5.1 |
-| 8 | E①' 共享段位置（request.ts 三元之后） | 基本无反方案，默认通过 | §5.1 |
-| 9 | F① 文件恢复：磁盘重读 vs 缓存回填 | 磁盘重读 | §5.2 |
-| 10 | F② 恢复契约 v1 内部 vs 全量 | v1 内部，契约延后 | §5.2 |
+| 1 | B① exit 投影位置 | B2 读方投影 | **B2 读方投影**：`message-v2` completed 分支按 `metadata.exit` 字段存在性翻译状态行；`prompt.ts:684` 补记 `!cmd` 的 exitCode |
+| 2 | B② 标注范围 | 只标非零 | **只标非零**（exit 0 静默；超时/取消已有正文说明不重复标） |
+| 3 | B③ 非零语义 | 保持成功语义 | **保持成功语义**（不渲染成 error；ZCode 的语义白名单记为后续增强） |
+| 4 | C① structuredContent | 追加 + 判等去重 | **追加 + 判等去重**（`JSON.stringify(sc)` 与 content text 项严格相等则跳过；并入同一次 truncate） |
+| 5 | C③ 错误路径 | 拆独立 PR | **合并进投影 PR**（↑ 推翻倾向；catalog 与 code-mode 两处 throw 同修，修正方案文档单列小节评审） |
+| 6 | D① serialize 组织 | 抽 core helper | **抽 core helper**（头尾截断 + metadata 行进 core，两侧 import） |
+| 7 | E① 委派指导 | default 式（系统提示词） | **ZCode 式**（↑ 推翻倾向："何时委派"移入 agent 工具描述——三情形 + 边界 + 不重复劳动；系统提示词只留 agent_list/send/stop 等机件说明；10 模板委派段不一致随之消失） |
+| 8 | E①' 共享段位置 | request.ts 三元后 | **provider() 内 `[template, SHARED]`**（↑ 推翻倾向：三元替换语义实为正确的 opt-out——工具型 agent 自然豁免；§5.1 分析已同步修正；自定义任务 agent 的缺口记引入条件） |
+| 9 | E② 第一步刀法 | 最小刀法 | **最小刀法**（共享段 + 删 default/trinity 三条硬冲突；其余模板软性表述保留） |
+| 10 | F① 文件恢复来源 | 磁盘重读 | **磁盘重读**（read/edit metadata 取候选 + 最近排序 top-K + 版本比对 + tail 去重 + 失效降级） |
+| 11 | F② 恢复契约 | v1 内部 | **v1 内部**（第一期只做内部恢复；插件契约记引入条件延后） |
+
+路线决议（同日）：ZCode 替换评估定为 **B——维持 fork，ZCode 作参照实现**，详见 `zcode-replacement-assessment.md` §5/§7/§8。
 
 ---
 
