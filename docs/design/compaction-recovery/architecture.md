@@ -15,7 +15,8 @@
 **非目标（v1 明确不做，记录引入条件）**
 
 - 插件恢复扩展契约：出现第一个真实插件消费者时，基于 `session.compacted` 事件与注入挂点（均为既有设施）设计契约。
-- 后台任务恢复：`BackgroundJob` 非持久化（`core/background-job.ts` 注释明示）；子代理可见性由 roster 覆盖。
+- 后台任务恢复：三层理由。(a) fork 当前唯一的后台任务形态是子代理委派（`BackgroundJob` 的全部消费方），其压缩后恢复已由 roster 机制覆盖（compacted 触发 + 只列 running + 持久化去重），本 feature 在 G2 引用而不重建；(b) `BackgroundJob` 有意非持久化（`core/background-job.ts` "intentionally not durable"），进程内句柄本身不可恢复，可恢复的存在性/liveness 信息正是 roster 的输出；(c) 后台 shell 尚不存在（P2 立项候选），为其建恢复通道是无消费者的 seam——**引入条件**：P2 后台 shell 落地并建立持久化任务注册表时，本模块新增 `"task"` 候选类别，以该注册表为状态源。
+  - 残余缺口（显式声明，v1 接受）：roster 恢复"谁在跑"（名字/状态/可查询），不恢复"委派任务的内容"——后者依赖摘要 Active 节的记载。验收第 6 条的"不重复启动"由可见性 + `agent_list` 查询覆盖；若将来需要恢复委派内容，涉及读取子会话历史的边界设计（读到哪、多大），单独立项。
 - 缓存回填路径：磁盘重读已定（决议 F①），缓存投影只作对照参考。
 
 ## 2. 核心流程
