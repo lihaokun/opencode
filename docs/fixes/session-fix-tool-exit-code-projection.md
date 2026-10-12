@@ -72,6 +72,7 @@ ZCode `apps/zcode-cli/packages/core/src/tool/handlers/bash-model-content.ts:50-6
 | 新增 | `!cmd` 路径 exitCode 进入 metadata（`prompt.ts` 补记） | 已加: `prompt.test.ts > shell records non-zero exit code in completed metadata` @ `896e093b4e`（该用例同时抓住了实施中"生成器补全值丢弃"的实现 bug，见 devlog） |
 | 新增 | compacted part（`[Old tool result content cleared]`）不加状态行 | 已加: 同 describe `compacted parts...` @ `896e093b4e` |
 | 新增 | 附件共存时状态行位于 outputText 内、附件不受影响 | 已加: 同 describe `exit line rides in the text...` @ `896e093b4e` |
+| 端到端 | **全链**：fake LLM 发起真实 bash 调用 → 进程退出 7 → loop 续跑 → **捕获的第二轮请求体**的 tool 消息含 `(no output)` 与 `[exit code: 7]`；exit 0 对照静默 | 已加: `prompt.test.ts > loop replays a non-zero bash exit code...` / `loop stays silent for a zero bash exit code` @ `ed32817a65` |
 | 已有 | message-v2 全量（45 项）+ shell/prompt 相关套件复跑 | 已复跑: message-v2 50/50、prompt.test.ts 99 pass+1 pre-existing skip、test/session/ 610 全过、core 1098 全过、双包 typecheck 干净 |
 
 ## 第七部分：代码更新清单

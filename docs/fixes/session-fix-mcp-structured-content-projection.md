@@ -78,6 +78,7 @@
 | 新增 | `audio` → `[MCP audio content omitted: <mime>]` 行 | 已加: `audio degrades to a placeholder line...` @ `12bd8a704f` |
 | 新增 | isError + 仅 sc → throw message 含 sc JSON；isError + 仅 text 无 sc → 兜底文案不变 | 已加: `catalog.test.ts > McpCatalog.callToolErrorMessage`（3 例）@ `12bd8a704f` |
 | 新增 | code-mode 镜像：isError message 同步 | 已加: `code-mode.test.ts > an MCP error carrying only structuredContent...` @ `12bd8a704f` |
+| 端到端 | **默认路径全链**：真 InMemory server（content+sc 并存）→ catalog 转换 → `SessionTools.resolve` execute 闭包 → output 文本 = text + sc 序列化，metadata/attachments 干净 | 已加: `mcp-default-path.test.ts > default MCP path carries structuredContent...` @ `ed32817a65` |
 | 已有 | catalog / code-mode / session tools 全量复跑 + 双包 typecheck | 已复跑: 三文件 53/53；session/mcp/tool 目录 1004 项中 994 pass + 7 skip + 1 todo + **2 项既有环境敏感失败**（write 权限 umask、oauth-callback，已用 stash 验证基线同样失败，与本修复无关）；typecheck 干净 |
 
 harness 说明：投影循环提取为纯函数 `projectMcpToolResult`（`tools.ts` 导出，唯一消费点在 execute 闭包），测试直接以 `CallToolResult` 形状驱动，无需搭服务 harness——提取本身被 typecheck 检出一处既有类型洞（内联代码靠推断逃过 `resource` 嵌套联合的属性访问，显式签名后以 `in` 收窄修复，见 devlog）。

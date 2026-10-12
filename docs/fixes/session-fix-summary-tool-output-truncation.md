@@ -73,6 +73,7 @@ ZCode 摘要输入**无字符截断**（完整 provider messages 直接进摘要
 | 新增 | exit 非零 → 摘要文本含 `[exit code: N]`；exit 0/null → 不含（V1 调用点组合行为） | 已加: `formatExitCodeLine renders only finite non-zero exits`（helper 直测）+ V1 调用点两行胶水（组合行为经 message-v2 既有用例覆盖 helper 语义）@ `fc071384f2` |
 | 新增 | compacted → `[Old tool result content cleared]` 不变 | 已加: V1 调用点分支保持原 ternary，compaction/prompt 套件回归通过 @ `fc071384f2` |
 | 新增 | attachments join 后整体参与头尾切分 | 已加: 调用点 `[output, ...attachments].join` 后整体进 helper（切片测试以合成文本覆盖等价行为）@ `fc071384f2` |
+| 端到端 | **全链**：真实 `processCompaction`，>2,000 字符工具结果（尾部 hint + exit 7）→ **捕获的摘要请求载荷**含 HEAD_MARKER、`[... 1084 chars truncated ...]`、`Full output saved to: /tmp/tool_x`、`[exit code: 7]`，且中段不在 | 已加: `compaction.test.ts > summary input keeps head, tail hint and non-zero exit for a long tool result` @ `ed32817a65` |
 | 已有 | core `session-compaction.test.ts`（含 :45 格式固化）+ `session-runner.test.ts` 压缩集成 + opencode `compaction.test.ts` 全量复跑 + 双包 typecheck | 已复跑: core 1102/1102（含格式固化与 runner 集成）、opencode session 目录 619/619、双包 typecheck 干净 |
 
 V1 serialize 的 completed 分支是 layer 闭包内联代码，组合行为（exit + compacted + attachments）以"helper 单元测试 + 调用点两行胶水"覆盖，不为胶水单独搭 layer harness（与 P0-1/P0-2 的覆盖口径一致）。
