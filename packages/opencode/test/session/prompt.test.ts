@@ -918,6 +918,39 @@ it.instance("loop replays a non-zero bash exit code into the next model request"
   }),
 )
 
+it.instance("loop replays grep output_mode results into the next model request", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Grep e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "needle-a.txt"), "needle\n"))
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "needle-b.txt"), "needle\n"))
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "find needles" }],
+    })
+    yield* llm.tool("grep", { pattern: "needle", output_mode: "files_with_matches" })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    const wire = JSON.stringify(replay)
+    expect(wire).toContain("Found 2 files")
+    expect(wire).toContain("needle-a.txt")
+    expect(wire).toContain("needle-b.txt")
+  }),
+)
+
 it.instance("loop stays silent for a zero bash exit code", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
