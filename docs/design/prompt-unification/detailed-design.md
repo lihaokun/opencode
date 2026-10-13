@@ -91,6 +91,7 @@
 1. `appends the shared working agreement to every model template`：遍历分支模型 id（muse-spark / gpt-4 / gpt-6 / codex / gemini / claude / trinity / kimi / default）→ `const [template, shared] = SystemPrompt.provider(m)` → `shared` 以 `# Working agreement` 开头；`template` 不含三条硬规则字串。
 2. `drops the hard brevity, no-explanation and no-comment rules from default and trinity`：import 两份 `.txt` → 逐条 `not.toContain`（`fewer than 4 lines` / `One word answers are best` / `just stop` / `DO NOT ADD ***ANY***` / `prefer to use the agent tool`）+ 正向 `toContain`（异步机件句 `Do not poll or ask an agent whether it has finished`）——负向证明删除、正向证明机件未误删。
 3. 快照核实：`test/tool/__snapshots__/parameters.test.ts.snap` 若含 agent 工具描述则随更新，理由"指导文本变更"（workflow 允许的用例随契约更新，更新记录在 devlog）。
+4. 端到端（`prompt.test.ts`，wire 级）：捕获 `llm.inputs` 请求体——default agent 断言共享段/委派指导在线上、被删规则不在；显式 `agent.prompt`（config 注入 marker prompt）断言整体替换后共享段与模型模板均不在载荷（I2 的线上背书）。
 
 ### 5.5 实施顺序
 

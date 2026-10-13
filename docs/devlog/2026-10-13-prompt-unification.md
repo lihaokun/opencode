@@ -22,6 +22,7 @@
 ## 测试
 
 - system.test 8/8；session+tool 目录 962 项仅剩已知 write umask 基线项；**全套 3981 项**失败 10 个，与基线归因清单精确匹配（cf-gateway×4 / HttpApi SDK×4 / oauth-callback / write umask），零新增；typecheck 干净。
+- **端到端补齐（`479ed7ba`）**：初版只有装配层断言（`provider()` 输出），未覆盖"线上载荷"——与 P0 同样的缺口。补 2 条 wire 级用例（捕获 `llm.inputs` 请求体）：(a) default agent 的 system 消息含共享段与委派指导、不含被删规则；(b) **显式 agent.prompt 的 opt-out 线上验证**——build 配置为 marker prompt 后，载荷含 marker、不含共享段与模型模板头（I2 不变量的端到端背书）。
 
 ## 待办
 
