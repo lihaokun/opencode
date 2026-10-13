@@ -827,6 +827,68 @@ it.instance("loop calls LLM and returns assistant message", () =>
   }),
 )
 
+it.instance("loop delivers the shared working agreement on the wire", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Shared agreement e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.text("ok")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const body = (yield* llm.inputs).at(-1)!
+    const wire = JSON.stringify(body)
+    // the shared agreement rides the system prompt…
+    expect(wire).toContain("# Working agreement")
+    expect(wire).toContain("carry it to completion")
+    // …and the dropped hard rules are gone from the wire too
+    expect(wire).not.toContain("fewer than 4 lines")
+    expect(wire).not.toContain("DO NOT ADD ***ANY***")
+    // delegation guidance lives in the agent tool description
+    expect(wire).toContain("When to delegate")
+  }),
+)
+
+it.instance("explicit agent prompt opts out of the shared section on the wire", () =>
+  Effect.gen(function* () {
+    const marker = "CUSTOM_MARKER_PROMPT_AGENT_BUILD"
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      agent: { build: { prompt: marker } },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Opt-out e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.text("ok")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const body = (yield* llm.inputs).at(-1)!
+    const wire = JSON.stringify(body)
+    expect(wire).toContain(marker)
+    expect(wire).not.toContain("# Working agreement")
+    // the model template is replaced wholesale by the explicit prompt
+    expect(wire).not.toContain("interactive CLI tool that helps users with software engineering tasks")
+  }),
+)
+
 it.instance("loop replays a non-zero bash exit code into the next model request", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
