@@ -44,8 +44,7 @@ grep tool execute
   │      count → "--count-matches"（解析 count 行）
   │      content → 现状 --json
   │      before/after/context → "-A n" / "-B n" / "-C n"（仅 content）
-  │      offset → "--offset n"（rg 原生，跳过前 n 个 match）
-  │      取数 = head_limit + offset 条（offset 在服务内应用，返回 slice 后的行）
+  │      offset → 服务内切片（rg 无 --offset flag，已核实；取数 limit+offset+1 条后 slice）
   ├─ 渲染（按模式）：
   │    content   → 现格式 + 状态行 "Showing matches N–M (offset O, limit L)"
   │    files     → 每文件一行（路径）
@@ -89,7 +88,7 @@ schema 扩展 + 校验（context 上限 10、mode 与 context 互斥说明）+ �
 
 1. **默认模式 = content 且逐字节兼容**：不传新参数 = 现行为，存量会话/摘要不受影响（I1）。
 2. **分页做在条目级**（匹配行/文件），`head_limit` 缺省 100 与现状一致；"仍有余量"用取数 `limit+offset+1` 探测。
-3. **files/count 不走 --json**：rg 原生文本行更简单，且服务层注释明确自己是行适配器——保持一致。
+3. **files/count 不走 --json**：rg 原生文本行更简单，且服务层注释明确自己是行适配器——保持一致。**offset 无 rg 原生支持**（已实证 rg 15.1.0 无 `--offset` flag），由服务层 `take(limit+offset+1)` + slice 实现，语义不变。
 4. **context 参数名用 before/after/context 而非 `-A/-B/-C`**：schema 键避免 dash 开头；ZCode 的 dash 风格是 CC 兼容面，fork 无此包袱。
 5. **不新增工具**：扩展现有 grep（issue："可以扩展现有工具或提供等效能力，不必仅为名字一致重命名"）。
 
