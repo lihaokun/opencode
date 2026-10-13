@@ -22,6 +22,7 @@
 ## 测试
 
 - 新增 7 个用例（三模式含单文件裸 count 怪癖、上下文 `:`/`-` 前缀、分页三态、insensitive、校验拒绝×2）；既有 6 用例全过（其中截断文案断言随行为变更更新，理由在测试内注释）。
+- **端到端补齐（`ab249ba4`）**：wire 级用例——loop 中 fake LLM 发起带 `output_mode` 的真实 grep 调用，捕获的第二轮请求载荷含 "Found 2 files" 与两个匹配文件路径（grep 结果经持久化/重放到线上）。
 - 回归：core 1102/1102（含 `serializeToolContent` 格式固化与 ripgrep 既有测试）、opencode tool 目录 328 全过、**全套 3990 项 0 失败**、双包 typecheck 干净。
 
 ## 待办
