@@ -22,6 +22,18 @@ export type FileDiff = typeof FileDiff.Type
 
 const prune = "7.days"
 const limit = 2 * 1024 * 1024
+// A file over patchFileLimit on either side of a diff gets counts but no patch,
+// and once one diff's patches add up to patchTotalLimit the remaining files get
+// counts only. Patches carry whole files (full context): one generated log, or a
+// turn that regenerated a thousand of them, used to put hundreds of megabytes
+// into a turn's summary and into every client that opened it.
+export const patchFileLimit = 1_000_000
+export const patchTotalLimit = 8_000_000
+
+/** git could not compare the two snapshots; the caller must not treat that as "nothing changed". */
+export class DiffError extends Schema.TaggedErrorClass<DiffError>()("SnapshotDiffError", {
+  message: Schema.String,
+}) {}
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
 const quote = [...cfg, "-c", "core.quotepath=false"]
@@ -42,6 +54,8 @@ export interface Interface {
   readonly revert: (patches: Patch[]) => Effect.Effect<void>
   readonly diff: (hash: string) => Effect.Effect<string>
   readonly diffFull: (from: string, to: string) => Effect.Effect<FileDiff[]>
+  /** Names and line counts only; no file content is read. Fails rather than report an empty change set when git fails. */
+  readonly diffStat: (from: string, to: string) => Effect.Effect<FileDiff[], DiffError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Snapshot") {}
@@ -543,23 +557,137 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           )
         })
 
+        type Row = {
+          file: string
+          status: "added" | "deleted" | "modified"
+          binary: boolean
+          additions: number
+          deletions: number
+        }
+
+        type Ref = {
+          file: string
+          side: "before" | "after"
+          ref: string
+        }
+
+        const refsOf = (rows: Row[], from: string, to: string) =>
+          rows.flatMap((row) => {
+            if (row.binary) return []
+            if (row.status === "added")
+              return [{ file: row.file, side: "after", ref: `${to}:${row.file}` } satisfies Ref]
+            if (row.status === "deleted") {
+              return [{ file: row.file, side: "before", ref: `${from}:${row.file}` } satisfies Ref]
+            }
+            return [
+              { file: row.file, side: "before", ref: `${from}:${row.file}` } satisfies Ref,
+              { file: row.file, side: "after", ref: `${to}:${row.file}` } satisfies Ref,
+            ]
+          })
+
+        // What changed between two snapshots, by name and line counts. git does
+        // the counting; no file content enters this process. Not locked itself:
+        // both callers hold the lock already. A git failure is an error, not an
+        // empty list: an empty list is what a turn that changed nothing looks
+        // like, and it gets written as such.
+        const changes = Effect.fnUntraced(function* (from: string, to: string) {
+          const status = new Map<string, "added" | "deleted" | "modified">()
+
+          const statuses = yield* git(
+            [...quote, ...args(["diff", "--no-ext-diff", "--name-status", "--no-renames", from, to, "--", "."])],
+            { cwd: state.directory },
+          )
+          if (statuses.code !== 0) {
+            return yield* new DiffError({ message: `git diff --name-status ${from} ${to}: ${statuses.stderr.trim()}` })
+          }
+
+          for (const line of statuses.text.trim().split("\n")) {
+            if (!line) continue
+            const [code, file] = line.split("\t")
+            if (!code || !file) continue
+            status.set(file, code.startsWith("A") ? "added" : code.startsWith("D") ? "deleted" : "modified")
+          }
+
+          const numstat = yield* git(
+            [...quote, ...args(["diff", "--no-ext-diff", "--no-renames", "--numstat", from, to, "--", "."])],
+            { cwd: state.directory },
+          )
+          if (numstat.code !== 0) {
+            return yield* new DiffError({ message: `git diff --numstat ${from} ${to}: ${numstat.stderr.trim()}` })
+          }
+
+          const rows = numstat.text
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .flatMap((line) => {
+              const [adds, dels, file] = line.split("\t")
+              if (!file) return []
+              const binary = adds === "-" && dels === "-"
+              const additions = binary ? 0 : parseInt(adds)
+              const deletions = binary ? 0 : parseInt(dels)
+              return [
+                {
+                  file,
+                  status: status.get(file) ?? "modified",
+                  binary,
+                  additions: Number.isFinite(additions) ? additions : 0,
+                  deletions: Number.isFinite(deletions) ? deletions : 0,
+                } satisfies Row,
+              ]
+            })
+
+          // Hide ignored-file removals from the user-facing diff output.
+          const ignored = yield* ignore(rows.map((r) => r.file))
+          return ignored.size > 0 ? rows.filter((r) => !ignored.has(r.file)) : rows
+        })
+
+        // Files whose blob on either side is too big to turn into a patch, asked
+        // of git up front so their content is never read. Output lines come back
+        // in input order; a missing ref has no size and is never counted. When
+        // git cannot answer at all the sizes are unknown, and the caller holds
+        // every patch back rather than read what it cannot bound.
+        const oversized = Effect.fnUntraced(function* (rows: Row[], from: string, to: string) {
+          const big = new Set<string>()
+          const refs = refsOf(rows, from, to)
+          if (!refs.length) return big
+          const check = yield* git([...cfg, ...args(["cat-file", "--batch-check"])], {
+            cwd: state.directory,
+            stdin: refs.map((item) => item.ref).join("\n") + "\n",
+          })
+          if (check.code !== 0) {
+            yield* Effect.logInfo("git cat-file --batch-check failed during snapshot diff; counts only, no patches", {
+              stderr: check.stderr,
+              refs: refs.length,
+            })
+            return undefined
+          }
+          const lines = check.text.split("\n")
+          refs.forEach((ref, i) => {
+            if (Number(lines[i]?.match(/ blob (\d+)$/)?.[1]) > patchFileLimit) big.add(ref.file)
+          })
+          return big
+        })
+
+        const diffStat = Effect.fnUntraced(function* (from: string, to: string) {
+          return yield* locked(
+            Effect.map(changes(from, to), (rows) =>
+              rows.map(
+                (row) =>
+                  ({
+                    file: row.file,
+                    additions: row.additions,
+                    deletions: row.deletions,
+                    status: row.status,
+                  }) satisfies FileDiff,
+              ),
+            ),
+          )
+        })
+
         const diffFull = Effect.fnUntraced(function* (from: string, to: string) {
           return yield* locked(
             Effect.gen(function* () {
-              type Row = {
-                file: string
-                status: "added" | "deleted" | "modified"
-                binary: boolean
-                additions: number
-                deletions: number
-              }
-
-              type Ref = {
-                file: string
-                side: "before" | "after"
-                ref: string
-              }
-
               const show = Effect.fnUntraced(function* (row: Row) {
                 if (row.binary) return ["", ""]
                 if (row.status === "added") {
@@ -587,18 +715,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
 
               const load = Effect.fnUntraced(
                 function* (rows: Row[]) {
-                  const refs = rows.flatMap((row) => {
-                    if (row.binary) return []
-                    if (row.status === "added")
-                      return [{ file: row.file, side: "after", ref: `${to}:${row.file}` } satisfies Ref]
-                    if (row.status === "deleted") {
-                      return [{ file: row.file, side: "before", ref: `${from}:${row.file}` } satisfies Ref]
-                    }
-                    return [
-                      { file: row.file, side: "before", ref: `${from}:${row.file}` } satisfies Ref,
-                      { file: row.file, side: "after", ref: `${to}:${row.file}` } satisfies Ref,
-                    ]
-                  })
+                  const refs = refsOf(rows, from, to)
                   if (!refs.length) return new Map<string, { before: string; after: string }>()
 
                   const batch = yield* appProcess.run(
@@ -682,70 +799,35 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               )
 
               const result: FileDiff[] = []
-              const status = new Map<string, "added" | "deleted" | "modified">()
-
-              const statuses = yield* git(
-                [...quote, ...args(["diff", "--no-ext-diff", "--name-status", "--no-renames", from, to, "--", "."])],
-                { cwd: state.directory },
+              const rows = yield* changes(from, to).pipe(
+                Effect.catchTag("SnapshotDiffError", (error) =>
+                  Effect.logWarning("snapshot diff failed", { error: error.message }).pipe(Effect.as([] as Row[])),
+                ),
               )
-
-              for (const line of statuses.text.trim().split("\n")) {
-                if (!line) continue
-                const [code, file] = line.split("\t")
-                if (!code || !file) continue
-                status.set(file, code.startsWith("A") ? "added" : code.startsWith("D") ? "deleted" : "modified")
-              }
-
-              const numstat = yield* git(
-                [...quote, ...args(["diff", "--no-ext-diff", "--no-renames", "--numstat", from, to, "--", "."])],
-                {
-                  cwd: state.directory,
-                },
-              )
-
-              const rows = numstat.text
-                .trim()
-                .split("\n")
-                .filter(Boolean)
-                .flatMap((line) => {
-                  const [adds, dels, file] = line.split("\t")
-                  if (!file) return []
-                  const binary = adds === "-" && dels === "-"
-                  const additions = binary ? 0 : parseInt(adds)
-                  const deletions = binary ? 0 : parseInt(dels)
-                  return [
-                    {
-                      file,
-                      status: status.get(file) ?? "modified",
-                      binary,
-                      additions: Number.isFinite(additions) ? additions : 0,
-                      deletions: Number.isFinite(deletions) ? deletions : 0,
-                    } satisfies Row,
-                  ]
-                })
-
-              // Hide ignored-file removals from the user-facing diff output.
-              const ignored = yield* ignore(rows.map((r) => r.file))
-              if (ignored.size > 0) {
-                const filtered = rows.filter((r) => !ignored.has(r.file))
-                rows.length = 0
-                rows.push(...filtered)
-              }
+              const big = yield* oversized(rows, from, to)
 
               const step = 100
               const patch = (file: string, before: string, after: string) =>
                 formatPatch(structuredPatch(file, file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }))
 
+              // Patch bytes produced so far. Past the total limit no more content
+              // is loaded and the remaining rows carry counts only; within a chunk
+              // the check is per row, so the overshoot is bounded by one chunk.
+              let spent = 0
               for (let i = 0; i < rows.length; i += step) {
                 const run = rows.slice(i, i + step)
-                const text = yield* load(run)
+                const text =
+                  !big || spent > patchTotalLimit ? undefined : yield* load(run.filter((row) => !big.has(row.file)))
 
                 for (const row of run) {
+                  const skip = row.binary || !big || big.has(row.file) || spent > patchTotalLimit
                   const hit = text?.get(row.file) ?? { before: "", after: "" }
-                  const [before, after] = row.binary ? ["", ""] : text ? [hit.before, hit.after] : yield* show(row)
+                  const [before, after] = skip ? ["", ""] : text ? [hit.before, hit.after] : yield* show(row)
+                  const diff = skip ? "" : patch(row.file, before, after)
+                  spent += diff.length
                   result.push({
                     file: row.file,
-                    patch: row.binary ? "" : patch(row.file, before, after),
+                    patch: diff,
                     additions: row.additions,
                     deletions: row.deletions,
                     status: row.status,
@@ -765,7 +847,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           Effect.forkScoped,
         )
 
-        return { cleanup, track, patch, restore, revert, diff, diffFull }
+        return { cleanup, track, patch, restore, revert, diff, diffFull, diffStat }
       }),
     )
 
@@ -793,6 +875,9 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
       }),
       diffFull: Effect.fn("Snapshot.diffFull")(function* (from: string, to: string) {
         return yield* InstanceState.useEffect(state, (s) => s.diffFull(from, to))
+      }),
+      diffStat: Effect.fn("Snapshot.diffStat")(function* (from: string, to: string) {
+        return yield* InstanceState.useEffect(state, (s) => s.diffStat(from, to))
       }),
     })
   }),

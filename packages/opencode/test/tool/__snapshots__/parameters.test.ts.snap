@@ -297,20 +297,20 @@ exports[`tool parameters JSON Schema (wire shape) skill 1`] = `
 }
 `;
 
-exports[`tool parameters JSON Schema (wire shape) task 1`] = `
+exports[`tool parameters JSON Schema (wire shape) agent 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
-    "background": {
-      "description": "Run the agent in the background. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
-      "type": "boolean",
-    },
-    "command": {
-      "description": "The command that triggered this task",
+    "cwd": {
+      "description": "Working directory for this Agent. To have it continue work in an existing directory or worktree, pass that path here. When omitted a NEW working directory is created and the Agent is told to use it -- so a directory named only in the prompt will be contradicted by that instruction.",
       "type": "string",
     },
     "description": {
-      "description": "A short (3-5 words) description of the task",
+      "description": "A short (3-5 word) description of the task",
+      "type": "string",
+    },
+    "name": {
+      "description": "Optional short name for this Agent, used to address it later with agent_send or agent_stop. Must not start with 'ses'. Names are a convenience: they are not guaranteed unique, and an ambiguous name is refused rather than guessed.",
       "type": "string",
     },
     "prompt": {
@@ -319,10 +319,6 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
     },
     "subagent_type": {
       "description": "The type of specialized agent to use for this task",
-      "type": "string",
-    },
-    "task_id": {
-      "description": "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)",
       "type": "string",
     },
   },
@@ -460,40 +456,6 @@ exports[`tool parameters JSON Schema (wire shape) write 1`] = `
   "required": [
     "content",
     "filePath",
-  ],
-  "type": "object",
-}
-`;
-
-exports[`tool parameters JSON Schema (wire shape) agent 1`] = `
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "properties": {
-    "cwd": {
-      "description": "Working directory for this Agent. When omitted a separate working directory is prepared for it automatically.",
-      "type": "string",
-    },
-    "description": {
-      "description": "A short (3-5 word) description of the task",
-      "type": "string",
-    },
-    "name": {
-      "description": "Optional short name for this Agent, used to address it later with agent_send or agent_stop. Must not start with 'ses'. Names are a convenience: they are not guaranteed unique, and an ambiguous name is refused rather than guessed.",
-      "type": "string",
-    },
-    "prompt": {
-      "description": "The task for the agent to perform",
-      "type": "string",
-    },
-    "subagent_type": {
-      "description": "The type of specialized agent to use for this task",
-      "type": "string",
-    },
-  },
-  "required": [
-    "description",
-    "prompt",
-    "subagent_type",
   ],
   "type": "object",
 }

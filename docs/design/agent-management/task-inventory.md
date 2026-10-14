@@ -84,6 +84,10 @@ Session 并按 fallback 链改写它。细化 §5.4.1 步骤 8。
 
 ## 6. 通知交付
 
+> 后记（`docs/fixes/agent-management-fix-run-end-notice.md`）：6.1–6.5 描述的 job 结算后 `notify` → `inject`
+> 路径已整体迁为 `SessionPrompt.reportRunEnd`，在子**每次** run 结束时触发；payload（6.2）与取消静默（6.1）的
+> 结论原样保留，"只在 `background.start` 注册一次"（6.5）不再成立。
+
 | # | 行为 | 位置 | 处置 | 落点与说明 |
 |---|---|---|---|---|
 | 6.1 | `notify(jobID)`：`completed` 注入完成、`error` 注入失败、其余（含 `cancelled`）**静默** | `:398-407` | **保留** | 不补 `cancelled` 分支。取消通知由 M4 `stop` 产出（细化 §5.4.7），二者互补；补了会重复 |

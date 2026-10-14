@@ -13,6 +13,16 @@ import { SessionID } from "../session/schema"
  */
 export type AgentStatus = "running" | "idle"
 
+/**
+ * How many Agents an injected roster or neighbour snapshot will name.
+ *
+ * The lists exist so a reader knows it has company and who that is; enumerating
+ * everyone is agent_list's job and reaching anyone is agent_send's. Ten keeps a
+ * widely fanned-out session from trading one unbounded list for a longer one,
+ * and sits at the same order of magnitude as the task prompt it travels with.
+ */
+export const ROSTER_MAX_ROWS = 10
+
 /** Where an Agent's suggested working directory came from. */
 export type WorkdirSource = "generated_git_worktree" | "generated_empty_workspace" | "provided_cwd"
 
@@ -72,6 +82,31 @@ export interface AgentNeighborhood {
 /** Session metadata keys this feature owns. */
 export const METADATA_AGENT_NAME = "agentName"
 export const METADATA_AGENT_WORKDIR = "agentWorkdir"
+/**
+ * The description the creator gave. The session title carries it too, with a
+ * " (@type subagent)" suffix; the run-end notice needs it bare, since the
+ * summary built from it is what the TUI shows.
+ */
+export const METADATA_AGENT_DESCRIPTION = "agentDescription"
+/**
+ * Whether the parent is told each time this agent's run ends. Written at
+ * creation and never changed: it is the scope of one delegation, which is
+ * exactly one session. A command subtask's child is false — its creator waits
+ * on the job itself. Read by SessionPrompt, which owns the run loop.
+ */
+export const METADATA_AGENT_NOTIFY = "agentNotify"
+
+/**
+ * TextPart.metadata.kind marking a run-end notification — the synthetic
+ * message SessionPrompt writes to the parent each time a subagent's run ends.
+ * The TUI renders one line from `summary` and never parses the model-facing
+ * text, so this literal is the only UI-facing contract that notification
+ * carries. The TUI cannot import it (part metadata is a free-form record on
+ * the SDK side, nothing is generated for it), so it keeps its own copy; the
+ * two are held together by contract-audit expectations §10 and fixture tests
+ * on both sides.
+ */
+export const NOTIFICATION_METADATA_KIND = "agent_notification"
 
 /**
  * Instance names must not be mistakable for a SessionID, because target
@@ -194,6 +229,21 @@ export interface AgentMessage {
   sender_agent: string | undefined
   body: string
 }
+
+/**
+ * A delivery into an Agent's inbox, tagged by sender kind. "agent" is agent_send
+ * traffic and the single cancellation notice — messages from another session,
+ * whose fields land in the rendered header and are escaped accordingly. "user"
+ * is a message from the human through the TUI: no sender session exists, the
+ * header is a fixed string with nothing to escape, and the body travels as
+ * parts so file attachments get the same treatment as a normal prompt.
+ *
+ * Both kinds flow through one identity resolution — the target's own
+ * agent/model/variant — which is why they share a single deliver entry.
+ */
+export type InboxMessage =
+  | { kind: "agent"; message: AgentMessage }
+  | { kind: "user"; message: { target: SessionID; parts: SessionPrompt.PromptInput["parts"] } }
 
 /**
  * As strong as the existing HTTP 204: the asynchronous request was accepted and

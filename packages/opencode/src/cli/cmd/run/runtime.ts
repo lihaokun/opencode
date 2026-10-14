@@ -794,7 +794,7 @@ export async function runInteractiveMode(
       files: input.files,
       initialInput: input.initialInput,
       thinking: input.thinking,
-        replay: input.replay,
+      replay: input.replay,
       replayLimit: input.replayLimit,
       demo: input.demo,
       boot: async () => ({

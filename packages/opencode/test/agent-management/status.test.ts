@@ -39,7 +39,8 @@ describe("AgentStatusProjection", () => {
       const session = yield* sessions.create({ title: "root" })
 
       expect(yield* projection.of(session.id)).toBe("idle")
-    }))
+    }),
+  )
 
   it.instance("busy projects to running", () =>
     Effect.gen(function* () {
@@ -50,7 +51,8 @@ describe("AgentStatusProjection", () => {
 
       yield* status.set(session.id, { type: "busy" })
       expect(yield* projection.of(session.id)).toBe("running")
-    }))
+    }),
+  )
 
   it.instance("retry projects to running, because the execution has not finished", () =>
     Effect.gen(function* () {
@@ -61,7 +63,8 @@ describe("AgentStatusProjection", () => {
 
       yield* status.set(session.id, { type: "retry", attempt: 1, message: "rate limited", next: Date.now() + 1000 })
       expect(yield* projection.of(session.id)).toBe("running")
-    }))
+    }),
+  )
 
   it.instance("returning to idle projects to idle", () =>
     Effect.gen(function* () {
@@ -73,5 +76,6 @@ describe("AgentStatusProjection", () => {
       yield* status.set(session.id, { type: "busy" })
       yield* status.set(session.id, { type: "idle" })
       expect(yield* projection.of(session.id)).toBe("idle")
-    }))
+    }),
+  )
 })

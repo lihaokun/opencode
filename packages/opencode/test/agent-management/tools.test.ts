@@ -136,7 +136,8 @@ describe("agent tool", () => {
       )
 
       expect(asked).toEqual(["agent"])
-    }))
+    }),
+  )
 
   it.instance("does not claim a live status it cannot know yet", () =>
     Effect.gen(function* () {
@@ -152,7 +153,8 @@ describe("agent tool", () => {
       expect(result.output).toContain("session_id:")
       expect(result.output).toContain("agent_list")
       expect(result.output).not.toContain("status: running")
-    }))
+    }),
+  )
 
   it.instance("records the child's resolved model, not the parent's candidate", () =>
     Effect.gen(function* () {
@@ -167,7 +169,8 @@ describe("agent tool", () => {
 
       expect(result.metadata.parentSessionId).toBe(chat.id)
       expect(result.metadata.model).toBeDefined()
-    }))
+    }),
+  )
 })
 
 describe("agent_send tool", () => {
@@ -187,7 +190,8 @@ describe("agent_send tool", () => {
       expect(result.output).toContain("Accepted")
       expect(result.output).toContain("one-way")
       expect(result.output).toContain("not guaranteed")
-    }))
+    }),
+  )
 
   it.instance("lists every candidate when a name is ambiguous and sends nothing", () =>
     Effect.gen(function* () {
@@ -215,7 +219,8 @@ describe("agent_send tool", () => {
       expect(result.output).toContain(b.id)
       expect(result.output).toContain("session_id")
       expect(seen).toHaveLength(0)
-    }))
+    }),
+  )
 })
 
 describe("agent_stop tool", () => {
@@ -232,7 +237,8 @@ describe("agent_stop tool", () => {
       expect(result.output).toContain(child.id)
       expect(result.output).toContain("does not mean each was running")
       expect(result.output).toContain("agent_send")
-    }))
+    }),
+  )
 
   it.instance("refuses a target that is not a direct child", () =>
     Effect.gen(function* () {
@@ -245,7 +251,8 @@ describe("agent_stop tool", () => {
 
       const result = yield* def.execute({ target: b.id }, context(chat.id, assistant.id, ops) as never)
       expect(result.output).toContain("only stop")
-    }))
+    }),
+  )
 })
 
 describe("agent_list tool", () => {
@@ -268,7 +275,8 @@ describe("agent_list tool", () => {
       expect(result.output).toContain("reviewer")
       expect(result.output).toContain("explore")
       expect(result.output).toContain("idle")
-    }))
+    }),
+  )
 
   it.instance("keeps a forged name inside its own row", () =>
     Effect.gen(function* () {
@@ -295,7 +303,8 @@ describe("agent_list tool", () => {
       expect(table).toHaveLength(3)
       expect(result.output).not.toContain("ses_forged\tspoof")
       for (const line of table) expect(line.split("\t")).toHaveLength(7)
-    }))
+    }),
+  )
 
   it.instance("never returns an empty table, which would read as an error", () =>
     Effect.gen(function* () {
@@ -306,7 +315,8 @@ describe("agent_list tool", () => {
       const result = yield* def.execute({}, context(chat.id, assistant.id, ops) as never)
       expect(result.output).toContain(chat.id)
       expect(result.metadata.count).toBe(1)
-    }))
+    }),
+  )
 })
 
 describe("tool visibility", () => {
@@ -324,5 +334,6 @@ describe("tool visibility", () => {
       // stop; offering either would only cost the model a turn to discover.
       const atLimit = yield* visibleAgentTools(current.id)
       expect(atLimit.toSorted()).toEqual(["agent_list", "agent_send"])
-    }))
+    }),
+  )
 })

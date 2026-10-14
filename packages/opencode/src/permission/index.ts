@@ -225,9 +225,7 @@ export function fromConfig(permission: ConfigPermissionV1.Info) {
   const ruleset: PermissionV1.Rule[] = []
   for (const [key, value] of Object.entries(permission)) {
     if (key === LEGACY_AGENT_PERMISSION_KEY) {
-      ruleset.push(
-        ...rulesFor(AGENT_PERMISSION_KEY, value).filter((rule) => !explicitPatterns.has(rule.pattern)),
-      )
+      ruleset.push(...rulesFor(AGENT_PERMISSION_KEY, value).filter((rule) => !explicitPatterns.has(rule.pattern)))
       continue
     }
     ruleset.push(...rulesFor(key, value))

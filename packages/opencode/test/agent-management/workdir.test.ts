@@ -81,7 +81,8 @@ describe("agent working directory", () => {
       const absolute = path.join(instance.directory, "somewhere")
       const result = yield* AgentWorkdir.prepareWorkdir({ cwd: absolute })
       expect(result).toEqual({ path: absolute, source: "provided_cwd" })
-    }))
+    }),
+  )
 
   // The reason this test exists: `git init` with nothing committed leaves HEAD
   // naming a branch that does not exist, and `prepareWorkdir` used to read it
@@ -145,7 +146,8 @@ describe("agent working directory", () => {
       const instance = yield* TestInstance
       const result = yield* AgentWorkdir.prepareWorkdir({ cwd: "./somewhere" })
       expect(result).toEqual({ path: path.join(instance.directory, "somewhere"), source: "provided_cwd" })
-    }))
+    }),
+  )
 })
 
 const run = Effect.fn("WorkdirTest.git")(function* (cwd: string, args: string[]) {

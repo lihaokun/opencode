@@ -25,8 +25,7 @@ const ConsoleStateResponse = Schema.Struct({
   switchableOrgCount: NonNegativeInt,
 }).annotate({ identifier: "ConsoleState" })
 
-const CapabilitiesResponse = Schema.Struct({
-}).annotate({ identifier: "ExperimentalCapabilities" })
+const CapabilitiesResponse = Schema.Struct({}).annotate({ identifier: "ExperimentalCapabilities" })
 
 const ConsoleOrgOption = Schema.Struct({
   accountID: Schema.String,

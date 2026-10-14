@@ -48,6 +48,8 @@ import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Type
 import { InstanceState } from "@/effect/instance-state"
 import { AGENT_TOOL_ID } from "@/tool/agent"
 import { AgentManagement } from "@/agent-management/schema"
+import { AgentDelegation } from "@/agent-management/delegation"
+import { AgentEvent } from "@opencode-ai/schema/agent-event"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -1547,11 +1549,122 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      const parentID = session.parentID
+      // A subagent reports to its parent at the end of every run. Hooked on the
+      // work itself rather than on the idle event: the runner executes the work
+      // exactly once per run (a re-arm is the next run, and joined callers only
+      // share the result), whereas idle can be published more than once for one
+      // run and also for a session that never ran.
+      const work =
+        parentID && session.metadata?.[AgentManagement.METADATA_AGENT_NOTIFY] === true
+          ? runLoop(input.sessionID).pipe(Effect.onExit((exit) => reportRunEnd(session, parentID, exit)))
+          : runLoop(input.sessionID)
       return yield* state.ensureRunning(
         input.sessionID,
         lastAssistant(input.sessionID),
-        runLoop(input.sessionID),
+        work,
         hasUnconsumedTurn(input.sessionID),
+      )
+    })
+
+    /**
+     * Whether any agent below this one is still going. Busy by status, or
+     * started as a job that has not reached busy yet: the agent tool registers
+     * the job synchronously, and the status flips a few ticks later in the
+     * forked fiber, so a parent stopping right after starting one must not
+     * read it as finished.
+     */
+    const hasLiveDescendant = Effect.fn("SessionPrompt.hasLiveDescendant")(function* (id: SessionID) {
+      const members = yield* agentTree.descendants(id, 0)
+      if (members.length === 0) return false
+      const busy = yield* status.list()
+      if (members.some((member) => busy.has(member.session_id))) return true
+      const ids = new Set<string>(members.map((member) => member.session_id))
+      return (yield* background.list()).some(
+        (job) =>
+          job.status === "running" &&
+          typeof job.metadata?.parentSessionId === "string" &&
+          ids.has(job.metadata.parentSessionId),
+      )
+    })
+
+    /**
+     * Tells the parent how a subagent's run ended, then settles the delegation
+     * ledger. Cancelled runs say nothing: agent_stop sends its own notice, and a
+     * second one here would make two for one stop.
+     */
+    const reportRunEnd = Effect.fn("SessionPrompt.reportRunEnd")(function* (
+      child: Session.Info,
+      parentID: SessionID,
+      exit: Exit.Exit<SessionV1.WithParts>,
+    ) {
+      const settled = events.publish(AgentEvent.Delegation, {
+        sessionID: child.id,
+        caller: parentID,
+        status: "settled",
+      })
+      // A message that landed inside the run's last iteration makes the runner
+      // start the next run straight away (#32): the child is not stopping, so
+      // there is nothing to report yet. Same predicate the runner uses, read
+      // just before it does; a message arriving in between only means the
+      // next run reports too, never that none does.
+      if (Exit.isSuccess(exit) && (yield* hasUnconsumedTurn(child.id))) return
+      const limits = yield* truncate.limits()
+      const outcome = classifyExit(child.id, exit, limits)
+      if (outcome.kind === "cancelled") return yield* settled
+      // A stop with one of its own agents still running is not the end of the
+      // child's work either: that agent reports to it when it finishes, which
+      // wakes it again. The parent hears once the whole subtree is quiet — the
+      // rule Claude Code states as "stops with no live background children of
+      // its own".
+      if (yield* hasLiveDescendant(child.id)) return
+      // The summary's wording is owned here: the TUI displays it verbatim and
+      // never re-derives it from state or description.
+      const description = child.metadata?.[AgentManagement.METADATA_AGENT_DESCRIPTION] ?? child.title
+      const summary = outcome.kind === "completed" ? `Agent completed: ${description}` : `Agent failed: ${description}`
+      // Forked: the parent's run is awaited so that `settled` means the result
+      // has been read, and awaiting it here would keep the child busy for as
+      // long as the parent takes.
+      yield* Effect.gen(function* () {
+        // Re-read the parent's identity at delivery time. Passing no model lets
+        // the parent's agent definition override and persist over its current
+        // model, and a variant captured when the child was created would revert
+        // a parent that switched mid-flight.
+        const parent = yield* sessions.get(parentID)
+        yield* prompt({
+          sessionID: parentID,
+          // Never fall back to the child's agent type. Doing so switches the
+          // parent to the subagent's definition and persists it — including
+          // that definition's model, which is how a subagent pinned to a broken
+          // model used to take its parent down. Omitting it lets
+          // createUserMessage pick the default agent, which is the right answer
+          // for a session that never bound one.
+          agent: parent.agent,
+          model: parent.model ? { providerID: parent.model.providerID, modelID: parent.model.id } : undefined,
+          variant: parent.model?.variant === "default" ? undefined : parent.model?.variant,
+          parts: [
+            {
+              type: "text",
+              synthetic: true,
+              text: AgentDelegation.renderOutput({
+                sessionID: child.id,
+                state: outcome.kind === "completed" ? "completed" : "error",
+                summary,
+                text: outcome.text,
+              }),
+              // The TUI renders one line from this metadata and never parses
+              // the model-facing text above.
+              metadata: { kind: AgentManagement.NOTIFICATION_METADATA_KIND, summary },
+            },
+          ],
+        })
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logError("run-end notice failed", { "session.id": child.id, parentID, cause }),
+        ),
+        Effect.ensuring(settled),
+        Effect.forkIn(scope, { startImmediately: true }),
       )
     })
 
@@ -1846,5 +1959,23 @@ export const node = LayerNode.make({
     Database.node,
   ],
 })
+
+/**
+ * The outcome of a run from its exit. A success is classified like a delegation
+ * result; an interrupt is a cancellation; anything else is a defect inside the
+ * run loop, reported as a failure so the parent is not left waiting.
+ */
+function classifyExit(
+  sessionID: SessionID,
+  exit: Exit.Exit<SessionV1.WithParts>,
+  limits: AgentDelegation.Limits,
+): AgentDelegation.Outcome {
+  if (Exit.isSuccess(exit)) return AgentDelegation.classify(exit.value, sessionID, limits)
+  if (Cause.hasInterruptsOnly(exit.cause)) return { kind: "cancelled" }
+  return {
+    kind: "failed",
+    text: AgentDelegation.formatSubagentFailure(Cause.pretty(exit.cause), sessionID, limits),
+  }
+}
 
 export * as SessionPrompt from "./prompt"

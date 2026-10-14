@@ -1,5 +1,7 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Agent } from "@/agent/agent"
+import { AgentInbox } from "@/agent-management/inbox"
+import { AgentManagement } from "@/agent-management/schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Command } from "@/command"
@@ -23,6 +25,7 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder, HttpApiError, HttpApiSchema } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import {
+  AgentMessagePayload,
   CommandPayload,
   DiffQuery,
   ForkPayload,
@@ -59,6 +62,17 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const todoSvc = yield* Todo.Service
     const summary = yield* SessionSummary.Service
     const events = yield* EventV2Bridge.Service
+    const inbox = yield* AgentInbox.Service
+    // Inline construction rather than a shared factory: SessionPrompt.Service
+    // does not structurally satisfy AgentPromptOps (prompt's error channel).
+    // deliver only exercises deliverAsync, which fails through the event
+    // stream; prompt here dies on error — a branch no code path reaches today.
+    const ops: AgentManagement.AgentPromptOps = {
+      cancel: (sessionID) => promptSvc.cancel(sessionID),
+      resolvePromptParts: (template) => promptSvc.resolvePromptParts(template),
+      prompt: (input) => promptSvc.prompt(input).pipe(Effect.catch(Effect.die)),
+      deliverAsync: (input) => promptSvc.deliverAsync(input),
+    }
     const scope = yield* Scope.Scope
 
     const list = Effect.fn("SessionHttpApi.list")(function* (ctx: { query: typeof ListQuery.Type }) {
@@ -320,6 +334,23 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return HttpApiSchema.NoContent.make()
     })
 
+    const agentMessage = Effect.fn("SessionHttpApi.agentMessage")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: typeof AgentMessagePayload.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      // Steps P1-P4 all live behind inbox.deliver: target lookup, identity
+      // resolved from the target session (the payload structurally cannot carry
+      // it, I1), the user header, and the deliverAsync fork.
+      yield* inbox
+        .deliver({
+          message: { kind: "user", message: { target: ctx.params.sessionID, parts: ctx.payload.parts } },
+          ops,
+        })
+        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+      return HttpApiSchema.NoContent.make()
+    })
+
     const command = Effect.fn("SessionHttpApi.command")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof CommandPayload.Type
@@ -422,6 +453,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("summarize", summarize)
       .handle("prompt", prompt)
       .handle("promptAsync", promptAsync)
+      .handle("agentMessage", agentMessage)
       .handle("command", command)
       .handle("shell", shell)
       .handle("revert", revert)
