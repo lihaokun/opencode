@@ -100,7 +100,7 @@ BackgroundJob settle 后注入会话消息——**复用 agent 委派的 notify 
 3. **完成通知复用委派 notify 管线**：通知制而非轮询制（ZCode 的 TaskOutput DEPRECATED 同方向）。
 4. **进程内输出缓冲，不落盘**（非目标第 2 条）。
 5. **输出读取与终止做成两个小工具**（CC 的 BashOutput/KillShell 先例），而非单工具 action 参数——模型对单一职责工具的选择更可靠。
-6. **工具命名前缀 `shell_`** 而非 `bash_`：对外工具 id 是 `bash`（兼容），但域语义是 shell；与 `ShellID.ToolID` 的 2.0 改名计划对齐。
+6. **工具命名前缀 `shell_`** 而非 `bash_`：`shell/id.ts:13-14` 已成文记录 "bash" 是兼容遗留、计划随 2.0 改名为 shell——新工具无兼容包袱，不该把旧误称（工具实际运行 bash/pwsh/powershell/cmd 四种 shell）烘焙进新契约面，否则 2.0 改名从改一个工具变成改三个。可发现性不依赖名字前缀：后台模式的返回文本会显式指引 "use shell_output…"（agent 工具用同样模式指引 agent_list/send/stop）。反方先例是 Claude Code 的 `BashOutput/KillShell`（bash 前缀同族），但 CC 的 "Bash" 是正当命名、无遗留问题；ZCode 的 `Task*` 家族（按任务域分组）反而更接近本方案。
 
 ## 7. 架构正确性论证（§4.2.1）
 
