@@ -1,3 +1,4 @@
+import path from "path"
 import { expect } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -365,8 +366,9 @@ it.instance("restored part reaches the model messages", () =>
 
 itDisabled.instance("apply respects restoration.enabled = false", () =>
   Effect.gen(function* () {
+    const test = yield* TestInstance
     const session = yield* SessionNs.Service.use((ssn) => ssn.create({}))
-    yield* seedRestorable(session.id, `${session.id}-body.txt`, "body text\n")
+    yield* seedRestorable(session.id, path.join(test.directory, "body.txt"), "body text\n")
     yield* apply({ sessionID: session.id })
     yield* apply({ sessionID: session.id })
     const parts = yield* SessionNs.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
@@ -381,9 +383,10 @@ itDisabled.instance("apply respects restoration.enabled = false", () =>
 
 itTight.instance("apply degrades to a reference under a tight budget", () =>
   Effect.gen(function* () {
+    const test = yield* TestInstance
     const session = yield* SessionNs.Service.use((ssn) => ssn.create({}))
     const body = "y".repeat(200)
-    yield* seedRestorable(session.id, `${session.id}-body.txt`, body)
+    yield* seedRestorable(session.id, path.join(test.directory, "body.txt"), body)
     yield* apply({ sessionID: session.id })
     const parts = yield* SessionNs.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
       Effect.map((msgs) => msgs.flatMap((m) => m.parts)),
