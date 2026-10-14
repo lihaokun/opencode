@@ -21,13 +21,13 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
+import { formatExitCodeLine, summarizeToolText } from "@opencode-ai/core/session/tool-result-projection"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 
 export const Event = SessionCompactionEvent
 
 export const PRUNE_MINIMUM = 20_000
 export const PRUNE_PROTECT = 40_000
-const TOOL_OUTPUT_MAX_CHARS = 2_000
 const PRUNE_PROTECTED_TOOLS = ["skill"]
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
 const MAX_PRESERVE_RECENT_TOKENS = 15_000
@@ -47,9 +47,6 @@ type CompletedCompaction = {
   assistantIndex: number
   summary: string | undefined
 }
-
-const truncate = (value: string) =>
-  value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
 
 const serialize = (message: SessionV1.WithParts) => {
   if (message.info.role === "user") {
@@ -73,10 +70,11 @@ const serialize = (message: SessionV1.WithParts) => {
         const attachments = (part.state.attachments ?? []).map(
           (item) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`,
         )
-        const output = part.state.time.compacted
+        const text = part.state.time.compacted
           ? "[Old tool result content cleared]"
-          : truncate([part.state.output, ...attachments].join("\n"))
-        return [call, `[Tool result]: ${output}`]
+          : summarizeToolText([part.state.output, ...attachments].join("\n"))
+        const exit = part.state.time.compacted ? undefined : formatExitCodeLine(part.state.metadata)
+        return [call, `[Tool result]: ${exit ? `${text}\n${exit}` : text}`]
       }
       if (part.state.status === "error") return [call, `[Tool error]: ${part.state.error}`]
       return [call]

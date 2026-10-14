@@ -827,6 +827,202 @@ it.instance("loop calls LLM and returns assistant message", () =>
   }),
 )
 
+it.instance("loop delivers the shared working agreement on the wire", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Shared agreement e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.text("ok")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const body = (yield* llm.inputs).at(-1)!
+    const wire = JSON.stringify(body)
+    // the shared agreement rides the system prompt…
+    expect(wire).toContain("# Working agreement")
+    expect(wire).toContain("carry it to completion")
+    // …and the dropped hard rules are gone from the wire too
+    expect(wire).not.toContain("fewer than 4 lines")
+    expect(wire).not.toContain("DO NOT ADD ***ANY***")
+    // delegation guidance lives in the agent tool description
+    expect(wire).toContain("When to delegate")
+  }),
+)
+
+it.instance("explicit agent prompt opts out of the shared section on the wire", () =>
+  Effect.gen(function* () {
+    const marker = "CUSTOM_MARKER_PROMPT_AGENT_BUILD"
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      agent: { build: { prompt: marker } },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Opt-out e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.text("ok")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const body = (yield* llm.inputs).at(-1)!
+    const wire = JSON.stringify(body)
+    expect(wire).toContain(marker)
+    expect(wire).not.toContain("# Working agreement")
+    // the model template is replaced wholesale by the explicit prompt
+    expect(wire).not.toContain("interactive CLI tool that helps users with software engineering tasks")
+  }),
+)
+
+it.instance("loop replays a non-zero bash exit code into the next model request", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Exit code e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "run it" }],
+    })
+    yield* llm.tool("bash", { command: `bun -e "process.exit(7)"` })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    const toolMessage = (replay!.messages as { role: string; content: unknown }[]).find((m) => m.role === "tool")
+    expect(JSON.stringify(toolMessage)).toContain("(no output)")
+    expect(JSON.stringify(toolMessage)).toContain("[exit code: 7]")
+  }),
+)
+
+it.instance("loop replays grep output_mode results into the next model request", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Grep e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "needle-a.txt"), "needle\n"))
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "needle-b.txt"), "needle\n"))
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "find needles" }],
+    })
+    yield* llm.tool("grep", { pattern: "needle", output_mode: "files_with_matches" })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    const wire = JSON.stringify(replay)
+    expect(wire).toContain("Found 2 files")
+    expect(wire).toContain("needle-a.txt")
+    expect(wire).toContain("needle-b.txt")
+  }),
+)
+
+it.instance("loop delivers background shell completion as a message on the wire", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Background shell e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the server" }],
+    })
+    yield* llm.tool("bash", {
+      command: `bun -e "console.log('bg-done-marker'); process.exit(0)"`,
+      run_in_background: true,
+    })
+    yield* llm.text("started")
+    yield* llm.text("ack")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    // The background process exits, the completion notification is delivered
+    // through the real deliverAsync path, and that message wakes a new model
+    // request — the notification must be on that wire.
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const hits = yield* llm.hits
+        return hits.length >= 3 ? true : undefined
+      }),
+      "background completion never reached the model",
+    )
+    const bodies = yield* llm.inputs
+    const notification = bodies
+      .filter((body) => JSON.stringify(body).includes("[shell task finished]"))
+      .at(-1)
+    expect(notification).toBeDefined()
+    const wire = JSON.stringify(notification)
+    expect(wire).toContain("bg-done-marker")
+    expect(wire).toContain("exit 0")
+  }),
+)
+
+it.instance("loop stays silent for a zero bash exit code", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Exit zero e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "run it" }],
+    })
+    yield* llm.tool("bash", { command: `bun -e "process.exit(0)"` })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    expect(JSON.stringify(replay)).not.toContain("[exit code:")
+  }),
+)
+
 withMcpInstructions.instance(
   "loop includes MCP instructions in model system context",
   () =>
@@ -3626,6 +3822,28 @@ unixNoLLMServer(
 
         const exit = yield* Fiber.await(fiber)
         expect(Exit.isSuccess(exit)).toBe(true)
+      }),
+    ),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "shell records non-zero exit code in completed metadata",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        const { prompt, chat } = yield* boot()
+
+        const exit = yield* prompt
+          .shell({ sessionID: chat.id, agent: "build", command: `bun -e "process.exit(7)"` })
+          .pipe(Effect.exit)
+        expect(Exit.isSuccess(exit)).toBe(true)
+
+        const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+        const tool = msgs.flatMap((m) => toolPart(m.parts)).find((p) => p?.state.status === "completed")
+        expect(tool).toBeDefined()
+        expect((tool!.state as SessionV1.ToolStateCompleted).metadata?.exit).toBe(7)
       }),
     ),
   { config: cfg },

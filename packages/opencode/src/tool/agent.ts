@@ -72,6 +72,7 @@ const AGENT_DESCRIPTION = [
   "- The returned `session_id` always works as a target for agent_send and agent_stop",
   "- `name` is optional and shorter to use, but is not guaranteed unique; if two subagents share one, that name is refused and you must use the session_id",
   "- Nesting is bounded: a subagent deep enough in the tree is not offered this tool at all",
+  "- When to delegate: the task matches one of the available agent types, you have independent work that can run in parallel, or answering would mean reading across several files — delegate it and keep the conclusion, not the file dumps. For a single-fact lookup where you already know the file, symbol, or value, search directly. Once you have delegated a search, do not repeat it yourself — wait for the result",
 ].join("\n")
 
 const LIST_DESCRIPTION = [
