@@ -3,7 +3,10 @@ import { Database } from "@opencode-ai/core/database/database"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { Effect, Option } from "effect"
+import { Cause, Effect, Exit, Layer, Option } from "effect"
+import { Config } from "@/config/config"
+import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+import { TestConfig } from "../fixture/config"
 import { Session as SessionNs } from "@/session/session"
 import { Todo } from "../../src/session/todo"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -41,6 +44,72 @@ const env = AppNodeBuilder.build(
 const it = testEffect(env)
 
 const cfg = restorationConfig(undefined)
+
+const seedRestorable = Effect.fn("test.seedRestorable")(function* (
+  sessionID: SessionID,
+  filePath: string,
+  fileBody: string,
+) {
+  const ssn = yield* SessionNs.Service
+  const fs = yield* FSUtil.Service
+  yield* fs.writeWithDirs(filePath, fileBody)
+  const user = yield* ssn.updateMessage({
+    id: MessageID.ascending(),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+    time: { created: Date.now() },
+  })
+  const assistant = yield* ssn.updateMessage({
+    id: MessageID.ascending(),
+    parentID: user.id,
+    role: "assistant",
+    sessionID,
+    mode: "build",
+    agent: "build",
+    path: { cwd: filePath, root: filePath },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ModelV2.ID.make("test-model"),
+    providerID: ProviderV2.ID.make("test"),
+    time: { created: Date.now() },
+  })
+  yield* ssn.updatePart({
+    id: PartID.ascending(),
+    messageID: assistant.id,
+    sessionID,
+    type: "tool",
+    tool: "read",
+    callID: "call_seed",
+    state: {
+      status: "completed",
+      input: { filePath },
+      output: `read ${filePath}`,
+      title: filePath,
+      metadata: { display: { path: filePath } },
+      time: { start: 0, end: 1 },
+    },
+  })
+  yield* ssn.updatePart({
+    id: PartID.ascending(),
+    messageID: user.id,
+    sessionID,
+    type: "compaction",
+    auto: false,
+    tail_start_id: assistant.id,
+  })
+})
+
+const configLayer = (info: Record<string, unknown>) =>
+  Layer.succeed(
+    Config.Service,
+    TestConfig.make({ get: () => Effect.succeed(info as ConfigV1.Info) }),
+  )
+const disabledEnv = Layer.mergeAll(env, configLayer({ compaction: { restoration: { enabled: false } } }))
+const tightEnv = Layer.mergeAll(env, configLayer({ compaction: { restoration: { enabled: true, budget_tokens: 30 } } }))
+const itDisabled = testEffect(disabledEnv)
+const itTight = testEffect(tightEnv)
 
 it.effect("buildTailText joins everything from the tail anchor onward", () =>
   Effect.gen(function* () {
@@ -290,5 +359,40 @@ it.instance("restored part reaches the model messages", () =>
     const msgs = yield* ssn.messages({ sessionID })
     const rendered = yield* MessageV2.toModelMessagesEffect(msgs, model)
     expect(JSON.stringify(rendered)).toContain(RESTORATION_SENTINEL)
+  }),
+)
+
+
+itDisabled.instance("apply respects restoration.enabled = false", () =>
+  Effect.gen(function* () {
+    const session = yield* SessionNs.Service.use((ssn) => ssn.create({}))
+    yield* seedRestorable(session.id, `${session.id}-body.txt`, "body text\n")
+    yield* apply({ sessionID: session.id })
+    yield* apply({ sessionID: session.id })
+    const parts = yield* SessionNs.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
+      Effect.map((msgs) => msgs.flatMap((m) => m.parts)),
+    )
+    const sentinels = parts.filter(
+      (p): p is SessionV1.TextPart => p.type === "text" && p.text.startsWith(RESTORATION_SENTINEL),
+    )
+    expect(sentinels).toHaveLength(0)
+  }),
+)
+
+itTight.instance("apply degrades to a reference under a tight budget", () =>
+  Effect.gen(function* () {
+    const session = yield* SessionNs.Service.use((ssn) => ssn.create({}))
+    const body = "y".repeat(200)
+    yield* seedRestorable(session.id, `${session.id}-body.txt`, body)
+    yield* apply({ sessionID: session.id })
+    const parts = yield* SessionNs.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
+      Effect.map((msgs) => msgs.flatMap((m) => m.parts)),
+    )
+    const sentinels = parts.filter(
+      (p): p is SessionV1.TextPart => p.type === "text" && p.text.startsWith(RESTORATION_SENTINEL),
+    )
+    expect(sentinels).toHaveLength(1)
+    expect(sentinels[0].text).toContain("restoration budget exhausted")
+    expect(sentinels[0].text).not.toContain(body)
   }),
 )
