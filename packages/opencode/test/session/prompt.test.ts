@@ -951,6 +951,51 @@ it.instance("loop replays grep output_mode results into the next model request",
   }),
 )
 
+it.instance("loop delivers background shell completion as a message on the wire", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Background shell e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the server" }],
+    })
+    yield* llm.tool("bash", {
+      command: `bun -e "console.log('bg-done-marker'); process.exit(0)"`,
+      run_in_background: true,
+    })
+    yield* llm.text("started")
+    yield* llm.text("ack")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    // The background process exits, the completion notification is delivered
+    // through the real deliverAsync path, and that message wakes a new model
+    // request — the notification must be on that wire.
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const hits = yield* llm.hits
+        return hits.length >= 3 ? true : undefined
+      }),
+      "background completion never reached the model",
+    )
+    const bodies = yield* llm.inputs
+    const notification = bodies
+      .filter((body) => JSON.stringify(body).includes("[shell task finished]"))
+      .at(-1)
+    expect(notification).toBeDefined()
+    const wire = JSON.stringify(notification)
+    expect(wire).toContain("bg-done-marker")
+    expect(wire).toContain("exit 0")
+  }),
+)
+
 it.instance("loop stays silent for a zero bash exit code", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
