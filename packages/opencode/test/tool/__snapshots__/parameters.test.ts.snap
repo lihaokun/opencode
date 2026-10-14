@@ -24,6 +24,10 @@ exports[`tool parameters JSON Schema (wire shape) bash 1`] = `
       "description": "The command to execute",
       "type": "string",
     },
+    "run_in_background": {
+      "description": "Run the command in the background: the tool returns a task id immediately, output is read with shell_output, and a completion message arrives when it finishes. Intended for long-running processes like dev servers and watchers. The timeout parameter does not apply.",
+      "type": "boolean",
+    },
     "timeout": {
       "description": "Optional timeout in milliseconds",
       "exclusiveMinimum": 0,
