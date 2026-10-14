@@ -24,6 +24,7 @@
 ## 测试
 
 - 新增 6 个用例（真进程）：立即返回 + 注册表 running、输出续读（interim running → kill → cancelled）、完成通知真实投递（recorded promptOps 捕获 `[shell task finished]` + `exit 7` + task_id）、kill 终止、同步路径零变更回归、未知任务可诊断错误。
+- **端到端补齐（`e5e20304`）**：wire 级用例——loop 中 fake LLM 发起 `run_in_background` 的真实 bash 调用；进程退出后通知经**真实 deliverAsync** 注入会话并唤醒新一轮请求，捕获的载荷含 `[shell task finished]`、`bg-done-marker` 与 `exit 0`。prompt.test 106 项全过。
 - 回归：shell.test 23/23（同步零变更）、tool 目录 334 全过（含 bash wire schema 快照 +4 行更新）、**全套 3997 项 0 失败**、双包 typecheck 干净。
 
 ## 待办
