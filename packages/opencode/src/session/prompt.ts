@@ -1584,17 +1584,27 @@ const layer = Layer.effect(
      * forked fiber, so a parent stopping right after starting one must not
      * read it as finished.
      */
+    /**
+     * Whether any agent below this one is still going. Busy by status, or
+     * started as a job that has not reached busy yet: the agent tool registers
+     * the job synchronously, and the status flips a few ticks later in the
+     * forked fiber, so a parent stopping right after starting one must not
+     * read it as finished. A background shell counts for the session that owns
+     * it (#53): its completion message wakes that session for another turn, so
+     * a run that stops while one is running has not finished its work.
+     */
     const hasLiveDescendant = Effect.fn("SessionPrompt.hasLiveDescendant")(function* (id: SessionID) {
       const members = yield* agentTree.descendants(id, 0)
-      if (members.length === 0) return false
       const busy = yield* status.list()
+      const running = (yield* background.list()).filter((job) => job.status === "running")
+      if (running.some((job) => job.metadata?.sessionId === id)) return true
+      if (members.length === 0) return false
       if (members.some((member) => busy.has(member.session_id))) return true
       const ids = new Set<string>(members.map((member) => member.session_id))
-      return (yield* background.list()).some(
+      return running.some(
         (job) =>
-          job.status === "running" &&
-          typeof job.metadata?.parentSessionId === "string" &&
-          ids.has(job.metadata.parentSessionId),
+          (typeof job.metadata?.parentSessionId === "string" && ids.has(job.metadata.parentSessionId)) ||
+          (typeof job.metadata?.sessionId === "string" && ids.has(job.metadata.sessionId)),
       )
     })
 

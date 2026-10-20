@@ -293,6 +293,32 @@ describe("tool.grep", () => {
     }),
   )
 
+  // The shorthand must reach ripgrep: before = after = context, and an
+  // explicit side overrides the shorthand for that side only.
+  it.instance("context shorthand expands to before and after, explicit sides win", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "sh.txt"), "b1\nb2\nMIDDLE\na2\na1\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      const both = yield* grep.execute(
+        { pattern: "MIDDLE", path: test.directory, include: "sh.txt", context: 2 },
+        ctx,
+      )
+      expect(both.output).toContain("Line 1- b1")
+      expect(both.output).toContain("Line 5- a1")
+
+      const mixed = yield* grep.execute(
+        { pattern: "MIDDLE", path: test.directory, include: "sh.txt", context: 2, after: 1 },
+        ctx,
+      )
+      expect(mixed.output).toContain("Line 1- b1")
+      expect(mixed.output).toContain("Line 4- a2")
+      expect(mixed.output).not.toContain("Line 5- a1")
+    }),
+  )
+
   it.instance("pagination distinguishes has-more, exact end and offset beyond", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance

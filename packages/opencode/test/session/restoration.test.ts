@@ -147,8 +147,22 @@ it.effect("collectCandidates keeps the most recent ref and appends todos", () =>
       }) as unknown as SessionV1.Part
 
     const messages = [
-      { info: { id: "a" }, parts: [toolPart("read", { display: { path: "/f/one" } }), toolPart("read", { display: { path: "/f/two" } })] },
-      { info: { id: "b" }, parts: [toolPart("read", { display: { path: "/f/one" } }), toolPart("edit", { filepath: "/f/one" }), toolPart("skill", { name: "pdf" })] },
+      {
+        info: { id: "a" },
+        parts: [
+          toolPart("read", { display: { type: "file", path: "/f/one" } }),
+          toolPart("read", { display: { type: "directory", path: "/f/dir" } }),
+          toolPart("read", { display: { type: "file", path: "/f/two" } }),
+        ],
+      },
+      {
+        info: { id: "b" },
+        parts: [
+          toolPart("read", { display: { type: "file", path: "/f/one" } }),
+          toolPart("edit", { filediff: { file: "/f/one" } }),
+          toolPart("skill", { name: "pdf" }),
+        ],
+      },
     ] as unknown as SessionV1.WithParts[]
 
     const candidates = collectCandidates(messages, [])

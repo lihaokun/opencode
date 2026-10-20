@@ -10,6 +10,8 @@ import { Plugin } from "../../src/plugin"
 import { Truncate } from "../../src/tool/truncate"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { SessionRunState } from "@/session/run-state"
+import { SessionStatus } from "@/session/status"
 import { ShellOutputTool, ShellKillTool, ShellTool } from "../../src/tool/shell"
 import { MessageID, SessionID } from "../../src/session/schema"
 import type { Tool } from "../../src/tool/tool"
@@ -28,6 +30,8 @@ const shellLayer = Layer.mergeAll(
       Agent.node,
       RuntimeFlags.node,
       BackgroundJob.node,
+      SessionStatus.node,
+      SessionRunState.node,
     ]),
   ),
   testInstanceStoreLayer,
@@ -148,6 +152,97 @@ it.instance("shell_kill stops a running background task", () =>
 
     const stopped = yield* tools.kill.execute({ task_id: taskId }, makeCtx())
     expect(stopped.output).toContain("stopped (cancelled)")
+  }),
+)
+
+// The job carries the owning session in its metadata, so the session-run
+// cancel cascade (agent_stop, interrupt) reaches the process. The stopped
+// session must also stay stopped: no completion delivery, no wake.
+it.instance("session cancel stops the background process and suppresses the completion notice", () =>
+  Effect.gen(function* () {
+    const delivered: unknown[] = []
+    const promptOps = {
+      deliverAsync: (input: unknown) =>
+        Effect.sync(() => {
+          delivered.push(input)
+        }),
+    } as unknown as AgentManagement.AgentPromptOps
+    const tools = yield* initTools
+    const runState = yield* SessionRunState.Service
+    const started = yield* tools.shell.execute(
+      { command: `bun -e "console.log('cancel-marker'); await Bun.sleep(30_000)"`, run_in_background: true },
+      makeCtx({ promptOps }),
+    )
+    const taskId = /shell_[^\s\]]+/.exec(started.output)![0]
+
+    const bg = yield* BackgroundJob.Service
+    const before = yield* bg.get(taskId)
+    expect(before?.metadata?.sessionId).toBe(sessionID)
+
+    yield* runState.cancel(sessionID)
+    const job = yield* bg.get(taskId)
+    expect(job?.status).toBe("cancelled")
+
+    // A cancelled job's run never reaches the delivery step; give the fiber a
+    // moment to prove the absence rather than racing it.
+    yield* Effect.sleep(500)
+    expect(delivered).toHaveLength(0)
+    const final = (yield* tools.output.execute({ task_id: taskId }, makeCtx())) as { output: string }
+    expect(final.output).toContain("status: cancelled")
+  }),
+)
+
+it.instance("background.start records the owning session id in job metadata", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const started = yield* tools.shell.execute(
+      { command: `bun -e "await Bun.sleep(1_000)"`, run_in_background: true },
+      makeCtx(),
+    )
+    const taskId = /shell_[^\s\]]+/.exec(started.output)![0]
+    const bg = yield* BackgroundJob.Service
+    const job = yield* bg.get(taskId)
+    expect(job?.metadata?.sessionId).toBe(sessionID)
+    expect(job?.type).toBe("shell")
+    yield* tools.kill.execute({ task_id: taskId }, makeCtx())
+  }),
+)
+
+// The buffer is a bounded tail, and the registry entry is dropped once the run
+// settles: a long-lived process must not retain every byte it printed, and a
+// finished task must not linger in the map for the life of the process.
+it.instance("buffer is capped and the task entry is cleaned up after the run settles", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const line = "x".repeat(900) + "\n"
+    const started = yield* tools.shell.execute(
+      {
+        command: `bun -e "for (let i = 0; i < 400; i++) console.log('${'x'.repeat(900)}') "`,
+        run_in_background: true,
+      },
+      makeCtx(),
+    )
+    const taskId = /shell_[^\s\]]+/.exec(started.output)![0]
+
+    // ~360 KB printed, cap is 200 K chars: wait out the run.
+    const bg = yield* BackgroundJob.Service
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const job = yield* bg.get(taskId)
+      if (job && job.status !== "running") break
+      yield* Effect.sleep(50)
+    }
+    const job = yield* bg.get(taskId)
+    expect(job?.status).toBe("completed")
+
+    const final = (yield* tools.output.execute({ task_id: taskId }, makeCtx())) as { output: string }
+    expect(final.output).toContain("status: exit 0")
+    expect(final.output.length).toBeLessThan(line.length * 400)
+
+    // Settled runs remove their registry entry; shell_output then falls back
+    // to the BackgroundJob snapshot for status and reports the missing tail.
+    const output = yield* tools.output.execute({ task_id: taskId }, makeCtx())
+    expect(output.output).toContain(`[shell task ${taskId}]`)
   }),
 )
 

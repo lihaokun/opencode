@@ -31,10 +31,29 @@ export { Parameters } from "./shell/prompt"
 const MAX_METADATA_LENGTH = 30_000
 
 /**
- * Live state of background shell tasks, keyed by task id. Process-local and
- * intentionally non-durable, mirroring the BackgroundJob registry semantics:
- * a restart loses both the process and its buffer.
+ * Tail cap for one background task's output buffer. Readers (the completion
+ * notice, shell_output, shell_kill) all show a tail anyway, so keeping more
+ * than the largest tail anyone can ask for is pure memory leak surface — a
+ * multi-hour dev server would otherwise retain every byte it ever printed.
  */
+const BACKGROUND_BUFFER_MAX_CHARS = 200_000
+
+// Keeps the buffer at or under the cap by dropping from the front. Amortized
+// O(1) per chunk once over the cap: the trim re-slices once per chunk, not
+// once per byte.
+const appendCapped = (buffer: string, chunk: string) => {
+  const next = buffer + chunk
+  return next.length <= BACKGROUND_BUFFER_MAX_CHARS ? next : next.slice(next.length - BACKGROUND_BUFFER_MAX_CHARS)
+}
+
+    /**
+     * Live state of background shell tasks, keyed by task id. Process-local and
+     * intentionally non-durable, mirroring the BackgroundJob registry semantics:
+     * a restart loses both the process and its buffer. Entries are removed once
+     * the run settles — output lives with the tool parts from then on, and an
+     * entry left behind would accumulate one per background call for the life
+     * of the process.
+     */
 const shellTasks = new Map<
   string,
   {
@@ -649,7 +668,7 @@ export const ShellTool = Tool.define(
               )
               yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
                 Effect.sync(() => {
-                  entry.buffer += chunk
+                  entry.buffer = appendCapped(entry.buffer, chunk)
                 }),
               )
               const code = yield* handle.exitCode.pipe(Effect.option)
@@ -676,6 +695,9 @@ export const ShellTool = Tool.define(
             })
             .pipe(Effect.ignore)
         }
+        // Runs on every exit path — success, failure, interruption — so the
+        // registry never outlives the process it describes.
+        yield* Effect.sync(() => shellTasks.delete(taskId))
         if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause)
         return entry.buffer
       })
@@ -684,6 +706,11 @@ export const ShellTool = Tool.define(
         id: taskId,
         type: "shell",
         title: input.command.slice(0, 80),
+        // Same shape agent delegation uses: cancelBackgroundJobs walks the
+        // session graph through this, so agent_stop and interrupt reach the
+        // process, and a stopped session is never woken by the completion
+        // notification.
+        metadata: { sessionId: ctx.sessionID },
         run,
       })
       return {
@@ -782,8 +809,24 @@ export const ShellOutputTool = Tool.define(
               .at(0)?.[0]
           if (!id) throw new Error("no background shell tasks in this session")
           const entry = shellTasks.get(id)
-          if (!entry || entry.sessionID !== ctx.sessionID) throw new Error(`unknown task: ${id}`)
           const job = yield* background.get(id).pipe(Effect.orElseSucceed(() => undefined))
+          // Settled runs drop their registry entry; the job snapshot still has
+          // the status, and the output tail lives in the delivered message and
+          // the tool part from then on.
+          if (!entry && job) {
+            const status = job.status === "running" ? "running" : job.status
+            const output = [
+              `[shell task ${id}] ${job.title ?? ""}`.trim(),
+              `status: ${status === "completed" ? `exit 0${job.output ? `\n${tailOf(job.output, params.tail_lines ?? 200)}` : ""}` : status}`,
+              ...(status === "completed" ? [] : [`(output tail no longer buffered; see the completion message)`]),
+            ].join("\n")
+            return {
+              title: (job.title ?? id).slice(0, 80),
+              metadata: { task_id: id, status: job.status },
+              output,
+            }
+          }
+          if (!entry || entry.sessionID !== ctx.sessionID) throw new Error(`unknown task: ${id}`)
           const status = !job
             ? "unknown"
             : job.status === "running"

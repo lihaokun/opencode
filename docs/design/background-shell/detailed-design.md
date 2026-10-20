@@ -42,9 +42,9 @@
 const shellTasks = new Map<string, { command: string; sessionID: SessionID; buffer: string; startedAt: number }>()
 ```
 
-生命周期：后台启动时建、进程退出后保留（供 shell_output 读终值）、随进程清理（本 feature 不删——进程本地 Map，量级 = 本会话后台任务数；记录：超长会话的大量后台任务是已知界限）。
+生命周期：后台启动时建；buffer 为**有界尾部**（`BACKGROUND_BUFFER_MAX_CHARS = 200_000`，超限从头丢弃——所有读者都只读尾部，保留更多纯属内存泄漏面）；run 结算（成功/失败/中断三路）后从 Map 删除（终值输出已随 settle 进入 `job.info.output`，完成通知也已投递；shell_output 对已删除条目回退读 BackgroundJob 快照）。复审修订（2026-10-18，PR #60 审核意见 A3）：初版"不删 + 无界 buffer"会在长 run 中累积超长输出与每任务一条的残留条目，已按有界尾部 + 结算清理修正。
 
-**BackgroundJob 注册**：`type: "shell"`、`title: command 前 80 字符`、run 返回**全量累计输出**（settle 后进 `job.info.output`）。
+**BackgroundJob 注册**：`type: "shell"`、`title: command 前 80 字符`、`metadata: { sessionId: ctx.sessionID }`（与 agent 委派同形——cancelBackgroundJobs 的会话级联经此匹配，agent_stop/中断可达后台进程；复审修订 A2）、run 返回**全量累计输出**（settle 后进 `job.info.output`）。
 
 **新工具 schema**：
 

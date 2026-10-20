@@ -80,6 +80,7 @@ head_limit: PositiveInt（默认 100）
      - `mode: "files_with_matches"` → `--files-with-matches`（替代 `--json`）
      - `mode: "count"` → `--count-matches`（替代 `--json`）
      - content：`--json`；`before/after/context` > 0 → `-B n` / `-A n` / `-C n`（三者可并存）
+     - **`context` 的展开（工具层，2026-10-18 复审核复意见 B4 修正）**：`before = params.before ?? params.context ?? 0`、`after = params.after ?? params.context ?? 0`——`context` 是双侧简写，显式单侧参数逐侧覆盖简写（`{context: 3, after: 1}` ⇒ before=3, after=1）。服务层收到的已是展开后的 `before`/`after`，从不接收 `context` 本身（rg 也没有 `-C` 之外的语义需求：`-C n` ≡ `-B n -A n`）
      - 收尾：`--` + pattern + `file ?? "."`
   2. parse 按 mode 分派：
      - content：现 RawMatch 解析扩展——接受 `type: "match" | "context"`（同一 data shape），产出 `{ ...match.data, context: type === "context" }`

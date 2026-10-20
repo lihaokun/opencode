@@ -102,9 +102,21 @@ export function collectCandidates(
         if (!ref) return
         byRef.set(`${kind}\0${ref}`, { kind, ref, lastUseSeq: seq })
       }
-      if (part.tool === "read") touch("file", (part.state.metadata as any)?.display?.path)
-      else if (part.tool === "edit") touch("file", (part.state.metadata as any)?.filepath)
-      else if (part.tool === "skill") touch("skill", (part.state.metadata as any)?.name)
+      // Read metadata is a free-form record; the display projection is the
+      // read tool's own contract (tool/read.ts). Directory reads carry the
+      // same display.path with type "directory" — restoring a directory
+      // listing is noise, only files are re-inlined. Edit parts carry the
+      // path in the filediff record (metadata.filepath is the permission
+      // request's shape, not the result's).
+      const meta = part.state.metadata as {
+        display?: { type?: string; path?: string }
+        filediff?: { file?: string }
+        name?: string
+      }
+      if (part.tool === "read") {
+        if (meta.display?.type === "file") touch("file", meta.display.path)
+      } else if (part.tool === "edit") touch("file", meta.filediff?.file)
+      else if (part.tool === "skill") touch("skill", meta.name)
     }
   }
   const candidates = [...byRef.values()].toSorted((a, b) => b.lastUseSeq - a.lastUseSeq)

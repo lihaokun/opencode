@@ -110,7 +110,7 @@ exports[`tool parameters JSON Schema (wire shape) grep 1`] = `
       "type": "number",
     },
     "context": {
-      "description": "Lines of context before and after each match, content mode only (max 10)",
+      "description": "Lines of context before and after each match, content mode only (max 10). Shorthand for before and after together; an explicit before or after overrides it for that side",
       "type": "number",
     },
     "head_limit": {

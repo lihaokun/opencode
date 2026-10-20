@@ -31,7 +31,8 @@ export const Parameters = Schema.Struct({
     description: "Lines of context after each match, content mode only (max 10)",
   }),
   context: Schema.optional(Schema.Number).annotate({
-    description: "Lines of context before and after each match, content mode only (max 10)",
+    description:
+      "Lines of context before and after each match, content mode only (max 10). Shorthand for before and after together; an explicit before or after overrides it for that side",
   }),
   offset: Schema.optional(Schema.Number).annotate({
     description: "Skip the first N results (for pagination)",
@@ -74,9 +75,12 @@ export const GrepTool = Tool.define(
             throw new Error("pattern is required")
           }
           const mode = params.output_mode ?? "content"
-          const before = params.before ?? 0
-          const after = params.after ?? 0
           const context = params.context ?? 0
+          // `context` is the shorthand for both sides; an explicit before/after
+          // wins over it per side, so {context: 3, after: 1} reads as
+          // before=3, after=1.
+          const before = params.before ?? context
+          const after = params.after ?? context
           if (before > 10 || after > 10 || context > 10) {
             throw new Error("context lines are capped at 10 (before/after/context)")
           }
