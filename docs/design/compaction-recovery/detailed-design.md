@@ -8,7 +8,7 @@
 
 - 新模块 `packages/opencode/src/session/restoration.ts`（M1 collect / materialize / render / buildTailText）
 - 注入入口 `apply`（M2，同文件）
-- 装配：`session/prompt.ts` 在 `applyAgentRoster` 之后追加一行调用
+- 装配：`session/prompt.ts` 的 compaction task arm——`compaction.process` 返回 `"continue"` 后内联调用（2026-10-18 复审核意见 B6 修订：初版挂在每 provider step 的 `applyAgentRoster` 之后，被审出每步全量读历史；修订后只在压缩结算点注入一次，快照语义 = 压缩时刻的磁盘状态，同时消除"压缩后模型改文件会重复追加 sentinel part"的初版缺陷）
 - 配置：`packages/core/src/v1/config/config.ts` 的 `compaction` struct 增加 `restoration` 子结构
 - 测试：restoration 单元测试（collect/materialize/render/buildTailText 纯函数）+ apply 幂等集成测试 + 注入后模型消息可见性测试
 

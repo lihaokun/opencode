@@ -1304,6 +1304,17 @@ const layer = Layer.effect(
               auto: task.auto,
               overflow: task.overflow,
             })
+            // Restoration is injected here and only here — the single point
+            // where every compaction entry (overflow guard, processor
+            // reactive, HTTP summarize, manual) settles. Snapshot semantics:
+            // it reads the disk as of the compaction moment, once per
+            // compaction; it is not re-run per model step.
+            if (result === "continue") {
+              yield* SessionRestoration.apply({ sessionID }).pipe(
+                Effect.provideService(Session.Service, sessions),
+                Effect.provideService(FSUtil.Service, fsys),
+              )
+            }
             if (result === "stop") break
             continue
           }
@@ -1336,10 +1347,6 @@ const layer = Layer.effect(
             Effect.provideService(Session.Service, sessions),
             Effect.provideService(AgentTree.Service, agentTree),
             Effect.provideService(AgentStatusProjection.Service, agentStatus),
-          )
-          yield* SessionRestoration.apply({ sessionID }).pipe(
-            Effect.provideService(Session.Service, sessions),
-            Effect.provideService(FSUtil.Service, fsys),
           )
 
           const msg: SessionV1.Assistant = {
