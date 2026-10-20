@@ -192,7 +192,7 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
 export const preparePayload = Effect.fn("LLMRequestPrep.preparePayload")(function* (input: PreparePayloadInput) {
   const system = [
     [
-      ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
+      ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.systemSections(input.model)),
       ...input.system,
       ...(input.user.system ? [input.user.system] : []),
     ]
