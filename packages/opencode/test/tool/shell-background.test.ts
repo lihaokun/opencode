@@ -88,7 +88,6 @@ it.instance("background start returns a task id immediately", () =>
     const taskId = /shell_[^\s\]]+/.exec(result.output)![0]
     const bg = yield* BackgroundJob.Service
     const all = yield* bg.list()
-    console.log("DEBUG ids:", JSON.stringify(all.map((j: any) => j.id)), "extracted:", taskId)
     const job = yield* bg.get(taskId)
     expect(job?.status).toBe("running")
     expect(result.metadata.exit).toBe(null)
@@ -254,13 +253,5 @@ it.instance("shell_output reports unknown tasks diagnosably", () =>
     if (Exit.isFailure(exit)) {
       expect(String(Cause.squash(exit.cause))).toContain("unknown task: shell_missing")
     }
-  }),
-)
-
-it.instance("PROBE init shell alone", () =>
-  Effect.gen(function* () {
-    const info = yield* ShellTool
-    const shell = yield* info.init()
-    expect(shell.description.length).toBeGreaterThan(0)
   }),
 )

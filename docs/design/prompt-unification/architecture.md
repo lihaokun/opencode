@@ -56,7 +56,9 @@ default.txt / trinity.txt 删除三条硬规则（L18-19、L58、L68 与 trinity
 
 （约 190 词；覆盖 issue 行为矩阵的 (d) 完成判据、(e) steering、验证与真实报告、交付，以及替代绝对禁注释的注释密度指导。）
 
-**委派指导**（移入 `tool/agent.ts` 的工具描述常量）：
+**委派指导**（~~移入 `tool/agent.ts` 的工具描述常量~~ **2026-10-18 复审核意见 D13 撤销**）：PR #59 已确立 agent 工具描述只陈述生命周期机件、不开用法处方；"When to delegate" 一节是用法处方，与该原则冲突，且共享段/P1 修剪后委派机件说明已保留在模板内，模型侧信息未缺失。撤销后委派时机不再有独立文本资产（记录：若未来要恢复，载体应是共享段而非工具描述）。
+
+~~原案（已撤销）：##
 
 ```md
 ## When to delegate
@@ -75,11 +77,11 @@ default.txt / trinity.txt 删除三条硬规则（L18-19、L58、L68 与 trinity
 
 ### M1 `session/system.ts`
 
-**函数/模块名称**：`provider`
+**函数/模块名称**：`provider`（2026-10-18 复审 B7 修订：早返回返回裸模板；`systemSections` = `[provider(model), SHARED]`，由唯一 caller `preparePayload` 使用——数组后置不变式移到 `systemSections`）
 
-功能描述：不变（按 model id 路由模板），唯一变化是每个分支的返回值由 `[模板]` 改为 `[模板, SHARED]`。
+功能描述：不变（按 model id 路由模板）；`systemSections` 保证每个模型模板路线的 section 数组末元素恒为 `SHARED_BEHAVIOR`。
 前置条件：`model` 为合法 Provider.Model。
-后置条件：返回数组长度 ≥ 2；末元素恒为 `SHARED_BEHAVIOR`（常量，单一来源）；`[0]` 为该模型的既有模板（既有测试兼容）。
+后置条件：`systemSections` 返回数组长度 ≥ 2；末元素恒为 `SHARED_BEHAVIOR`（常量，单一来源）；`[0]` 为该模型的既有模板（既有测试兼容）。
 不变式：所有分支共享同一 `SHARED_BEHAVIOR` 引用。
 副作用：无。
 
@@ -89,7 +91,7 @@ default.txt / trinity.txt 删除三条硬规则（L18-19、L58、L68 与 trinity
 
 ### M3 `tool/agent.ts` 描述
 
-工具描述常量追加 "When to delegate" 节（§3 文本资产），与既有描述合并；不改变工具行为。
+~~工具描述常量追加 "When to delegate" 节~~（2026-10-18 复审 D13 撤销——见 §3 委派指导段；描述保持 #59 的纯机件口径）。
 
 ### M4 验证
 

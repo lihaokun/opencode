@@ -301,7 +301,6 @@ function llm() {
     Stream.Stream<LLMEvent, unknown> | ((input: LLM.StreamInput) => Stream.Stream<LLMEvent, unknown>)
   > = []
   const streamBatches: LLM.Interface["streamBatches"] = (input) => {
-    console.log("PROBE streamBatches called, queue len:", queue.length)
     const item = queue.shift() ?? Stream.empty
     const stream = typeof item === "function" ? item(input) : item
     return stream.pipe(Stream.mapEffect((event) => Effect.succeed([event])))

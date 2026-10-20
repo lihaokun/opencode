@@ -853,8 +853,9 @@ it.instance("loop delivers the shared working agreement on the wire", () =>
     // …and the dropped hard rules are gone from the wire too
     expect(wire).not.toContain("fewer than 4 lines")
     expect(wire).not.toContain("DO NOT ADD ***ANY***")
-    // delegation guidance lives in the agent tool description
-    expect(wire).toContain("When to delegate")
+    // #59: tool descriptions state mechanics, they do not prescribe workflow —
+    // the delegation prescription this PR once added is gone from the wire.
+    expect(wire).not.toContain("When to delegate")
   }),
 )
 

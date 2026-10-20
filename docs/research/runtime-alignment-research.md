@@ -287,7 +287,7 @@ P1 两项是**新能力/新契约**，走完整设计流程；本节只把"设�
 | 4 | C① structuredContent | 追加 + 判等去重 | **追加 + 判等去重**（`JSON.stringify(sc)` 与 content text 项严格相等则跳过；并入同一次 truncate） |
 | 5 | C③ 错误路径 | 拆独立 PR | **合并进投影 PR**（↑ 推翻倾向；catalog 与 code-mode 两处 throw 同修，修正方案文档单列小节评审） |
 | 6 | D① serialize 组织 | 抽 core helper | **抽 core helper**（头尾截断 + metadata 行进 core，两侧 import） |
-| 7 | E① 委派指导 | default 式（系统提示词） | **ZCode 式**（↑ 推翻倾向："何时委派"移入 agent 工具描述——三情形 + 边界 + 不重复劳动；系统提示词只留 agent_list/send/stop 等机件说明；10 模板委派段不一致随之消失） |
+| 7 | E① 委派指导 | default 式（系统提示词） | **ZCode 式 → 2026-10-18 复审 D13 再推翻**：移入工具描述的处方与 PR #59"agent 描述只讲机件不开处方"冲突，已从 `AGENT_DESCRIPTION` 撤销；委派机件说明保留在模板与描述中，委派时机不再有独立文本资产（恢复载体应为共享段） |
 | 8 | E①' 共享段位置 | request.ts 三元后 | **provider() 内 `[template, SHARED]`**（↑ 推翻倾向：三元替换语义实为正确的 opt-out——工具型 agent 自然豁免；§5.1 分析已同步修正；自定义任务 agent 的缺口记引入条件） |
 | 9 | E② 第一步刀法 | 最小刀法 | **最小刀法**（共享段 + 删 default/trinity 三条硬冲突；其余模板软性表述保留） |
 | 10 | F① 文件恢复来源 | 磁盘重读 | **磁盘重读**（read/edit metadata 取候选 + 最近排序 top-K + 版本比对 + tail 去重 + 失效降级） |

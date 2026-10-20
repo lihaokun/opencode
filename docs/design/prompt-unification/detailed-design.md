@@ -7,9 +7,9 @@
 ## 1. 范围
 
 - 新文本资产 `packages/opencode/src/session/prompt/shared-behavior.txt`
-- `session/system.ts`：`provider` 重构为单一返回表达式 `[template, PROMPT_SHARED]`
+- `session/system.ts`：~~`provider` 重构为单一返回表达式 `[template, PROMPT_SHARED]`~~（2026-10-18 复审 B7 修订：`provider` 保持早返回返回裸模板（AGENTS.md 风格）；新增 `systemSections(model)` = `[provider(model), PROMPT_SHARED]`，唯一 caller 是 `request.ts` 的 `preparePayload`）
 - `session/prompt/default.txt` 与 `trinity.txt`：按删除清单修剪
-- `tool/agent.ts`：`AGENT_DESCRIPTION` 追加 "When to delegate" 行
+- ~~`tool/agent.ts`：`AGENT_DESCRIPTION` 追加 "When to delegate" 行~~（2026-10-18 复审 D13 撤销：与 #59"描述只讲机件不开处方"原则冲突；wire 测试改为负向断言）
 - 测试：`system.test.ts` 新增断言（共享段全分支覆盖 + 模板删除规则 + 机件行保留）；`test/tool/__snapshots__/parameters.test.ts.snap` 若因描述变更产生 diff 则随行为变更更新（实施时核实）
 
 不覆盖：其余 8 份模板（非目标）、消息内注入通道（非目标）、`request.ts`（架构 I2/I3 保证不触碰）。
@@ -74,24 +74,18 @@
 | L89 | 删（同 default L85） |
 | L74 / L85-87 | **保留**（trinity 特有：one tool per message、question tool、防循环——非冲突规则） |
 
-### 5.3 agent.ts — AGENT_DESCRIPTION 追加
+### 5.3 agent.ts — ~~AGENT_DESCRIPTION 追加~~（D13 撤销）
 
-在行数组末尾（`nesting` 行之后）追加一行（与既有行风格一致）：
-
-```
-"- When to delegate: the task matches one of the available agent types, you have independent work that can run in parallel, or answering would mean reading across several files — delegate it and keep the conclusion, not the file dumps. For a single-fact lookup where you already know the file, symbol, or value, search directly. Once you have delegated a search, do not repeat it yourself — wait for the result",
-```
-
-正确性论证：trivial + 纯指导文本追加（无 schema/行为变更）；单一来源断言由 §5.4 的模板负向断言背书（default/trinity 不再含委派指导）。
+~~在行数组末尾追加 "When to delegate" 行~~。2026-10-18 复审核意见 D13：#59（agent 工具描述只陈述生命周期机件、不开用法处方）先于本子计划的既有契约，该行是用法处方，撤销。wire 测试（§5.4 第 4 条）对委派指导改负向断言；委派机件（异步返回、消息送达、agent_list）仍在描述与模板中，模型侧信息不缺失。
 
 ### 5.4 测试
 
 `system.test.ts` 追加：
 
-1. `appends the shared working agreement to every model template`：遍历分支模型 id（muse-spark / gpt-4 / gpt-6 / codex / gemini / claude / trinity / kimi / default）→ `const [template, shared] = SystemPrompt.provider(m)` → `shared` 以 `# Working agreement` 开头；`template` 不含三条硬规则字串。
+1. `appends the shared working agreement to every model template`：遍历分支模型 id（muse-spark / gpt-4 / gpt-6 / codex / gemini / claude / trinity / kimi / default）→ `SystemPrompt.systemSections(m)` → 末元素以 `# Working agreement` 开头；`[0]` 不含三条硬规则字串。
 2. `drops the hard brevity, no-explanation and no-comment rules from default and trinity`：import 两份 `.txt` → 逐条 `not.toContain`（`fewer than 4 lines` / `One word answers are best` / `just stop` / `DO NOT ADD ***ANY***` / `prefer to use the agent tool`）+ 正向 `toContain`（异步机件句 `Do not poll or ask an agent whether it has finished`）——负向证明删除、正向证明机件未误删。
-3. 快照核实：`test/tool/__snapshots__/parameters.test.ts.snap` 若含 agent 工具描述则随更新，理由"指导文本变更"（workflow 允许的用例随契约更新，更新记录在 devlog）。
-4. 端到端（`prompt.test.ts`，wire 级）：捕获 `llm.inputs` 请求体——default agent 断言共享段/委派指导在线上、被删规则不在；显式 `agent.prompt`（config 注入 marker prompt）断言整体替换后共享段与模型模板均不在载荷（I2 的线上背书）。
+3. 快照核实：`test/tool/__snapshots__/parameters.test.ts.snap` 若含 agent 工具描述则随更新（D13 后应回到 #59 基线）。
+4. 端到端（`prompt.test.ts`，wire 级）：捕获 `llm.inputs` 请求体——default agent 断言共享段在线上、被删规则与委派处方均不在；显式 `agent.prompt`（config 注入 marker prompt）断言整体替换后共享段与模型模板均不在载荷（I2 的线上背书）。
 
 ### 5.5 实施顺序
 
