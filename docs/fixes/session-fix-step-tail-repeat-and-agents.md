@@ -12,15 +12,15 @@
 
 fermat 主会话 `ses_eab1fbdaaffehPhBL8zpBtj52H`（volce `glm-5.3-flash`，`opencode --auto`，`1.18.31-fmv3-pr59.2`），2026-10-20 22:09:59–22:41:33：
 
-| 项目 | 数值 |
-|---|---|
-| 同一次 run 内的步数 | step 5 → 187，期间无新消息、无 run 重启 |
-| 每步内容 | 只有一个 Edit，输入逐字相同，`oldString == newString` |
-| 每步结果 | `No changes to apply: oldString and newString are identical.` |
-| API 调用 | 178 次（日志 `stream` 178、助手消息 178、step-finish 178） |
-| 每次上下文 | 83.9–86.9 万 token；每次输出均为同样的 152 token，推理 0 token |
-| 合计发送 | 1.52 亿 token，约 31 分钟 |
-| `doom_loop` 记录 | 0 |
+| 项目                | 数值                                                           |
+| ------------------- | -------------------------------------------------------------- |
+| 同一次 run 内的步数 | step 5 → 187，期间无新消息、无 run 重启                        |
+| 每步内容            | 只有一个 Edit，输入逐字相同，`oldString == newString`          |
+| 每步结果            | `No changes to apply: oldString and newString are identical.`  |
+| API 调用            | 178 次（日志 `stream` 178、助手消息 178、step-finish 178）     |
+| 每次上下文          | 83.9–86.9 万 token；每次输出均为同样的 152 token，推理 0 token |
+| 合计发送            | 1.52 亿 token，约 31 分钟                                      |
+| `doom_loop` 记录    | 0                                                              |
 
 **最小复现**（脚本化 LLM，`test/session/prompt.test.ts` 的 `useServerConfig` 夹具）：
 
@@ -36,12 +36,12 @@ fermat 主会话 `ses_eab1fbdaaffehPhBL8zpBtj52H`（volce `glm-5.3-flash`，`ope
 
 本机主会话 `ses_f0d514ecbffewBeKO9m9H1ND2W`，自 2026-10-18 23:35 压缩以来：
 
-| 项目 | 数值 |
-|---|---|
-| 主 agent 调用 agent_send | 429 次 |
+| 项目                                   | 数值                            |
+| -------------------------------------- | ------------------------------- |
+| 主 agent 调用 agent_send               | 429 次                          |
 | 发出时目标的结束报告已到、本步尚未看到 | 35 次（8%），报告早到 0.2–61 秒 |
-| 直接子 agent | 394 个 |
-| 调用 agent_list | 1 次；返回 290 行、48,599 字符 |
+| 直接子 agent                           | 394 个                          |
+| 调用 agent_list                        | 1 次；返回 290 行、48,599 字符  |
 
 **最小复现**：父 agent 某一步开始后，子 agent 的 run 结束、结束报告写入；父 agent 在同一步内对该子 agent 调 agent_send。下一步父 agent 看到的记录顺序是"自己的 agent_send → 结束报告"，且两者都不带 run 身份与时间，无法判断报告属于哪一次 run。
 
@@ -56,12 +56,12 @@ fermat 主会话 `ses_eab1fbdaaffehPhBL8zpBtj52H`（volce `glm-5.3-flash`，`ope
 
 ### 1.4 预期与实际
 
-| 场景 | 预期 | 实际 |
-|---|---|---|
-| 一次返回内重复调用 | 第 3 个起不执行，以错误返回 | 询问被自动放行，全部执行 |
-| 跨步原样重复 | 模型每步看到"已重复 N 次"的事实 | 无任何信号，上下文每步只追加同样的一对调用与报错 |
-| 结束报告与 agent_send | 带 run 编号与时间，可判断先后 | 不带，只能靠记录顺序，而顺序在竞态下是反的 |
-| 查看子 agent | 可查单个、可过滤 | 只能整表输出 |
+| 场景                  | 预期                            | 实际                                             |
+| --------------------- | ------------------------------- | ------------------------------------------------ |
+| 一次返回内重复调用    | 第 3 个起不执行，以错误返回     | 询问被自动放行，全部执行                         |
+| 跨步原样重复          | 模型每步看到"已重复 N 次"的事实 | 无任何信号，上下文每步只追加同样的一对调用与报错 |
+| 结束报告与 agent_send | 带 run 编号与时间，可判断先后   | 不带，只能靠记录顺序，而顺序在竞态下是反的       |
+| 查看子 agent          | 可查单个、可过滤                | 只能整表输出                                     |
 
 ## 第二部分：根因分析
 
@@ -123,11 +123,11 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 
 ### 3.3 与上游 #3445 在 1.1 输入上的差异
 
-| 调用 | 上游 #3445 | 本 fork 现状（#22） | 本修复 |
-|---|---|---|---|
-| 第 1 步 Edit | 当前消息只有 1 个部件，不比较 | 新检测器，签名数 1 | 无上一步，计数 0 |
-| 第 2 步 Edit | 同上 | 新检测器，签名数 1 | 调用相同、结果相同，计数 1/1 |
-| 第 k 步 Edit | 同上 | 同上 | 计数 k−1，第 k+1 步请求末尾附带 |
+| 调用         | 上游 #3445                    | 本 fork 现状（#22） | 本修复                          |
+| ------------ | ----------------------------- | ------------------- | ------------------------------- |
+| 第 1 步 Edit | 当前消息只有 1 个部件，不比较 | 新检测器，签名数 1  | 无上一步，计数 0                |
+| 第 2 步 Edit | 同上                          | 新检测器，签名数 1  | 调用相同、结果相同，计数 1/1    |
+| 第 k 步 Edit | 同上                          | 同上                | 计数 k−1，第 k+1 步请求末尾附带 |
 
 首个差异出现在第 2 步：现有实现的状态在步间被丢弃。
 
@@ -159,6 +159,7 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
   ```
 
   `resultRepeat = 0` 时后半句改为 `the results differed.`
+
 - 不设上限，不结束 run，不拦截。
 - 已知局限：只比较相邻两步，交替循环（失败编辑 → 读文件 → 失败编辑）不计数。
 
@@ -257,19 +258,19 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 
 ## 第七部分：代码更新清单（计划）
 
-| 文件 | 改动 |
-|---|---|
-| `packages/opencode/src/session/prompt.ts` | 末尾段组装；跨步计数状态；run 记录的开始与结束 |
-| `packages/opencode/src/session/step-tail.ts`（新） | 末尾段的纯函数：计数更新、各节渲染 |
-| `packages/opencode/src/session/tools.ts` | 一步内检测器；执行包装中的拒绝 |
-| `packages/opencode/src/session/processor.ts` | 删除检测器与 `doom_loop` 询问 |
-| `packages/opencode/src/provider/transform.ts` | 缓存断点跳过末尾段 |
-| `packages/opencode/src/agent-management/inbox.ts` | agent 消息打标记 |
-| `packages/opencode/src/agent-management/schema.ts` | `agentRun` 元数据键与类型 |
-| `packages/opencode/src/agent-management/delegation.ts` | 报告属性与摘要 |
-| `packages/opencode/src/tool/agent.ts` | agent_send 返回、agent_list 参数、agent_status、描述 |
-| `packages/opencode/src/tool/registry.ts` | 注册 agent_status 并跟随 agent_list 的可见性 |
-| 测试 | `test/session/step-tail.test.ts`（新）、`prompt.test.ts`、`processor-effect.test.ts`、`doom-loop.test.ts`、agent-management 相关测试 |
+| 文件                                                   | 改动                                                                                                                                 |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `packages/opencode/src/session/prompt.ts`              | 末尾段组装；跨步计数状态；run 记录的开始与结束                                                                                       |
+| `packages/opencode/src/session/step-tail.ts`（新）     | 末尾段的纯函数：计数更新、各节渲染                                                                                                   |
+| `packages/opencode/src/session/tools.ts`               | 一步内检测器；执行包装中的拒绝                                                                                                       |
+| `packages/opencode/src/session/processor.ts`           | 删除检测器与 `doom_loop` 询问                                                                                                        |
+| `packages/opencode/src/provider/transform.ts`          | 缓存断点跳过末尾段                                                                                                                   |
+| `packages/opencode/src/agent-management/inbox.ts`      | agent 消息打标记                                                                                                                     |
+| `packages/opencode/src/agent-management/schema.ts`     | `agentRun` 元数据键与类型                                                                                                            |
+| `packages/opencode/src/agent-management/delegation.ts` | 报告属性与摘要                                                                                                                       |
+| `packages/opencode/src/tool/agent.ts`                  | agent_send 返回、agent_list 参数、agent_status、描述                                                                                 |
+| `packages/opencode/src/tool/registry.ts`               | 注册 agent_status 并跟随 agent_list 的可见性                                                                                         |
+| 测试                                                   | `test/session/step-tail.test.ts`（新）、`prompt.test.ts`、`processor-effect.test.ts`、`doom-loop.test.ts`、agent-management 相关测试 |
 
 ## 第八部分：文档更新清单（计划）
 
