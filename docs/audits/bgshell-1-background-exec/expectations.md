@@ -20,7 +20,7 @@
 | 字段 | 类型 | 契约来源 | 实现位置 | 一致性机制 |
 |---|---|---|---|---|
 | bash `run_in_background` | `boolean?`（缺省 false） | 细化 §4 | `tool/shell.ts` Parameters + wire 快照 | `parameters.test.ts.snap` |
-| `task_id`（工具返回文本内） | `` `shell_${uuid}` `` | 细化 §5.1 | backgroundRun | 正则测试断言 |
+| `task_id`（**返回 metadata + 文本双承载**；2026-10-20 独立审 ❌-4 修复：metadata 原缺 task_id/status，已补 `{ task_id, status: "running" }`——初版 expectations 按实现抽成"仅文本"，未标注与细化 §5.1 的冲突，属抽取错误，已更正） | `` `shell_${uuid}` `` | 细化 §5.1 | backgroundRun 返回 | metadata 断言 + 正则测试 |
 | `BackgroundJob.start` `metadata.sessionId` | `SessionID`（2026-10-18 A2 修订新增） | 细化 §4 | backgroundRun | shell-background.test（cancel 路径） |
 | shell_output `task_id` / `tail_lines` | `string?` / `number?`（默认 200） | 细化 §4 | ShellOutputTool | 直接调用测试 |
 | shell_kill `task_id` | `string` | 细化 §4 | ShellKillTool | 直接调用测试 |
@@ -32,7 +32,7 @@
 |---|---|---|
 | job status | `running \| completed \| error \| cancelled` | `BackgroundJob`（既有，只消费） |
 | job type | `"shell"`（本 feature 新增值；`"agent"` 为既有值） | 细化 §4 |
-| 完成通知 status 行 | `exit N` \| `error: <msg>` \| `terminated` | 细化 §5.4 |
+| 完成通知 status 行 | `exit N` \| `error: <msg>` \| `terminated`（细化 §5.4 原文 "killed" 措辞废弃——取消路通知被有意抑制不发送，见 P9；2026-10-20 勘误） | 细化 §5.4 |
 
 ## 4. 流程步骤（机械化）
 
@@ -43,7 +43,7 @@
 - P5 工具立即返回 task_id + 指引文本
 - P6 run 内：spawn → 流累积（appendCapped）→ exitCode await
 - P7 run 内末尾：完成通知 deliverAsync（`[shell task finished] <task_id> <command> · <status>` + 尾部）→ `Effect.ignore`
-- P8 run 结算（成功/失败/中断三路）：`shellTasks.delete`
+- P8 run 结算：`shellTasks.delete`（2026-10-20 独立审 ❌-3 修复：原实现 delete 在 run body 内，中断路被跳过、条目按取消次数泄漏；已改 `Effect.ensuring` 三路均达）
 - P9 会话级 cancel 级联经 `metadata.sessionId` 命中 shell job（agent_stop / runState.cancel）
 
 ## 5. 行为契约（语义）
@@ -52,8 +52,11 @@
 - 后台任务完成**投递消息唤醒**，模型不轮询（G4）
 - 通知投递失败不影响任务状态（`Effect.ignore`）
 - 取消的会话不再收到完成通知（A2 修订语义）
+- **结算后 shell_output 报告真实退出码**（2026-10-20 独立审 ❌-1 修复：settle 输出以 status 行打头，回退分支解析之——原实现把 completed 一律渲染成 "exit 0"，非零退出被伪造为成功；已补非零退出回归）
+- **shell_kill 幂等**（2026-10-20 独立审 ❌-2 修复：已结算任务经 BackgroundJob 快照应答 "already settled"，不再抛 unknown task；属主校验经 metadata.sessionId）
 - `shell_output` 对已删除条目回退 BackgroundJob 快照（A3 修订语义）；`unknown task` 可诊断
 - buffer 有界（超长输出不留全部——A3）
+- 工具描述/返回文本说明重启丢任务（2026-10-20 独立审 ❌-5 修复：run_in_background 返回文本已补）
 
 ## 6. 时序/状态契约
 

@@ -42,7 +42,7 @@
 const shellTasks = new Map<string, { command: string; sessionID: SessionID; buffer: string; startedAt: number }>()
 ```
 
-生命周期：后台启动时建；buffer 为**有界尾部**（`BACKGROUND_BUFFER_MAX_CHARS = 200_000`，超限从头丢弃——所有读者都只读尾部，保留更多纯属内存泄漏面）；run 结算（成功/失败/中断三路）后从 Map 删除（终值输出已随 settle 进入 `job.info.output`，完成通知也已投递；shell_output 对已删除条目回退读 BackgroundJob 快照）。复审修订（2026-10-18，PR #60 审核意见 A3）：初版"不删 + 无界 buffer"会在长 run 中累积超长输出与每任务一条的残留条目，已按有界尾部 + 结算清理修正。
+生命周期：后台启动时建；buffer 为**有界尾部**（`BACKGROUND_BUFFER_MAX_CHARS = 200_000`，超限从头丢弃——所有读者都只读尾部，保留更多纯属内存泄漏面）；run 结算（成功/失败/中断三路——delete 挂 `Effect.ensuring`，中断路也必达；2026-10-20 独立审 ❌-3 修复）后从 Map 删除。**settle 输出以 status 行打头**（`exit N` / `error: …` / `terminated`），`job.info.output` 因此携带真实退出码——shell_output 的结算后回退分支解析该行报告真实 code，不猜测（2026-10-20 独立审 ❌-1 修复：原实现把 completed 一律渲染成 "exit 0"）。shell_kill 对已结算任务经快照幂等应答（❌-2）。。复审修订（2026-10-18，PR #60 审核意见 A3）：初版"不删 + 无界 buffer"会在长 run 中累积超长输出与每任务一条的残留条目，已按有界尾部 + 结算清理修正。
 
 **BackgroundJob 注册**：`type: "shell"`、`title: command 前 80 字符`、`metadata: { sessionId: ctx.sessionID }`（与 agent 委派同形——cancelBackgroundJobs 的会话级联经此匹配，agent_stop/中断可达后台进程；复审修订 A2）、run 返回**全量累计输出**（settle 后进 `job.info.output`）。
 

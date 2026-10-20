@@ -245,6 +245,86 @@ it.instance("buffer is capped and the task entry is cleaned up after the run set
   }),
 )
 
+// The post-settle fallback reports the REAL exit code: the settle output leads
+// with the status line precisely so the fallback never has to guess. A non-zero
+// exit displayed as "exit 0" would make the model read a failure as success.
+it.instance("shell_output after settle reports the real non-zero exit code", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const started = yield* tools.shell.execute(
+      { command: `bun -e "console.log('seven'); process.exit(7)"`, run_in_background: true },
+      makeCtx(),
+    )
+    const taskId = /shell_[^\s\]]+/.exec(started.output)![0]
+    const bg = yield* BackgroundJob.Service
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const job = yield* bg.get(taskId)
+      if (job && job.status !== "running") break
+      yield* Effect.sleep(50)
+    }
+
+    const final = (yield* tools.output.execute({ task_id: taskId }, makeCtx())) as { output: string }
+    expect(final.output).toContain("status: exit 7")
+    expect(final.output).not.toContain("exit 0")
+    expect(final.output).toContain("seven")
+  }),
+)
+
+// Killing cancels the run fiber mid-flight, so the entry cleanup must survive
+// the interruption: one cancelled task, one removed entry — no leak.
+it.instance("shell_kill cleans the registry entry; killing a settled task is idempotent", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const started = yield* tools.shell.execute(
+      { command: `bun -e "console.log('kill-marker'); await Bun.sleep(30_000)"`, run_in_background: true },
+      makeCtx(),
+    )
+    const taskId = /shell_[^\s\]]+/.exec(started.output)![0]
+    yield* waitUntilOutput(tools.output, makeCtx(), taskId, "kill-marker")
+
+    yield* tools.kill.execute({ task_id: taskId }, makeCtx())
+    // Settled (as cancelled) — the entry is gone even though the run was
+    // interrupted before reaching its own cleanup.
+    const bg = yield* BackgroundJob.Service
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const job = yield* bg.get(taskId)
+      if (job && job.status !== "running") break
+      yield* Effect.sleep(50)
+    }
+    expect((yield* bg.get(taskId))?.status).toBe("cancelled")
+
+    // Idempotent kill: a settled task answers from its snapshot instead of
+    // erroring with "unknown task".
+    const again = yield* tools.kill.execute({ task_id: taskId }, makeCtx())
+    expect(again.output).toContain("already settled (cancelled)")
+  }),
+)
+
+// The start result carries the task handle in metadata for programmatic
+// consumers (detailed-design §5.1): the text is for the model, the metadata
+// is the interface.
+it.instance("start result metadata carries task_id and running status", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const started = yield* tools.shell.execute(
+      { command: `bun -e "await Bun.sleep(500)"`, run_in_background: true },
+      makeCtx(),
+    )
+    const taskId = /shell_[^\s\]]+/.exec(started.output)![0]
+    expect(started.metadata).toMatchObject({ task_id: taskId, status: "running" })
+    expect(started.output).toContain("a restart loses them")
+    const bg = yield* BackgroundJob.Service
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const job = yield* bg.get(taskId)
+      if (job && job.status !== "running") break
+      yield* Effect.sleep(50)
+    }
+  }),
+)
+
 it.instance("shell_output reports unknown tasks diagnosably", () =>
   Effect.gen(function* () {
     const tools = yield* initTools

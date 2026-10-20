@@ -1,4 +1,5 @@
 import { Cause, Effect, Exit, Option, Schema, Stream } from "effect"
+import { PositiveInt } from "@opencode-ai/core/schema"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import { randomUUID } from "node:crypto"
@@ -695,12 +696,17 @@ export const ShellTool = Tool.define(
             })
             .pipe(Effect.ignore)
         }
-        // Runs on every exit path — success, failure, interruption — so the
-        // registry never outlives the process it describes.
-        yield* Effect.sync(() => shellTasks.delete(taskId))
         if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause)
-        return entry.buffer
-      })
+        // The settle output leads with the status line: BackgroundJob.Info has
+        // no exit-code field, and this is what lets shell_output's post-settle
+        // fallback report the REAL exit code instead of guessing.
+        return `${status}\n${entry.buffer}`
+      }).pipe(
+        // Interrupting the run fiber (shell_kill, session cancel) skips the
+        // body above, so the registry entry would leak one per cancelled task.
+        // ensuring runs on every exit — interruption included.
+        Effect.ensuring(Effect.sync(() => shellTasks.delete(taskId))),
+      )
 
       const info = yield* background.start({
         id: taskId,
@@ -715,11 +721,14 @@ export const ShellTool = Tool.define(
       })
       return {
         title: input.command.slice(0, 80),
-        metadata: { output: "", exit: null, truncated: false },
+        // task_id/status ride the metadata too (detailed-design §5.1): the
+        // text is for the model, the metadata is the programmable surface —
+        // UI/SDK consumers read it from the tool part without parsing prose.
+        metadata: { task_id: info.id, status: "running", output: "", exit: null, truncated: false },
         output: [
           `[shell task ${info.id}] started in the background: ${input.command}`,
           ``,
-          `Output and completion arrive as a message when it finishes; read interim output with shell_output (task_id: ${info.id}). The timeout parameter does not apply to background tasks.`,
+          `Output and completion arrive as a message when it finishes; read interim output with shell_output (task_id: ${info.id}). The timeout parameter does not apply to background tasks. Note: background tasks live with this process — a restart loses them.`,
         ].join("\n"),
       }
     })
@@ -792,7 +801,7 @@ export const ShellOutputTool = Tool.define(
         task_id: Schema.optional(
           Schema.String.annotate({ description: "Background shell task id; defaults to the most recent one" }),
         ),
-        tail_lines: Schema.optional(Schema.Number).annotate({
+        tail_lines: Schema.optional(PositiveInt).annotate({
           description: "How many trailing output lines to show (default 200)",
         }),
       }),
@@ -814,11 +823,18 @@ export const ShellOutputTool = Tool.define(
           // the status, and the output tail lives in the delivered message and
           // the tool part from then on.
           if (!entry && job) {
-            const status = job.status === "running" ? "running" : job.status
+            // Settled runs drop their registry entry; the job snapshot still
+            // has the status, and the settle output leads with the status
+            // line, so the exit code reported here is the real one — never a
+            // guessed exit 0.
+            const settled = job.output?.split("\n", 1)[0]
+            const status = job.status === "running" ? "running" : (settled ?? job.status)
+            const outputTail = job.output ? job.output.slice(job.output.indexOf("\n") + 1) : undefined
             const output = [
               `[shell task ${id}] ${job.title ?? ""}`.trim(),
-              `status: ${status === "completed" ? `exit 0${job.output ? `\n${tailOf(job.output, params.tail_lines ?? 200)}` : ""}` : status}`,
-              ...(status === "completed" ? [] : [`(output tail no longer buffered; see the completion message)`]),
+              `status: ${status}`,
+              ...(outputTail && status !== "running" ? [tailOf(outputTail, params.tail_lines ?? 200)] : []),
+              ...(status === "running" ? [] : job.output ? [] : [`(output tail no longer buffered; see the completion message)`]),
             ].join("\n")
             return {
               title: (job.title ?? id).slice(0, 80),
@@ -865,8 +881,22 @@ export const ShellKillTool = Tool.define(
       }),
       execute: (params: { task_id: string }, ctx: Tool.Context) =>
         Effect.gen(function* () {
+          // Idempotent (detailed-design §5.3): an already-settled task has no
+          // registry entry, but its BackgroundJob snapshot answers — killing a
+          // finished task reports what happened instead of erroring.
           const entry = shellTasks.get(params.task_id)
-          if (!entry || entry.sessionID !== ctx.sessionID) throw new Error(`unknown task: ${params.task_id}`)
+          if (!entry) {
+            const job = yield* background.get(params.task_id).pipe(Effect.orElseSucceed(() => undefined))
+            if (!job || job.metadata?.sessionId !== ctx.sessionID) {
+              throw new Error(`unknown task: ${params.task_id}`)
+            }
+            return {
+              title: (job.title ?? params.task_id).slice(0, 80),
+              metadata: { task_id: params.task_id, status: job.status },
+              output: `[shell task ${params.task_id}] already settled (${job.status})${job.output ? `\n${tailOf(job.output, 50)}` : ""}`,
+            }
+          }
+          if (entry.sessionID !== ctx.sessionID) throw new Error(`unknown task: ${params.task_id}`)
           const info = yield* background.cancel(params.task_id)
           const status = info?.status ?? "cancelled"
           return {
