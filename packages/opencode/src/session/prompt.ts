@@ -1578,25 +1578,24 @@ const layer = Layer.effect(
     })
 
     /**
-     * Whether any agent below this one is still going. Busy by status, or
-     * started as a job that has not reached busy yet: the agent tool registers
-     * the job synchronously, and the status flips a few ticks later in the
-     * forked fiber, so a parent stopping right after starting one must not
-     * read it as finished.
-     */
-    /**
-     * Whether any agent below this one is still going. Busy by status, or
-     * started as a job that has not reached busy yet: the agent tool registers
-     * the job synchronously, and the status flips a few ticks later in the
-     * forked fiber, so a parent stopping right after starting one must not
-     * read it as finished. A background shell counts for the session that owns
-     * it (#53): its completion message wakes that session for another turn, so
-     * a run that stops while one is running has not finished its work.
+     * Whether this agent or any agent below it is still going. The session
+     * itself counts when it owns a running background shell (#53): the shell's
+     * completion message wakes it for another turn, so a run that stops while
+     * one is running has not finished its work. Descendants count when busy by
+     * status, or started as a job that has not reached busy yet: the agent tool
+     * registers the job synchronously, and the status flips a few ticks later
+     * in the forked fiber, so a parent stopping right after starting one must
+     * not read it as finished. Their background shells count the same way.
      */
     const hasLiveDescendant = Effect.fn("SessionPrompt.hasLiveDescendant")(function* (id: SessionID) {
       const members = yield* agentTree.descendants(id, 0)
       const busy = yield* status.list()
-      const running = (yield* background.list()).filter((job) => job.status === "running")
+      // The session's own agent job (type "agent", id = its SessionID) is still
+      // running while reportRunEnd executes inside it, so only shell jobs count
+      // for the self side — an agent job is ending by definition here.
+      const running = (yield* background.list()).filter(
+        (job) => job.status === "running" && (job.type === "shell" || job.id !== id),
+      )
       if (running.some((job) => job.metadata?.sessionId === id)) return true
       if (members.length === 0) return false
       if (members.some((member) => busy.has(member.session_id))) return true

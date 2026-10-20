@@ -2317,7 +2317,7 @@ itCompaction.instance(
           input: { filePath: spec },
           output: "read spec.md",
           title: "spec.md",
-          metadata: { display: { path: spec } },
+          metadata: { display: { type: "file", path: spec } },
           time: { start: 0, end: 1 },
         },
       })

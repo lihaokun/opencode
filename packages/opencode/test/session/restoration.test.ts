@@ -88,7 +88,7 @@ const seedRestorable = Effect.fn("test.seedRestorable")(function* (
       input: { filePath },
       output: `read ${filePath}`,
       title: filePath,
-      metadata: { display: { path: filePath } },
+      metadata: { display: { type: "file", path: filePath } },
       time: { start: 0, end: 1 },
     },
   })
@@ -293,7 +293,7 @@ it.instance("apply writes one restoration part and stays idempotent", () =>
         input: { filePath: `${dir}/body.txt` },
         output: `read ${dir}/body.txt`,
         title: "body.txt",
-        metadata: { display: { path: `${dir}/body.txt` } },
+        metadata: { display: { type: "file", path: `${dir}/body.txt` } },
         time: { start: 0, end: 1 },
       },
     })
