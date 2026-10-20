@@ -18,7 +18,7 @@
 
 | 项 | 核实结果 | 复用方式 |
 |---|---|---|
-| H1 路径字段 ★ | read → `metadata.display.path`（`read.ts:288-295`）；edit → `metadata.filepath`（`edit.ts:107,150`） | collect 的候选提取 |
+| H1 路径字段 ★（2026-10-20 独立审 B5 同步修订） | read → `metadata.display.path` 且仅 `display.type === "file"`（`read.ts:288-298` 目录读取同形 type:"directory"，须过滤）；edit → **`metadata.filediff.file`**（`edit.ts:181-211`——初稿的 `metadata.filepath` 是 permission request 的 metadata 形状，edit **result** metadata 从未含 filepath，按初稿实现 edit 候选恒空） | collect 的候选提取 |
 | H3 tail 重建 ★ | `Session.messages({sessionID})` 返回全量 `WithParts[]`（`session.ts:536`）；tail 体量受 preserve_recent 预算（2k~15k token）约束，全量读取后切片成本同阶 | `buildTailText` |
 | skill 定位 ★ | skill tool part `metadata: { name, dir }`（`skill.ts:62-65`）；`Skill.Service` 可按 name 解析 `info.location` | materialize 的 skill 正文重读 |
 | synthetic part ★ | `{ id, messageID, sessionID, type: "text", text, synthetic: true }` 经 `sessions.updatePart` + push 入 `userMessage.parts`（`reminders.ts:138-151`）；哨兵前缀 + `findLast` + 逐字节比较的去重先例 | apply 的写入与去重 |
@@ -91,7 +91,7 @@ restoration: Schema.optional(Schema.Struct({
 - **调用关系**：callers: apply；callees: 无。
 - **实现思路**：
   1. 正向遍历全部 parts，维护 `Map<(kind,ref), lastUseSeq>`（seq 用 PartID/单调序号——取 part 的持久化顺序，实现用遍历计数器）
-  2. tool completed part 且 `tool === "read"` → `metadata.display?.path` → file 候选；`tool === "edit"` → `metadata.filepath` → file 候选；`tool === "skill"` → `metadata.name` → skill 候选
+  2. tool completed part 且 `tool === "read"` → `display.type === "file"` 时取 `metadata.display.path`（目录读取过滤掉）；`tool === "edit"` → `metadata.filediff.file`（2026-10-20 B5 同步修订，理由见 §2 H1 行）；`tool === "skill"` → `metadata.name` → skill 候选
   3. `todos.length > 0` → push todo 候选（固定 ref `"todo"`，lastUseSeq = 最大遍历计数）
   4. Map → 数组，按 lastUseSeq 降序
 - **退出覆盖**：纯函数，仅正常返回；metadata 缺字段（如 `display` undefined）→ 跳过该 part（不产生候选）。
@@ -122,8 +122,8 @@ restoration: Schema.optional(Schema.Struct({
 - **调用关系**：callers: apply；callees: Token.estimate。
 - **实现思路**：
   1. 过滤：`max_files` 对 file 类 `inlined` 候选取前 N（排序已在 collect 保证按最近）
-  2. 组装三节：Files（inlined 的 `### file: path` + content 围栏）/ Skills / Todos；reference/missing/skipped-budget 以单行引用形式列入对应节（`- path (reason)`）
-  3. 顺序累加，累计 token 估算超过 `budget_tokens` 时：当前候选降级为 `skipped-budget` 引用行（引用行本身计入预算），后续全部同样降级
+  2. 组装三节：Files（inlined 的 `### file: path` + content 围栏）/ Skills / Todos；reference/missing/skipped-budget 以单行引用形式集中列入 **`## Not restored` 节**（2026-10-20 独立审同步：初稿"列入对应节"，实现为独立降级节——展示形状以实现为准）
+  3. 顺序累加，累计 token 估算超过 `budget_tokens` 时：当前候选降级为 `skipped-budget` 引用行，后续全部同样降级（2026-10-20 独立审口径修订：~~引用行本身计入预算~~ → 仅 inlined content 计入 `used`；引用行约 15-30 token/条，不记账的方向是"多注入"而非"丢失"，G3 实质不受影响，按实现口径修文档）
   4. 整体无任何节有内容 → 返回 `undefined`
   5. 输出 = `RESTORATION_SENTINEL` 行 + 三节 markdown
 - **退出覆盖**：`undefined`（无材料）与文本两种返回。

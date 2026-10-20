@@ -9,7 +9,7 @@
 
 - schema 仅 `pattern/path/include`；固定 `limit: 100`；输出格式固定为 content 行（`Found N matches…\n path:\n  Line X: text`）
 - `Ripgrep.Service.grep` 是刻意薄的执行适配器（接口注释："deliberately exposes raw process-oriented rows"）——接受 `GrepInput {cwd, pattern, file?, include?, limit}`，内部拼 `rg --json --hidden --no-messages [--glob=…] -- pattern <path>`
-- 扩展点清晰：扩 `GrepInput` + args 构造即可；上下文行、计数、文件列表、大小写、偏移全部是 **rg 原生 flag**（`-A/-B/-C`、`--count-matches`、`--files-with-matches`、`-i`、`--offset`），无需新依赖
+- 扩展点清晰：扩 `GrepInput` + args 构造即可；上下文行、计数、文件列表、大小写是 **rg 原生 flag**（`-A/-B/-C`、`--count-matches`、`--files-with-matches`、`-i`）；~~偏移~~ **2026-10-20 独立审清扫**：rg 无 `--offset` flag（细化 §0 已实证），偏移由服务层切片实现——本行初稿与细化 §0 及决策 3 矛盾，以细化为准
 - 非法表达式已有专门错误通道（`Ripgrep.InvalidPatternError` → 工具 error）✓；无匹配已有区分（"No files found"）✓；缺的是**输出模式、上下文行、分页**
 
 **参照（ZCode `contracts/src/tools/grep.ts`）**：`output_mode(content|files_with_matches|count)`、`-A/-B/-C/context`、`-n`、`-i`、`-o`、`type`、`head_limit`、`offset`、`multiline`；输出回显 `[Showing results with pagination = limit: N, offset: M]` 并返回 `truncated/appliedLimit/appliedOffset`。
@@ -22,7 +22,7 @@
 - **G2 上下文行**：content 模式下可取匹配行的前后文（`before`/`after`/`context`，上限 10 行）
 - **G3 分页**：`head_limit`（默认 100，兼容现状）+ `offset`；**显式区分**无匹配、分页越界、仍有余量三种结局（issue 验收第 8 条）
 - **G4 大小写**：`insensitive` 开关（rg `-i`）
-- **G5 兼容**：全部新参数 optional；不传时输出与现状**逐字节一致**（P0-1/P0-3 的退出码与摘要行为不受影响）
+- **G5 兼容**：全部新参数 optional；不传时输出与现状**结构一致**（2026-10-20 独立审修订：截断尾行文案被分页状态行取代——旧行文 exactly-100 误报缺陷顺带修复；P0-1/P0-3 的退出码与摘要行为不受影响）
 
 **非目标（记录理由与引入条件）**
 
@@ -66,7 +66,7 @@ grep tool execute
 
 ### M1 `core/ripgrep.ts`（执行适配器扩展）
 
-`GrepInput` 扩展 + args 构造 + 两种新解析器（files 行、count 行，均为 rg `--json` 之外的简单文本行——**决策：files/count 模式不走 --json**，rg 的 `--files-with-matches`/`--count-matches` 原生输出是纯文本行，逐行解析即可，复用 `run` 的行解析骨架）。`--offset` 为 rg 原生 flag，服务内不需要 slice。
+`GrepInput` 扩展 + args 构造 + 两种新解析器（files 行、count 行，均为 rg `--json` 之外的简单文本行——**决策：files/count 模式不走 --json**，rg 的 `--files-with-matches`/`--count-matches` 原生输出是纯文本行，逐行解析即可，复用 `run` 的行解析骨架）。~~`--offset` 为 rg 原生 flag，服务内不需要 slice~~（**2026-10-20 独立审清扫**：rg 15.1.0 无 `--offset`，与细化 §0 实证矛盾；实际实现即服务层 `take(limit+offset+1)` + slice，见决策 3）。
 
 ### M2 `tool/grep.ts`（工具层）
 
@@ -74,19 +74,21 @@ schema 扩展 + 校验（context 上限 10、mode 与 context 互斥说明）+ �
 
 ### M3 测试
 
-- 单元：渲染三分支 + 越界 + hasMore + 默认参数逐字节兼容（不传新参数 → 输出与改前一致，快照对照）
+- 单元：渲染三分支 + 越界 + hasMore + 默认参数兼容（不传新参数 → args 与渲染结构与改前一致；**截断尾行文案例外，见 G5 修订**）
 - 集成：临时目录真文件上跑 rg（content/context/files/count/insensitive/offset 各一 + 非法表达式 + 分页越界）
 - 既有 grep 测试不破坏（若有）
 
+> **2026-10-20 独立审补充（§6.5 路径 B）**：细化 §5.4 点名的"非法表达式回归"与"真 rg 窗口边界"两测试实施时遗漏（前者 commit message 曾误称已含），已在修复批次补齐。
+
 ## 5. 接口规约（§3.3）
 
-**接口：tool/grep.ts → Ripgrep.Service**：`GrepInput` 扩展为超集；服务责任：按 mode 选择 rg 形态并返回对应行；非法 pattern 仍走 `InvalidPatternError`；limit 语义 = 本页条目数（服务内完成 offset 跳过）。
+**接口：tool/grep.ts → Ripgrep.Service**：`GrepInput` 扩展为超集；服务责任：按 mode 选择 rg 形态并返回对应行 + **全量条目计数 `total`**（非页切片长度——越界文案引用的是全量）；非法 pattern 仍走 `InvalidPatternError`；limit 语义 = 本页条目数（服务内完成 offset 跳过）。
 
-**接口：模型 → grep 工具**：新参数全 optional；缺省行为与旧版逐字节一致（G5/I1）。
+**接口：模型 → grep 工具**：新参数全 optional；`offset`/`head_limit` 有 schema 级非负/正整数约束。缺省行为与旧版兼容（G5/I1，**修订**见下）。
 
 ## 6. 关键设计决策
 
-1. **默认模式 = content 且逐字节兼容**：不传新参数 = 现行为，存量会话/摘要不受影响（I1）。
+1. **默认模式 = content 且兼容**（**2026-10-20 独立审修订**：*"逐字节一致"收窄为"结构兼容"*）：不传新参数时 rg args 与渲染结构与现状一致；例外是 **≥limit 截断时的尾行文案被分页状态行取代**（旧 `Found N matches (more matches available)` + `(Results truncated…)` 的尾缀组合 → `(more results available; increase offset to N)`）——旧行文在 exactly-100 条时会误报截断，新状态行顺带修复该缺陷；存量会话中该文案只出现在截断场景，摘要投影不受影响（I1 以"默认路径零新 args + 渲染结构不变"为准，文案字面除外）。
 2. **分页做在条目级**（匹配行/文件），`head_limit` 缺省 100 与现状一致；"仍有余量"用取数 `limit+offset+1` 探测。
 3. **files/count 不走 --json**：rg 原生文本行更简单，且服务层注释明确自己是行适配器——保持一致。**offset 无 rg 原生支持**（已实证 rg 15.1.0 无 `--offset` flag），由服务层 `take(limit+offset+1)` + slice 实现，语义不变。
 4. **context 参数名用 before/after/context 而非 `-A/-B/-C`**：schema 键避免 dash 开头；ZCode 的 dash 风格是 CC 兼容面，fork 无此包袱。
@@ -100,13 +102,13 @@ schema 扩展 + 校验（context 上限 10、mode 与 context 互斥说明）+ �
 
 **关键假设**
 
-- H1：rg 二进制版本支持 `--offset` 与 `-A/-B/-C`（rg 13+/14+ 均支持；bundle 的 ripgrep 由 `RipgrepBinary` 管理，细化时核实其版本下限）
+- H1：rg 二进制版本支持 `-A/-B/-C`（~~含 `--offset`~~ **2026-10-20 清扫**：rg 无 `--offset`，offset 走服务层切片——细化 §0 实证；bundle 的 ripgrep 由 `RipgrepBinary` 管理）
 - H2：`--json` 与文本行模式在 `run` 骨架内可共存（run 的 parse 是行级函数，与输出格式无关——事实）
-- H3：content 模式默认路径（无新参数）不触发任何新 args ⇒ 逐字节兼容可由构造审查 + 快照保证
+- H3：content 模式默认路径（无新参数）不触发任何新 args ⇒ 兼容由构造审查 + 单元测试保证（截断尾行文案例外，决策 1 修订）
 
 **模块级不变量**
 
-- I1：无新参数时，rg args 与渲染输出和现状完全一致 — 维护方：M2 默认参数路径 + 单元快照
+- I1：无新参数时，rg args 与渲染输出**结构**和现状一致（截断尾行文案例外——决策 1 修订）；空结果 metadata 反映本次请求的 mode/offset/limit — 维护方：M2 默认参数路径 + 单元测试
 - I2：`before/after/context ≤ 10` 与 mode-context 互斥在工具层强制 — 维护方：M2 schema 校验（超限拒绝并说明，非静默截断）
 
 **preservation 论证**：I1 的破坏途径是新参数缺省时混入新 args——M1 的 args 追加全部以参数存在为条件（展开式守卫）；I2 由工具层入口单点校验。

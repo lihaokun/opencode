@@ -155,8 +155,13 @@ const layer = Layer.effect(
             Stream.runCollect,
             Effect.map((chunk) => [...chunk]),
           )
+          // `total` is the FULL entry count, not the page slice: the tool layer
+          // renders "total" in beyond-window messages, and a page-length number
+          // there would read as "0 results exist". One past the window when the
+          // stream was cut at limit+offset+1, else the whole list.
           const truncated = rows.length > input.limit + offset
-          if (truncated) return { items: rows.slice(offset, offset + input.limit), truncated, partial: false }
+          const total = truncated ? input.limit + offset + 1 : rows.length
+          if (truncated) return { items: rows.slice(offset, offset + input.limit), total, truncated, partial: false }
 
           const code = yield* handle.exitCode
           const stderr = yield* Fiber.join(stderrFiber)
@@ -166,7 +171,7 @@ const layer = Layer.effect(
           if (code !== 0 && code !== 1 && code !== 2) {
             return yield* failure(stderr.trim() || `ripgrep failed with code ${code}`)
           }
-          return { items: rows.slice(offset, offset + input.limit), truncated: false, partial: code === 2 }
+          return { items: rows.slice(offset, offset + input.limit), total, truncated: false, partial: code === 2 }
         }),
       )
       const abortable = input.signal ? program.pipe(Effect.raceFirst(waitForAbort(input.signal))) : program
@@ -344,13 +349,13 @@ const layer = Layer.effect(
                 ? {
                     mode,
                     files: result.items as readonly string[],
-                    total: result.items.length,
+                    total: result.total,
                     hasMore: result.truncated,
                   }
                 : {
                     mode,
                     counts: result.items as readonly GrepCount[],
-                    total: result.items.length,
+                    total: result.total,
                     hasMore: result.truncated,
                   },
             ),

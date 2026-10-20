@@ -62,7 +62,9 @@
 ## 7. 不变量契约（property-based）
 
 C11 第三组（`test/session/pbt-render-materials.test.ts`，固定 seed）：任意
-材料序列下，每 ref 的 inlined 标题数 ≤ max_files；token 预算不超
+材料序列（**2026-10-20 独立审勘误：生成器当前只产 `kind: "file"` 的材料**——
+skill/todo 类由确定性单测覆盖，PBT 措辞收窄为 file 类序列）下，每 ref 的
+inlined 标题数 ≤ max_files；token 预算不超
 budget_tokens；渲染幂等（同输入同输出）。collect/materialize/buildTailText
 由确定性单测覆盖（目录过滤负例在 B5 修订中加入）。
 

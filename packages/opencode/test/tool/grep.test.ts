@@ -344,13 +344,16 @@ describe("tool.grep", () => {
       expect(last.output).toContain("Showing matches 5-5 (offset 4, limit 2)")
       expect(last.output).not.toContain("more results available")
 
-      // offset beyond results is distinct from no matches at all
+      // offset beyond results is distinct from no matches at all, and the
+      // total shown is the real match count (5), not the empty page length.
       const beyond = yield* grep.execute(
         { pattern: "needle", path: test.directory, include: "p*.txt", head_limit: 2, offset: 9 },
         ctx,
       )
-      expect(beyond.output).toContain("No matches at offset 9")
+      expect(beyond.output).toContain("No matches at offset 9 (total matches: 5)")
       expect(beyond.output).not.toContain("No files found")
+      // The metadata of an empty page still reflects this request.
+      expect(beyond.metadata).toMatchObject({ matches: 0, truncated: false, output_mode: "content", offset: 9 })
     }),
   )
 
@@ -391,6 +394,42 @@ describe("tool.grep", () => {
       if (Exit.isFailure(wrongMode)) {
         expect(String(Cause.squash(wrongMode.cause))).toContain("only apply to output_mode=content")
       }
+    }),
+  )
+
+  // Schema-level guards: a negative offset or zero limit would degenerate the
+  // pagination window (nonsense ranges, empty pages reported as truncated).
+  // The dedicated invalid-pattern channel must survive the search rewrite:
+  // an illegal expression is a diagnostic error, not a generic failure.
+  it.instance("invalid regex reports the ripgrep parse error", () =>
+    Effect.gen(function* () {
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const exit = yield* Effect.exit(grep.execute({ pattern: "[", path: "/" }, ctx))
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const message = String(Cause.squash(exit.cause))
+        expect(message.toLowerCase()).toContain("regex parse error")
+      }
+    }),
+  )
+
+  it.instance("rejects negative offset and non-positive head_limit at the schema", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "f.txt"), "needle\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      const negativeOffset = yield* Effect.exit(
+        grep.execute({ pattern: "needle", path: test.directory, offset: -5 }, ctx),
+      )
+      expect(Exit.isFailure(negativeOffset)).toBe(true)
+
+      const zeroLimit = yield* Effect.exit(
+        grep.execute({ pattern: "needle", path: test.directory, head_limit: 0 }, ctx),
+      )
+      expect(Exit.isFailure(zeroLimit)).toBe(true)
     }),
   )
 })

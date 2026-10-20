@@ -1,5 +1,6 @@
 import path from "path"
 import { Effect, Schema } from "effect"
+import { NonNegativeInt, PositiveInt } from "@opencode-ai/core/schema"
 import { InstanceState } from "@/effect/instance-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
@@ -34,10 +35,10 @@ export const Parameters = Schema.Struct({
     description:
       "Lines of context before and after each match, content mode only (max 10). Shorthand for before and after together; an explicit before or after overrides it for that side",
   }),
-  offset: Schema.optional(Schema.Number).annotate({
+  offset: Schema.optional(NonNegativeInt).annotate({
     description: "Skip the first N results (for pagination)",
   }),
-  head_limit: Schema.optional(Schema.Number).annotate({
+  head_limit: Schema.optional(PositiveInt).annotate({
     description: "Maximum number of results to return (default 100)",
   }),
 })
@@ -66,11 +67,6 @@ export const GrepTool = Tool.define(
         ctx: Tool.Context,
       ) =>
         Effect.gen(function* () {
-          const empty = {
-            title: params.pattern,
-            metadata: { matches: 0, truncated: false, output_mode: "content", offset: 0, head_limit: 100 },
-            output: "No files found",
-          }
           if (!params.pattern) {
             throw new Error("pattern is required")
           }
@@ -89,6 +85,14 @@ export const GrepTool = Tool.define(
           }
           const headLimit = params.head_limit ?? 100
           const offset = params.offset ?? 0
+          // Empty-result metadata reflects THIS request (mode/offset/limit),
+          // not hardcoded defaults — a caller reading metadata after a
+          // beyond-window result still sees what was asked.
+          const empty = {
+            title: params.pattern,
+            metadata: { matches: 0, truncated: false, output_mode: mode, offset, head_limit: headLimit },
+            output: "No files found",
+          }
 
           yield* ctx.ask({
             permission: "grep",
@@ -130,13 +134,11 @@ export const GrepTool = Tool.define(
           // like the legacy projection did, in every mode.
           const rowBase = requestedInfo?.type === "Directory" ? requested : path.dirname(requested)
 
+          // `matches` counts match entries, not rendered rows: context rows ride
+          // along in content mode but are not matches. The service's `total` is
+          // the match/file count in every mode, so reuse it.
           const metadata = {
-            matches:
-              result.mode === "content"
-                ? result.rows.length
-                : result.mode === "count"
-                  ? result.counts.length
-                  : result.files.length,
+            matches: result.total,
             truncated: result.hasMore,
             output_mode: mode,
             offset,
@@ -169,7 +171,7 @@ export const GrepTool = Tool.define(
             if (result.counts.length === 0) {
               return {
                 ...empty,
-                output: offset > 0 ? `No matches at offset ${offset}` : "No files found",
+                output: offset > 0 ? `No matches at offset ${offset} (total matches: ${result.total})` : "No files found",
               }
             }
             const totalMatches = result.counts.reduce((sum: number, item) => sum + item.count, 0)
