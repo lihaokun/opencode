@@ -99,14 +99,14 @@ default.txt / trinity.txt 删除三条硬规则（L18-19、L58、L68 与 trinity
 
 ## 5. 接口规约（§3.3 格式）
 
-**接口：prompt.ts → system.ts**（既有）不变：`SystemPrompt.provider(model)` 签名、返回类型、调用位置不变——仅返回内容多一段。`agent.prompt` 显式替换路径的互斥语义不变（G4/I2）。
+**接口：prompt.ts → system.ts**（既有）**2026-10-18 复审 B7 修订**：`SystemPrompt.provider(model)` 返回类型由 `string[]` 改为裸 `string`；新增 `SystemPrompt.systemSections(model)` 返回 `[template, PROMPT_SHARED]`；调用位置移至 `request.ts:195` 的三元右支。`agent.prompt` 显式替换路径的互斥语义不变（G4/I2）。
 
 **接口：工具描述 → 模型**（既有通道）：agent 工具描述文本变更不改变工具 schema/行为，仅指导文本。
 
 ## 6. 关键设计决策
 
-1. **共享段放 `provider()` 内 `[模板, SHARED]`**（决议 E①'，推翻初稿"三元后"）：三元替换语义即工具型/自定义 agent 的正确 opt-out；把改动限制在 `system.ts`（fork 稳定区），不触上游热点 `request.ts`。
-2. **委派指导进工具描述**（决议 E①，ZCode 式）：10 模板委派段不一致问题消失；指导与 fork 异步工具语义（agent_list/send/stop）共置于一处。
+1. **共享段经 `systemSections` 装配 `[模板, SHARED]`**（决议 E①'，推翻初稿"三元后"；**2026-10-18 复审 B7 再修订**：装配函数为 `systemSections`，`provider` 恢复裸模板早返回）：三元替换语义即工具型/自定义 agent 的正确 opt-out；改动集中在 `system.ts`（fork 稳定区）+ `request.ts` 三元右支一行。
+2. **~~委派指导进工具描述~~**（决议 E①，ZCode 式；**2026-10-18 复审 D13 撤销**——与 #59"agent 描述只讲机件不开处方"冲突，见 §3 委派指导段）：~~10 模板委派段不一致问题消失；指导与 fork 异步工具语义共置于一处~~。委派段不一致随共享段+修剪已消除；委派时机不再有独立文本资产。
 3. **共享段置于模板之后**：后置覆盖压平模板残留软冲突；位于缓存前缀稳定区（模板按模型路由、SHARED 恒定）。
 4. **最小刀法**（决议 E②）：只动 default/trinity 三条硬规则 + 委派句；其余模板矩阵记档迭代。
 5. **共享段是 `.txt` 文件**：与模板同构，纯文本资产，无代码逻辑。
@@ -124,18 +124,18 @@ default.txt / trinity.txt 删除三条硬规则（L18-19、L58、L68 与 trinity
 
 **关键假设**
 
-- **H1（已核实）**：无测试固化模板全文；`system.test.ts` 以 `provider(...)[0]` + `toContain` 断言，共享段放 `[1]` 不影响既有断言。
+- **H1（已核实；2026-10-18 B7 后更新）**：无测试固化模板全文；`system.test.ts` 原以 `provider(...)[0]` + `toContain` 断言，B7 后已改为裸模板断言（:91/100/109）与 `systemSections` 解构断言（:127），共享段断言在 `systemSections` 末元素上。
 - **H2**：后置文本在指令跟随上有覆盖优势但非硬保证——因此 default/trinity 的硬规则是**删除**而非仅靠覆盖压制；其余模板的软冲突留待迭代。
 - **H3**：模板为静态 `.txt` import，无逐模型条件装配（`system.ts:28-51` 事实）。
 - **H4**：共享段文案本身的行为效果属评测问题，本架构只保证"送达与一致性"，效果由 M4 的人工场景抽查与后续实验检验。
 
 **模块级不变量**
 
-- I1：`provider()` 任意分支返回数组的末元素恒为 `SHARED_BEHAVIOR` — 维护方：M1 单点收口（所有分支经同一返回表达式）。
-- I2：显式 `agent.prompt` 路径不含 SHARED — 维护方：`request.ts:195` 三元位置不变（本 feature 不触碰该文件）。
+- I1（**2026-10-18 复审 B7 修订**）：`systemSections(model)` 返回数组的末元素恒为 `SHARED_BEHAVIOR` — 维护方：`systemSections` 单表达式（`[provider(model), PROMPT_SHARED]`）。**保护点是 `systemSections` 而非 `provider`**：B7 后 `provider` 返回裸模板，直接调用它拿不到 SHARED；"唯一装配点"约定由生产侧 grep 断言维护（当前唯一 caller = `request.ts:195`）。
+- I2：显式 `agent.prompt` 路径不含 SHARED — 维护方：`request.ts:195` 三元位置不变（B7 的装配改动仅限三元右支）。
 - I3：插件 `experimental.chat.system.transform` 仍追加于整段之后 — 由装配顺序不变保证。
 
-**preservation 论证**：I1 的破坏途径是新增模板分支漏加 SHARED——M1 收口为单一返回表达式后分支只能提供模板变量，结构上无法绕过；I2/I3 的破坏途径是改动 `request.ts` 装配——本 feature 明确不触碰该文件。
+**preservation 论证**：I1 的破坏途径有二——(a) 新增模板分支漏路由：`provider` 逐分支早返回与 default 兜底保证任何 model id 都拿到一份模板；(b) 出现绕过 `systemSections` 的新 caller：当前以"生产侧唯一 caller"约定 + grep 检查维护，结构强制降级为约定强制（B7 的已声明代价，workflow §8.3 同步记录）。I2/I3 的破坏途径是改动 `request.ts` 装配——B7 改动后仍只触及三元右支。
 
 ## 8. 细化阶段待核实清单
 

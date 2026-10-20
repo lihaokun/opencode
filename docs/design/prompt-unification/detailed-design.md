@@ -2,7 +2,7 @@
 
 > 状态：细化阶段（§4.3），待 §4.4 审查后实施。
 > 架构依据：`docs/design/prompt-unification/architecture.md`（已确认，含共享段与委派指导草稿文案）。
-> 待核实清单已全部核实：模板无快照固化（H1）；trinity/default 删除行号逐一核对（本文 §5.2）；agent 工具描述位置为 `tool/agent.ts:63-75` 的 `AGENT_DESCRIPTION` 行数组常量；`system.test.ts` 断言风格为 `provider(...)[0]` + `toContain`。
+> 待核实清单已全部核实：模板无快照固化（H1）；trinity/default 删除行号逐一核对（本文 §5.2）；agent 工具描述位置为 `tool/agent.ts:63-75` 的 `AGENT_DESCRIPTION` 行数组常量；`system.test.ts` 断言风格原为 `provider(...)[0]` + `toContain`（2026-10-18 复审 B7 后改为裸模板断言 + `systemSections` 解构，见 §5.1 修订段）。
 
 ## 1. 范围
 
@@ -38,10 +38,12 @@
 
 ### 5.1 system.ts — provider 重构
 
-- **实现思路**：10 个 `if` 分支的 `return [PROMPT_X]` 改为对 `template` 变量赋值（muse 分支保留 `replaceAll("{{MODEL_NAME}}", name)`），函数末尾单点 `return [template, PROMPT_SHARED]`。
-- **分支覆盖**：muse/gpt-4|o1|o3/gpt(6|codex|其他)/gemini/claude/trinity/kimi/default 十路全部改为赋值；无遗漏（与现分支一一对应）。
-- **退出覆盖**：单返回点。
-- **正确性论证**：等价性——每分支赋值的模板与原返回元素逐一相同，新增末元素恒为 `PROMPT_SHARED`（单一常量来源 ⇒ I1 结构性成立）；既有测试取 `[0]` + `toContain` ⇒ 输出对既有断言逐字节兼容。trivial + 单点收口理由（无分支逻辑新增）。
+> **2026-10-18 复审 B7 全文修订**：本节原方案（`template` 变量赋值 + 末尾单点 `return [template, PROMPT_SHARED]`）因违反 AGENTS.md 早返回风格已被回退，以下为修订后口径，原文本删除。
+
+- **实现思路**：`provider(model)` 保持逐分支早返回，返回**裸模板 string**（muse 分支保留 `replaceAll("{{MODEL_NAME}}", name)`）；新增 `systemSections(model)` = `[provider(model), PROMPT_SHARED]`，唯一生产 caller 是 `request.ts` 的 `preparePayload` 三元。
+- **分支覆盖**：muse/gpt-4|o1|o3/gpt(6|codex|其他)/gemini/claude/trinity/kimi/default 十路逐一早返回；无遗漏（与现分支一一对应）。
+- **退出覆盖**：每分支一个返回点；`systemSections` 单表达式。
+- **正确性论证**：等价性——每分支返回的模板与原实现逐一相同；`systemSections` 末元素恒为 `PROMPT_SHARED`（单一常量来源 ⇒ I1 成立，但保护点是 `systemSections` 而非 `provider`——直接调用 `provider` 拿不到 SHARED，该约定由 expectations §2"唯一 caller"行与 grep 断言维护）；既有测试改为 `systemSections` 或裸模板断言（system.test.ts:91/100/109 已随 B7 调整）。trivial + 纯文本组装理由。
 
 ### 5.2 模板修剪（删除清单，行号为当前 dev 基线核对值）
 
