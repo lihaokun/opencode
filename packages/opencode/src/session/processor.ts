@@ -12,7 +12,6 @@ import { Snapshot } from "@/snapshot"
 import { Session } from "./session"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
-import { DoomLoop } from "./doom-loop"
 import { isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
@@ -87,7 +86,6 @@ type ToolCall = {
 
 interface ProcessorContext extends Input {
   toolcalls: Record<string, ToolCall>
-  doomLoop: DoomLoop.Detector
   shouldBreak: boolean
   snapshot: string | undefined
   blocked: boolean
@@ -155,9 +153,7 @@ const layer = Layer.effect(
     const session = yield* Session.Service
     const config = yield* Config.Service
     const snapshot = yield* Snapshot.Service
-    const agents = yield* Agent.Service
     const llm = yield* LLM.Service
-    const permission = yield* Permission.Service
     const plugin = yield* Plugin.Service
     const summary = yield* SessionSummary.Service
     const scope = yield* Scope.Scope
@@ -175,7 +171,6 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         model: input.model,
         toolcalls: {},
-        doomLoop: DoomLoop.create(),
         shouldBreak: false,
         snapshot: initialSnapshot,
         blocked: false,
@@ -464,8 +459,7 @@ const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
-            const toolCall = yield* ensureToolCall(value)
-            const firstDelivery = toolCall.part.state.status === "pending"
+            yield* ensureToolCall(value)
             const input = isRecord(value.input) ? value.input : { value: value.input }
             yield* updateToolCall(value.id, (match) => ({
               ...match,
@@ -483,17 +477,6 @@ const layer = Layer.effect(
                 : value.providerMetadata,
             }))
 
-            if (!firstDelivery || !ctx.doomLoop.check(value.name, input)) return
-
-            const agent = yield* agents.get(ctx.assistantMessage.agent)
-            yield* permission.ask({
-              permission: "doom_loop",
-              patterns: [value.name],
-              sessionID: ctx.assistantMessage.sessionID,
-              metadata: { tool: value.name, input },
-              always: [value.name],
-              ruleset: agent.permission,
-            })
             return
           }
 

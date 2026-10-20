@@ -12,6 +12,7 @@ import {
 
 const TEST_TIMEOUT_MS = 180_000
 const SERVER_READY_TIMEOUT_MS = 45_000
+const REFUSED = "Not run: within this one response, the same tool calls have now been repeated three times in a row."
 
 type Sdk = ReturnType<typeof createOpencodeClient>
 
@@ -87,15 +88,6 @@ function listPermissions(sdk: Sdk, directory: string) {
   }, "permission list response")
 }
 
-function waitForDoomLoopPermission(sdk: Sdk, directory: string, sessionID: string) {
-  return poll(
-    listPermissions(sdk, directory).pipe(
-      Effect.map((items) => items.find((item) => item.permission === "doom_loop" && item.sessionID === sessionID)),
-    ),
-    `timed out waiting for doom_loop permission for session ${sessionID}`,
-  )
-}
-
 function sessionStatus(sdk: Sdk, directory: string) {
   return call(async () => {
     const result = await sdk.session.status({ directory })
@@ -150,84 +142,6 @@ function matchingParts(value: unknown, calls: readonly EncodedPeriodicToolCall[]
   return toolParts(value).filter((part) => ids.has(String(part.callID)))
 }
 
-function callsMatch(value: unknown, fixture: PeriodicToolCallFixture, status: string) {
-  const parts = matchingParts(value, fixture.calls)
-  if (parts.length !== fixture.calls.length) return false
-  return fixture.calls.every((expected) => {
-    const matches = parts.filter((part) => part.callID === expected.id)
-    return (
-      matches.length === 1 &&
-      matches[0]?.tool === expected.tool &&
-      record(matches[0]?.state).status === status &&
-      JSON.stringify(record(matches[0]?.state).input) === JSON.stringify(expected.input)
-    )
-  })
-}
-
-function expectCalls(value: unknown, fixture: PeriodicToolCallFixture, status: string) {
-  const parts = matchingParts(value, fixture.calls)
-  expect(parts).toHaveLength(fixture.calls.length)
-  for (const expected of fixture.calls) {
-    const matches = parts.filter((part) => part.callID === expected.id)
-    expect(matches).toHaveLength(1)
-    expect(matches[0]).toMatchObject({
-      callID: expected.id,
-      tool: expected.tool,
-      state: {
-        status,
-        input: expected.input,
-      },
-    })
-  }
-}
-
-function hasAssistantError(value: unknown) {
-  return array(value).some((message) => {
-    const info = record(record(message).info)
-    return info.role === "assistant" && info.error !== undefined
-  })
-}
-
-function rejectedCallsMatch(value: unknown, fixture: PeriodicToolCallFixture) {
-  const parts = matchingParts(value, fixture.calls)
-  if (parts.length !== fixture.calls.length) return false
-  return fixture.calls.every((expected) => {
-    const matches = parts.filter((part) => part.callID === expected.id)
-    if (matches.length !== 1 || matches[0]?.tool !== expected.tool) return false
-    const state = record(matches[0]?.state)
-    if (JSON.stringify(state.input) !== JSON.stringify(expected.input)) return false
-    return state.status === "completed" || state.status === "error"
-  })
-}
-
-function expectRejectedCalls(value: unknown, fixture: PeriodicToolCallFixture) {
-  const parts = matchingParts(value, fixture.calls)
-  expect(parts).toHaveLength(fixture.calls.length)
-  for (const expected of fixture.calls) {
-    const matches = parts.filter((part) => part.callID === expected.id)
-    expect(matches).toHaveLength(1)
-    expect(matches[0]).toMatchObject({
-      callID: expected.id,
-      tool: expected.tool,
-      state: { input: expected.input },
-    })
-    expect(["completed", "error"]).toContain(String(record(matches[0]?.state).status))
-  }
-}
-
-function expectPendingCall(value: unknown, expected: EncodedPeriodicToolCall) {
-  const matches = toolParts(value).filter((part) => part.callID === expected.id)
-  expect(matches).toHaveLength(1)
-  expect(matches[0]).toMatchObject({
-    callID: expected.id,
-    tool: expected.tool,
-    state: {
-      status: "running",
-      input: expected.input,
-    },
-  })
-}
-
 function enqueue(
   llm: Parameters<Parameters<typeof cliIt.live>[1]>[0]["llm"],
   prompt: string,
@@ -249,169 +163,59 @@ function prompt(sdk: Sdk, sessionID: string, text: string) {
   )
 }
 
-function replyPermission(sdk: Sdk, directory: string, requestID: string, decision: "once" | "reject") {
-  return call(() => sdk.permission.reply({ requestID, directory, reply: decision }), `${decision} permission reply`)
+// Fix doc session-fix-step-tail-repeat-and-agents §4.2: a repeat inside one
+// response is refused without a permission request. The calls before it run,
+// the refused one returns the error, and the run goes on to the model's reply.
+function expectRefusedRepeat(value: unknown, fixture: PeriodicToolCallFixture) {
+  const parts = matchingParts(value, fixture.calls)
+  expect(parts).toHaveLength(fixture.calls.length)
+  for (const expected of fixture.calls) {
+    const matches = parts.filter((part) => part.callID === expected.id)
+    expect(matches).toHaveLength(1)
+    expect(matches[0]).toMatchObject({ callID: expected.id, tool: expected.tool, state: { input: expected.input } })
+  }
+  const unfinished = parts
+    .filter((part) => record(part.state).status !== "completed")
+    .map((part) => [part.callID, record(part.state).status, record(part.state).error])
+  expect(unfinished).toEqual([[fixture.calls.at(-1)?.id, "error", REFUSED]])
 }
 
-function expectPermission(input: {
-  readonly pending: Record<string, unknown>
-  readonly sessionID: string
-  readonly trigger: EncodedPeriodicToolCall
-}) {
-  expect(input.pending).toMatchObject({
-    sessionID: input.sessionID,
-    permission: "doom_loop",
-    patterns: [input.trigger.tool],
-    metadata: {
-      tool: input.trigger.tool,
-      input: input.trigger.input,
-    },
-    always: [input.trigger.tool],
-  })
-  expect(typeof input.pending.id).toBe("string")
-  expect(String(input.pending.id).length).toBeGreaterThan(0)
-}
-
-describe("periodic doom-loop spawned server permissions", () => {
+describe("periodic doom-loop spawned server", () => {
   cliIt.live(
-    "continues after once and asks again for the next periodic cycle",
+    "refuses each response's repeat without a permission request and finishes both prompts",
     (test) =>
       Effect.gen(function* () {
-        const first = alternatingFixture("once-first-call")
-        const firstPrompt = "serve period-two once reply"
-        const firstContinuation = `${firstPrompt} completed`
-        yield* enqueue(test.llm, firstPrompt, first.item, reply().text(firstContinuation).stop())
-
         const server = yield* test.opencode.serve({ readyTimeoutMs: SERVER_READY_TIMEOUT_MS })
         const sdk = createOpencodeClient({ baseUrl: server.url, directory: test.home })
-        const created = yield* call(() => sdk.session.create({ title: "periodic once" }), "session creation")
+        const created = yield* call(() => sdk.session.create({ title: "periodic refusal" }), "session creation")
         expect(created.response.status).toBe(200)
         const sessionID = String(record(created.data).id)
 
-        const prompted = yield* prompt(sdk, sessionID, firstPrompt)
-        expect(prompted.response.status).toBe(204)
+        // Each prompt's response gets its own detector, so the second cycle is
+        // refused again; a pending ask would block the run and time out here.
+        yield* Effect.forEach(["first", "second"], (round) =>
+          Effect.gen(function* () {
+            const fixture = alternatingFixture(`${round}-call`)
+            const text = `serve period-two ${round} prompt`
+            const continuation = `${text} completed`
+            yield* enqueue(test.llm, text, fixture.item, reply().text(continuation).stop())
 
-        const firstPending = yield* waitForDoomLoopPermission(sdk, test.home, sessionID)
-        const firstTrigger = first.calls.at(-1)
-        if (!firstTrigger) throw new Error("periodic fixture did not contain a trigger call")
-        expectPermission({ pending: firstPending, sessionID, trigger: firstTrigger })
-        expect(record((yield* sessionStatus(sdk, test.home))[sessionID]).type).toBe("busy")
-        const beforeFirstReply = yield* waitForMessages(
-          sdk,
-          test.home,
-          sessionID,
-          (value) => toolParts(value).some((part) => part.callID === firstTrigger.id),
-          "timed out waiting for the threshold call before the once reply",
+            const prompted = yield* prompt(sdk, sessionID, text)
+            expect(prompted.response.status).toBe(204)
+            const settled = yield* waitForMessages(
+              sdk,
+              test.home,
+              sessionID,
+              (value) => JSON.stringify(value).includes(continuation),
+              `timed out waiting for the ${round} prompt to finish`,
+            )
+            yield* waitForIdle(sdk, test.home, sessionID)
+            expectRefusedRepeat(settled, fixture)
+            expect(yield* listPermissions(sdk, test.home)).toEqual([])
+            expectPromptInputs(yield* test.llm.inputs, text, 2)
+          }),
         )
-        expectPendingCall(beforeFirstReply, firstTrigger)
-
-        const firstAnswered = yield* replyPermission(sdk, test.home, String(firstPending.id), "once")
-        expect(firstAnswered.response.status).toBe(200)
-        expect(firstAnswered.data).toBe(true)
-
-        const firstMessages = yield* waitForMessages(
-          sdk,
-          test.home,
-          sessionID,
-          (value) => JSON.stringify(value).includes(firstContinuation) && callsMatch(value, first, "completed"),
-          "timed out waiting for the once-approved cycle to complete",
-        )
-        yield* waitForIdle(sdk, test.home, sessionID)
-        expectCalls(firstMessages, first, "completed")
-        expect(yield* listPermissions(sdk, test.home)).toEqual([])
-        expectPromptInputs(yield* test.llm.inputs, firstPrompt, 2)
         expect(yield* test.llm.pending).toBe(0)
-
-        const second = alternatingFixture("once-second-call")
-        const secondPrompt = "serve period-two after once reply"
-        const secondContinuation = `${secondPrompt} continuation must remain queued`
-        yield* enqueue(test.llm, secondPrompt, second.item, reply().text(secondContinuation).stop())
-
-        const secondPrompted = yield* prompt(sdk, sessionID, secondPrompt)
-        expect(secondPrompted.response.status).toBe(204)
-        const secondPending = yield* waitForDoomLoopPermission(sdk, test.home, sessionID)
-        const secondTrigger = second.calls.at(-1)
-        if (!secondTrigger) throw new Error("follow-up fixture did not contain a trigger call")
-        expectPermission({ pending: secondPending, sessionID, trigger: secondTrigger })
-        expect(secondPending.id).not.toBe(firstPending.id)
-        const beforeSecondReply = yield* waitForMessages(
-          sdk,
-          test.home,
-          sessionID,
-          (value) => toolParts(value).some((part) => part.callID === secondTrigger.id),
-          "timed out waiting for the follow-up threshold call",
-        )
-        expectPendingCall(beforeSecondReply, secondTrigger)
-
-        const secondAnswered = yield* replyPermission(sdk, test.home, String(secondPending.id), "reject")
-        expect(secondAnswered.response.status).toBe(200)
-        expect(secondAnswered.data).toBe(true)
-        const secondMessages = yield* waitForMessages(
-          sdk,
-          test.home,
-          sessionID,
-          (value) => hasAssistantError(value) && rejectedCallsMatch(value, second),
-          "timed out waiting for the follow-up rejection to settle",
-        )
-        yield* waitForIdle(sdk, test.home, sessionID)
-        expect(JSON.stringify(secondMessages)).not.toContain(secondContinuation)
-        expectRejectedCalls(secondMessages, second)
-        expect(yield* listPermissions(sdk, test.home)).toEqual([])
-        expectPromptInputs(yield* test.llm.inputs, secondPrompt, 1)
-        expect(yield* test.llm.pending).toBe(1)
-      }),
-    TEST_TIMEOUT_MS,
-  )
-
-  cliIt.live(
-    "stops a periodic cycle after the SDK replies reject",
-    (test) =>
-      Effect.gen(function* () {
-        const fixture = alternatingFixture("reject-call")
-        const promptText = "serve period-two reject reply"
-        const continuation = `${promptText} continuation must remain queued`
-        yield* enqueue(test.llm, promptText, fixture.item, reply().text(continuation).stop())
-
-        const server = yield* test.opencode.serve({ readyTimeoutMs: SERVER_READY_TIMEOUT_MS })
-        const sdk = createOpencodeClient({ baseUrl: server.url, directory: test.home })
-        const created = yield* call(() => sdk.session.create({ title: "periodic reject" }), "session creation")
-        expect(created.response.status).toBe(200)
-        const sessionID = String(record(created.data).id)
-
-        const prompted = yield* prompt(sdk, sessionID, promptText)
-        expect(prompted.response.status).toBe(204)
-
-        const pending = yield* waitForDoomLoopPermission(sdk, test.home, sessionID)
-        const trigger = fixture.calls.at(-1)
-        if (!trigger) throw new Error("periodic fixture did not contain a trigger call")
-        expectPermission({ pending, sessionID, trigger })
-        expect(record((yield* sessionStatus(sdk, test.home))[sessionID]).type).toBe("busy")
-        const beforeReply = yield* waitForMessages(
-          sdk,
-          test.home,
-          sessionID,
-          (value) => toolParts(value).some((part) => part.callID === trigger.id),
-          "timed out waiting for the threshold call before rejection",
-        )
-        expectPendingCall(beforeReply, trigger)
-
-        const answered = yield* replyPermission(sdk, test.home, String(pending.id), "reject")
-        expect(answered.response.status).toBe(200)
-        expect(answered.data).toBe(true)
-
-        const terminalMessages = yield* waitForMessages(
-          sdk,
-          test.home,
-          sessionID,
-          (value) => hasAssistantError(value) && rejectedCallsMatch(value, fixture),
-          "timed out waiting for the rejected cycle to settle",
-        )
-        yield* waitForIdle(sdk, test.home, sessionID)
-        expect(JSON.stringify(terminalMessages)).not.toContain(continuation)
-        expectRejectedCalls(terminalMessages, fixture)
-        expect(yield* listPermissions(sdk, test.home)).toEqual([])
-        expectPromptInputs(yield* test.llm.inputs, promptText, 1)
-        expect(yield* test.llm.pending).toBe(1)
       }),
     TEST_TIMEOUT_MS,
   )

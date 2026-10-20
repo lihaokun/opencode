@@ -112,7 +112,7 @@ detect(seq) := ∃ p ∈ [1,10]. threeEqualBlocks(seq, p)
 
 ### 3.2 跨步计数
 
-参考定义，`steps` 为本次 run 内已完成步骤的列表，每步记为 `(calls, results)`，`calls` 为按顺序的 `[tool, canonical(input)]` 列表，`results` 为按顺序的 `[status, output 或 error]` 列表：
+参考定义，`steps` 为本次 run 内已完成步骤的列表，每步记为 `(calls, results)`，`calls` 为按顺序的 `[tool, input]` 列表（input 按模型给出的键顺序序列化，与 3.1 的签名相同），`results` 为按顺序的 `[status, output 或 error]` 列表：
 
 ```text
 callRepeat(steps)   := 末尾满足 steps[i].calls = steps[i-1].calls 且 calls 非空 的最长连续 i 的个数
@@ -137,28 +137,37 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 
 - **位置**：`prompt.ts` 组装 `messages` 时，在历史消息之后、最后一步的 `MAX_STEPS_PROMPT` 之前，追加一条 user 消息。内容由若干节组成，无内容时不追加。
 - **不持久化**：只存在于本步请求中，下一步重新生成。不写入会话历史，不进入压缩输入。
-- **缓存**：该消息带 `providerOptions.opencode.tail = true` 标记；`provider/transform.ts` 的 `applyCaching` 选取最后两条消息时跳过带此标记的消息。其他提供方忽略未知的 `opencode` 命名空间。
+- **缓存**：该消息带 `providerOptions.opencode.tail = true` 标记；`provider/transform.ts` 的 `applyCaching` 选取最后两条消息时跳过带此标记的消息。
+- **标记不出 transform**：`ProviderTransform.message` 在放置缓存断点之后、提供方键重映射之前删除该标记。原因：重映射会把 `providerOptions[providerID]` 改名为 SDK 键，提供方 ID 恰为 `opencode`（Zen）时标记会变成 `anthropic.tail` 等 SDK 选项。现有 SDK 忽略未知字段，删除是防御，保证请求体不受标记影响。
+- **Mistral**：该系列要求 tool 消息后不能直接接 user，transform 会在两者之间插入一条 assistant `Done.`。有末尾段时这条插入也只出现在每步可变的后缀里，不影响前缀缓存。
 - **追溯**：每步以 INFO 日志记录末尾段文本（`message="step tail"`，含 session 与 step）。消息部件没有通用元数据字段，不为此改动数据结构。
 - 节的顺序：子 agent 状态（4.9）在前，重复计数（4.3）在后。
 
 ### 4.2 #76 一步内重复：拒绝执行
 
 - 在 `SessionTools.resolve` 内为本步创建一个 `DoomLoop` 检测器（工具表每步重建，检测器天然是一步的范围）。
-- 内置工具与 MCP 工具的执行包装在调用前执行 `check(tool, input)`；检测为真时**不执行**，以错误返回：`Not run: this response already contains the same <tool> call <k> times in a row.`
+- 工具表组装完成后统一包装每个工具的执行函数（含内置工具、MCP 工具、三个 MCP 资源工具，代码模式的提前返回同样经过）：调用前执行 `check(tool, input)`；检测为真时**不执行**，以错误返回：
+
+  ```text
+  Not run: within this one response, the same tool calls have now been repeated three times in a row.
+  ```
+
+  不点名工具：周期大于 1 的循环由多个工具组成，"同一工具 k 次"的说法对它不成立。统一包装与旧 processor 检查的覆盖面一致（它看到每一个调用）。
+
 - 兼容 `doom_loop` 权限键：按会话与 agent 的合并规则求值，`allow` 时不拒绝；`ask`、`deny` 均直接拒绝，不发起询问。
 - 删除 processor 中的检测器与 `doom_loop` 询问。TUI 的 auto 回复逻辑不变（不再收到此类询问）。
 
 ### 4.3 #76 跨步重复：只计数
 
 - 状态由 `runLoop` 持有，run 开始为空、run 结束丢弃。
-- 每步开始前，取本次 run 内最近两个已完成步骤（按本 run 记录的助手消息 id），按 3.2 的定义更新 `callRepeat` 与 `resultRepeat`：调用相同则 `callRepeat + 1`，否则清零；调用与结果都相同则 `resultRepeat + 1`，否则清零。
-- `callRepeat > 0` 时末尾附带一节：
+- 每步结束且 run 决定继续时，读取刚结束这一步的助手消息的工具部件，与本 run 上一步的签名比较，按 3.2 的定义更新 `callRepeat` 与 `resultRepeat`：调用相同则 `callRepeat + 1`，否则清零；调用与结果都相同则 `resultRepeat + 1`，否则清零；本步没有工具调用时两者清零。发送前因预估溢出而撤回、转去压缩的一步不是完成的步骤，不参与比较，计数原样带到压缩后真正执行的那一步。
+- `callRepeat > 0` 时下一步请求的末尾附带一节。模型读到它时上一步已经结束，所以说"你的上一步"：
 
   ```text
-  This step repeated the previous step's tool calls: 3 times in a row; the results were identical too: 3 times in a row.
+  Your last step repeated the tool calls of the step before it: 3 times in a row; the results were identical too: 3 times in a row.
   ```
 
-  `resultRepeat = 0` 时后半句改为 `the results differed.`
+  `resultRepeat = 0` 时后半句改为 `the results differed this time.`
 
 - 不设上限，不结束 run，不拦截。
 - 已知局限：只比较相邻两步，交替循环（失败编辑 → 读文件 → 失败编辑）不计数。
@@ -234,7 +243,7 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 **回归（必做）**
 
 - R1：1.1 最小复现。断言 N 次 Edit 均执行，第 2 步起每步请求末尾含重复计数节且计数递增；末尾段不出现在会话历史中。
-- R2：一次返回内 3 个相同调用，第 3 个未执行、以错误返回，run 继续；auto 模式下行为相同（不产生询问）。
+- R2：一次返回内 3 个相同调用，第 3 个未执行、以错误返回，run 继续。CLI `run`（非交互，询问一律自动拒绝）与 serve 下同样不产生询问，run 正常结束。
 - R3：1.2 竞态。子 agent 结束报告含 run 与时间；agent_send 返回含目标 run 状态。
 
 **边缘**
@@ -243,11 +252,14 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 - 轮询：相同命令、结果不变 → 两个计数都递增；结果变化 → 只有调用计数递增；不拦截。
 - 不同输入的连续编辑计数为 0；新 run 计数从 0 开始。
 - 一步多个调用按顺序整组比较；顺序不同视为不同。
+- 发送前因溢出撤回并压缩的一步不清零计数（先在修正前的代码上确认失败）。
 - re-arm 不增加 run 编号；agent_stop 记 `stopped`；无上一个 run 时 agent_send 返回省略第二句。
 - agent_status：按名字和 id 查询；超出可查范围报错；agent_list 被禁用时 agent_status 不可见。
 - agent_list：各过滤项、默认上限、排序、计数行。
 - 末尾子 agent 节：无子 agent 时不附带；变化超过 8 行时截断。
-- 缓存：第 n+1 步请求的真实历史部分与第 n 步逐字相同；`applyCaching` 从不在末尾段上加断点。
+- 缓存：第 n+1 步请求的真实历史部分与第 n 步逐字相同；`applyCaching` 从不在末尾段上加断点；Anthropic 请求体中最后一个断点落在工具结果上，不落在末尾段文本上。
+- 标记：提供方 ID 为 `opencode` 时，标记不进入 SDK 选项，该提供方自己的其他选项照常重映射。
+- 工具表统一包装：同一工具表内第三次相同调用被拒绝且工具未执行；中间插入不同调用会打断连续；`doom_loop: allow` 时全部执行。
 
 **随机（PBT）**
 
@@ -256,26 +268,33 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 - P3：随机生成子 agent 事件序列（发送到空闲 / 在跑、完成 / 失败 / 被停、re-arm），断言 run 编号严格递增、每份报告编号等于当时进行中的 run、agent_send 预告的编号与下一份报告一致、结束时间不早于开始时间。
 - P4：随机生成子 agent 集合与过滤参数，断言 agent_list 结果为全集子集、计数行与全集统计一致、行数不超过上限。
 
+**既有用例的改写**（契约按 4.2 有意改变：不再询问，拒绝后 run 继续）
+
+- `test/session/processor-effect.test.ts`：4 个"询问 / deny 即停"用例改为 1 个周期 2 用例加 3 个周期 1 用例（默认、allow、deny），断言 processor 不询问、不停止、调用全部记录。检测已不在 processor 内，这些用例的假 LLM 自带工具结果，只能验证 processor 不再介入。
+- `test/cli/run/periodic-doom-loop-process.test.ts`：5 个"询问后退出码 1"用例改为"最后执行的那个调用被拒绝、其余完成、run 继续、退出码 0、无询问"；deny 用例同样改为拒绝后继续。其余 4 个（未达阈值、近似未命中、周期 11 超界、allow）不变。
+- `test/cli/serve/periodic-doom-loop-process.test.ts`：once 与 reject 两个回复流程在新契约下不存在，合并为 1 个用例：同一会话两次提示，各自的循环都在最后一个调用被拒绝，全程没有权限请求，run 正常结束。
+
 ## 第七部分：代码更新清单（计划）
 
-| 文件                                                   | 改动                                                                                                                                 |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `packages/opencode/src/session/prompt.ts`              | 末尾段组装；跨步计数状态；run 记录的开始与结束                                                                                       |
-| `packages/opencode/src/session/step-tail.ts`（新）     | 末尾段的纯函数：计数更新、各节渲染                                                                                                   |
-| `packages/opencode/src/session/tools.ts`               | 一步内检测器；执行包装中的拒绝                                                                                                       |
-| `packages/opencode/src/session/processor.ts`           | 删除检测器与 `doom_loop` 询问                                                                                                        |
-| `packages/opencode/src/provider/transform.ts`          | 缓存断点跳过末尾段                                                                                                                   |
-| `packages/opencode/src/agent-management/inbox.ts`      | agent 消息打标记                                                                                                                     |
-| `packages/opencode/src/agent-management/schema.ts`     | `agentRun` 元数据键与类型                                                                                                            |
-| `packages/opencode/src/agent-management/delegation.ts` | 报告属性与摘要                                                                                                                       |
-| `packages/opencode/src/tool/agent.ts`                  | agent_send 返回、agent_list 参数、agent_status、描述                                                                                 |
-| `packages/opencode/src/tool/registry.ts`               | 注册 agent_status 并跟随 agent_list 的可见性                                                                                         |
-| 测试                                                   | `test/session/step-tail.test.ts`（新）、`prompt.test.ts`、`processor-effect.test.ts`、`doom-loop.test.ts`、agent-management 相关测试 |
+| 文件                                                   | 改动                                                                                                                                                                                                                                                                        |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/opencode/src/session/prompt.ts`              | 末尾段组装；跨步计数状态；run 记录的开始与结束                                                                                                                                                                                                                              |
+| `packages/opencode/src/session/step-tail.ts`（新）     | 末尾段的纯函数：计数更新、各节渲染                                                                                                                                                                                                                                          |
+| `packages/opencode/src/session/tools.ts`               | 一步内检测器；工具表组装完成后统一包装执行函数并拒绝重复                                                                                                                                                                                                                    |
+| `packages/opencode/src/session/processor.ts`           | 删除检测器与 `doom_loop` 询问                                                                                                                                                                                                                                               |
+| `packages/opencode/src/provider/transform.ts`          | 缓存断点跳过末尾段；放置断点后删除标记                                                                                                                                                                                                                                      |
+| `packages/opencode/src/agent-management/inbox.ts`      | agent 消息打标记                                                                                                                                                                                                                                                            |
+| `packages/opencode/src/agent-management/schema.ts`     | `agentRun` 元数据键与类型                                                                                                                                                                                                                                                   |
+| `packages/opencode/src/agent-management/delegation.ts` | 报告属性与摘要                                                                                                                                                                                                                                                              |
+| `packages/opencode/src/tool/agent.ts`                  | agent_send 返回、agent_list 参数、agent_status、描述                                                                                                                                                                                                                        |
+| `packages/opencode/src/tool/registry.ts`               | 注册 agent_status 并跟随 agent_list 的可见性                                                                                                                                                                                                                                |
+| 测试                                                   | `test/session/step-tail.test.ts`（新）、`prompt.test.ts`、`processor-effect.test.ts`、`tools.test.ts`、`test/provider/transform.test.ts`、`test/cli/run/periodic-doom-loop-process.test.ts`、`test/cli/serve/periodic-doom-loop-process.test.ts`、agent-management 相关测试 |
 
 ## 第八部分：文档更新清单（计划）
 
 - 本文档：回填第六、七部分的实际状态与提交。
 - `docs/fixes/session-processor-fix-periodic-doom-loop.md`：注明"状态只保存在 processor 内"的范围局限，由本修复取代其处理方式。
+- `packages/web/src/content/docs/permissions.mdx`、`agents.mdx`（英文，沿用 #22 只改英文的先例）：`doom_loop` 改为描述一步内拒绝与 `allow` 关闭。
 - `docs/design/agent-management/architecture.md`、`detailed-design.md`、相关子计划：run 记录、报告属性、agent_send 返回、agent_status、agent_list 参数、末尾段。
 - `docs/audits/<subplan-id>/expectations.md`（§6）：本修复新增的契约——agent_status 参数与返回、agent_list 参数与输出、报告属性、agent 消息元数据、`agentRun` 元数据。
 - 工具描述（`tool/agent.ts` 中的 description）：只写事实，不教用法（#59 的原则）。

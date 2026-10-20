@@ -59,6 +59,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
+import { StepTail } from "./step-tail"
 import { AgentTree } from "@/agent-management/tree"
 import { AgentStatusProjection } from "@/agent-management/status"
 import { SessionTools } from "./tools"
@@ -1216,6 +1217,10 @@ const layer = Layer.effect(
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
         // This bounds one in-memory overflow-recovery episode and intentionally resets with this runLoop.
         let compactionToken: "none" | "compacted" | "skip" = "none"
+        // Step-to-step repeat counting for the step tail. Scoped to this run on
+        // purpose: a repeat across runs may be the agent's own choice.
+        let previousStep: StepTail.StepSignature | undefined
+        let repeat = StepTail.NO_REPEAT
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1425,8 +1430,11 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            const tail = StepTail.render([StepTail.renderRepeat(repeat)])
+            if (tail) yield* Effect.logInfo("step tail", { "session.id": sessionID, step, text: tail })
             const messages = [
               ...modelMsgs,
+              ...(tail ? [StepTail.message(tail)] : []),
               ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
             ]
             const streamInput: LLM.StreamInput = {
@@ -1514,6 +1522,13 @@ const layer = Layer.effect(
                 overflow,
               })
             }
+            // Only a step that ran counts; one withdrawn above for compaction before
+            // sending is not a step (fix doc session-fix-step-tail-repeat-and-agents §3.2).
+            const current = StepTail.signature(
+              yield* MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database)),
+            )
+            repeat = StepTail.nextRepeat(previousStep, current, repeat)
+            previousStep = current
             return "continue" as const
           }).pipe(
             Effect.ensuring(instruction.clear(handle.message.id)),

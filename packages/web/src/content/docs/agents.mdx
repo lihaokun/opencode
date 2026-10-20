@@ -449,7 +449,7 @@ The available permission keys are:
 | `lsp`                | `lsp`                                                            |
 | `skill`              | `skill`                                                          |
 | `question`           | `question`                                                       |
-| `doom_loop`          | Recovery prompts when an agent appears stuck                     |
+| `doom_loop`          | Repeated tool calls within one model response                    |
 
 `read`, `edit`, `glob`, `grep`, `list`, `bash`, `agent`, `agent_list`, `agent_send`, `agent_stop`, `external_directory`, `lsp`, and `skill` accept either a shorthand action (`"allow" | "ask" | "deny"`) or an object of glob/pattern → action for fine-grained control. The remaining keys accept the shorthand action only.
 

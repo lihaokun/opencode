@@ -54,6 +54,7 @@ import { Format } from "../../src/format"
 import { provideInstance, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer, type Usage } from "../lib/llm-server"
+import { periodicToolCallResponse } from "../lib/periodic-tool-calls"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -2565,6 +2566,183 @@ it.instance("glob tool keeps instance context during prompt runs", () =>
     expect(result.parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
   }),
 )
+
+// Fix doc session-fix-step-tail-repeat-and-agents, R1: the fermat storm, one
+// identical failing edit per step. Each request ends with the count of the
+// repeats so far, and no copy of the tail lands in the history. The history part
+// of each request is the previous request's history plus the new step, byte for
+// byte, so the prompt cache keeps hitting. A new run counts from zero again.
+it.instance(
+  "a repeated failing edit across steps is counted in a step tail, never stored",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Repeat",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const file = path.join(dir, "lemma.v")
+      yield* writeText(file, "Proof. lia. Qed.\n")
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "fix the proof" }],
+      })
+      const edit = { filePath: file, oldString: "lia.", newString: "lia." }
+      yield* llm.tool("edit", edit)
+      yield* llm.tool("edit", edit)
+      yield* llm.tool("edit", edit)
+      yield* llm.text("done")
+
+      yield* prompt.loop({ sessionID: session.id })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "try again" }],
+      })
+      yield* llm.tool("edit", edit)
+      yield* llm.tool("edit", edit)
+      yield* llm.text("done again")
+      yield* prompt.loop({ sessionID: session.id })
+
+      const requests = (yield* llm.inputs).map((body) => {
+        const messages = Array.isArray(body.messages) ? body.messages.map((message) => JSON.stringify(message)) : []
+        const last = Array.isArray(body.messages) ? body.messages.at(-1) : undefined
+        const tail =
+          last?.role === "user" && typeof last.content === "string" && last.content.startsWith("Your last step")
+            ? last.content
+            : undefined
+        return { tail, history: tail ? messages.slice(0, -1) : messages }
+      })
+      const once =
+        "Your last step repeated the tool calls of the step before it: 1 time in a row; the results were identical too: 1 time in a row."
+      expect(requests.map((request) => request.tail)).toEqual([
+        undefined,
+        undefined,
+        once,
+        "Your last step repeated the tool calls of the step before it: 2 times in a row; the results were identical too: 2 times in a row.",
+        undefined,
+        undefined,
+        once,
+      ])
+      for (const index of [1, 2, 3, 5, 6]) {
+        const previous = requests[index - 1]!.history
+        expect(requests[index]!.history.slice(0, previous.length), `request ${index}`).toEqual(previous)
+        expect(requests[index]!.history.length).toBeGreaterThan(previous.length)
+      }
+      const stored = JSON.stringify(yield* MessageV2.filterCompactedEffect(session.id))
+      expect(stored).not.toContain("Your last step")
+    }),
+  30_000,
+)
+
+// A step withdrawn before sending, because the request would overflow and the
+// session compacts first, is not a step: the count carries over to the step
+// that actually runs after the compaction (fix doc §3.2 counts completed steps).
+it.instance(
+  "a step withdrawn for compaction before sending does not reset the repeat count",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(preflightCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Repeat across compaction",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      // Compaction needs earlier history to summarize.
+      yield* seed(session.id, { finish: "stop", userText: "an earlier turn" })
+      const file = path.join(dir, "lemma.v")
+      yield* writeText(file, "Proof. lia. Qed.\n")
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "fix the proof" }],
+      })
+      // Two of these calls fit the preflight budget; the third request does not.
+      const big = "x".repeat(80_000)
+      const edit = { filePath: file, oldString: big, newString: big }
+      yield* llm.tool("edit", edit)
+      yield* llm.tool("edit", edit)
+      yield* llm.text("summary of the failed edits")
+      yield* llm.tool("edit", edit)
+      yield* llm.text("done")
+
+      yield* prompt.loop({ sessionID: session.id })
+
+      const tails = (yield* llm.inputs).map((body) => {
+        const last = Array.isArray(body.messages) ? body.messages.at(-1) : undefined
+        return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("Your last step")
+          ? last.content
+          : undefined
+      })
+      expect(tails).toEqual([
+        undefined,
+        undefined,
+        undefined,
+        "Your last step repeated the tool calls of the step before it: 1 time in a row; the results were identical too: 1 time in a row.",
+        "Your last step repeated the tool calls of the step before it: 2 times in a row; the results were identical too: 2 times in a row.",
+      ])
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
+    }),
+  30_000,
+)
+
+// R2: one response that calls the same tool three times. The third call is
+// refused before it runs and the run goes on; a doom_loop allow rule opts out.
+for (const optOut of [false, true]) {
+  it.instance(
+    `three identical calls in one response ${optOut ? "all run under doom_loop allow" : "refuse the third"}`,
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({
+          title: "Storm",
+          permission: [
+            { permission: "*", pattern: "*", action: "allow" },
+            { permission: "doom_loop", pattern: "*", action: optOut ? "allow" : "ask" },
+          ],
+        })
+        yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "find text files" }],
+        })
+        const glob = { tool: "glob", input: { pattern: "**/*.txt" } }
+        yield* llm.push(
+          periodicToolCallResponse({ blocks: [[glob], [glob], [glob]], chunkStyle: "one-per-chunk" }).item,
+        )
+        yield* llm.text("done")
+
+        const result = yield* prompt.loop({ sessionID: session.id })
+
+        expect(yield* llm.calls).toBe(2)
+        expect(result.parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
+        const states = (yield* MessageV2.filterCompactedEffect(session.id))
+          .flatMap((msg) => msg.parts)
+          .filter((part): part is SessionV1.ToolPart => part.type === "tool")
+          .map((part) => (part.state.status === "error" ? part.state.error : part.state.status))
+        expect(states).toEqual(
+          optOut
+            ? ["completed", "completed", "completed"]
+            : [
+                "completed",
+                "completed",
+                "Not run: within this one response, the same tool calls have now been repeated three times in a row.",
+              ],
+        )
+      }),
+  )
+}
 
 it.instance("loop continues when finish is stop but assistant has tool parts", () =>
   Effect.gen(function* () {

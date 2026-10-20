@@ -22,6 +22,7 @@ import { EffectBridge } from "@/effect/bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { isRecord } from "@/util/record"
+import { DoomLoop } from "./doom-loop"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 
 const MCP_RESOURCE_TOOLS = {
@@ -388,7 +389,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
   }
 
-  if (flags.experimentalCodeMode) return tools
+  if (flags.experimentalCodeMode) return refuseRepeats(tools, input)
 
   for (const [key, entry] of Object.entries(yield* mcp.tools())) {
     const item = McpCatalog.convertTool(entry.def, entry.client, entry.timeout)
@@ -492,8 +493,31 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     tools[key] = item
   }
 
-  return tools
+  return refuseRepeats(tools, input)
 })
+
+// The tool table is rebuilt for every provider step, so one detector sees exactly
+// the calls of one model response, in the order they start. A response that
+// repeats the same calls three times in a row is a storm: the repeat is refused
+// instead of run, unless a doom_loop allow rule opts out.
+function refuseRepeats(tools: Record<string, AITool>, input: { agent: Agent.Info; session: Session.Info }) {
+  const repeats = DoomLoop.create()
+  const rules = Permission.merge(input.agent.permission, input.session.permission ?? [])
+  for (const [key, item] of Object.entries(tools)) {
+    const execute = item.execute
+    if (!execute) continue
+    item.execute = (args, options) => {
+      if (!repeats.check(key, isRecord(args) ? args : { value: args })) return execute(args, options)
+      if (Permission.evaluate("doom_loop", key, rules).action === "allow") return execute(args, options)
+      return Promise.reject(
+        new Error(
+          "Not run: within this one response, the same tool calls have now been repeated three times in a row.",
+        ),
+      )
+    }
+  }
+  return tools
+}
 
 function toRecord(value: unknown) {
   if (isRecord(value)) return value
