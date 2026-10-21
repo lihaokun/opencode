@@ -54,6 +54,16 @@ reviewer 带 issue #77（fermat 长 run 实测：摘要重试挂错消息 → �
 - 全套回归（2026-10-20，HEAD `22377e6c`）：core 1102/1102 全绿；opencode 3983 pass / 16 fail。16 个失败逐个核实为环境性：①`httpapi-listen` 6 个 + `session HttpApi` 4 个 + `pty bridge` 1 个 + `concurrent loop callers` 1 个——共享机代理（Bun 进程启动时捕获，2026-10-13 隔离日志的同型问题：当时只精确 skip 了 real-listener 一条，其余走真实 TCP listener 的 PTY 变体在代理+高负载下超时 5s 上限；dev 基线 stash 验证同样失败、单跑同样失败、去代理变量进程级启动也失败——`no_proxy` preload 对真实 listener 路径不够）②其余 4 个为 prompt.test 负载贴限类（独立审核员已在 dev 基线复现同样失败）。本分支改动文件（shell/grep/ripgrep/prompt/restoration）定向全绿。
 - 双包 typecheck 干净。
 
+## 追加：wire 级测试充足性审计 + 三个补测（2026-10-21）
+
+针对"端测是否充分"的盘点结论：A1/A3/B4/D13/B7/#77 已有 wire 级覆盖，缺三处——①MCP 投影（structuredContent 注入只在 wire 上可见，单测只覆盖投影函数）、②B6 注入点（任务臂注入被删/被改时无测试红）、③D14 正向场景（既有覆盖只测了 shell 通知，未测委派下运行中后台 shell 阻塞父报告的正路径）。三处全补（`0f193fb9`、`267cd7d`）：
+
+- MCP wire 测试：`withMcpTool` 定制层挂真实 MCP SDK 内存 client（guide-server/lookup，返回 text + structuredContent），驱动真实 loop，断言模型请求同时含 `src/a.ts`（structured 投影）与结果文本。两个坑：MCP 工具注册表的 key 是 server 名不是 def.name（`tools["guide-server"]`）；`useServerConfig` 自带的 TestLLMServer 与定制层内的实例是两个对象，必须用层内 server + writeConfig。
+- D14 正向 wire 测试：父会话委派子 agent，子启动 1.5s 后台 shell，断言 job 未结算前 `notices(parent)` 为空、结算后父收到恰一条通知（不能用 kill——A2 取消抑制投递，子 agent 永远不会醒来）。
+- B6 注入点 wire 测试：既有 overflow 测试种入已完成 read（挂在被重放的当前轮上——挂独立轮会污染 summaryBody），断言第三条请求含文件磁盘当前内容、重放 user 上恰有一个 restoration part、非 synthetic text 与原轮逐字相等。
+
+教训：commit message 先于实现声称覆盖（0f193fb9 声称含 B6 但 diff 不含）——按"每步 commit"节奏提交时，message 必须只描述 diff 实际内容，补测用后续 commit 并注明关系。
+
 ## 度量
 
 | 指标           | 数值                                        |
