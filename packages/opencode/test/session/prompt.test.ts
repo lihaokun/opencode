@@ -16,6 +16,7 @@ import { Command } from "../../src/command"
 import { Config } from "@/config/config"
 import { LSP } from "@/lsp/lsp"
 import { MCP } from "../../src/mcp"
+import type { Client as MCPClient } from "@modelcontextprotocol/sdk/client/index.js"
 import { Permission } from "../../src/permission"
 import { Plugin } from "../../src/plugin"
 import { Provider as ProviderSvc } from "@/provider/provider"
@@ -113,14 +114,14 @@ function errorTool(parts: SessionV1.Part[]) {
   return part?.state.status === "error" ? (part as ErrorToolPart) : undefined
 }
 
-function makeMcp(instructions: MCP.ServerInstructions[] = []) {
+function makeMcp(instructions: MCP.ServerInstructions[] = [], tools: Record<string, MCP.McpTool> = {}) {
   return Layer.succeed(
     MCP.Service,
     MCP.Service.of({
       status: () => Effect.succeed({}),
       clients: () => Effect.succeed({}),
       instructions: () => Effect.succeed(instructions),
-      tools: () => Effect.succeed({}),
+      tools: () => Effect.succeed(tools),
       prompts: () => Effect.succeed({}),
       resources: () => Effect.succeed({}),
       resourceTemplates: () => Effect.succeed({}),
@@ -234,11 +235,15 @@ const promptRoot = LayerNode.group([
   RuntimeFlags.node,
 ])
 
-function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makePrompt(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  mcpTools?: Record<string, MCP.McpTool>
+  processor?: "blocking"
+}) {
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
-    [MCP.node, makeMcp(input?.mcpInstructions)],
+    [MCP.node, makeMcp(input?.mcpInstructions, input?.mcpTools)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
   if (input?.processor === "blocking") {
@@ -249,6 +254,7 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
 
 function makeHttp(input?: {
   mcpInstructions?: MCP.ServerInstructions[]
+  mcpTools?: Record<string, MCP.McpTool>
   processor?: "blocking"
   plugin?: "oversized-tool"
 }) {
@@ -256,7 +262,7 @@ function makeHttp(input?: {
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
-    [MCP.node, makeMcp(input?.mcpInstructions)],
+    [MCP.node, makeMcp(input?.mcpInstructions, input?.mcpTools)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
   if (input?.processor === "blocking") {
@@ -285,6 +291,28 @@ const withMcpInstructions = testEffect(
         tools: ["guide-server_lookup"],
       },
     ],
+  }),
+)
+// An MCP server exposing one tool whose result carries structuredContent — the
+// wire path under projection (session/tools.ts projectMcpToolResult).
+const withMcpTool = testEffect(
+  makeHttp({
+    mcpTools: {
+      "guide-server": {
+        def: {
+          name: "lookup",
+          description: "lookup things",
+          inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+        },
+        client: {
+          callTool: async () => ({
+            content: [{ type: "text", text: "查询完成" }],
+            structuredContent: { matches: [{ path: "src/a.ts", line: 42 }] },
+            isError: false,
+          }),
+        } as unknown as MCPClient,
+      },
+    },
   }),
 )
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
@@ -949,6 +977,45 @@ it.instance("loop replays grep output_mode results into the next model request",
     expect(wire).toContain("Found 2 files")
     expect(wire).toContain("needle-a.txt")
     expect(wire).toContain("needle-b.txt")
+  }),
+)
+
+// The MCP projection runs on the real tool-call path (session/tools.ts): the
+// model's request must carry the appended structuredContent, not just the text
+// item — this is what the unit tests on projectMcpToolResult cannot prove.
+withMcpTool.instance("loop replays an MCP structuredContent into the next model request", () =>
+  Effect.gen(function* () {
+    const llm = yield* TestLLMServer
+    const dir = (yield* TestInstance).directory
+    yield* writeConfig(dir, providerCfg(llm.url))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "MCP projection e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "look it up" }],
+    })
+    yield* llm.tool("guide-server", { q: "needle" })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    const wire = JSON.stringify(replay)
+    // The text item AND the appended structuredContent both ride the replay;
+    // "src/a.ts" appears twice — once in the appended JSON payload, once in
+    // the text item's own copy through the projection's \n\n append.
+    expect(wire).toContain("src/a.ts")
+    expect(wire).toContain("查询完成")
+    // 2 = one in the text item's replay, one in the appended structured JSON
+    expect(wire.split("src/a.ts")).toHaveLength(2)
   }),
 )
 
@@ -4734,6 +4801,50 @@ it.instance("every run end reports, not only the first", () =>
     expect(list[1].part.text).toContain("second done")
     yield* awaitWithTimeout(llm.wait(4), "the parent never ran on the second notice", "5 seconds")
   }),
+)
+
+// #53 via the review round's D14: a child that stops while its OWN background
+// shell is still running has not finished its work — the shell's completion
+// message will wake it for another turn, so the parent must not hear "Agent
+// completed" yet. Only when the shell settles does the notice go out.
+it.instance("a child with a running background shell does not report until the shell settles", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const parent = yield* (yield* Session.Service).create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    yield* user(child.id, "start the watcher")
+    // The child starts a background shell that outlives its run, then the run
+    // ends with one more model turn.
+    yield* llm.pushMatch(matching("start the watcher"), reply().tool("bash", {
+      command: `bun -e "await Bun.sleep(1_500)"`,
+      run_in_background: true,
+    }).stop())
+    yield* llm.textMatch(matching("Bun.sleep"), "started the watcher")
+
+    yield* prompt.loop({ sessionID: child.id })
+
+    // The run ended while the shell was still running: the parent hears
+    // nothing yet — the shell's completion will wake the child (D14/#53).
+    const before = yield* notices(parent.id)
+    expect(before).toEqual([])
+
+    // The shell settles normally: its completion notice wakes the child, that
+    // run ends, and only then does the parent hear "Agent completed".
+    const bg = yield* BackgroundJob.Service
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const jobs = yield* bg.list()
+      const shell = jobs.find((job) => job.type === "shell" && job.metadata?.sessionId === child.id)
+      if (shell && shell.status !== "running") break
+      yield* Effect.sleep(50)
+    }
+    const [notice] = yield* awaitNotices(parent.id, 1)
+    expect(notice.part.metadata?.summary).toContain("Agent completed")
+    yield* awaitWithTimeout(llm.wait(3), "the parent never ran on the notice", "5 seconds")
+  }),
+  20_000,
 )
 
 it.instance("reads the parent's identity when it delivers, not when the child started", () =>
