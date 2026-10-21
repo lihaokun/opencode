@@ -3,7 +3,7 @@
 > 对应 issue：[lihaokun/opencode#74](https://github.com/lihaokun/opencode/issues/74)（[Integration] GPT apply_patch-only tool set stalls path-gated FSM workflows）
 > 分析版本基线：`v1.18.31-fmv2.1`（受影响 release），当前 `dev` HEAD `d9d7de31fb`（两者相关逻辑逐字一致）
 > 文档性质：问题 + 根因 + 调研 + 修正方案（工作流 §7.1 八部分），合一文档。
-> 状态：方案已确认（彻底移除 apply_patch），**实施未开始**。
+> 状态：**已实施**（2026-10-21，`fix/issue-74-model-conditional-tools` 分支，实施 commits 见第七部分回填）。
 
 ## 第一部分：现象与复现
 
@@ -268,41 +268,45 @@ for (const [tool, enabled] of Object.entries(result.tools)) {
 
 ## 第六部分：测试用例清单
 
-| 类型 | 用例描述 | 状态（修复后回填） |
+| 类型 | 用例描述 | 状态（已回填） |
 |------|---------|------------------|
-| 回归 | GPT 系 modelID（`gpt-6-luna`、`gpt-5.3-codex`）工具集含 write/edit、不含 apply_patch；非 GPT 对照组不变 | 待加 |
-| 回归 | codex 系 ID 提示词落到 PROMPT_GPT；gpt.txt 全文不含 "apply_patch" | 待加 |
-| 新增 | config `tools` 折叠：`patch` 别名删除后不产生 edit 规则；`apply_patch` 键落独立 deny 规则 | 待加 |
-| 新增 | （核对项）A 类消费者测试中 apply_patch fixture → write/edit 后全部通过 | 待核 |
+| 回归 | GPT 系 modelID（`gpt-6-luna`、`gpt-5.3-codex`、`gpt-5.5`）工具集含 write/edit、不含 apply_patch；`claude-opus-4-5` 对照组不变 | 已加: `test/tool/registry.test.ts` "offers the same editing tools regardless of model ID" + a0f412e6a7 |
+| 回归 | codex 系 ID（`gpt-5.3-codex`、`gpt-5.5-codex-max`）提示词落到 PROMPT_GPT；gpt.txt 全文不含 "apply_patch" 且含 "Edit/Write" | 已加: `test/session/system.test.ts` 两条 + a0f412e6a7 |
+| 新增 | config `tools` 折叠：`patch` 别名删除后不再产生 edit 规则（落悬空 per-tool 规则） | 已加: `test/config/config.test.ts` "migrates legacy patch alias as a dangling per-tool permission rule" + a0f412e6a7 |
+| 新增 | （核对项）A 类消费者测试中 apply_patch fixture → write/edit 后全部通过 | 已核: permission/plan-mode/acp/cli-run 全绿（154 pass，仅 snapshot-tool-race 为分支上既有超时，stash 验证与本次无关） |
 
 ## 第七部分：代码更新清单
 
-| 文件 | 函数 / 行号 | 改动概述 | 状态（修复后回填） |
+| 文件 | 函数 / 行号 | 改动概述 | 状态（已回填） |
 |------|------------|---------|------------------|
-| `packages/opencode/src/tool/registry.ts` | :44/:139/:336-339 | 删 ApplyPatchTool 注册与 usePatch 分支 | 待改 |
-| `packages/opencode/src/tool/apply_patch.ts` + `.txt` | 全文件 | 删除 | 待改 |
-| `packages/opencode/src/patch/index.ts` | 全文件 | 删除 | 待改 |
-| `packages/opencode/src/cli/cmd/run/tool.ts` | :20/:99/:404/:535/:703/:727/:1072-1083 | 删 patch 面板 | 待改 |
-| `packages/opencode/src/cli/cmd/run/demo.ts` | :629/:1060/:1092 | 删 emitPatch | 待改 |
-| `packages/opencode/src/cli/cmd/agent.ts` | :17 | 注释更新 | 待改 |
-| `packages/opencode/src/permission/index.ts` | :241 | edits 数组删 apply_patch | 待改 |
-| `packages/opencode/src/config/config.ts` | :571 | 折叠表删 "patch" | 待改 |
-| `packages/core/src/tool/apply-patch.ts` + `builtins.ts` :6/:35 | 全文件/:35 | 删除/摘除 | 待改 |
-| `packages/core/src/file-mutation.ts` | :205 | 删 TODO 注释 | 待改 |
-| `packages/opencode/src/session/prompt/gpt.txt` | :27-28 | tool-agnostic 化 | 待改 |
-| `packages/opencode/src/session/prompt/codex.txt` | 全文件 | 删除 | 待改 |
-| `packages/opencode/src/session/system.ts` | :15/:37-39 | 删 codex 分支 | 待改 |
-| `packages/opencode/test/…`（4.2 表所列） | 各处 | 删/改 fixture 与快照 | 待改 |
-| `packages/core/test/…`（4.2 表所列） | 各处 | 同上 | 待改 |
-| 新增回归测试 ×3（4.2） | 新文件/既有文件 | 见第六部分 | 待加 |
+| `packages/opencode/src/tool/registry.ts` | import/:139/`patch: Tool.init`/builtin 列表/usePatch 分支 | 删 ApplyPatchTool 注册与 usePatch 分支 | 已改: 574bee6b71 |
+| `packages/opencode/src/tool/apply_patch.ts` + `.txt` | 全文件 | 删除 | 已改: 574bee6b71 |
+| `packages/opencode/src/patch/index.ts` | 全文件 | 删除 | 已改: 574bee6b71 |
+| `packages/opencode/src/cli/cmd/run/tool.ts` | import/类型映射/runPatch/snapPatch/patchTitle/patchLine/scrollPatch*/面板项 | 删 patch 面板 | 已改: 574bee6b71 |
+| `packages/opencode/src/cli/cmd/run/demo.ts` | emitPatch/`:patch` kind/mix 序列 | 删 emitPatch | 已改: 574bee6b71 |
+| `packages/opencode/src/cli/cmd/agent.ts` | :16-18 注释 | 注释更新 | 已改: 574bee6b71 |
+| `packages/opencode/src/permission/index.ts` | :241 | edits 数组删 apply_patch | 已改: 116e3a1adf |
+| `packages/opencode/src/config/config.ts` | :572 | 折叠表删 "patch" | 已改: 116e3a1adf |
+| `packages/core/src/tool/apply-patch.ts` + `builtins.ts` | 全文件/import+注册 | 删除/摘除 | 已改: 82572f2b80 |
+| `packages/core/src/file-mutation.ts` | :205 TODO | 删 TODO 注释 | 已改: 82572f2b80 |
+| `packages/core/src/v1/config/agent.ts` | normalize 折叠 | 删 "patch" 别名（实施中新发现，见下） | 已改: a0f412e6a7 |
+| `packages/core/src/v1/config/migrate.ts` | normalizeAction | 删 "patch"→edit 归一（实施中新发现，见下） | 已改: a0f412e6a7 |
+| `packages/opencode/src/session/prompt/gpt.txt` | :27-28 | tool-agnostic 化 | 已改: 622d25c765 |
+| `packages/opencode/src/session/prompt/codex.txt` | 全文件 | 删除 | 已改: 622d25c765 |
+| `packages/opencode/src/session/system.ts` | import/codex 分支 | 删 codex 分支 | 已改: 622d25c765 |
+| `packages/opencode/test/…`（4.2 表所列） | 各处 | 删/改 fixture 与快照 | 已改: 574bee6b71 + a0f412e6a7 |
+| `packages/core/test/…`（4.2 表所列） | 各处 | 同上 | 已改: 82572f2b80 |
+| 新增回归测试 ×3（4.2） | registry/system/config | 见第六部分 | 已加: a0f412e6a7 |
+
+**实施中的计划外发现**：原清单低估了 config 折叠面——core 包（`v1/config/agent.ts` 的 per-agent `tools` normalize、`v1/config/migrate.ts` 的 `normalizeAction`）存在第二组同样的 `"patch"` 别名折叠，回归测试抓出后才暴露（opencode 侧改完测试仍红）。两处已随第六部分回归用例一并修复。教训与 CLAUDE.md 已知限制回写一致：改折叠语义时按 consumer 全集排查，不按文件。
 
 ## 第八部分：文档更新清单
 
-| 文档路径 | 要改什么 | 状态（修复后回填） |
+| 文档路径 | 要改什么 | 状态（已回填） |
 |---------|---------|------------------|
-| 本文档（第七部分） | 回填 commit hash | 待回填 |
-| `CLAUDE.md` 已知限制段 | 回写经验教训：模型 ID 嗅探分叉工具面的隐患；历史 part 渲染兼容层的保留边界 | 待改 |
-| `docs/devlog/2026-10-21-remove-apply-patch.md` | 新增 devlog（含度量段） | 待加 |
+| 本文档（第七部分） | 回填 commit hash | 已回填: 本轮 |
+| `CLAUDE.md` 已知限制段 | 回写经验教训：模型 ID 嗅探分叉工具面的隐患；历史 part 渲染兼容层的保留边界 | 已改: 本轮 |
+| `docs/devlog/2026-10-21-remove-apply-patch.md` | 新增 devlog（含度量段） | 已加: 本轮 |
 
 **必填判定**：本修复改变了对外行为契约（模型可见工具集、提示词选择、config `tools` 折叠语义），第八部分不允许写"无"。
 
