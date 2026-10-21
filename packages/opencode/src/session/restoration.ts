@@ -269,9 +269,24 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
   let compactionIdx = -1
   let tailStartID: string | undefined
   let restorationIdx = -1
+  // A marker counts as settled only when a completed summary points at it
+  // (#77): summary && finish && !error, parentID = the marker's message —
+  // the same predicate filterCompacted uses. This covers both settled shapes:
+  // a tail-retaining compaction (tail_start_id set by compaction.process) and
+  // a full-summary fallback (tail_start_id undefined because there is no tail
+  // to retain). A marker whose summary is in flight, failed, or was parked on
+  // a newer user message by a retry has no such assistant — restoring "before
+  // that compaction" would stack the block on top of a full, un-compacted
+  // history.
+  const settledMarkers = new Set<string>()
+  for (const msg of messages) {
+    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error) {
+      settledMarkers.add(msg.info.parentID)
+    }
+  }
   messages.forEach((msg, index) => {
     for (const part of msg.parts) {
-      if (part.type === "compaction") {
+      if (part.type === "compaction" && settledMarkers.has(msg.info.id)) {
         compactionIdx = index
         tailStartID = part.tail_start_id
       }

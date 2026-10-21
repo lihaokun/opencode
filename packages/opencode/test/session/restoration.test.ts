@@ -100,6 +100,24 @@ const seedRestorable = Effect.fn("test.seedRestorable")(function* (
     auto: false,
     tail_start_id: assistant.id,
   })
+  // The settled marker needs a completed summary pointing at it (#77 guard):
+  // restore() only triggers for markers with summary && finish && !error.
+  yield* ssn.updateMessage({
+    id: MessageID.ascending(),
+    parentID: user.id,
+    role: "assistant",
+    sessionID,
+    mode: "compaction",
+    agent: "compaction",
+    summary: true,
+    finish: "stop",
+    path: { cwd: filePath, root: filePath },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ModelV2.ID.make("test-model"),
+    providerID: ProviderV2.ID.make("test"),
+    time: { created: Date.now() },
+  })
 })
 
 const configLayer = (info: Record<string, unknown>) =>
@@ -308,6 +326,23 @@ it.instance("apply writes one restoration part and stays idempotent", () =>
       auto: false,
       tail_start_id: assistant.id,
     })
+    // Settled marker (#77 guard): a completed summary pointing at the marker.
+    yield* ssn.updateMessage({
+      id: MessageID.ascending(),
+      parentID: user.id,
+      role: "assistant",
+      sessionID,
+      mode: "compaction",
+      agent: "compaction",
+      summary: true,
+      finish: "stop",
+      path: { cwd: dir, root: dir },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ModelV2.ID.make("test-model"),
+      providerID: ProviderV2.ID.make("test"),
+      time: { created: Date.now() },
+    })
 
     yield* apply({ sessionID })
     yield* apply({ sessionID })
@@ -411,5 +446,65 @@ itTight.instance("apply degrades to a reference under a tight budget", () =>
     expect(sentinels).toHaveLength(1)
     expect(sentinels[0].text).toContain("restoration budget exhausted")
     expect(sentinels[0].text).not.toContain(body)
+  }),
+)
+
+// #77: a compaction marker whose summary never completed against it (a retry
+// parked the summary on a newer user message, or the summary failed) has no
+// completed summary assistant pointing at it. Restoring "before that
+// compaction" would stack the block on top of a full, un-compacted history —
+// the marker must be settled. A full-summary compaction (tail_start_id
+// undefined but a completed summary present) still counts.
+it.instance("apply skips an unsettled compaction marker, accepts a full-summary one", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const session = yield* SessionNs.Service.use((ssn) => ssn.create({}))
+    yield* seedRestorable(session.id, path.join(test.directory, "body.txt"), "body text\n")
+    const ssn = yield* SessionNs.Service
+    const unset = (field: "tail_start_id" | "finish") =>
+      Effect.gen(function* () {
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        for (const msg of msgs) {
+          if (field === "tail_start_id") {
+            for (const part of msg.parts) {
+              if (part.type === "compaction") yield* ssn.updatePart({ ...part, tail_start_id: undefined })
+            }
+          } else {
+            for (const m of msgs) {
+              if (m.info.role === "assistant" && m.info.summary) {
+                yield* ssn.updateMessage({ ...m.info, finish: undefined })
+              }
+            }
+          }
+        }
+      })
+
+    // No completed summary pointing at the marker → not settled → no restore.
+    yield* unset("finish")
+    yield* apply({ sessionID: session.id })
+    const before = yield* SessionNs.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
+      Effect.map((all) => all.flatMap((m) => m.parts)),
+    )
+    expect(
+      before.filter((p): p is SessionV1.TextPart => p.type === "text" && p.text.startsWith(RESTORATION_SENTINEL)),
+    ).toHaveLength(0)
+
+    // Summary completed (finish restored) → settled → the restoration lands.
+    const ssn2 = yield* SessionNs.Service
+    const msgs2 = yield* ssn2.messages({ sessionID: session.id })
+    for (const m of msgs2) {
+      if (m.info.role === "assistant" && m.info.summary) {
+        yield* ssn2.updateMessage({ ...m.info, finish: "stop" })
+      }
+    }
+    yield* apply({ sessionID: session.id })
+    const after = yield* SessionNs.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
+      Effect.map((all) => all.flatMap((m) => m.parts)),
+    )
+    const sentinels = after.filter(
+      (p): p is SessionV1.TextPart => p.type === "text" && p.text.startsWith(RESTORATION_SENTINEL),
+    )
+    expect(sentinels.length).toBeGreaterThanOrEqual(1)
+    expect(sentinels[0]!.text).toContain("body text")
   }),
 )
