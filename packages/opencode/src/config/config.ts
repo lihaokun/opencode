@@ -569,7 +569,7 @@ const layer = Layer.effect(
           const perms: Record<string, ConfigPermissionV1.Action> = {}
           for (const [tool, enabled] of Object.entries(result.tools)) {
             const action: ConfigPermissionV1.Action = enabled ? "allow" : "deny"
-            if (tool === "write" || tool === "edit" || tool === "patch") {
+            if (tool === "write" || tool === "edit") {
               perms.edit = action
               continue
             }

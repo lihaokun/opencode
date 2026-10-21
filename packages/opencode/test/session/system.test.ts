@@ -109,6 +109,20 @@ describe("session.system", () => {
     }
   })
 
+  test("routes codex-family gpt models to the shared gpt prompt", () => {
+    for (const id of ["gpt-5.3-codex", "gpt-5.5-codex-max"]) {
+      const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)[0]
+      expect(prompt).not.toContain("powered by Muse")
+      expect(prompt).not.toContain("apply_patch")
+    }
+  })
+
+  test("the gpt prompt never names apply_patch", () => {
+    const prompt = SystemPrompt.provider({ api: { id: "gpt-5.5" } } as Provider.Model)[0]
+    expect(prompt).not.toContain("apply_patch")
+    expect(prompt).toContain("Edit/Write")
+  })
+
   it.effect("skills output is sorted by name and stable across calls", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service

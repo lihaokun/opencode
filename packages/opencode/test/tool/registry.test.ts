@@ -118,6 +118,33 @@ describe("tool.registry", () => {
     }),
   )
 
+  // Regression for #74: the registry used to swap write/edit out for
+  // apply_patch whenever the model ID contained "gpt-", which broke
+  // path-gated integrations built on the (tool, filePath) contract. The
+  // tool surface must not depend on the model ID at all.
+  it.instance("offers the same editing tools regardless of model ID", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const agent = yield* agents.defaultInfo()
+      const idsFor = (modelID: string) =>
+        registry
+          .tools({
+            providerID: ProviderV2.ID.make("openai"),
+            modelID: ModelV2.ID.make(modelID),
+            agent,
+          })
+          .pipe(Effect.map((tools) => tools.map((tool) => tool.id)))
+
+      for (const modelID of ["gpt-6-luna", "gpt-5.3-codex", "gpt-5.5", "claude-opus-4-5"]) {
+        const ids = yield* idsFor(modelID)
+        expect(ids).toContain("write")
+        expect(ids).toContain("edit")
+        expect(ids).not.toContain("apply_patch")
+      }
+    }),
+  )
+
   withCodeMode.instance("exposes execute when code mode is enabled", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service

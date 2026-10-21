@@ -853,7 +853,7 @@ test("does not double-space before completed bash output when inline tool header
   }
 })
 
-test("does not emit blank patch snapshots between edit and task", async () => {
+test("does not emit blank edit snapshots between edit and task", async () => {
   const out = await setup()
 
   try {
@@ -889,39 +889,6 @@ test("does not emit blank patch snapshots between edit and task", async () => {
     take()
     await out.scrollback.append(
       toolCommit({
-        tool: "apply_patch",
-        phase: "final",
-        toolState: "completed",
-        state: {
-          status: "completed",
-          input: {
-            patchText: "*** Begin Patch\n*** End Patch",
-          },
-          output: "",
-          title: "apply_patch",
-          metadata: {
-            files: [
-              {
-                type: "update",
-                filePath: "src/demo-format.ts",
-                relativePath: "src/demo-format.ts",
-                diff: "@@ -1 +1 @@\n-export const demo = 1\n+export const demo = 42\n",
-                deletions: 1,
-              },
-              {
-                type: "add",
-                filePath: "README-demo.md",
-                relativePath: "README-demo.md",
-              },
-            ],
-          },
-          time: { start: 2, end: 3 },
-        },
-      }),
-    )
-    take()
-    await out.scrollback.append(
-      toolCommit({
         tool: "task",
         phase: "final",
         toolState: "completed",
@@ -943,10 +910,12 @@ test("does not emit blank patch snapshots between edit and task", async () => {
     take()
 
     const output = lines.join("\n")
-    expect(output).toContain("+ Created README-demo.md")
-    expect(output).not.toContain("~ Patched src/demo-format.ts")
-    expect(output).toContain("+ Created README-demo.md\n\n# Explore Task")
-    expect(output).not.toContain("+ Created README-demo.md\n\n\n# Explore Task")
+    expect(output).toContain("# Edited src/demo-format.ts")
+    expect(output).not.toContain("+ Created README-demo.md")
+    // The edit's rendered diff block sits between the header and the task
+    // section; the point of this test is that no extra blank entry appears.
+    expect(output).toContain("1 + export const demo = 42\n\n# Explore Task")
+    expect(output).not.toContain("1 + export const demo = 42\n\n\n# Explore Task")
   } finally {
     out.scrollback.destroy()
   }

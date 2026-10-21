@@ -1434,7 +1434,7 @@ it.instance("migrates legacy edit tool to edit permission", () =>
   }),
 )
 
-it.instance("migrates legacy patch tool to edit permission", () =>
+it.instance("migrates legacy patch alias as a dangling per-tool permission rule", () =>
   Effect.gen(function* () {
     const test = yield* TestInstance
     yield* writeConfigEffect(test.directory, {
@@ -1442,8 +1442,11 @@ it.instance("migrates legacy patch tool to edit permission", () =>
       agent: { test: { tools: { patch: true } } },
     })
 
+    // The "patch" alias was removed with the apply_patch tool: it must no
+    // longer fold into the edit permission (which would silently flip every
+    // editing tool). It lands as its own rule that no tool matches.
     const config = yield* Config.use.get()
-    expect(config.agent?.["test"]?.permission).toEqual({ edit: "allow" })
+    expect(config.agent?.["test"]?.permission).toEqual({ patch: "allow" })
   }),
 )
 
