@@ -181,7 +181,7 @@ it.effect("preserves running tool start time across metadata updates", () =>
   }),
 )
 
-// Fix doc session-fix-step-tail-repeat-and-agents, §4.2: one resolved table is
+// Fix doc session-fix-step-tail-repeat-and-agents, §4.2: one guarded table is
 // one model response. Its third identical call in a row is refused before the
 // tool runs; a different call breaks the streak; a doom_loop allow rule opts out.
 const REFUSED = "Not run: within this one response, the same tool calls have now been repeated three times in a row."
@@ -190,25 +190,30 @@ const REFUSED = "Not run: within this one response, the same tool calls have now
 // each call as "ran" or its error text, plus how often echo really ran.
 const echoResponse = Effect.fn("test.echoResponse")(function* (doomLoop: "ask" | "allow", values: readonly unknown[]) {
   echoed = 0
-  const tools = yield* SessionTools.resolve({
-    agent: {
-      ...agent,
-      permission: [
-        { permission: "*", pattern: "*", action: "allow" },
-        { permission: "doom_loop", pattern: "*", action: doomLoop },
-      ],
-    },
-    model,
-    session: { id: sessionID, permission: [] } as unknown as Session.Info,
-    processor: {
-      message: { id: messageID } as SessionV1.Assistant,
-      updateToolCall: () => Effect.die("unused"),
-      completeToolCall: () => Effect.void,
-    },
-    bypassAgentCheck: false,
-    messages: [],
-    promptOps: {} as never,
-  })
+  const guarded = {
+    ...agent,
+    permission: [
+      { permission: "*", pattern: "*", action: "allow" as const },
+      { permission: "doom_loop", pattern: "*", action: doomLoop },
+    ],
+  }
+  const session = { id: sessionID, permission: [] } as unknown as Session.Info
+  const tools = SessionTools.refuseRepeats(
+    yield* SessionTools.resolve({
+      agent: guarded,
+      model,
+      session,
+      processor: {
+        message: { id: messageID } as SessionV1.Assistant,
+        updateToolCall: () => Effect.die("unused"),
+        completeToolCall: () => Effect.void,
+      },
+      bypassAgentCheck: false,
+      messages: [],
+      promptOps: {} as never,
+    }),
+    { agent: guarded, session },
+  )
   const execute = tools.echo.execute
   if (!execute) throw new Error("echo tool is missing execute")
   const seen = yield* Effect.forEach(values, (value, index) =>

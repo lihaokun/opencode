@@ -389,7 +389,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
   }
 
-  if (flags.experimentalCodeMode) return refuseRepeats(tools, input)
+  if (flags.experimentalCodeMode) return tools
 
   for (const [key, entry] of Object.entries(yield* mcp.tools())) {
     const item = McpCatalog.convertTool(entry.def, entry.client, entry.timeout)
@@ -493,14 +493,15 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     tools[key] = item
   }
 
-  return refuseRepeats(tools, input)
+  return tools
 })
 
 // The tool table is rebuilt for every provider step, so one detector sees exactly
 // the calls of one model response, in the order they start. A response that
 // repeats the same calls three times in a row is a storm: the repeat is refused
-// instead of run, unless a doom_loop allow rule opts out.
-function refuseRepeats(tools: Record<string, AITool>, input: { agent: Agent.Info; session: Session.Info }) {
+// instead of run, unless a doom_loop allow rule opts out. Call it on the step's
+// final table, after every tool the model may call has been added.
+export function refuseRepeats(tools: Record<string, AITool>, input: { agent: Agent.Info; session: Session.Info }) {
   const repeats = DoomLoop.create()
   const rules = Permission.merge(input.agent.permission, input.session.permission ?? [])
   for (const [key, item] of Object.entries(tools)) {

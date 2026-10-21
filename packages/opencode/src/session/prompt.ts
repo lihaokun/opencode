@@ -1409,6 +1409,7 @@ const layer = Layer.effect(
                 },
               })
             }
+            SessionTools.refuseRepeats(tools, { agent, session })
 
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
@@ -1511,19 +1512,22 @@ const layer = Layer.effect(
             }
 
             if (result === "stop") return "break" as const
+            // The provider rejected the request as too long: no response finished.
+            const rejected = result === "compact" && !handle.message.finish
             if (result === "compact") {
-              const overflow = !handle.message.finish
-              if (overflow) compactionToken = "compacted"
+              if (rejected) compactionToken = "compacted"
               yield* compaction.create({
                 sessionID,
                 agent: lastUser.agent,
                 model: lastUser.model,
                 auto: true,
-                overflow,
+                overflow: rejected,
               })
             }
-            // Only a step that ran counts; one withdrawn above for compaction before
-            // sending is not a step (fix doc session-fix-step-tail-repeat-and-agents §3.2).
+            // Only a step whose response finished counts. One withdrawn above for
+            // compaction before sending, or rejected by the provider as too long, is
+            // not a step (fix doc session-fix-step-tail-repeat-and-agents §3.2).
+            if (rejected) return "continue" as const
             const current = StepTail.signature(
               yield* MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database)),
             )

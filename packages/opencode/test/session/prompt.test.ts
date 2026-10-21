@@ -53,8 +53,10 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { provideInstance, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { raw, reply, TestLLMServer, type Usage } from "../lib/llm-server"
-import { periodicToolCallResponse } from "../lib/periodic-tool-calls"
+import { httpError, raw, reply, TestLLMServer, type Item, type Usage } from "../lib/llm-server"
+import { periodicToolCallResponse, type PeriodicToolCallChunkStyle } from "../lib/periodic-tool-calls"
+import { oracle } from "../lib/doom-loop-oracle"
+import { StepTail } from "../../src/session/step-tail"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -2742,6 +2744,224 @@ for (const optOut of [false, true]) {
         )
       }),
   )
+}
+
+// Review fixes after bfc07a0e80 (fix doc "审核补正"), run level. One run is
+// driven through the real loop with a scripted model; each step ends one of
+// these ways: an identical failing edit A or B, a completed text step without
+// tool calls (E), or a provider context overflow that compacts (O). Only completed
+// steps count (§3.2), so O must not touch the counters.
+type StepOutcome = "A" | "B" | "E" | "O"
+const REFUSED = "Not run: within this one response, the same tool calls have now been repeated three times in a row."
+
+const runOutcomes = Effect.fn("test.runOutcomes")(function* (plan: readonly StepOutcome[], id: string) {
+  const { dir, llm } = yield* useServerConfig(providerCfg)
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const session = yield* sessions.create({
+    title: `outcomes ${id}`,
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  })
+  // Compaction needs earlier history; both texts carry the case id so this
+  // case's scripted replies match only this case's requests.
+  yield* seed(session.id, { finish: "stop", userText: `earlier turn ${id}` })
+  const file = path.join(dir, `lemma-${id}.v`)
+  yield* writeText(file, "Proof. lia. Qed.\n")
+  yield* prompt.prompt({
+    sessionID: session.id,
+    agent: "build",
+    noReply: true,
+    parts: [{ type: "text", text: `fix the proof ${id}` }],
+  })
+  const edits = {
+    A: { filePath: file, oldString: "lia.", newString: "lia." },
+    B: { filePath: file, oldString: "Qed.", newString: "Qed." },
+  }
+  const items = plan.flatMap((step): (Item | ReturnType<typeof reply>)[] => {
+    if (step === "O")
+      return [httpError(400, { error: { message: "Prompt exceeds max length" } }), reply().text("summary").stop()]
+    // A text answer with a vendor finish completes the step and the run goes on.
+    // An empty reply would not: the processor retries it inside the same step.
+    if (step === "E") return [vendorFinish(`thinking ${id}`, "vendor_stop")]
+    return [reply().tool("edit", edits[step])]
+  })
+  yield* llm.pushMatch((hit) => JSON.stringify(hit.body).includes(id), ...items, reply().text(`done ${id}`).stop())
+  const before = (yield* llm.inputs).length
+  yield* prompt.loop({ sessionID: session.id })
+  const actual = (yield* llm.inputs).slice(before).map((body) => {
+    const last = Array.isArray(body.messages) ? body.messages.at(-1) : undefined
+    return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("Your last step")
+      ? last.content
+      : undefined
+  })
+
+  // The definition: count the trailing run of completed steps whose calls equal
+  // the previous completed step's calls. Equal edits here always fail the same
+  // way, so the results counter equals the calls counter.
+  const completed: string[] = []
+  const expected: (string | undefined)[] = []
+  const tail = () => {
+    let count = 0
+    for (let i = completed.length - 1; i >= 1 && completed[i] !== "" && completed[i] === completed[i - 1]; i--) count++
+    return StepTail.renderRepeat({ calls: count, results: count })
+  }
+  for (const step of plan) {
+    expected.push(tail())
+    if (step === "O") {
+      expected.push(undefined)
+      continue
+    }
+    completed.push(step === "E" ? "" : step)
+  }
+  expected.push(tail())
+  return { actual, expected }
+})
+
+// R4: a provider overflow between identical edits keeps the count (review finding 2).
+it.instance(
+  "a step the provider rejects as too long does not reset the repeat count",
+  () =>
+    Effect.gen(function* () {
+      const result = yield* runOutcomes(["A", "A", "O", "A"], "r4-overflow")
+      expect(result.actual).toEqual([
+        undefined,
+        undefined,
+        "Your last step repeated the tool calls of the step before it: 1 time in a row; the results were identical too: 1 time in a row.",
+        undefined,
+        "Your last step repeated the tool calls of the step before it: 1 time in a row; the results were identical too: 1 time in a row.",
+        "Your last step repeated the tool calls of the step before it: 2 times in a row; the results were identical too: 2 times in a row.",
+      ])
+      expect(result.actual).toEqual(result.expected)
+    }),
+  30_000,
+)
+
+// P5: random step outcomes through the real loop, compared with the definition.
+it.instance(
+  "step tails over random step outcomes match the completed-steps definition",
+  () =>
+    Effect.gen(function* () {
+      for (let n = 0; n < 12; n++) {
+        const next = rng(5100 + n)
+        const length = 2 + Math.floor(next() * 6)
+        // At most one recoverable overflow per run: after a compaction there is
+        // no earlier history left, so a second overflow ends the run.
+        const overflowAt = next() < 0.6 ? Math.floor(next() * length) : -1
+        const plan = Array.from({ length }, (_, index): StepOutcome => {
+          if (index === overflowAt) return "O"
+          const roll = next()
+          return roll < 0.55 ? "A" : roll < 0.85 ? "B" : "E"
+        })
+        const result = yield* runOutcomes(plan, `p5-${n}`)
+        expect(result.actual, `seed ${5100 + n} plan ${plan.join("")}`).toEqual(result.expected)
+      }
+    }),
+  240_000,
+)
+
+// R4 and P6: every tool of the final table is guarded within one response,
+// StructuredOutput included (review finding 1). Random periods and tools from
+// the final table; refusal positions follow the three-equal-blocks oracle.
+const runResponse = Effect.fn("test.runResponse")(function* (
+  calls: readonly { tool: string; input: Record<string, unknown> }[],
+  chunkStyle: PeriodicToolCallChunkStyle,
+  id: string,
+) {
+  const { llm } = yield* useServerConfig(providerCfg)
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const session = yield* sessions.create({
+    title: `response ${id}`,
+    permission: [
+      { permission: "*", pattern: "*", action: "allow" },
+      { permission: "doom_loop", pattern: "*", action: "ask" },
+    ],
+  })
+  yield* prompt.prompt({
+    sessionID: session.id,
+    agent: "build",
+    noReply: true,
+    format: new SessionV1.OutputFormatJsonSchema({
+      type: "json_schema",
+      schema: {
+        type: "object",
+        properties: { result: { type: "number" } },
+        required: ["result"],
+        additionalProperties: false,
+      },
+      retryCount: 0,
+    }),
+    parts: [{ type: "text", text: `structured response ${id}` }],
+  })
+  const response = periodicToolCallResponse({ blocks: [calls], chunkStyle, idPrefix: id })
+  yield* llm.pushMatch(
+    (hit) => JSON.stringify(hit.body).includes(id),
+    response.item,
+    reply().tool("StructuredOutput", { result: 0 }),
+  )
+  yield* prompt.loop({ sessionID: session.id })
+  const parts = (yield* MessageV2.filterCompactedEffect(session.id))
+    .flatMap((msg) => msg.parts)
+    .filter((part): part is SessionV1.ToolPart => part.type === "tool")
+  return response.calls.map((call) => {
+    const part = parts.find((item) => item.callID === call.id)
+    if (!part) return "missing"
+    return part.state.status === "error" && part.state.error === REFUSED ? "refused" : "ran"
+  })
+})
+
+it.instance(
+  "three identical StructuredOutput calls in one response refuse the third",
+  () =>
+    Effect.gen(function* () {
+      const call = { tool: "StructuredOutput", input: { result: 1 } }
+      expect(yield* runResponse([call, call, call], "one-per-chunk", "r4-structured")).toEqual([
+        "ran",
+        "ran",
+        "refused",
+      ])
+    }),
+  30_000,
+)
+
+it.instance(
+  "refusals over random responses from the final tool table match the three-equal-blocks definition",
+  () =>
+    Effect.gen(function* () {
+      const dir = (yield* TestInstance).directory
+      const styles: PeriodicToolCallChunkStyle[] = ["all-batched", "one-per-chunk", "pairs", "fragmented-sequential"]
+      for (let n = 0; n < 12; n++) {
+        const next = rng(6100 + n)
+        const pick = <T>(items: readonly T[]) => items[Math.floor(next() * items.length)]!
+        const random = () => {
+          const value = Math.floor(next() * 2)
+          return pick([
+            { tool: "glob", input: { pattern: `none-${value}-*.txt` } },
+            { tool: "grep", input: { pattern: `never-${value}` } },
+            { tool: "read", input: { filePath: path.join(dir, `missing-${value}.txt`) } },
+            { tool: "StructuredOutput", input: { result: value } },
+          ])
+        }
+        const block = Array.from({ length: 1 + Math.floor(next() * 3) }, random)
+        const noise = Array.from({ length: Math.floor(next() * 3) }, random)
+        const calls = [...noise, ...block, ...block, ...block]
+        const expected = calls.map((_, index) => (oracle(calls.slice(0, index + 1), 10) ? "refused" : "ran"))
+        const actual = yield* runResponse(calls, pick(styles), `p6-${n}`)
+        expect(actual, `seed ${6100 + n}`).toEqual(expected)
+      }
+    }),
+  240_000,
+)
+
+function rng(seed: number) {
+  let state = seed >>> 0
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0
+    let t = state
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
 }
 
 it.instance("loop continues when finish is stop but assistant has tool parts", () =>

@@ -3777,6 +3777,56 @@ describe("ProviderTransform.message - step tail", () => {
     ])
   })
 
+  // Review finding 3 after bfc07a0e80: with Anthropic automatic caching the
+  // server breakpoint lands on the last block, which is the tail and changes
+  // every step. An explicit breakpoint with the same TTL goes on the last block
+  // before the tail, so the stable prefix is written and read across steps.
+  test("anthropic automatic caching keeps a breakpoint before the tail on the wire", async () => {
+    const cacheControl = { type: "ephemeral", ttl: "1h" } as const
+    const model = createModel("anthropic", "@ai-sdk/anthropic")
+    const transformed = ProviderTransform.message(history(), model, { cacheControl })
+    let body: any
+    const provider = createAnthropic({
+      apiKey: "test-key",
+      fetch: Object.assign(
+        async (...args: Parameters<typeof fetch>) => {
+          body = JSON.parse(String(args[1]?.body))
+          return Response.json({
+            type: "message",
+            id: "msg_1",
+            model: "claude-test",
+            role: "assistant",
+            content: [{ type: "text", text: "ok" }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 1, output_tokens: 1 },
+          })
+        },
+        { preconnect: () => undefined },
+      ),
+    })
+    await generateText({
+      model: provider("claude-test"),
+      messages: transformed,
+      providerOptions: { anthropic: { cacheControl } },
+    })
+
+    expect(body.cache_control).toEqual(cacheControl)
+    expect(body.messages.at(-1).content.map((block: any) => [block.type, block.cache_control])).toEqual([
+      ["tool_result", cacheControl],
+      ["text", undefined],
+    ])
+    expect(
+      body.messages.slice(0, -1).flatMap((message: any) => message.content.filter((block: any) => block.cache_control)),
+    ).toEqual([])
+  })
+
+  test("anthropic automatic caching adds no explicit breakpoint without a tail", () => {
+    const result = ProviderTransform.message(history().slice(0, -1), createModel("anthropic", "@ai-sdk/anthropic"), {
+      cacheControl: { type: "ephemeral" },
+    })
+    expect(result.every((message) => message.providerOptions === undefined)).toBe(true)
+  })
+
   test("a provider whose ID is opencode keeps its own options but never gets the marker", () => {
     const messages = history().map((msg) =>
       msg.role === "user" && !msg.providerOptions ? { ...msg, providerOptions: { opencode: { keep: "me" } } } : msg,

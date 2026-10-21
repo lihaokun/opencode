@@ -138,6 +138,7 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 - **位置**：`prompt.ts` 组装 `messages` 时，在历史消息之后、最后一步的 `MAX_STEPS_PROMPT` 之前，追加一条 user 消息。内容由若干节组成，无内容时不追加。
 - **不持久化**：只存在于本步请求中，下一步重新生成。不写入会话历史，不进入压缩输入。
 - **缓存**：该消息带 `providerOptions.opencode.tail = true` 标记；`provider/transform.ts` 的 `applyCaching` 选取最后两条消息时跳过带此标记的消息。
+- **Anthropic 自动缓存**：配置了顶层 `cacheControl` 时不走 `applyCaching`，服务端把断点放在最后一个可缓存块，也就是末尾段；末尾段每步都变，于是每步只写不读。此时在末尾段之前的最后一条消息上加一个显式断点，取值与顶层 `cacheControl` 相同（含 TTL，避免长短 TTL 顺序冲突）。显式断点只加这一个，自动断点仍落在末尾段，占用一个槽位。
 - **标记不出 transform**：`ProviderTransform.message` 在放置缓存断点之后、提供方键重映射之前删除该标记。原因：重映射会把 `providerOptions[providerID]` 改名为 SDK 键，提供方 ID 恰为 `opencode`（Zen）时标记会变成 `anthropic.tail` 等 SDK 选项。现有 SDK 忽略未知字段，删除是防御，保证请求体不受标记影响。
 - **Mistral**：该系列要求 tool 消息后不能直接接 user，transform 会在两者之间插入一条 assistant `Done.`。有末尾段时这条插入也只出现在每步可变的后缀里，不影响前缀缓存。
 - **追溯**：每步以 INFO 日志记录末尾段文本（`message="step tail"`，含 session 与 step）。消息部件没有通用元数据字段，不为此改动数据结构。
@@ -145,8 +146,8 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 
 ### 4.2 #76 一步内重复：拒绝执行
 
-- 在 `SessionTools.resolve` 内为本步创建一个 `DoomLoop` 检测器（工具表每步重建，检测器天然是一步的范围）。
-- 工具表组装完成后统一包装每个工具的执行函数（含内置工具、MCP 工具、三个 MCP 资源工具，代码模式的提前返回同样经过）：调用前执行 `check(tool, input)`；检测为真时**不执行**，以错误返回：
+- 每步由 `prompt.ts` 在本步最终工具表组装完成之后（`SessionTools.resolve` 的结果再加上 StructuredOutput）调用 `SessionTools.refuseRepeats`，为本步创建一个 `DoomLoop` 检测器（工具表每步重建，检测器天然是一步的范围）。
+- 包装最终工具表中每个工具的执行函数（含内置工具、MCP 工具、三个 MCP 资源工具、StructuredOutput，代码模式同样经过）：调用前执行 `check(tool, input)`；检测为真时**不执行**，以错误返回：
 
   ```text
   Not run: within this one response, the same tool calls have now been repeated three times in a row.
@@ -160,7 +161,7 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 ### 4.3 #76 跨步重复：只计数
 
 - 状态由 `runLoop` 持有，run 开始为空、run 结束丢弃。
-- 每步结束且 run 决定继续时，读取刚结束这一步的助手消息的工具部件，与本 run 上一步的签名比较，按 3.2 的定义更新 `callRepeat` 与 `resultRepeat`：调用相同则 `callRepeat + 1`，否则清零；调用与结果都相同则 `resultRepeat + 1`，否则清零；本步没有工具调用时两者清零。发送前因预估溢出而撤回、转去压缩的一步不是完成的步骤，不参与比较，计数原样带到压缩后真正执行的那一步。
+- 每步结束且 run 决定继续时，读取刚结束这一步的助手消息的工具部件，与本 run 上一步的签名比较，按 3.2 的定义更新 `callRepeat` 与 `resultRepeat`：调用相同则 `callRepeat + 1`，否则清零；调用与结果都相同则 `resultRepeat + 1`，否则清零；本步没有工具调用时两者清零。发送前因预估溢出而撤回、转去压缩的一步，以及服务端报上下文越界、转去压缩的一步（结果为压缩且消息没有 finish），都不是完成的步骤，不参与比较，计数原样带到压缩后真正执行的那一步。空回复也不构成一步：processor 在同一步内重试，重试得到的响应才是这一步的内容。
 - `callRepeat > 0` 时下一步请求的末尾附带一节。模型读到它时上一步已经结束，所以说"你的上一步"：
 
   ```text
@@ -253,6 +254,7 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 - 不同输入的连续编辑计数为 0；新 run 计数从 0 开始。
 - 一步多个调用按顺序整组比较；顺序不同视为不同。
 - 发送前因溢出撤回并压缩的一步不清零计数（先在修正前的代码上确认失败）。
+- R4（审核补正）：服务端报越界并压缩的一步不清零计数；一次返回内三个相同的 StructuredOutput 调用，第三个被拒绝；Anthropic 自动缓存模式下请求体除顶层 `cache_control` 外，末尾段之前的最后一块带同 TTL 的显式断点。三项均先在 `bfc07a0e80` 上确认失败。
 - re-arm 不增加 run 编号；agent_stop 记 `stopped`；无上一个 run 时 agent_send 返回省略第二句。
 - agent_status：按名字和 id 查询；超出可查范围报错；agent_list 被禁用时 agent_status 不可见。
 - agent_list：各过滤项、默认上限、排序、计数行。
@@ -265,6 +267,8 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 
 - P1：随机生成多步 `(calls, results)` 序列（工具、输入、成功/失败随机，含重复与交替），每步比较增量计数与 3.2 朴素定义。
 - P2：随机生成一步内的调用序列，比较拒绝位置与 3.1 三段相等 oracle（复用现有 oracle）。
+- P5（run 层，审核补正）：随机生成一次 run 内每步的结局序列（调用 A、调用 B、无工具调用的完成步、服务端越界后压缩），经真实 `runLoop` 与脚本化 LLM 执行，每个请求的末尾段与"只计已完成步骤"的 3.2 定义比对。
+- P6（run 层，审核补正）：随机选取最终工具表中的工具（含 StructuredOutput）与周期，经真实 `runLoop` 发出一次返回内的周期重复，拒绝位置与 3.1 oracle 比对。
 - P3：随机生成子 agent 事件序列（发送到空闲 / 在跑、完成 / 失败 / 被停、re-arm），断言 run 编号严格递增、每份报告编号等于当时进行中的 run、agent_send 预告的编号与下一份报告一致、结束时间不早于开始时间。
 - P4：随机生成子 agent 集合与过滤参数，断言 agent_list 结果为全集子集、计数行与全集统计一致、行数不超过上限。
 
@@ -278,11 +282,11 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 
 | 文件                                                   | 改动                                                                                                                                                                                                                                                                        |
 | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `packages/opencode/src/session/prompt.ts`              | 末尾段组装；跨步计数状态；run 记录的开始与结束                                                                                                                                                                                                                              |
+| `packages/opencode/src/session/prompt.ts`              | 末尾段组装；跨步计数状态（只计完成的步骤）；最终工具表组装后调用重复拒绝；run 记录的开始与结束                                                                                                                                                                              |
 | `packages/opencode/src/session/step-tail.ts`（新）     | 末尾段的纯函数：计数更新、各节渲染                                                                                                                                                                                                                                          |
-| `packages/opencode/src/session/tools.ts`               | 一步内检测器；工具表组装完成后统一包装执行函数并拒绝重复                                                                                                                                                                                                                    |
+| `packages/opencode/src/session/tools.ts`               | 导出 `refuseRepeats`：一步内检测器与执行包装                                                                                                                                                                                                                                |
 | `packages/opencode/src/session/processor.ts`           | 删除检测器与 `doom_loop` 询问                                                                                                                                                                                                                                               |
-| `packages/opencode/src/provider/transform.ts`          | 缓存断点跳过末尾段；放置断点后删除标记                                                                                                                                                                                                                                      |
+| `packages/opencode/src/provider/transform.ts`          | 缓存断点跳过末尾段；自动缓存模式下在末尾段前加显式断点；放置断点后删除标记                                                                                                                                                                                                  |
 | `packages/opencode/src/agent-management/inbox.ts`      | agent 消息打标记                                                                                                                                                                                                                                                            |
 | `packages/opencode/src/agent-management/schema.ts`     | `agentRun` 元数据键与类型                                                                                                                                                                                                                                                   |
 | `packages/opencode/src/agent-management/delegation.ts` | 报告属性与摘要                                                                                                                                                                                                                                                              |
@@ -306,3 +310,11 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 - 压缩重试时摘要挂到最新用户消息（#77）。
 - 压缩后恢复只在压缩处理后执行（#60 的修订），需确认标记确有已完成摘要。
 - StructuredOutput 成功后不终止当前工具循环（#18）。
+
+## 审核补正（提交 `bfc07a0e80` 之后）
+
+外部审核在第一组提交后发现三处问题，均已复现并确认。三处都出在模块之间的衔接处：当时的随机测试只做在纯函数（P1）和 `SessionTools.resolve` 的返回值（P2）上，缓存测试只覆盖手动断点路径，都没有走到这些衔接点。为此补了 run 层的 P5、P6。
+
+1. **StructuredOutput 不受一步内拒绝保护。** `prompt.ts` 在 `SessionTools.resolve` 完成包装之后才加入 StructuredOutput，而旧 processor 检查能看到每一个调用。复现：一次返回内三个相同的 StructuredOutput 调用全部完成。修正：包装移到本步最终工具表组装之后（4.2）。本修正不涉及 #18 的终止机制。
+2. **服务端报上下文越界会清零跨步计数。** 越界的请求没有完成模型步骤，却被当作"没有工具调用的一步"参与比较。复现：相同 Edit 两步，服务端返回越界，压缩，再一次相同 Edit，压缩后两次请求都没有末尾段。修正：结果为压缩且消息没有 finish 的一步跳过计数更新（4.3）。
+3. **Anthropic 自动缓存模式下末尾段承载了断点。** 配置顶层 `cacheControl` 时跳过 `applyCaching`，自动断点落在每步都变的末尾段上，每步只写不读。官方说明见 <https://platform.claude.com/docs/en/build-with-claude/prompt-caching#automatic-caching>，其中把"可变后缀上的断点"列为常见错误，建议在静态前缀末尾放显式断点。修正见 4.1。
