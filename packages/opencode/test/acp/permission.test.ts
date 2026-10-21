@@ -242,7 +242,7 @@ describe("acp permissions", () => {
     })
   })
 
-  it("includes per-file diff blocks and locations for apply_patch permission metadata", async () => {
+  it("includes per-file diff blocks and locations for edit permission metadata", async () => {
     const first = await tempFile("first.ts", "one\n")
     const second = await tempFile("second.ts", "alpha\n")
     const harness = createHarness()
@@ -270,7 +270,7 @@ describe("acp permissions", () => {
       }),
     )
 
-    await pollUntil(() => harness.replies.length === 1, "apply_patch permission was never replied")
+    await pollUntil(() => harness.replies.length === 1, "edit permission was never replied")
 
     expect(harness.requests[0]?.toolCall).toMatchObject({
       toolCallId: "call_1",
