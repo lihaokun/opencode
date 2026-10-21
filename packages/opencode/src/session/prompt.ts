@@ -5,6 +5,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import os from "os"
 import { SessionID, MessageID, PartID } from "./schema"
 import { MessageV2 } from "./message-v2"
+import { SessionRestoration } from "./restoration"
 import { SessionRevert } from "./revert"
 import { Session } from "./session"
 import { Agent } from "../agent/agent"
@@ -654,6 +655,7 @@ const layer = Layer.effect(
           const args = Shell.args(sh, input.command, cwd)
           let output = ""
           let aborted = false
+          let exitCode: number | undefined
 
           const finish = Effect.uninterruptible(
             Effect.gen(function* () {
@@ -671,7 +673,7 @@ const layer = Layer.effect(
                   time: { ...part.state.time, end: completed },
                   input: part.state.input,
                   title: "",
-                  metadata: { output },
+                  metadata: { output, ...(exitCode !== undefined ? { exit: exitCode } : {}) },
                   output,
                 }
                 yield* sessions.updatePart(part)
@@ -703,13 +705,16 @@ const layer = Layer.effect(
                   }
                 }),
               )
-              yield* handle.exitCode
+              return yield* handle.exitCode
             }).pipe(Effect.scoped, Effect.orDie),
           ).pipe(Effect.exit)
 
           if (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause) && !Cause.hasDies(exit.cause)) {
             aborted = true
           }
+          // Record the process exit code so the replay projection can surface
+          // non-zero exits for `!` commands the same way it does for the bash tool.
+          if (Exit.isSuccess(exit)) exitCode = exit.value
           yield* finish
 
           if (Exit.isFailure(exit) && !aborted && !Cause.hasInterruptsOnly(exit.cause)) {
@@ -1299,6 +1304,17 @@ const layer = Layer.effect(
               auto: task.auto,
               overflow: task.overflow,
             })
+            // Restoration is injected here and only here — the single point
+            // where every compaction entry (overflow guard, processor
+            // reactive, HTTP summarize, manual) settles. Snapshot semantics:
+            // it reads the disk as of the compaction moment, once per
+            // compaction; it is not re-run per model step.
+            if (result === "continue") {
+              yield* SessionRestoration.apply({ sessionID }).pipe(
+                Effect.provideService(Session.Service, sessions),
+                Effect.provideService(FSUtil.Service, fsys),
+              )
+            }
             if (result === "stop") break
             continue
           }
@@ -1569,23 +1585,32 @@ const layer = Layer.effect(
     })
 
     /**
-     * Whether any agent below this one is still going. Busy by status, or
-     * started as a job that has not reached busy yet: the agent tool registers
-     * the job synchronously, and the status flips a few ticks later in the
-     * forked fiber, so a parent stopping right after starting one must not
-     * read it as finished.
+     * Whether this agent or any agent below it is still going. The session
+     * itself counts when it owns a running background shell (#53): the shell's
+     * completion message wakes it for another turn, so a run that stops while
+     * one is running has not finished its work. Descendants count when busy by
+     * status, or started as a job that has not reached busy yet: the agent tool
+     * registers the job synchronously, and the status flips a few ticks later
+     * in the forked fiber, so a parent stopping right after starting one must
+     * not read it as finished. Their background shells count the same way.
      */
     const hasLiveDescendant = Effect.fn("SessionPrompt.hasLiveDescendant")(function* (id: SessionID) {
       const members = yield* agentTree.descendants(id, 0)
-      if (members.length === 0) return false
       const busy = yield* status.list()
+      // The session's own agent job (type "agent", id = its SessionID) is still
+      // running while reportRunEnd executes inside it, so only shell jobs count
+      // for the self side — an agent job is ending by definition here.
+      const running = (yield* background.list()).filter(
+        (job) => job.status === "running" && (job.type === "shell" || job.id !== id),
+      )
+      if (running.some((job) => job.metadata?.sessionId === id)) return true
+      if (members.length === 0) return false
       if (members.some((member) => busy.has(member.session_id))) return true
       const ids = new Set<string>(members.map((member) => member.session_id))
-      return (yield* background.list()).some(
+      return running.some(
         (job) =>
-          job.status === "running" &&
-          typeof job.metadata?.parentSessionId === "string" &&
-          ids.has(job.metadata.parentSessionId),
+          (typeof job.metadata?.parentSessionId === "string" && ids.has(job.metadata.parentSessionId)) ||
+          (typeof job.metadata?.sessionId === "string" && ids.has(job.metadata.sessionId)),
       )
     })
 

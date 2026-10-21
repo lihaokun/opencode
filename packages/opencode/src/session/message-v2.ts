@@ -29,6 +29,7 @@ import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { formatExitCodeLine } from "@opencode-ai/core/session/tool-result-projection"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
@@ -295,9 +296,13 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
         if (part.type === "tool") {
           toolNames.add(part.tool)
           if (part.state.status === "completed") {
-            const outputText = part.state.time.compacted
+            const baseText = part.state.time.compacted
               ? "[Old tool result content cleared]"
               : truncateToolOutput(part.state.output, options?.toolOutputMaxChars)
+            // A non-zero exit only lives in metadata, which the model would never see
+            // without projecting it here. Success (0) and timeout/abort (null) stay silent.
+            const exitLine = part.state.time.compacted ? undefined : formatExitCodeLine(part.state.metadata)
+            const outputText = exitLine ? `${baseText}\n${exitLine}` : baseText
             const attachments = part.state.time.compacted || options?.stripMedia ? [] : (part.state.attachments ?? [])
 
             // For providers that don't support media in tool results, extract media files

@@ -16,6 +16,7 @@ import { Command } from "../../src/command"
 import { Config } from "@/config/config"
 import { LSP } from "@/lsp/lsp"
 import { MCP } from "../../src/mcp"
+import type { Client as MCPClient } from "@modelcontextprotocol/sdk/client/index.js"
 import { Permission } from "../../src/permission"
 import { Plugin } from "../../src/plugin"
 import { Provider as ProviderSvc } from "@/provider/provider"
@@ -113,14 +114,14 @@ function errorTool(parts: SessionV1.Part[]) {
   return part?.state.status === "error" ? (part as ErrorToolPart) : undefined
 }
 
-function makeMcp(instructions: MCP.ServerInstructions[] = []) {
+function makeMcp(instructions: MCP.ServerInstructions[] = [], tools: Record<string, MCP.McpTool> = {}) {
   return Layer.succeed(
     MCP.Service,
     MCP.Service.of({
       status: () => Effect.succeed({}),
       clients: () => Effect.succeed({}),
       instructions: () => Effect.succeed(instructions),
-      tools: () => Effect.succeed({}),
+      tools: () => Effect.succeed(tools),
       prompts: () => Effect.succeed({}),
       resources: () => Effect.succeed({}),
       resourceTemplates: () => Effect.succeed({}),
@@ -234,11 +235,15 @@ const promptRoot = LayerNode.group([
   RuntimeFlags.node,
 ])
 
-function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makePrompt(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  mcpTools?: Record<string, MCP.McpTool>
+  processor?: "blocking"
+}) {
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
-    [MCP.node, makeMcp(input?.mcpInstructions)],
+    [MCP.node, makeMcp(input?.mcpInstructions, input?.mcpTools)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
   if (input?.processor === "blocking") {
@@ -249,6 +254,7 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
 
 function makeHttp(input?: {
   mcpInstructions?: MCP.ServerInstructions[]
+  mcpTools?: Record<string, MCP.McpTool>
   processor?: "blocking"
   plugin?: "oversized-tool"
 }) {
@@ -256,7 +262,7 @@ function makeHttp(input?: {
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
-    [MCP.node, makeMcp(input?.mcpInstructions)],
+    [MCP.node, makeMcp(input?.mcpInstructions, input?.mcpTools)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
   if (input?.processor === "blocking") {
@@ -285,6 +291,28 @@ const withMcpInstructions = testEffect(
         tools: ["guide-server_lookup"],
       },
     ],
+  }),
+)
+// An MCP server exposing one tool whose result carries structuredContent — the
+// wire path under projection (session/tools.ts projectMcpToolResult).
+const withMcpTool = testEffect(
+  makeHttp({
+    mcpTools: {
+      "guide-server": {
+        def: {
+          name: "lookup",
+          description: "lookup things",
+          inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+        },
+        client: {
+          callTool: async () => ({
+            content: [{ type: "text", text: "查询完成" }],
+            structuredContent: { matches: [{ path: "src/a.ts", line: 42 }] },
+            isError: false,
+          }),
+        } as unknown as MCPClient,
+      },
+    },
   }),
 )
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
@@ -824,6 +852,242 @@ it.instance("loop calls LLM and returns assistant message", () =>
     const parts = result.parts.filter((p) => p.type === "text")
     expect(parts.some((p) => p.type === "text" && p.text === "world")).toBe(true)
     expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+it.instance("loop delivers the shared working agreement on the wire", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Shared agreement e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.text("ok")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const body = (yield* llm.inputs).at(-1)!
+    const wire = JSON.stringify(body)
+    // the shared agreement rides the system prompt…
+    expect(wire).toContain("# Working agreement")
+    expect(wire).toContain("carry it to completion")
+    // …and the dropped hard rules are gone from the wire too
+    expect(wire).not.toContain("fewer than 4 lines")
+    expect(wire).not.toContain("DO NOT ADD ***ANY***")
+    // #59: tool descriptions state mechanics, they do not prescribe workflow —
+    // the delegation prescription this PR once added is gone from the wire.
+    expect(wire).not.toContain("When to delegate")
+  }),
+)
+
+it.instance("explicit agent prompt opts out of the shared section on the wire", () =>
+  Effect.gen(function* () {
+    const marker = "CUSTOM_MARKER_PROMPT_AGENT_BUILD"
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      agent: { build: { prompt: marker } },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Opt-out e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.text("ok")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const body = (yield* llm.inputs).at(-1)!
+    const wire = JSON.stringify(body)
+    expect(wire).toContain(marker)
+    expect(wire).not.toContain("# Working agreement")
+    // the model template is replaced wholesale by the explicit prompt
+    expect(wire).not.toContain("interactive CLI tool that helps users with software engineering tasks")
+  }),
+)
+
+it.instance("loop replays a non-zero bash exit code into the next model request", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Exit code e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "run it" }],
+    })
+    yield* llm.tool("bash", { command: `bun -e "process.exit(7)"` })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    const toolMessage = (replay!.messages as { role: string; content: unknown }[]).find((m) => m.role === "tool")
+    expect(JSON.stringify(toolMessage)).toContain("(no output)")
+    expect(JSON.stringify(toolMessage)).toContain("[exit code: 7]")
+  }),
+)
+
+it.instance("loop replays grep output_mode results into the next model request", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Grep e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "needle-a.txt"), "needle\n"))
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "needle-b.txt"), "needle\n"))
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "find needles" }],
+    })
+    yield* llm.tool("grep", { pattern: "needle", output_mode: "files_with_matches" })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    const wire = JSON.stringify(replay)
+    expect(wire).toContain("Found 2 files")
+    expect(wire).toContain("needle-a.txt")
+    expect(wire).toContain("needle-b.txt")
+  }),
+)
+
+// The MCP projection runs on the real tool-call path (session/tools.ts): the
+// model's request must carry the appended structuredContent, not just the text
+// item — this is what the unit tests on projectMcpToolResult cannot prove.
+withMcpTool.instance("loop replays an MCP structuredContent into the next model request", () =>
+  Effect.gen(function* () {
+    const llm = yield* TestLLMServer
+    const dir = (yield* TestInstance).directory
+    yield* writeConfig(dir, providerCfg(llm.url))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "MCP projection e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "look it up" }],
+    })
+    yield* llm.tool("guide-server", { q: "needle" })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    const wire = JSON.stringify(replay)
+    // The text item AND the appended structuredContent both ride the replay;
+    // "src/a.ts" appears twice — once in the appended JSON payload, once in
+    // the text item's own copy through the projection's \n\n append.
+    expect(wire).toContain("src/a.ts")
+    expect(wire).toContain("查询完成")
+    // 2 = one in the text item's replay, one in the appended structured JSON
+    expect(wire.split("src/a.ts")).toHaveLength(2)
+  }),
+)
+
+it.instance("loop delivers background shell completion as a message on the wire", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Background shell e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the server" }],
+    })
+    yield* llm.tool("bash", {
+      command: `bun -e "console.log('bg-done-marker'); process.exit(0)"`,
+      run_in_background: true,
+    })
+    yield* llm.text("started")
+    yield* llm.text("ack")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    // The background process exits, the completion notification is delivered
+    // through the real deliverAsync path, and that message wakes a new model
+    // request — the notification must be on that wire.
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const hits = yield* llm.hits
+        return hits.length >= 3 ? true : undefined
+      }),
+      "background completion never reached the model",
+    )
+    const bodies = yield* llm.inputs
+    const notification = bodies
+      .filter((body) => JSON.stringify(body).includes("[shell task finished]"))
+      .at(-1)
+    expect(notification).toBeDefined()
+    const wire = JSON.stringify(notification)
+    expect(wire).toContain("bg-done-marker")
+    expect(wire).toContain("exit 0")
+  }),
+)
+
+it.instance("loop stays silent for a zero bash exit code", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Exit zero e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "run it" }],
+    })
+    yield* llm.tool("bash", { command: `bun -e "process.exit(0)"` })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    expect(JSON.stringify(replay)).not.toContain("[exit code:")
   }),
 )
 
@@ -1716,6 +1980,13 @@ it.instance("loop compacts and replays once after provider context overflow", ()
     const answerMarker = "provider-overflow-recovered-marker"
 
     yield* seed(chat.id, { finish: "stop" })
+    // A completed read gives the restoration something to restore: after the
+    // overflow-triggered compaction settles, the task arm injects the file's
+    // current on-disk body, and this test asserts it on the third request.
+    // The read rides the CURRENT turn (the one overflow replays), so the
+    // summary payload stays free of the replayed markers.
+    const restoredFile = path.join((yield* TestInstance).directory, "overflow-restored.md")
+    yield* writeText(restoredFile, "OVERFLOW-RESTORED-BODY")
     const original = yield* prompt.prompt({
       sessionID: chat.id,
       agent: "build",
@@ -1726,6 +1997,22 @@ it.instance("loop compacts and replays once after provider context overflow", ()
         { type: "text", text: currentMarker },
         { type: "text", text: detailMarker },
       ],
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: original.info.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "overflow-read-call",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: { filePath: restoredFile },
+        output: "read overflow-restored.md",
+        title: "overflow-restored.md",
+        metadata: { display: { type: "file", path: restoredFile } },
+        time: { start: 1, end: 2 },
+      },
     })
     yield* llm.error(400, { error: { message: "Prompt exceeds max length" } })
     yield* llm.text(summaryMarker)
@@ -1754,6 +2041,10 @@ it.instance("loop compacts and replays once after provider context overflow", ()
     expect(finalBody).toContain(systemMarker)
     expect(finalBody.split(currentMarker)).toHaveLength(2)
     expect(finalBody.split(detailMarker)).toHaveLength(2)
+    // B6: the compaction task arm injects the restoration block, and the
+    // post-compaction request carries the file's current on-disk body.
+    expect(finalBody).toContain("OVERFLOW-RESTORED-BODY")
+    expect(finalBody).toContain("restored from before the last compaction")
 
     const markerUsers = messages.filter(
       (message) =>
@@ -1778,11 +2069,21 @@ it.instance("loop compacts and replays once after provider context overflow", ()
     expect(replay.info.model.variant).toBe(original.info.model.variant)
     expect(replay.info.system).toBe(original.info.system)
     expect(replay.info.tools).toEqual(original.info.tools)
+    // The replayed user carries the injected restoration block (B6 task-arm
+    // injection), so compare only the non-synthetic text parts, then assert
+    // the restoration part itself is the one extra part on this message.
     expect(
-      replay.parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+      replay.parts
+        .filter((part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic)
+        .map((part) => part.text),
     ).toEqual(
       original.parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
     )
+    const restorationParts = replay.parts.filter(
+      (part): part is SessionV1.TextPart => part.type === "text" && part.text.startsWith("<!-- opencode:restoration -->"),
+    )
+    expect(restorationParts).toHaveLength(1)
+    expect(restorationParts[0].text).toContain("OVERFLOW-RESTORED-BODY")
     expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
     expect(messages.filter((message) => message.info.role === "assistant" && message.info.summary)).toHaveLength(1)
 
@@ -1794,6 +2095,7 @@ it.instance("loop compacts and replays once after provider context overflow", ()
     }
     expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: answerMarker }))
   }),
+  20_000,
 )
 
 it.instance("loop persists a second provider context overflow after one recovery", () =>
@@ -3632,6 +3934,28 @@ unixNoLLMServer(
   30_000,
 )
 
+it.instance(
+  "shell records non-zero exit code in completed metadata",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        const { prompt, chat } = yield* boot()
+
+        const exit = yield* prompt
+          .shell({ sessionID: chat.id, agent: "build", command: `bun -e "process.exit(7)"` })
+          .pipe(Effect.exit)
+        expect(Exit.isSuccess(exit)).toBe(true)
+
+        const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+        const tool = msgs.flatMap((m) => toolPart(m.parts)).find((p) => p?.state.status === "completed")
+        expect(tool).toBeDefined()
+        expect((tool!.state as SessionV1.ToolStateCompleted).metadata?.exit).toBe(7)
+      }),
+    ),
+  { config: cfg },
+  30_000,
+)
+
 // bun rather than sleep for the command that has to take a moment: the shell
 // behind this brings its own builtins and sleep is not among them, so on Windows
 // the command failed and the test sat waiting for a shell run that was never
@@ -4515,6 +4839,50 @@ it.instance("every run end reports, not only the first", () =>
     expect(list[1].part.text).toContain("second done")
     yield* awaitWithTimeout(llm.wait(4), "the parent never ran on the second notice", "5 seconds")
   }),
+)
+
+// #53 via the review round's D14: a child that stops while its OWN background
+// shell is still running has not finished its work — the shell's completion
+// message will wake it for another turn, so the parent must not hear "Agent
+// completed" yet. Only when the shell settles does the notice go out.
+it.instance("a child with a running background shell does not report until the shell settles", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const parent = yield* (yield* Session.Service).create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    yield* user(child.id, "start the watcher")
+    // The child starts a background shell that outlives its run, then the run
+    // ends with one more model turn.
+    yield* llm.pushMatch(matching("start the watcher"), reply().tool("bash", {
+      command: `bun -e "await Bun.sleep(1_500)"`,
+      run_in_background: true,
+    }).stop())
+    yield* llm.textMatch(matching("Bun.sleep"), "started the watcher")
+
+    yield* prompt.loop({ sessionID: child.id })
+
+    // The run ended while the shell was still running: the parent hears
+    // nothing yet — the shell's completion will wake the child (D14/#53).
+    const before = yield* notices(parent.id)
+    expect(before).toEqual([])
+
+    // The shell settles normally: its completion notice wakes the child, that
+    // run ends, and only then does the parent hear "Agent completed".
+    const bg = yield* BackgroundJob.Service
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const jobs = yield* bg.list()
+      const shell = jobs.find((job) => job.type === "shell" && job.metadata?.sessionId === child.id)
+      if (shell && shell.status !== "running") break
+      yield* Effect.sleep(50)
+    }
+    const [notice] = yield* awaitNotices(parent.id, 1)
+    expect(notice.part.metadata?.summary).toContain("Agent completed")
+    yield* awaitWithTimeout(llm.wait(3), "the parent never ran on the notice", "5 seconds")
+  }),
+  20_000,
 )
 
 it.instance("reads the parent's identity when it delivers, not when the child started", () =>

@@ -3,6 +3,7 @@ import {
   CallToolResultSchema,
   ListToolsResultSchema,
   ToolSchema,
+  type CallToolResult,
   type Tool as MCPToolDef,
 } from "@modelcontextprotocol/sdk/types.js"
 import { dynamicTool, jsonSchema, type JSONSchema7, type Tool } from "ai"
@@ -14,6 +15,21 @@ const MAX_LIST_PAGES = 1_000
 const TolerantListToolsResultSchema = ListToolsResultSchema.extend({
   tools: ToolSchema.omit({ outputSchema: true }).array(),
 })
+
+/**
+ * Model-facing message for an errored tool call: text content items plus the
+ * structuredContent channel (servers may put error details only there), joined
+ * with a stable fallback when both are empty.
+ */
+export function callToolErrorMessage(result: CallToolResult): string {
+  const parts = result.content
+    .flatMap((item) => (item.type === "text" ? [item.text] : []))
+    .filter((text) => text.trim())
+  if (result.structuredContent !== undefined && result.structuredContent !== null) {
+    parts.push(JSON.stringify(result.structuredContent))
+  }
+  return parts.join("\n\n") || "MCP tool returned an error"
+}
 
 export async function paginate<T, R extends { nextCursor?: string }>(
   list: (cursor?: string) => Promise<R>,
@@ -65,13 +81,7 @@ export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: numbe
           onprogress: () => {},
         },
       )
-      if (result.isError)
-        throw new Error(
-          result.content
-            .flatMap((item) => (item.type === "text" ? [item.text] : []))
-            .filter((text) => text.trim())
-            .join("\n\n") || "MCP tool returned an error",
-        )
+      if (result.isError) throw new Error(callToolErrorMessage(result))
       if (result.content.length > 0 || result.structuredContent === undefined || result.structuredContent === null)
         return result
       return {

@@ -21,12 +21,15 @@ import { SessionSummary } from "../../src/session/summary"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { RESTORATION_SENTINEL, SessionRestoration } from "../../src/session/restoration"
 
 import { Provider } from "@/provider/provider"
 import * as SessionProcessorModule from "../../src/session/processor"
 import { ProviderTest } from "../fake/provider"
 import { testEffect } from "../lib/effect"
+import path from "path"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { TestConfig } from "../fixture/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
@@ -241,7 +244,7 @@ const env = AppNodeBuilder.build(compactionTestNode, [
 const it = testEffect(env)
 
 const compactionEnv = AppNodeBuilder.build(
-  LayerNode.group([SessionNs.node, SessionProjector.node, Database.node, EventV2Bridge.node, CrossSpawnSpawner.node]),
+  LayerNode.group([SessionNs.node, SessionProjector.node, Database.node, EventV2Bridge.node, CrossSpawnSpawner.node, FSUtil.node]),
 )
 const itCompaction = testEffect(compactionEnv)
 
@@ -1280,6 +1283,51 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
+    "summary input keeps head, tail hint and non-zero exit for a long tool result",
+    () => {
+      const stub = llm()
+      let captured = ""
+      stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const first = yield* createUserMessage(session.id, "first")
+        const assistant = yield* createAssistantMessage(session.id, first.id, "/tmp")
+        const longOutput = `${"HEAD_MARKER\n"}${"a".repeat(3_000)}${"TAIL_MARKER\n(Results are truncated...)\nFull output saved to: /tmp/tool_x"}`
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "tool",
+          tool: "bash",
+          callID: "call_exit_e2e",
+          state: {
+            status: "completed",
+            input: { command: "deploy --quiet" },
+            output: longOutput,
+            title: "deploy",
+            metadata: { exit: 7 },
+            time: { start: 0, end: 1 },
+          },
+        })
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+        yield* SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
+
+        expect(captured).toContain("HEAD_MARKER")
+        expect(captured).toContain("[... 1084 chars truncated ...]")
+        expect(captured).toContain("Full output saved to: /tmp/tool_x")
+        expect(captured).toContain("[exit code: 7]")
+        expect(captured).not.toContain("a".repeat(1_500))
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 20 }) }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
     "falls back to full summary when retained tail media exceeds preserve token budget",
     () => {
       const stub = llm()
@@ -2238,3 +2286,112 @@ describe("SessionNs.getUsage", () => {
     expect(result.tokens.cache.write).toBe(300)
   })
 })
+
+itCompaction.instance(
+  "keeps constraints, failures and restoration intact across three consecutive compactions",
+  () => {
+    const stub = llm()
+    let captured = ""
+    stub.push(reply("summary-1", (input) => (captured = JSON.stringify(input.messages))))
+    return Effect.gen(function* () {
+      const test = yield* TestInstance
+      const fs = yield* FSUtil.Service
+      const ssn = yield* SessionNs.Service
+      const session = yield* ssn.create({})
+      const spec = path.join(test.directory, "spec.md")
+      yield* fs.writeWithDirs(spec, "SPEC_MARKER pnpm only\n")
+
+      // Turn 1: a user constraint, a spec read, and a failed command.
+      const u1 = yield* createUserMessage(session.id, "always use pnpm; deploy and report")
+      const a1 = yield* createAssistantMessage(session.id, u1.id, test.directory)
+      yield* ssn.updatePart({
+        id: PartID.ascending(),
+        messageID: a1.id,
+        sessionID: session.id,
+        type: "tool",
+        tool: "read",
+        callID: "c_read",
+        state: {
+          status: "completed",
+          input: { filePath: spec },
+          output: "read spec.md",
+          title: "spec.md",
+          metadata: { display: { type: "file", path: spec } },
+          time: { start: 0, end: 1 },
+        },
+      })
+      yield* ssn.updatePart({
+        id: PartID.ascending(),
+        messageID: a1.id,
+        sessionID: session.id,
+        type: "tool",
+        tool: "bash",
+        callID: "c_deploy",
+        state: {
+          status: "completed",
+          input: { command: "deploy" },
+          output: "deploy failed\n",
+          title: "deploy",
+          metadata: { exit: 7 },
+          time: { start: 0, end: 1 },
+        },
+      })
+      yield* createSummaryCompaction(session.id)
+
+      const runCompaction = (label: string) =>
+        Effect.gen(function* () {
+          const msgs = yield* ssn.messages({ sessionID: session.id })
+          const parent = msgs.at(-1)?.info.id
+          expect(parent).toBeTruthy()
+          const procExit = yield* Effect.exit(
+            SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false }),
+          )
+          expect(Exit.isFailure(procExit)).toBe(false)
+          return captured
+        })
+
+      const c1 = yield* runCompaction("c1")
+      expect(c1).toContain("always use pnpm")
+      // the tool OUTPUT is "read spec.md"; the on-disk body (SPEC_MARKER) is
+      // restored later from disk — deliberately different strings so the
+      // restoration proves it re-read the current file version.
+      expect(c1).toContain("read spec.md")
+      expect(c1).toContain("[exit code: 7]")
+
+      // Turns 2-3 + compactions: with the tiny preserve budget every
+      // compaction falls back to a full summary — the constraint re-appears in
+      // every payload, which is exactly the acceptance target (it survives
+      // three consecutive compactions).
+      stub.push(reply("summary-2", (input) => (captured = JSON.stringify(input.messages))))
+      const u2 = yield* createUserMessage(session.id, "continue")
+      yield* createSummaryCompaction(session.id)
+      const c2 = captured
+      expect(c2).toContain("always use pnpm")
+      expect(c2).toContain("continue")
+
+      stub.push(reply("summary-3", (input) => (captured = JSON.stringify(input.messages))))
+      const u3 = yield* createUserMessage(session.id, "wrap up")
+      yield* createSummaryCompaction(session.id)
+      const c3 = captured
+      expect(c3).toContain("always use pnpm")
+
+      // Restoration after the third compaction: the spec is re-read from disk
+      // (current version) and the restoration part is idempotent.
+      yield* SessionRestoration.apply({ sessionID: session.id })
+      let msgs = yield* ssn.messages({ sessionID: session.id })
+      let restored = msgs
+        .flatMap((m) => m.parts)
+        .filter((p): p is SessionV1.TextPart => p.type === "text" && p.text.startsWith(RESTORATION_SENTINEL))
+      expect(restored).toHaveLength(1)
+      expect(restored[0].text).toContain("SPEC_MARKER pnpm only")
+
+      yield* SessionRestoration.apply({ sessionID: session.id })
+      msgs = yield* ssn.messages({ sessionID: session.id })
+      restored = msgs
+        .flatMap((m) => m.parts)
+        .filter((p): p is SessionV1.TextPart => p.type === "text" && p.text.startsWith(RESTORATION_SENTINEL))
+      expect(restored).toHaveLength(1)
+    }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 20 }) }))
+  },
+  { git: true },
+)

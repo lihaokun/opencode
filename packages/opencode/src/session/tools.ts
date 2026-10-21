@@ -21,6 +21,7 @@ import { PartID } from "./schema"
 import { EffectBridge } from "@/effect/bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 
@@ -426,45 +427,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             result,
           )
 
-          const textParts: string[] = []
-          const attachments: Omit<SessionV1.FilePart, "id" | "sessionID" | "messageID">[] = []
-          for (const contentItem of result.content) {
-            if (contentItem.type === "text") textParts.push(contentItem.text)
-            else if (contentItem.type === "image") {
-              attachments.push({
-                type: "file",
-                mime: contentItem.mimeType,
-                url: `data:${contentItem.mimeType};base64,${contentItem.data}`,
-              })
-            } else if (contentItem.type === "resource") {
-              const { resource } = contentItem
-              if (resource.text) textParts.push(resource.text)
-              if (resource.blob) {
-                const mime = resource.mimeType ?? "application/octet-stream"
-                const size = base64Size(resource.blob)
-                if (!SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES.has(mime)) {
-                  textParts.push(
-                    `[Binary MCP resource omitted: ${resource.uri} (${mime}, ${formatBytes(size)}) is not a supported attachment type]`,
-                  )
-                  continue
-                }
-                if (size > MAX_MCP_RESOURCE_BLOB_BYTES) {
-                  textParts.push(
-                    `[Binary MCP resource omitted: ${resource.uri} (${mime}, ${formatBytes(size)}) exceeds ${formatBytes(MAX_MCP_RESOURCE_BLOB_BYTES)}]`,
-                  )
-                  continue
-                }
-                attachments.push({
-                  type: "file",
-                  mime,
-                  url: `data:${mime};base64,${resource.blob}`,
-                  filename: resource.uri,
-                })
-              }
-            }
-          }
+          const projected = projectMcpToolResult(result)
 
-          const truncated = yield* truncate.output(textParts.join("\n\n"), {}, input.agent)
+          const truncated = yield* truncate.output(projected.text, {}, input.agent)
           const metadata = {
             ...result.metadata,
             truncated: truncated.truncated,
@@ -475,7 +440,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             title: "",
             metadata,
             output: truncated.content,
-            attachments: attachments.map((attachment) => ({
+            attachments: projected.attachments.map((attachment) => ({
               ...attachment,
               id: PartID.ascending(),
               sessionID: ctx.sessionID,
@@ -494,6 +459,79 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
 
   return tools
 })
+
+/**
+ * Projection of an MCP CallToolResult to model-visible text plus attachments
+ * (the default, non-code-mode path). structuredContent is a separate channel
+ * that would otherwise never reach the model when content is non-empty — the
+ * catalog only converts it when content is empty — so it is appended unless a
+ * content item already carries the same data: the fast path covers catalog's
+ * own empty-content conversion, and the semantic path (parse + deep equals)
+ * covers pretty-printed or reordered echoes. Unhandled content types degrade
+ * to explicit placeholder lines instead of vanishing silently.
+ */
+export function projectMcpToolResult(result: CallToolResult): {
+  text: string
+  attachments: Omit<SessionV1.FilePart, "id" | "sessionID" | "messageID">[]
+} {
+  const textParts: string[] = []
+  const attachments: Omit<SessionV1.FilePart, "id" | "sessionID" | "messageID">[] = []
+  for (const contentItem of result.content) {
+    if (contentItem.type === "text") textParts.push(contentItem.text)
+    else if (contentItem.type === "image") {
+      attachments.push({
+        type: "file",
+        mime: contentItem.mimeType,
+        url: `data:${contentItem.mimeType};base64,${contentItem.data}`,
+      })
+    } else if (contentItem.type === "resource") {
+      const { resource } = contentItem
+      if ("text" in resource && resource.text) textParts.push(resource.text)
+      if ("blob" in resource && resource.blob) {
+        const mime = resource.mimeType ?? "application/octet-stream"
+        const size = base64Size(resource.blob)
+        if (!SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES.has(mime)) {
+          textParts.push(
+            `[Binary MCP resource omitted: ${resource.uri} (${mime}, ${formatBytes(size)}) is not a supported attachment type]`,
+          )
+          continue
+        }
+        if (size > MAX_MCP_RESOURCE_BLOB_BYTES) {
+          textParts.push(
+            `[Binary MCP resource omitted: ${resource.uri} (${mime}, ${formatBytes(size)}) exceeds ${formatBytes(MAX_MCP_RESOURCE_BLOB_BYTES)}]`,
+          )
+          continue
+        }
+        attachments.push({
+          type: "file",
+          mime,
+          url: `data:${mime};base64,${resource.blob}`,
+          filename: resource.uri,
+        })
+      }
+    } else if (contentItem.type === "resource_link") {
+      textParts.push(`${contentItem.name}: ${contentItem.uri}`)
+    } else if (contentItem.type === "audio") {
+      textParts.push(`[MCP audio content omitted: ${contentItem.mimeType}]`)
+    }
+  }
+  const structured = result.structuredContent
+  if (structured !== undefined && structured !== null) {
+    const serialized = JSON.stringify(structured)
+    if (!textParts.some((item) => item === serialized || parsesTo(item, structured))) {
+      textParts.push(serialized)
+    }
+  }
+  return { text: textParts.join("\n\n"), attachments }
+}
+
+function parsesTo(text: string, value: unknown) {
+  try {
+    return Bun.deepEquals(JSON.parse(text), value)
+  } catch {
+    return false
+  }
+}
 
 function toRecord(value: unknown) {
   if (isRecord(value)) return value

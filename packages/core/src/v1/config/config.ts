@@ -165,6 +165,24 @@ export const Info = Schema.Struct({
       reserved: Schema.optional(NonNegativeInt).annotate({
         description: "Token buffer for compaction. Leaves enough window to avoid overflow during compaction.",
       }),
+      restoration: Schema.optional(
+        Schema.Struct({
+          enabled: Schema.optional(Schema.Boolean).annotate({
+            description: "Re-supply needed files, skills and todos after compaction (default: true)",
+          }),
+          max_files: Schema.optional(NonNegativeInt).annotate({
+            description: "Maximum number of files restored after compaction (default: 5)",
+          }),
+          file_max_tokens: Schema.optional(NonNegativeInt).annotate({
+            description: "Per-file token cap for restoration; larger files degrade to a reference (default: 4000)",
+          }),
+          budget_tokens: Schema.optional(NonNegativeInt).annotate({
+            description: "Total token budget for restoration materials (default: 8000)",
+          }),
+        }),
+      ).annotate({
+        description: "Post-compaction restoration of task-relevant files, skills and todos.",
+      }),
     }),
   ),
   experimental: Schema.optional(

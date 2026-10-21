@@ -1366,6 +1366,92 @@ describe("session.message-v2.toModelMessage", () => {
   })
 })
 
+describe("session.message-v2.tool exit code projection", () => {
+  const assistantID = "m-asst-exit"
+  const userID = "m-user-exit"
+
+  function completedToolPart(
+    callID: string,
+    metadata: Record<string, unknown>,
+    output = "(no output)",
+  ): SessionV1.ToolPart {
+    return {
+      ...basePart(assistantID, `p-${callID}`),
+      type: "tool",
+      callID,
+      tool: "bash",
+      state: {
+        status: "completed",
+        input: { command: "true" },
+        output,
+        title: "bash",
+        metadata,
+        time: { start: 0, end: 1 },
+      },
+      metadata: {},
+    } as SessionV1.ToolPart
+  }
+
+  function inputWith(part: SessionV1.Part) {
+    return [
+      { info: userInfo(userID), parts: [] },
+      { info: assistantInfo(assistantID, userID), parts: [part] },
+    ]
+  }
+
+  async function toolResultText(part: SessionV1.Part): Promise<string> {
+    const result = await MessageV2.toModelMessages(inputWith(part), model)
+    const toolResult = result.flatMap((m) => m.content as any[]).find((p) => p.type === "tool-result")
+    const output = toolResult.output
+    return typeof output === "string" ? output : output.value
+  }
+
+  test("regression: silent non-zero exit is visible to the model, exit 0 stays silent", async () => {
+    expect(await toolResultText(completedToolPart("c1", { exit: 7 }))).toBe("(no output)\n[exit code: 7]")
+    expect(await toolResultText(completedToolPart("c2", { exit: 0 }))).toBe("(no output)")
+  })
+
+  test("null exit (timeout/abort) adds no line", async () => {
+    expect(await toolResultText(completedToolPart("c3", { exit: null }))).toBe("(no output)")
+  })
+
+  test("missing or non-numeric exit adds no line and does not throw", async () => {
+    expect(await toolResultText(completedToolPart("c4", {}))).toBe("(no output)")
+    expect(await toolResultText(completedToolPart("c5", { exit: "7" }))).toBe("(no output)")
+    expect(await toolResultText(completedToolPart("c6", undefined as unknown as Record<string, unknown>))).toBe(
+      "(no output)",
+    )
+  })
+
+  test("compacted parts are not annotated", async () => {
+    const part = completedToolPart("c7", { exit: 7 })
+    ;(part.state as any).time.compacted = Date.now()
+    expect(await toolResultText(part)).toBe("[Old tool result content cleared]")
+  })
+
+  test("exit line rides in the text next to attachments", async () => {
+    const part = completedToolPart("c8", { exit: 7 }, "failed badly")
+    ;(part.state as any).attachments = [
+      {
+        ...basePart(assistantID, "p-c8-file"),
+        type: "file",
+        mime: "image/png",
+        filename: "shot.png",
+        url: "data:image/png;base64,Zm9v",
+      },
+    ]
+    const result = await MessageV2.toModelMessages(inputWith(part), model)
+    const toolResult = result.flatMap((m) => m.content as any[]).find((p) => p.type === "tool-result")
+    expect(toolResult.output).toStrictEqual({
+      type: "content",
+      value: [
+        { type: "text", text: "failed badly\n[exit code: 7]" },
+        { type: "media", mediaType: "image/png", data: "Zm9v" },
+      ],
+    })
+  })
+})
+
 describe("session.message-v2.fromError", () => {
   test("serializes context_length_exceeded as ContextOverflowError", () => {
     const input = {
