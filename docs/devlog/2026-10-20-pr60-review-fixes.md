@@ -36,6 +36,10 @@ Reviewer（lihaokun）在 PR #60 留 14 项审核意见（A 必修 3 / B 应修 
 
 **独立审修复**：grep 三处行为修复 + schema 约束 + 补非法表达式回归（原 commit 曾误称已含）；bgshell 五项修复（settle 输出带 status 行、`Effect.ensuring` 清理、kill 幂等快照应答、metadata 补齐、tail_lines PositiveInt）+ 新增 3 测试；两份契约文档与两份 expectations 按实现口径修订并标注。
 
+## 追加：reviewer 二轮（2026-10-20 晚，#77 交互防御）
+
+reviewer 带 issue #77（fermat 长 run 实测：摘要重试挂错消息 → 压缩不生效反复触发）回来，指出与本 PR 恢复逻辑的交互：恢复取最新标记、不查摘要是否完成，压缩未生效时恢复块会叠在完整历史上。核实属实（`prompt.ts:1301` 用 `lastUser.id`、`filterCompacted:551` 只认完成摘要、`restoration.ts` 扫描无摘要检查）。按 reviewer 划界只在本 PR 做"标记必须已结算"判断（commit `eef5174bb1`）：谓词与 `filterCompacted`/`completedCompactions` 同款（summary && finish && !error 且 parentID 指向标记），同时覆盖尾保留与全量摘要两种结算形态——**第一版用 `tail_start_id` 判断是错的**：全量摘要回退路径的 `tail_start_id` 就是 undefined，GAP-1 测试当场抓红。#77 其余三项（摘要 parentID 锚定、失败摘要排除、TUI 读数）另开 PR。
+
 ## 实施插曲（教训）
 
 1. **D14 自指 bug 是本轮最有价值的失败**：扩展一个"计数活后代"的谓词时，"会话自身的 job 也匹配该形状"这种自指只有既有行为测试能抓——单元级的 hasLiveDescendant 根本不存在。回归断言的覆盖面要按"谁会被这个改动改变行为"来选，不是按新函数选。
