@@ -1980,6 +1980,13 @@ it.instance("loop compacts and replays once after provider context overflow", ()
     const answerMarker = "provider-overflow-recovered-marker"
 
     yield* seed(chat.id, { finish: "stop" })
+    // A completed read gives the restoration something to restore: after the
+    // overflow-triggered compaction settles, the task arm injects the file's
+    // current on-disk body, and this test asserts it on the third request.
+    // The read rides the CURRENT turn (the one overflow replays), so the
+    // summary payload stays free of the replayed markers.
+    const restoredFile = path.join((yield* TestInstance).directory, "overflow-restored.md")
+    yield* writeText(restoredFile, "OVERFLOW-RESTORED-BODY")
     const original = yield* prompt.prompt({
       sessionID: chat.id,
       agent: "build",
@@ -1990,6 +1997,22 @@ it.instance("loop compacts and replays once after provider context overflow", ()
         { type: "text", text: currentMarker },
         { type: "text", text: detailMarker },
       ],
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: original.info.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "overflow-read-call",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: { filePath: restoredFile },
+        output: "read overflow-restored.md",
+        title: "overflow-restored.md",
+        metadata: { display: { type: "file", path: restoredFile } },
+        time: { start: 1, end: 2 },
+      },
     })
     yield* llm.error(400, { error: { message: "Prompt exceeds max length" } })
     yield* llm.text(summaryMarker)
@@ -2018,6 +2041,10 @@ it.instance("loop compacts and replays once after provider context overflow", ()
     expect(finalBody).toContain(systemMarker)
     expect(finalBody.split(currentMarker)).toHaveLength(2)
     expect(finalBody.split(detailMarker)).toHaveLength(2)
+    // B6: the compaction task arm injects the restoration block, and the
+    // post-compaction request carries the file's current on-disk body.
+    expect(finalBody).toContain("OVERFLOW-RESTORED-BODY")
+    expect(finalBody).toContain("restored from before the last compaction")
 
     const markerUsers = messages.filter(
       (message) =>
@@ -2042,11 +2069,21 @@ it.instance("loop compacts and replays once after provider context overflow", ()
     expect(replay.info.model.variant).toBe(original.info.model.variant)
     expect(replay.info.system).toBe(original.info.system)
     expect(replay.info.tools).toEqual(original.info.tools)
+    // The replayed user carries the injected restoration block (B6 task-arm
+    // injection), so compare only the non-synthetic text parts, then assert
+    // the restoration part itself is the one extra part on this message.
     expect(
-      replay.parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+      replay.parts
+        .filter((part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic)
+        .map((part) => part.text),
     ).toEqual(
       original.parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
     )
+    const restorationParts = replay.parts.filter(
+      (part): part is SessionV1.TextPart => part.type === "text" && part.text.startsWith("<!-- opencode:restoration -->"),
+    )
+    expect(restorationParts).toHaveLength(1)
+    expect(restorationParts[0].text).toContain("OVERFLOW-RESTORED-BODY")
     expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
     expect(messages.filter((message) => message.info.role === "assistant" && message.info.summary)).toHaveLength(1)
 
@@ -2058,6 +2095,7 @@ it.instance("loop compacts and replays once after provider context overflow", ()
     }
     expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: answerMarker }))
   }),
+  20_000,
 )
 
 it.instance("loop persists a second provider context overflow after one recovery", () =>
