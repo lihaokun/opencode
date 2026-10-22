@@ -95,11 +95,6 @@ jobs:
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
 
-      - name: Check generated client
-        if: runner.os == 'Linux' && matrix.shard == 1
-        working-directory: packages/client
-        run: bun run check:generated
-
       - name: Run HttpApi exerciser gates
         if: runner.os == 'Linux' && matrix.shard == 1
         timeout-minutes: 20
