@@ -183,19 +183,21 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 
 - **开始**：`loop()` 包装的工作开始时，若上一个 run 已关闭（有 `ended_at`）或尚无记录，则 `number + 1`，写入 `started_at` 与 `woken_by`，清除 `ended_at`、`outcome`；若上一个 run 未关闭（同一 run 的 re-arm），保持不变。
 - **结束**：工作退出时，若成功退出且有未消费的消息（re-arm，与 `reportRunEnd` 的判断一致），不关闭；否则写入 `ended_at` 与 `outcome`（被中断为 `stopped`）。
-- **woken_by**：取唤醒本 run 的最新用户消息的来源：agent 消息（见下）记发送方 session、名字与类型；人经 TUI 发送记 `user`；其余记 `system`。
-- **agent 消息打标记**（#73 的服务端部分）：`AgentInbox.deliver` 投递 agent 发送方的消息时，文本部件增加 `metadata: { kind: "agent_message", sender, sender_name, sender_agent }`。模型看到的文本不变；TUI 的展示改动仍在 #73 另做。
+- **woken_by**：首次 run 记创建者（父）；此后取唤醒本 run 的最新用户消息的来源：agent 消息与子 agent 的结束报告（二者都带发送方标记）记发送方 session、名字与类型；人经 TUI 发送记 `user`；其余记 `system`。2026-10-23 决定：结束报告唤醒的 run 记为发报告的子 agent，不记 `system`。
+- **agent 消息打标记**（#73 的服务端部分）：`AgentInbox.deliver` 投递 agent 发送方的消息时，文本部件增加 `metadata: { kind: "agent_message", sender, sender_name, sender_agent }`；人经 TUI 发进子会话的头行部件带 `{ kind: "user_message" }`；结束报告的部件在既有 `agent_notification` 之上增加发送方三字段。模型看到的文本不变；TUI 的展示改动仍在 #73 另做。
+- **run 结束的定义**（#81，2026-10-23 并入）：循环正常退出且插件钩子 `experimental.session.stop` 放行。钩子阻止则落库一条合成用户消息（理由）并在同一 run 内继续，不加号、不关闭记录、不发报告。详见子计划 `agentmgmt-2-run-state` §4.4。
 
 ### 4.5 #75 结束报告
 
 - `renderOutput` 增加属性：`<agent id="…" state="completed" run="5" ended="2026-10-20T03:41:18+08:00">`。时间为带时区的完整时间。
 - 摘要（TUI 一行显示）追加 `(run 5, ended 03:41:18)`。
+- 停止通知加一行 `run: 5, stopped at <时间>`。run 号允许不连续：被取消的 run 由停止通知承载，因后代仍在跑而推迟的报告报告的是实际关闭的那个 run，不回溯补发（2026-10-23 决定）。
 
 ### 4.6 #75 agent_send 返回
 
 投递后读取目标的状态与 `agentRun`：
 
-- 目标空闲：`ses_xxx (cw-b333) resumed: run 6 started at <时间>. Its run 5 ended at <时间> (completed); that report reaches you as a separate message.`（无上一个 run 时省略第二句）
+- 目标空闲：`ses_xxx (cw-b333) was idle; this message starts run 6 (sent <时间>). Its run 5 ended at <时间> (completed); that report reaches you as a separate message.`（无上一个 run 时省略第二句）。写 "starts" 而不写 "started at"：投递只到"已接受"，不能宣称已开始（2026-10-23 决定）；状态与记录的快照在投递之前读取。
 - 目标在跑：`ses_xxx (cw-b333) is in run 5 (started <时间>); it reads this at its next step.`
 - 目标没有 `agentRun`（如主会话）：只写 `running` 或 `idle`。
 - 末尾一行：`Current state of one agent: agent_status(target="ses_xxx").`
@@ -229,6 +231,8 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 
 - 来源标注取 `woken_by`：本会话发送为 `your message`，其他 agent 为其名字，人为 `user`，其余为 `system`。
 - 现有写入历史的花名册保持不变。
+
+**设计落点**：4.4–4.9 的详细设计、不变量与测试在 `docs/design/agent-management/subplans/agentmgmt-2-run-state.md`；本文档与之冲突时以子计划为准。
 
 ## 第五部分：正确性论证
 
@@ -299,8 +303,8 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 - 本文档：回填第六、七部分的实际状态与提交。
 - `docs/fixes/session-processor-fix-periodic-doom-loop.md`：注明"状态只保存在 processor 内"的范围局限，由本修复取代其处理方式。
 - `packages/web/src/content/docs/permissions.mdx`、`agents.mdx`（英文，沿用 #22 只改英文的先例）：`doom_loop` 改为描述一步内拒绝与 `allow` 关闭。
-- `docs/design/agent-management/architecture.md`、`detailed-design.md`、相关子计划：run 记录、报告属性、agent_send 返回、agent_status、agent_list 参数、末尾段。
-- `docs/audits/<subplan-id>/expectations.md`（§6）：本修复新增的契约——agent_status 参数与返回、agent_list 参数与输出、报告属性、agent 消息元数据、`agentRun` 元数据。
+- `docs/design/agent-management/architecture.md`、`detailed-design.md`、子计划 `agentmgmt-2-run-state.md`、调研 §18：run 记录、报告属性、agent_send 返回、agent_status、agent_list 参数、末尾段、停止钩子。（已写，待回填 commit）
+- `docs/audits/agentmgmt-2-run-state/expectations.md`（§6）：本修复新增的契约——agent_status 参数与返回、agent_list 参数与输出、报告属性、agent 消息元数据、`agentRun` 元数据、停止钩子。（已写）
 - 工具描述（`tool/agent.ts` 中的 description）：只写事实，不教用法（#59 的原则）。
 
 ## 举一反三

@@ -122,6 +122,9 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
 ## 4. 数据结构定义
 
+> **子计划 2（`agentmgmt-2-run-state`）修订**：引入 `AgentRun`、`WakeSource` 与四种 part metadata 约定，
+> 定义见架构 §3 与子计划 §4.1–§4.3；本节其余不变。
+
 本细化不引入新的跨模块类型。架构 §3 已定义 `AgentStatus` / `AgentSkeleton` / `AgentInfo` /
 `WorkdirSource` / `AgentNeighborhood` / `TargetRef` / `AgentMessage` / `Accepted` /
 `DelegationOutcome` / `StopOutcome` / `StopPlan` / `SubagentRoster`，此处不重复。
@@ -300,6 +303,10 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
     后者会把合法的 body 判为违规。
 
 #### 5.3.2 `deliver(message: AgentMessage) -> Effect<Accepted, AgentNotFound | SelfDelivery>`
+
+> **子计划 2 修订（#73 服务端）**：步骤 4 的 parts 带发送方标记——agent 路的唯一 text part 带
+> `{ kind: "agent_message", sender, sender_name?, sender_agent? }`，user 路的头行 part 带 `{ kind: "user_message" }`；
+> `render()` 的输出与头行文本逐字不变（子计划 2 §5.2.3，I10）。
 
 - **功能描述**：以目标 Session 自身的身份**fork 进**普通异步消息入口。
 - **调用关系**：callers: M5 `agent_send`、M4 `stop`（一条取消通知）；
@@ -554,6 +561,11 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
 #### 5.4.4 `startDelegation({ session, agent, model, variant, parts, caller, notify = true }) -> Effect<void>`
 
+> **子计划 2 修订**：run-end notice 之前先关闭 run 记录（`agentRun.ended_at` / `outcome`），报告带
+> `run="<n>" ended="<ISO+tz>"` 属性与摘要后缀 ` (run n, ended HH:MM:SS)`，metadata 增发送方三字段；
+> run 记录的开始写在同一个 work 包装的入口（子计划 2 §5.2.2、§5.4.1）。在此之前还有一道插件停止钩子：
+> `runLoop` 正常退出 → `experimental.session.stop` 放行 → 记录关闭 → 报告（子计划 2 §5.1.2）。
+
 - **功能描述**：起初始委托的后台执行。**不再负责结局通知**——通知由 `SessionPrompt.reportRunEnd`
   在子的**每次** run 结束时发出（见本节末"run-end notice"），初始委托那次与 `agent_send` 驱动的
   每一次走同一条路。job 的存在是为了 `agent_list`（状态）、`agent_stop`（取消）与 command-subtask
@@ -641,6 +653,9 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   也是 §5.4.7 不需要排序论证的原因。副作用：只读。
 
 #### 5.4.7 `stop(caller, target) -> Effect<StopOutcome, NotAChild | AgentNotFound>`
+
+> **子计划 2 修订**：步骤 4 的通知正文加一行 `run: <n>, stopped at <ISO+tz>`；被取消 fiber 的 `onExit`
+> 尚未关闭记录时写 `stop requested at <now>`，不等待（子计划 2 §5.4.2）。
 
 - **功能描述**：自底向上**无条件**取消目标子树；只向 `notify_boundary` 发一条 cancelled 通知。
 - **调用关系**：callers: M5 `agent_stop`；callees: M4 `plan`、`SessionRunState.cancel`、
@@ -796,6 +811,10 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
 #### 5.5.2 `agent_list(ctx) -> Effect<string>`
 
+> **子计划 2 修订**：增 `status` / `relation` / `query` / `limit`（默认 50）参数；每行增 `run` 与 `last`；
+> 在跑在前、其余按最近活动倒序；末尾计数行 `showing <n> of <total> (<r> running, <i> idle)`。
+> 不带参数时默认上限 50 是有意的行为改变（子计划 2 §5.5.3）。
+
 - **功能描述**：渲染调用者的邻居 roster。**AgentInfo 在此组装。**
 - **实现思路**：
   1. `neighborhood(ctx.sessionID)` 得 `AgentSkeleton[]`。失败 → 渲染错误返回。
@@ -812,6 +831,12 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   后置：每行 status 是该次调用瞬间的快照，不保证行间一致（架构 §5 接口已声明）。副作用：无。
 
 #### 5.5.3 `agent_send(params, ctx) -> Effect<string>`
+
+> **子计划 2 修订**：步骤 5 之前取目标状态投影与 `agentRun` 的快照；步骤 6 的 Accepted 渲染按快照分四种：
+> 空闲有记录 `was idle; this message starts run N+1 (sent …). Its run N ended at … (<outcome>); that report
+> reaches you as a separate message.`、空闲无记录（省第二句）、在跑 `is in run N (started …); it reads this at
+> its next step.`、非子会话（只写 running / idle）；末尾恒加 `Current state of one agent: agent_status(target="…").`；
+> 既有三句保留。成立性论证见子计划 2 §5.4.3。
 
 - **实现思路**：
   1. caller 取自 `ctx.sessionID`。
@@ -849,6 +874,9 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   （架构 §7 G4 论证）。副作用：委托给 M4。
 
 #### 5.5.5 `visibleTools(session: Session.Info) -> Effect<ToolName[]>`
+
+> **子计划 2 修订**：两个分支都把 `agent_status` 与 `agent_list` 并列；注册表的权限过滤对 `agent_status`
+> 以 `agent_list` 的键求值（子计划 2 §5.5.2，I9）。
 
 - **功能描述**：按调用者深度决定向模型暴露哪些 Agent 工具。
 - **调用点**：`session/tools.ts` 的 `SessionTools.resolve`，**不是工具执行期**。
@@ -998,9 +1026,29 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   - 不含状态 ⇒ 不会过期成错误信息，只会过期成不完整信息，而不完整由"明写是快照"承担。
   - 副作用：只读；返回值由 `create` 写入初始 prompt。
 
+#### 5.5.8 `agent_status(params, ctx) -> Effect<string>`  *（子计划 2）*
+
+- 见子计划 2 §5.5.1：`resolveTarget(caller, target, "neighbor")` → `agent_list` 权限求值 → 读取会话、状态投影、
+  `agentRun` → 渲染 key: value 行（run 行三种写法：在跑 / 空闲有记录 / 从未跑过；非子会话省略）。
+- 正确性论证：解析范围与权限键与 `agent_list` 相同，故不暴露它之外的信息。副作用：无。
+
+#### 5.5.9 末尾段子 agent 节  *（子计划 2）*
+
+- 见子计划 2 §5.3：`runLoop` 组装 tail 时采集直接子的状态投影与 `agentRun`，纯函数 `StepTail.renderSubagents`
+  渲染在跑计数与最近 5 步内的 run 开始 / 结束（至多 8 行，超出保留最近的）；门与花名册相同（无子或
+  `agent_list` deny 不附带）。不写入历史、不进压缩输入、缓存断点跳过（机制已在 `step-tail` 分支落地）。
+
+### 5.6 停止钩子  *（子计划 2，#81）*
+
+- 见子计划 2 §5.1：`runLoop` 的正常退出分支在 `break` 前触发 `experimental.session.stop`；阻止时落库一条
+  合成用户消息（text = reason，metadata `stop_hook`）并继续同一次 run；连续阻止达 `stop_hook_block_cap`
+  （默认 8）强制放行，任一步调用工具即清零；钩子抛错或无理由按放行。出错退出、人中断、agent_stop、
+  结构化输出结束不触发。主会话与子 agent 同一分支，宿主不区分。
+
 ## 6. 完整性自检 checklist
 
-- [x] 所有函数实现思路推导连续（无跳步）—— 每个非 trivial 函数按编号步骤展开
+- [x] 所有函数实现思路推导连续（无跳步）—— 每个非 trivial 函数按编号步骤展开；子计划 2 新增的
+      §5.5.8 / §5.5.9 / §5.6 的步骤与论证在子计划文档 §5 内展开，本文件只保留指针
 - [x] 所有 if / else / switch 分支已覆盖 —— `neighborhood` 的有无父、`of` 的三支状态、
       `resolveTarget` 的 id/名称与三种基数（**含多匹配这一正常可达分支**）、
       `prepareWorkdir` 的三分支、`classify` 的六分支、`stop` 的成功/失败、
