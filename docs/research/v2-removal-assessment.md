@@ -116,6 +116,57 @@ TUI move.tsx（tui/src/component/prompt/move.tsx）
 2. **阶段 2**：摘内嵌 server 的 `/api` rail（`packages/protocol` + `packages/server` 主体 + `httpapi/server.ts` 的 `ServerApi` 挂载与 `SessionV2.node` + `makeApi` 引用）+ 四个共享件内联 + 删 `core/tool`、core V2 运行时（保留 §4 清单；`buildPrompt` 内联）
 3. **阶段 3（可选）**：move-session 改读 V1 表 → 删 projector 链；web UI 按 §5 决策处理
 
+## 8. 保留项不动的原因详解
+
+对 PR 跟踪清单"执行约束"前四条逐条展开。
+
+### 8.1 38 个 DB migration journal 不能动（表 DDL 保留）
+
+**机制**：迁移注册表 `database/migration.gen.ts` 按文件名顺序静态 import 全部 38 个迁移，runner（`database/migration.ts`）用**文件里的 `id` 字符串**与用户数据库的 `migration` 表（`id TEXT PRIMARY KEY`）做差集——只执行用户库没记录过的迁移。
+
+**为什么不能动**：
+
+- 已发布版本（`v1.18.25-fmv1`、`v1.18.31-fmv2` 等）的用户库已把这 38 个 id 记入 `migration` 表。删掉某个迁移文件对老用户无感（id 已在表里，runner 跳过）；但若删的是**建表**迁移，新装用户从零建库时注册表少一项 → `session_message`/`event` 等表不会被创建 → 保留代码（`SessionProjector` 写 `session_message`、`MoveSession` 读它、`EventV2` 写 `event` 表）启动后第一次写入即崩。
+- 兼容路径：`migration.ts:48-68` 专门处理从 Drizzle 老 journal（`__drizzle_migrations` 表）升级来的用户，seed 逻辑按 id 匹配。动历史迁移 id 会让这批用户的 journal seed 失配，已执行 SQL 被重放——例如 `20260622170816_reset_v2_session_state` 会**清空** `session_message`/`event`/`workspace` 等表的数据。
+- **结论**：迁移文件是用户数据的不可变历史。删除 V2 运行时（写入方）≠ 删除表（数据的家）。空表零成本（SQLite 几十 KB），删了要么崩新装要么毁老库。表清理属于"未来某天出 fork 自有存储格式"的范畴，不在本次代码删除内。
+
+### 8.2 `core/src/v1/` 是 V1 wire schema，不是 V2 运行时
+
+**这是全调研最容易误判的一条**：目录名的 `v1` 指"V1 协议的数据格式定义"，不是"第一代实现"。
+
+核实依据：
+
+- `core/src/v1/session.ts`（68 行）只有 schema 与错误类型——`export {...} from "@opencode-ai/schema/session-v1"` 加 `NamedError.create` 定义（`ContextOverflowError`、`APIError` 等），无任何运行时逻辑。
+- 消费它的 28 个 `packages/opencode` 文件全是 V1 核心代码：`session/message-v2.ts`（消息持久化格式）、`session/processor.ts`（会话循环）等。
+- `packages/schema/src/event-manifest.ts:35-36` 直接从 `SessionV1.Event.Definitions` 构建整个事件清单（durable/live 两类）；V1 运行时经 `EventV2Bridge` publish 的正是这些 `SessionV1.Event.*` 事件 → GlobalBus → TUI `/global/event`。
+- TUI 消费 `session.updated`、`message.part.updated` 等事件的类型就来自这条链（`tui/src/context/sync.tsx`、`routes/session/index.tsx`）。
+
+**删了会怎样**：V1 运行时无法定义消息/事件格式，TUI 收不到事件，typecheck 直接失败。它与 `packages/schema` 一体，属产品地基。
+
+### 8.3 `@opencode-ai/sdk/v2` 目录名带 v2 但实为 V1 产品 SDK
+
+三层证据：
+
+- **生成源**：`sdk/js/script/build.ts:14` — `bun dev generate > openapi.json`，`cwd(opencode)` 即从 `packages/opencode`（V1 运行时路由）导出 openapi（162 个路径中 111 个非 `/api` 前缀）。
+- **URL 逐个验证**：`sdk/js/src/v2/gen/sdk.gen.ts` 中 `Session2` 类 25 个端点全部是 `/session/*`；`/api/*` 端点只在 `Session3`、`Question2` 等另一组类里。目录名 "v2" 是上游生成器升级时的命名残留（hey-api 输出目录 `src/v2/gen`），不是协议代际。
+- **消费者**：TUI 的 `sdk.tsx:1`、`cli/cmd/run`、acp 全 import 它；TUI 54 个 `sdk.client.*` 方法逐个映射后零 `/api` 调用。
+
+**删了会怎样**：TUI 与 CLI run 模式失去全部 HTTP 客户端，产品不可用。真正与 V2 相关的是生成物里的 `/api` 类（`Session3` 等 58 个端点），随阶段 2 摘 rail 时把生成器 contract 源改掉后重新生成。
+
+### 8.4 41 个文件名带 v2 的 UI 文件与协议无关
+
+这些 "v2" 是 **UI 组件第二代**命名：
+
+- `packages/ui/src/v2/`——纯组件库目录（components/styles），不 import 任何协议/HTTP 代码
+- `settings-v2/dialog-settings-v2.tsx` 的 import：`solid-js`、`@opencode-ai/ui/v2/dialog-v2`、`TabsV2`——引用的是 UI 第二代组件
+- `session-ui/src/v2/components/*`（31 个文件）、`review-panel-v2`、`prompt-input-v2` 同理：指"这一代 UI 组件"，与 server API 轨、`SessionV2` 服务无任何 import 关系
+
+**删了会怎样**：纯 UI 回归，且在 web UI 去留（阶段 3）决策前它们仍在编译链里，删了 typecheck 直接失败。其去留跟 web UI 决策走，不跟 V2 协议删除走。
+
+### 8.5 共同判定原则
+
+这四条里 "v2" 字样的来源各不相同：**数据格式代际**（V1 wire schema）、**生成器输出目录名**（`sdk/js/src/v2`）、**UI 组件代际**（`ui/v2`）。真正待删的"V2 协议"只有 `core/src/session` 运行时与 `/api` 路由轨。文件名/目录名的字面 v2 不可作为删除依据——这正是本调研从消费者反查、而非按名字正删的原因。
+
 ## 附：核实过的事实清单（供实施者复核）
 
 - TUI 无 `/api` 调用：`sdk.gen.ts` 中 `/api` 端点全部位于 `Session3`/`Question2`/`Permission2`/`Pty2` 等类，`OpencodeClient` 属性只暴露 V1 类
