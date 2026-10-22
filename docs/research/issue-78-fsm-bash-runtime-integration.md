@@ -14,6 +14,7 @@
 | 核心代码 diff | **0**（现状已满足，不需要为协作改 OC 核心） |
 | 仓库内是否有内置 FSM/hook adapter | **无**（全仓库无 `updated_input` 消费点，符合对方"复用 FSM 侧插件适配"的预期） |
 | 缺口 | 仅两项：宿主回归测试（对方清单第 3 项）、issue 下版本确认回复（第 1/4 项） |
+| 接缝覆盖范围 | **仅默认 runtime**（`SessionPrompt` 循环，CLI/TUI/server 主路径）。core V2 runner 无 plugin hook，见 §8 |
 
 ## 2. 请求背景：FSM 侧要做什么
 
@@ -169,6 +170,8 @@ CLAUDE.md「已知限制」中两条与本接缝直接相关，写回归时须�
   hook 顺序 await（`plugin/index.ts:291-295`）、改写后统一走 schema decode，非法更新不裸执行。
 - 无内置 hook adapter，发布链按 FSM 侧插件适配消费 `updated_input`，核心 diff 为零。
 - 宿主回归落在哪个 commit（6.1 完成后回填）。
+- **范围披露**：hook 接缝在默认 runtime（CLI/TUI/opencode server）生效；`opencode serve` 的
+  core V2 路由当前不执行 before-hook（详见 §8），FSM 在该使用形态下改写不生效。
 
 ### 6.3 收尾文档
 
@@ -181,3 +184,34 @@ CLAUDE.md「已知限制」中两条与本接缝直接相关，写回归时须�
 - **不在 OC 内复制 profile/quoting/依赖判断**：这些归 FSM 侧（对方 issue 原文明确）。
 - **不承诺 CC 侧行为**：CC 走公开 `PreToolUse.updatedInput`，与本仓库无关。
 - 本调研不触发 §2.3 子计划判定：无契约变更、无新 user-facing 能力，属测试补充 + 协作确认。
+
+## 8. 接缝覆盖范围（v2 runtime 无 hook，属已知边界）
+
+本仓库存在两套并行 runtime（CLAUDE.md「已知限制」已记录）：
+
+| Runtime | 入口 | before-hook | FSM 改写可用？ |
+|---------|------|------------|---------------|
+| **默认**（CLI / TUI / opencode 包 server） | `SessionPrompt` 循环 → `SessionTools.resolve`（§4.1） | ✅ `tools.ts:109` | ✅ 可用 |
+| **core V2 runner**（`cli serve` / sdk-next embedded server，真实消费者是 `packages/app` web 前端） | `packages/core/src/session/runner/llm.ts` → `packages/core/src/tool/registry.ts` `settle` | ❌ 无（llm.ts 设计清单明确 "Add … plugins …" 为未完成项） | ❌ 不可用 |
+
+核实依据：
+
+- `packages/core/src/session/runner/llm.ts:63-85` 的设计 checklist 中，"Resolve policy-filtered
+  built-in, MCP, **plugin**, and structured-output tool definitions" 与 "Add scoped runtime context,
+  progress updates, attachment normalization, **plugins**, and cancellation settlement" 两项均为 `[ ]` 未完成。
+- `packages/core/src/tool/registry.ts` 的 `materialize`/`settle` 路径无任何 Plugin 依赖
+  （`grep -rln Plugin packages/core/src/tool/` 仅命中 AGENTS.md 文档）。
+
+影响评估：
+
+- **对本次协作无阻断**：FSM 侧已测版本 `1.18.31-fmv2.1` 的验证路径就是默认 runtime；
+  issue 的四项请求全部落在默认 runtime 语义内。FSM 插件经 `plugin` 配置加载后，
+  在 CLI/TUI/默认 server 使用形态下按 §4.1 生效。
+- **披露义务**：issue 回复（§6.2）应向 FSM 侧明确——若未来通过 `opencode serve`（V2 路由）
+  或 app/web 前端使用 FSM 沙盒改写，该路径当前**不会**执行 before-hook，改写不生效。
+  属宿主已知边界，不是本次协作要修的缺陷；若 FSM 场景需要 V2 支持，届时按
+  llm.ts checklist 的 plugins 项单独排期。
+- **code-mode 边界**：`experimentalCodeMode` 开启时，`tools.ts:411` 提前 return，
+  内置 bash 工具不在工具列表中（bash 由 code-mode 子工具链承载，`code-mode.ts:142`
+  对子工具仍发 before-hook，但那是 MCP 子工具语义，FSM 的 `bash` 匹配不适用）。
+  FSM 场景默认不开 code-mode，无实际影响，记录备查。
