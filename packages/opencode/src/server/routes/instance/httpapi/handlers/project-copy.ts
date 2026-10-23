@@ -1,11 +1,18 @@
+import * as InstanceState from "@/effect/instance-state"
 import { Agent } from "@/agent/agent"
 import { Provider } from "@/provider/provider"
 import { LLM } from "@/session/llm"
 import { MessageID, SessionID } from "@/session/schema"
 import { Slug } from "@opencode-ai/core/util/slug"
 import { LLMEvent } from "@opencode-ai/llm"
+import { ProjectCopy } from "@opencode-ai/core/project/copy"
+import { Git } from "@opencode-ai/core/git"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { Effect, Stream } from "effect"
-import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
+import { LocationServiceMap } from "@opencode-ai/core/location-services"
+import { Location } from "@opencode-ai/core/location"
+import { ProjectCopyError } from "../groups/project-copy"
 import { InstanceHttpApi } from "../api"
 
 const COPY_NAME_AGENT: Agent.Info = {
@@ -59,17 +66,78 @@ export const projectCopyHandlers = HttpApiBuilder.group(InstanceHttpApi, "projec
       return output ? slugify(output.split(/\s+/).slice(0, 3).join(" ")) : Slug.create()
     })
 
-    return handlers.handle("generateName", (ctx) =>
-      generateName(ctx.payload.context).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning("project copy name generation failed", {
-            projectID: ctx.params.projectID,
-            cause,
-          }).pipe(Effect.as(Slug.create())),
+    const badRequest = <A>(effect: Effect.Effect<A, ProjectCopy.Error>) =>
+      effect.pipe(
+        Effect.mapError(
+          (error) =>
+            new ProjectCopyError({
+              name: "ProjectCopyError",
+              data: {
+                message: message(error),
+                forceRequired: error instanceof Git.WorktreeError ? error.forceRequired : undefined,
+              },
+            }),
         ),
-        Effect.map((name) => ({ name })),
-      ),
-    )
+      )
+
+    const located = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+      const locations = yield* LocationServiceMap.Service
+      return yield* effect.pipe(
+        Effect.provide(
+          locations.get(Location.Ref.make({ directory: AbsolutePath.make((yield* InstanceState.context).worktree) })),
+        ),
+      )
+    })
+
+    return handlers
+      .handle("generateName", (ctx) =>
+        generateName(ctx.payload.context).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("project copy name generation failed", {
+              projectID: ctx.params.projectID,
+              cause,
+            }).pipe(Effect.as(Slug.create())),
+          ),
+          Effect.map((name) => ({ name })),
+        ),
+      )
+      .handle("projectCopy.create", (ctx) =>
+        Effect.gen(function* () {
+          const worktree = AbsolutePath.make((yield* InstanceState.context).worktree)
+          return yield* located(
+            Effect.gen(function* () {
+              const copies = yield* ProjectCopy.Service
+              return yield* badRequest(
+                copies.create({
+                  ...ctx.payload,
+                  projectID: ctx.params.projectID,
+                  sourceDirectory: worktree,
+                }),
+              )
+            }),
+          )
+        }),
+      )
+      .handle("projectCopy.remove", (ctx) =>
+        located(
+          Effect.gen(function* () {
+            const copies = yield* ProjectCopy.Service
+            return yield* badRequest(copies.remove({ ...ctx.payload, projectID: ctx.params.projectID })).pipe(
+              Effect.as(HttpApiSchema.NoContent.make()),
+            )
+          }),
+        ),
+      )
+      .handle("projectCopy.refresh", (ctx) =>
+        located(
+          Effect.gen(function* () {
+            const copies = yield* ProjectCopy.Service
+            return yield* badRequest(copies.refresh({ projectID: ctx.params.projectID })).pipe(
+              Effect.as(HttpApiSchema.NoContent.make()),
+            )
+          }),
+        ),
+      )
   }),
 )
 
@@ -78,6 +146,18 @@ function slugify(input: string) {
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+/, "")
-    .replace(/-+$/, "")
+    .replace(/^-+|-+$/g, "")
+}
+
+function message(error: ProjectCopy.Error) {
+  if (error instanceof ProjectCopy.SourceDirectoryNotFoundError)
+    return `Project copy source not found: ${error.directory}`
+  if (error instanceof ProjectCopy.DestinationExistsError)
+    return `Project copy destination already exists: ${error.directory}`
+  if (error instanceof ProjectCopy.DirectoryUnavailableError)
+    return `Project copy directory unavailable: ${error.directory}`
+  if (error instanceof ProjectCopy.InvalidDirectoryError) return `Invalid project copy directory: ${error.directory}`
+  if (error instanceof ProjectCopy.StrategyUnavailableError)
+    return `Project copy strategy unavailable: ${error.strategy}`
+  return error.message
 }
