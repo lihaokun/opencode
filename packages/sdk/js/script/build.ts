@@ -138,5 +138,9 @@ await $`rm -f openapi.json`
 // default stack overflows on constrained runners (observed as
 // getQuickTypeOfExpression RangeError under CI parallelism). NODE_OPTIONS
 // rejects --stack-size, so hand the flag to the node binary that hosts tsc.
-await $`bun x node --stack-size=8192 node_modules/typescript/bin/tsc`
+// Resolve the script from this package (the store layout differs per platform,
+// so a literal node_modules path breaks on Windows CI).
+const { createRequire } = await import("node:module")
+const tscPath = createRequire(import.meta.url).resolve("typescript/bin/tsc")
+await $`bun x node --stack-size=8192 ${tscPath}`
 await $`rm -f openapi.json`
