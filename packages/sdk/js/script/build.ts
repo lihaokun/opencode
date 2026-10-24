@@ -133,5 +133,10 @@ await Bun.write(sseTypesPath, sseTypesPatched)
 await $`bun prettier --write src/gen`
 await $`bun prettier --write src/v2`
 await $`rm -rf dist`
-await $`bun tsc`
-await $`rm openapi.json`
+await $`rm -f openapi.json`
+// The generated surface makes tsc's recursive type walkers run deep; the
+// default stack overflows on constrained runners (observed as
+// getQuickTypeOfExpression RangeError under CI parallelism). NODE_OPTIONS
+// rejects --stack-size, so hand the flag to the node binary that hosts tsc.
+await $`bun x node --stack-size=8192 node_modules/typescript/bin/tsc`
+await $`rm -f openapi.json`
