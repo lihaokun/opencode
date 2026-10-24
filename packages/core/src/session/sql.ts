@@ -4,16 +4,26 @@ import { ProjectTable } from "../project/sql"
 import type { SessionMessage } from "./message"
 import type { Prompt } from "./prompt"
 import type { SessionInput } from "./input"
-import type { Snapshot } from "../snapshot"
 import { PermissionV1 } from "../v1/permission"
 import { ProjectV2 } from "../project"
 import type { SessionSchema } from "./schema"
 import type { MessageID, PartID, SessionV1 } from "../v1/session"
 import { WorkspaceV2 } from "../workspace"
 import { Timestamps } from "../database/schema.sql"
-import type { SystemContext } from "../system-context/index"
 import { AgentV2 } from "../agent"
 import type { Revert } from "@opencode-ai/schema/revert"
+
+/** Legacy persisted session diff shape. */
+export type LegacyFileDiff = {
+  file?: string
+  patch?: string
+  additions: number
+  deletions: number
+  status?: "added" | "deleted" | "modified"
+}
+
+/** Persisted snapshot of namespaced system-context sources for one session epoch. */
+export type ContextSnapshot = Readonly<Record<string, { value: unknown; removed?: string }>>
 
 type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
 type V1MessageData = Omit<SessionV1.Info, "id" | "sessionID">
@@ -38,7 +48,7 @@ export const SessionTable = sqliteTable(
     summary_additions: integer(),
     summary_deletions: integer(),
     summary_files: integer(),
-    summary_diffs: text({ mode: "json" }).$type<Snapshot.LegacyFileDiff[]>(),
+    summary_diffs: text({ mode: "json" }).$type<LegacyFileDiff[]>(),
     metadata: text({ mode: "json" }).$type<Record<string, unknown>>(),
     cost: real().notNull().default(0),
     tokens_input: integer().notNull().default(0),
@@ -171,6 +181,6 @@ export const SessionContextEpochTable = sqliteTable("session_context_epoch", {
     .primaryKey()
     .references(() => SessionTable.id, { onDelete: "cascade" }),
   baseline: text().notNull(),
-  snapshot: text({ mode: "json" }).notNull().$type<SystemContext.Snapshot>(),
+  snapshot: text({ mode: "json" }).notNull().$type<ContextSnapshot>(),
   baseline_seq: integer().notNull(),
 })

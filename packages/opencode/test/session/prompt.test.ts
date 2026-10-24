@@ -4,6 +4,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
+import { asc } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
@@ -40,8 +41,8 @@ import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
-import { SessionV2 } from "@opencode-ai/core/session"
-import { SessionExecution } from "@opencode-ai/core/session/execution"
+import { SessionMessage } from "@opencode-ai/schema/session-message"
+import { Schema } from "effect"
 import { Skill } from "../../src/skill"
 import { SystemPrompt } from "../../src/session/system"
 import { Shell } from "@opencode-ai/core/shell"
@@ -57,7 +58,6 @@ import { raw, reply, TestLLMServer, type Usage } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { Identifier } from "../../src/id/id"
 import { AgentManagement } from "@/agent-management/schema"
 import { AgentEvent } from "@opencode-ai/schema/agent-event"
@@ -2321,23 +2321,19 @@ noLLMServer.instance.skip(
         ],
       })
 
-      const messages = yield* SessionV2.Service.use((session) => session.messages({ sessionID: chat.id })).pipe(
-        Effect.provide(
-          LayerNode.compile(SessionV2.node, [
-            [SessionExecution.node, SessionExecution.noopLayer],
-            [LocationServiceMap.node, locationServiceMapLayer],
-          ]),
-        ),
-      )
       const { db } = yield* Database.Service
-      const row = yield* db
+      const rows = yield* db
         .select()
         .from(SessionMessageTable)
         .where(eq(SessionMessageTable.session_id, chat.id))
-        .get()
+        .orderBy(asc(SessionMessageTable.seq))
+        .all()
         .pipe(Effect.orDie)
+      const messages = yield* Effect.forEach(rows, (row) =>
+        Schema.decodeUnknownEffect(SessionMessage.Message)({ ...row.data, id: row.id, type: row.type }),
+      )
+      expect(typeof rows[0]?.data.time.created).toBe("number")
       expect(messages.find((message) => message.type === "user")).toMatchObject({ type: "user", text: "hello v2" })
-      expect(typeof row?.data.time.created).toBe("number")
       expect(messages).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ type: "synthetic", text: expect.stringContaining("Called the Read tool") }),
