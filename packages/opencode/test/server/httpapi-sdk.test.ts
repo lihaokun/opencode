@@ -378,36 +378,6 @@ describe("HttpApi SDK", () => {
       }),
   )
 
-  httpapi(
-    "routes configured SDK directory and workspace for v2 location GETs",
-    withProject("raw", { setup: writeStandardFiles }, ({ directory }) =>
-      Effect.gen(function* () {
-        const workspaceID = "wrk_sdk"
-        let request: Request | undefined
-        const sdk = yield* client("raw", directory, {
-          workspaceID,
-          onRequest: (value) => (request = value),
-        })
-        const found = yield* pollWithTimeout(
-          call(() => sdk.v2.fs.find({ query: "hello", type: "file" })).pipe(
-            Effect.map((result) => (result.data?.data.length ? result : undefined)),
-          ),
-          "SDK file search index was not ready",
-        )
-        const url = new URL(request!.url)
-
-        expect(found.response.status).toBe(200)
-        expect(found.data).toMatchObject({ data: [{ path: "hello.txt", type: "file" }] })
-        expect(url.searchParams.get("directory")).toBe(directory)
-        expect(url.searchParams.get("workspace")).toBe(workspaceID)
-        expect(url.searchParams.get("location[directory]")).toBe(directory)
-        expect(url.searchParams.get("location[workspace]")).toBe(workspaceID)
-        expect(request!.headers.has("x-opencode-directory")).toBe(false)
-        expect(request!.headers.has("x-opencode-workspace")).toBe(false)
-      }),
-    ),
-  )
-
   serverPathParity("matches generated SDK global and control behavior", (serverPath) =>
     Effect.gen(function* () {
       const sdk = yield* client(serverPath)

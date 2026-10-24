@@ -11,6 +11,30 @@ export const GenerateNamePayload = Schema.Struct({
   context: Schema.optional(Schema.String),
 })
 
+const LocationQuery = Schema.Struct({
+  location: Schema.optional(
+    Schema.Struct({
+      directory: Schema.optional(Schema.String),
+      workspace: Schema.optional(Schema.String),
+    }),
+  ),
+}).annotate({ identifier: "LocationQuery" })
+
+const locationQueryOpenApi = OpenApi.annotations({
+  transform: (operation) => {
+    const parameters = operation.parameters
+    if (!Array.isArray(parameters)) return operation
+    return {
+      ...operation,
+      parameters: parameters.map((parameter) =>
+        parameter?.name === "location" && parameter?.in === "query"
+          ? { ...parameter, style: "deepObject", explode: true }
+          : parameter,
+      ),
+    }
+  },
+})
+
 export class ProjectCopyError extends Schema.ErrorClass<ProjectCopyError>("ProjectCopyError")(
   {
     name: Schema.Literal("ProjectCopyError"),
@@ -44,11 +68,13 @@ export const ProjectCopyApi = HttpApi.make("projectCopyName").add(
     .add(
       HttpApiEndpoint.post("projectCopy.create", "/experimental/project/:projectID/copy", {
         params: { projectID: Project.ID },
-        query: WorkspaceRoutingQuery,
+        query: LocationQuery,
         payload: CreatePayload,
         success: ProjectCopy.Copy,
         error: ProjectCopyError,
-      }).annotateMerge(
+      })
+        .annotateMerge(locationQueryOpenApi)
+        .annotateMerge(
         OpenApi.annotations({
           identifier: "v2.projectCopy.create",
           summary: "Create project copy",
@@ -59,11 +85,13 @@ export const ProjectCopyApi = HttpApi.make("projectCopyName").add(
     .add(
       HttpApiEndpoint.delete("projectCopy.remove", "/experimental/project/:projectID/copy", {
         params: { projectID: Project.ID },
-        query: WorkspaceRoutingQuery,
+        query: LocationQuery,
         payload: RemovePayload,
         success: HttpApiSchema.NoContent,
         error: ProjectCopyError,
-      }).annotateMerge(
+      })
+        .annotateMerge(locationQueryOpenApi)
+        .annotateMerge(
         OpenApi.annotations({
           identifier: "v2.projectCopy.remove",
           summary: "Remove project copy",
@@ -74,10 +102,12 @@ export const ProjectCopyApi = HttpApi.make("projectCopyName").add(
     .add(
       HttpApiEndpoint.post("projectCopy.refresh", "/experimental/project/:projectID/copy/refresh", {
         params: { projectID: Project.ID },
-        query: WorkspaceRoutingQuery,
+        query: LocationQuery,
         success: HttpApiSchema.NoContent,
         error: ProjectCopyError,
-      }).annotateMerge(
+      })
+        .annotateMerge(locationQueryOpenApi)
+        .annotateMerge(
         OpenApi.annotations({
           identifier: "v2.projectCopy.refresh",
           summary: "Refresh project copy",

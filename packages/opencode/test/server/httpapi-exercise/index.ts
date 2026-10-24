@@ -648,6 +648,15 @@ const scenarios: Scenario[] = [
         check(auth.test === undefined, "auth remove should delete provider from isolated auth file")
       }),
     ),
+  http.protected.get("/api/location", "v2.location.get").json(200, object),
+  http.protected.get("/api/reference", "v2.reference.list").json(200, locationData(array)),
+  http.protected
+    .get("/api/fs/find", "v2.fs.find")
+    .at((ctx) => ({
+      path: "/api/fs/find?query=hello&type=file",
+      headers: ctx.headers(),
+    }))
+    .json(200, locationData(array)),
   http.protected
     .get("/session", "session.list")
     .seeded((ctx) => ctx.session({ title: "List me" }))
