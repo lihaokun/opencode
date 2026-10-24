@@ -1,5 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { ConfigReferencePlugin } from "@opencode-ai/core/config/plugin/reference"
 import { Config } from "@/config/config"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Provider } from "@/provider/provider"
@@ -99,12 +100,34 @@ const layer = Layer.effect(
       Effect.fn("Agent.state")(function* (ctx) {
         const cfg = yield* config.get()
         const skillDirs = yield* skill.dirs()
-        const referenceDirs = Object.keys(cfg.references ?? cfg.reference ?? {}).length
-          ? yield* Effect.gen(function* () {
-              yield* (yield* PluginV2.Service).wait(PluginV2.ID.make("core/config-reference"))
-              return (yield* (yield* Reference.Service).list()).map((reference) => reference.path)
-            }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
+        // Local reference directories resolve from config alone. Reading them
+        // through the config-reference plugin's shared Reference list tied the
+        // whitelist to a plugin-registration race; the plugin still owns the
+        // combined list for prompt guidance, but the whitelist only needs the
+        // local paths. Remote (repository) references resolve to cache paths
+        // only after materialization, so they keep going through the plugin.
+        const referenceEntries = Object.entries(cfg.references ?? cfg.reference ?? {})
+        const hasRemoteReference = referenceEntries.some(
+          ([, entry]) =>
+            typeof entry !== "string" && "repository" in entry,
+        )
+        const localReferenceDirs = referenceEntries.length
+          ? ConfigReferencePlugin.localDirs({
+              documents: [{ references: cfg.references ?? cfg.reference }],
+              directory: ctx.directory,
+              home: Global.Path.home,
+            })
           : []
+        const remoteReferenceDirs =
+          hasRemoteReference && referenceEntries.length
+            ? yield* Effect.gen(function* () {
+                yield* (yield* PluginV2.Service).wait(PluginV2.ID.make("core/config-reference"))
+                return (yield* (yield* Reference.Service).list())
+                  .filter((reference) => reference.source.type === "git")
+                  .map((reference) => reference.path)
+              }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
+            : []
+        const referenceDirs = [...localReferenceDirs, ...remoteReferenceDirs]
         const whitelistedDirs = [
           Truncate.GLOB,
           path.join(Global.Path.tmp, "*"),
