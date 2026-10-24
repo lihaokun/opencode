@@ -1,16 +1,28 @@
 export * as PluginPtyEnvironment from "./pty-environment"
 
-import { PtyEnvironment } from "@opencode-ai/server/pty-environment"
-import { Effect, Layer } from "effect"
+import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
+import { Context, Effect, Layer } from "effect"
 import { InstanceStore } from "@/project/instance-store"
 import { Plugin } from "."
 
+export interface Interface {
+  readonly get: (input: { directory: string; cwd: string }) => Effect.Effect<Record<string, string>>
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/ServerPtyEnvironment") {}
+
+export const node = makeGlobalNode({
+  service: Service,
+  layer: Layer.succeed(Service, Service.of({ get: () => Effect.succeed({}) })),
+  deps: [],
+})
+
 export const layer = Layer.effect(
-  PtyEnvironment.Service,
+  Service,
   Effect.gen(function* () {
     const plugin = yield* Plugin.Service
     const instances = yield* InstanceStore.Service
-    return PtyEnvironment.Service.of({
+    return Service.of({
       get: Effect.fn("PtyEnvironment.get")(function* (input) {
         return yield* instances.provide(
           { directory: input.directory },

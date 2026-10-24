@@ -75,24 +75,42 @@ const generatedTypes = await Bun.file("./src/v2/gen/types.gen.ts").text()
 if (/export type SessionNext\w+1 =/.test(generatedTypes)) {
   throw new Error("Session history generated duplicate Session event variants")
 }
-const historyTypesPatched = generatedTypes.replace(
-  /(export type V2SessionHistoryData = \{[\s\S]*?query\?: \{\s*limit\?: )string([;,]\s*after\?: )string/,
-  "$1number$2number",
-)
-if (historyTypesPatched === generatedTypes) {
+// The numeric-query patch targets the V2 history endpoints. When the spec no
+// longer carries them (the /api rail was removed from the embedded server),
+// there is nothing to patch and the generated types are used as-is.
+const hasV2History = generatedTypes.includes("export type V2SessionHistoryData =")
+const historyTypesPatched = hasV2History
+  ? generatedTypes.replace(
+      /(export type V2SessionHistoryData = \{[\s\S]*?query\?: \{\s*limit\?: )string([;,]\s*after\?: )string/,
+      "$1number$2number",
+    )
+  : generatedTypes
+if (hasV2History && historyTypesPatched === generatedTypes) {
   throw new Error("Session history numeric query patch did not apply")
 }
 await Bun.write("./src/v2/gen/types.gen.ts", historyTypesPatched)
 
 const generatedSdk = await Bun.file("./src/v2/gen/sdk.gen.ts").text()
-const historySdkPatched = generatedSdk.replace(
-  /(Get session history[\s\S]*?parameters: \{\s*sessionID: string[;,]\s*limit\?: )string([;,]\s*after\?: )string/,
-  "$1number$2number",
-)
-if (historySdkPatched === generatedSdk) {
+const hasV2HistorySdk = generatedSdk.includes("Get session history")
+const historySdkPatched = hasV2HistorySdk
+  ? generatedSdk.replace(
+      /(Get session history[\s\S]*?parameters: \{\s*sessionID: string[;,]\s*limit\?: )string([;,]\s*after\?: )string/,
+      "$1number$2number",
+    )
+  : generatedSdk
+if (hasV2HistorySdk && historySdkPatched === generatedSdk) {
   throw new Error("Session history numeric SDK patch did not apply")
 }
 await Bun.write("./src/v2/gen/sdk.gen.ts", historySdkPatched)
+
+// Re-export the hand-maintained domain types (plugin author API contracts that
+// outlive the generated OpenAPI surface) through the generated types module so
+// `@opencode-ai/sdk/v2/types` keeps exposing them.
+const typesWithDomain = historyTypesPatched.endsWith("\n") ? historyTypesPatched : historyTypesPatched + "\n"
+const domainLine = `export * from "../domain.js"`
+if (!typesWithDomain.includes(domainLine)) {
+  await Bun.write("./src/v2/gen/types.gen.ts", typesWithDomain + domainLine + "\n")
+}
 
 // Patch a @hey-api/openapi-ts codegen bug: SseFn incorrectly passes the
 // endpoint's TError into the second generic of ServerSentEventsResult, which
@@ -115,5 +133,14 @@ await Bun.write(sseTypesPath, sseTypesPatched)
 await $`bun prettier --write src/gen`
 await $`bun prettier --write src/v2`
 await $`rm -rf dist`
-await $`bun tsc`
-await $`rm openapi.json`
+await $`rm -f openapi.json`
+// The generated surface makes tsc's recursive type walkers run deep; the
+// default stack overflows on constrained runners (observed as
+// getQuickTypeOfExpression RangeError under CI parallelism). NODE_OPTIONS
+// rejects --stack-size, so hand the flag to the node binary that hosts tsc.
+// Resolve the script from this package (the store layout differs per platform,
+// so a literal node_modules path breaks on Windows CI).
+const { createRequire } = await import("node:module")
+const tscPath = createRequire(import.meta.url).resolve("typescript/bin/tsc")
+await $`bun x node --stack-size=8192 ${tscPath}`
+await $`rm -f openapi.json`

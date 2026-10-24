@@ -1,6 +1,8 @@
 import { ProjectV2 } from "@opencode-ai/core/project"
-import { Schema } from "effect"
-import { HttpApi, HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
+import { ProjectCopy } from "@opencode-ai/schema/project-copy"
+import { Project } from "@opencode-ai/schema/project"
+import { Schema, Struct } from "effect"
+import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
@@ -8,6 +10,44 @@ import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware
 export const GenerateNamePayload = Schema.Struct({
   context: Schema.optional(Schema.String),
 })
+
+const LocationQuery = Schema.Struct({
+  location: Schema.optional(
+    Schema.Struct({
+      directory: Schema.optional(Schema.String),
+      workspace: Schema.optional(Schema.String),
+    }),
+  ),
+}).annotate({ identifier: "LocationQuery" })
+
+const locationQueryOpenApi = OpenApi.annotations({
+  transform: (operation) => {
+    const parameters = operation.parameters
+    if (!Array.isArray(parameters)) return operation
+    return {
+      ...operation,
+      parameters: parameters.map((parameter) =>
+        parameter?.name === "location" && parameter?.in === "query"
+          ? { ...parameter, style: "deepObject", explode: true }
+          : parameter,
+      ),
+    }
+  },
+})
+
+export class ProjectCopyError extends Schema.ErrorClass<ProjectCopyError>("ProjectCopyError")(
+  {
+    name: Schema.Literal("ProjectCopyError"),
+    data: Schema.Struct({
+      message: Schema.String,
+      forceRequired: Schema.optional(Schema.Boolean),
+    }),
+  },
+  { httpApiStatus: 400 },
+) {}
+
+const CreatePayload = Schema.Struct(Struct.omit(ProjectCopy.CreateInput.fields, ["projectID", "sourceDirectory"]))
+const RemovePayload = Schema.Struct(Struct.omit(ProjectCopy.RemoveInput.fields, ["projectID"]))
 
 export const ProjectCopyApi = HttpApi.make("projectCopyName").add(
   HttpApiGroup.make("projectCopyName")
@@ -25,7 +65,57 @@ export const ProjectCopyApi = HttpApi.make("projectCopyName").add(
         }),
       ),
     )
-    .annotateMerge(OpenApi.annotations({ title: "projectCopy", description: "Project copy naming routes." }))
+    .add(
+      HttpApiEndpoint.post("projectCopy.create", "/experimental/project/:projectID/copy", {
+        params: { projectID: Project.ID },
+        query: LocationQuery,
+        payload: CreatePayload,
+        success: ProjectCopy.Copy,
+        error: ProjectCopyError,
+      })
+        .annotateMerge(locationQueryOpenApi)
+        .annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.projectCopy.create",
+          summary: "Create project copy",
+          description: "Create a project copy with the configured strategy.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.delete("projectCopy.remove", "/experimental/project/:projectID/copy", {
+        params: { projectID: Project.ID },
+        query: LocationQuery,
+        payload: RemovePayload,
+        success: HttpApiSchema.NoContent,
+        error: ProjectCopyError,
+      })
+        .annotateMerge(locationQueryOpenApi)
+        .annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.projectCopy.remove",
+          summary: "Remove project copy",
+          description: "Remove a project copy directory.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.post("projectCopy.refresh", "/experimental/project/:projectID/copy/refresh", {
+        params: { projectID: Project.ID },
+        query: LocationQuery,
+        success: HttpApiSchema.NoContent,
+        error: ProjectCopyError,
+      })
+        .annotateMerge(locationQueryOpenApi)
+        .annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.projectCopy.refresh",
+          summary: "Refresh project copy",
+          description: "Refresh project copy directory state.",
+        }),
+      ),
+    )
+    .annotateMerge(OpenApi.annotations({ title: "projectCopy", description: "Project copy routes." }))
     .middleware(InstanceContextMiddleware)
     .middleware(WorkspaceRoutingMiddleware)
     .middleware(Authorization),
