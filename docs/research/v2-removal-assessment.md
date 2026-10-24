@@ -112,8 +112,10 @@ TUI move.tsx（tui/src/component/prompt/move.tsx）
 
 ## 7. 建议实施顺序（每阶段独立可回归）
 
+> **实施修订（2026-10-22，方案 B → C）**：执行阶段 2 时发现本节原方案低估了一处消费者——TUI 的 `data.tsx` 快照层经 `sdk.client.v2.<ns>.<method>` 双层调用消费 `/api` rail 的 9 类只读端点（§2 的消费者正查只匹配了单层 `sdk.client.<ns>` 形态，漏掉这批）。完整把 TUI 快照层迁到 V1 端点的方案（B）执行受挫后回滚，用户改选 **C 方案：最小保留面**——不迁移，只重建 TUI 实际承重的 3 个只读端点（`/api/location`、`/api/reference`、`/api/fs/find`，autocomplete 与 location key 承重），其余 6 类确认零 TUI 读者后随快照域一并删除；`data.tsx` 缩减至 reference 快照。协议包与 server 包整体删除不变（3 端点直接实现在内嵌 server 的 V1 groups 里，wire 形状与既有 SDK 契约一致）。下述阶段 2 的"摘 rail + 删 V2 运行时"表述仍适用于 C，仅"四个共享件内联"扩为实际发生的内联（cors、pty-environment；`ServerAuthorization` re-export 零消费者直接删）。
+
 1. **阶段 1（零风险）**：删 `packages/sdk-next`、`packages/cli`、`packages/client`、core V2 测试——纯零消费者，typecheck/test 即可验证
-2. **阶段 2**：摘内嵌 server 的 `/api` rail（`packages/protocol` + `packages/server` 主体 + `httpapi/server.ts` 的 `ServerApi` 挂载与 `SessionV2.node` + `makeApi` 引用）+ 四个共享件内联 + 删 `core/tool`、core V2 运行时（保留 §4 清单；`buildPrompt` 内联）
+2. **阶段 2**：摘内嵌 server 的 `/api` rail（`packages/protocol` + `packages/server` 主体 + `httpapi/server.ts` 的 `ServerApi` 挂载与 `SessionV2.node` + `makeApi` 引用）+ 四个共享件内联 + 删 `core/tool`、core V2 运行时（保留 §4 清单；`buildPrompt` 内联）。C 方案修订：rail 摘除以"重建 3 端点"收尾，protocol/server 整包删除
 3. **阶段 3（可选）**：move-session 改读 V1 表 → 删 projector 链；web UI 按 §5 决策处理
 
 ## 8. 保留项不动的原因详解
