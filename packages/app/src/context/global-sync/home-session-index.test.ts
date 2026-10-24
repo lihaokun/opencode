@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { QueryClient } from "@tanstack/solid-query"
-import type { Session, SessionV2Info } from "@opencode-ai/sdk/v2/client"
+import type { Session } from "@opencode-ai/sdk/v2/client"
 import {
   applyHomeSessionEvent,
   appendHomeSessionEvent,
@@ -21,25 +21,32 @@ const session = (input: {
   updated?: number
 }) => ({
   id: input.id,
+  slug: input.id,
   parentID: input.parentID,
   projectID: "project",
+  directory: input.directory ?? "/project",
   cost: 0,
   tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
   time: { created: 1, updated: input.updated ?? 1, archived: input.archived },
   title: input.id,
-  location: { directory: input.directory ?? "/project" },
+  version: "",
 })
 
-describe("Home V2 session index", () => {
-  test("loads the Home index with one global V2 request", async () => {
+const page = (sessions: Session[], next?: string) => ({
+  data: sessions,
+  response: { headers: new Headers(next ? { "x-next-cursor": next } : undefined) },
+})
+
+describe("Home session index", () => {
+  test("loads the Home index with one global request", async () => {
     const calls: unknown[] = []
     const result = await loadHomeSessionIndex(async (input) => {
       calls.push(input)
-      return { data: { data: [session({ id: "root" })], cursor: {} } }
+      return page([session({ id: "root" }) as Session])
     })
 
     expect(result.sessions).toHaveLength(1)
-    expect(calls).toEqual([{ limit: HOME_V2_SESSION_PAGE_LIMIT, order: "desc" }])
+    expect(calls).toEqual([{ limit: HOME_V2_SESSION_PAGE_LIMIT }])
   })
 
   test("loads subsequent pages until the session index is complete", async () => {
@@ -49,16 +56,12 @@ describe("Home V2 session index", () => {
       async (input, options) => {
         calls.push({ input, signal: options.signal })
         if (!("cursor" in input)) {
-          return {
-            data: {
-              data: Array.from({ length: HOME_V2_SESSION_PAGE_LIMIT }, (_, index) =>
-                session({ id: `page-1-${index}` }),
-              ),
-              cursor: { next: "next-page" },
-            },
-          }
+          return page(
+            Array.from({ length: HOME_V2_SESSION_PAGE_LIMIT }, (_, index) => session({ id: `page-1-${index}` })) as Session[],
+            "20",
+          )
         }
-        return { data: { data: [session({ id: "page-2" })], cursor: {} } }
+        return page([session({ id: "page-2" }) as Session])
       },
       0,
       controller.signal,
@@ -66,9 +69,9 @@ describe("Home V2 session index", () => {
 
     expect(result.sessions).toHaveLength(HOME_V2_SESSION_PAGE_LIMIT + 1)
     expect(calls).toEqual([
-      { input: { limit: HOME_V2_SESSION_PAGE_LIMIT, order: "desc" }, signal: controller.signal },
+      { input: { limit: HOME_V2_SESSION_PAGE_LIMIT }, signal: controller.signal },
       {
-        input: { limit: HOME_V2_SESSION_PAGE_LIMIT, order: "desc", cursor: "next-page" },
+        input: { limit: HOME_V2_SESSION_PAGE_LIMIT, cursor: 20 },
         signal: controller.signal,
       },
     ])
@@ -78,19 +81,17 @@ describe("Home V2 session index", () => {
     const activeNull = {
       ...session({ id: "active-null", updated: 20 }),
       time: { created: 1, updated: 20, archived: null },
-    } as unknown as SessionV2Info
+    } as unknown as Session
     const result = parseHomeSessionIndex([
-      session({ id: "root", updated: 30 }),
+      session({ id: "root", updated: 30 }) as Session,
       activeNull,
-      session({ id: "child", parentID: "root", updated: 40 }),
-      session({ id: "archived", archived: 50, updated: 50 }),
+      session({ id: "child", parentID: "root", updated: 40 }) as Session,
+      session({ id: "archived", archived: 50, updated: 50 }) as Session,
     ])
 
     expect(result).toEqual([
       expect.objectContaining({
         id: "root",
-        slug: "root",
-        version: "",
         directory: "/project",
         projectID: "project",
         title: "root",
@@ -106,7 +107,7 @@ describe("Home V2 session index", () => {
   test("preserves the per-directory Home retention limit", () => {
     const now = 10 * 60 * 60 * 1000
     const sessions = Array.from({ length: 80 }, (_, index) => ({
-      ...parseHomeSessionIndex([session({ id: `session-${index}`, updated: index + 1 })])[0],
+      ...parseHomeSessionIndex([session({ id: `session-${index}`, updated: index + 1 }) as Session])[0]!,
       directory: index % 2 === 0 ? "/one" : "/two",
     }))
 
@@ -116,7 +117,7 @@ describe("Home V2 session index", () => {
   })
 
   test("replays session events over the loaded index", () => {
-    const initial = parseHomeSessionIndex([session({ id: "old" })])
+    const initial = parseHomeSessionIndex([session({ id: "old" }) as Session])
     const created = { ...initial[0], id: "new", slug: "new", title: "new", time: { created: 2, updated: 2 } }
 
     const afterCreate = applyHomeSessionEvent(initial, {
@@ -132,7 +133,7 @@ describe("Home V2 session index", () => {
   })
 
   test("applies only events newer than the index baseline", () => {
-    const initial = parseHomeSessionIndex([session({ id: "old" })])
+    const initial = parseHomeSessionIndex([session({ id: "old" }) as Session])
     const stale = { ...initial[0], title: "stale" }
     const current = { ...initial[0], title: "current" }
     const first = appendHomeSessionEvent(undefined, {

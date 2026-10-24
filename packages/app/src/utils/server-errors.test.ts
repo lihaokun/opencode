@@ -1,7 +1,14 @@
 import { describe, expect, test } from "bun:test"
-import type { SessionNotFoundError } from "@opencode-ai/sdk/v2/client"
 import type { ConfigInvalidError, ProviderModelNotFoundError } from "./server-errors"
 import { formatServerError, isSessionNotFoundError, parseReadableConfigInvalidError } from "./server-errors"
+
+// Local stand-in for the wire error shape: the production check matches on the
+// `_tag`/`sessionID` fields only.
+type SessionNotFoundError = {
+  readonly _tag: "SessionNotFoundError"
+  readonly sessionID: string
+  readonly message?: string
+}
 
 function fill(text: string, vars?: Record<string, string | number>) {
   if (!vars) return text
