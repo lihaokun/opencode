@@ -110,6 +110,18 @@ const configLayer = (
 const layer = configLayer()
 
 const it = testEffect(layer)
+
+// Same layer as `it` but with Npm.Service recording install() calls, so tests
+// can assert whether (and how) the plugin SDK install was attempted.
+const npmRecordingIt = testEffect(
+  LayerNode.compile(LayerNode.group([Config.node, FSUtil.node, Env.node, CrossSpawnSpawner.node]), [
+    [Auth.node, AuthTest.empty],
+    [Account.node, AccountTest.empty],
+    [Npm.node, NpmTest.recording],
+    [httpClient, Layer.succeed(HttpClient.HttpClient, unexpectedHttp)],
+  ]),
+)
+
 const configIt = (options?: Parameters<typeof configLayer>[0]) => testEffect(configLayer(options))
 
 const schemaConfig = (config: object) => ({ $schema: "https://opencode.ai/config.json", ...config })
@@ -1151,6 +1163,54 @@ it.effect("installs dependencies in writable OPENCODE_CONFIG_DIR", () =>
 
     expect(yield* FSUtil.use.readFileString(path.join(configDir, ".gitignore"))).toContain("package-lock.json")
   }).pipe(Effect.provide(testInstanceStoreLayer), Effect.provide(LayerNode.compile(CrossSpawnSpawner.node))),
+)
+
+npmRecordingIt.effect("skips the plugin SDK install when no local plugin files exist", () =>
+  Effect.gen(function* () {
+    yield* NpmTest.reset
+    const dir = yield* tmpdirScoped()
+    const configDir = path.join(dir, "configdir")
+    // A plugin subdirectory without any .ts/.js files must not trigger the install.
+    yield* FSUtil.use.ensureDir(path.join(configDir, "plugin"))
+
+    yield* withProcessEnv(
+      "OPENCODE_CONFIG_DIR",
+      configDir,
+      Config.Service.use((svc) => svc.get().pipe(Effect.andThen(svc.waitForDependencies()))).pipe(
+        provideInstanceEffect(dir),
+      ),
+    )
+
+    expect(yield* NpmTest.calls).toEqual([])
+  }).pipe(Effect.provide(testInstanceStoreLayer), Effect.provide(LayerNode.compile(CrossSpawnSpawner.node))),
+)
+
+npmRecordingIt.effect(
+  "installs the plugin SDK pinned to the SDK's own version for local plugins",
+  () =>
+    Effect.gen(function* () {
+      yield* NpmTest.reset
+      const dir = yield* tmpdirScoped()
+      const configDir = path.join(dir, "configdir")
+      yield* FSUtil.use.ensureDir(configDir)
+      yield* FSUtil.use.writeWithDirs(path.join(configDir, "plugin", "hello.ts"), "export default {}\n")
+
+      yield* withProcessEnv(
+        "OPENCODE_CONFIG_DIR",
+        configDir,
+        Config.Service.use((svc) => svc.get().pipe(Effect.andThen(svc.waitForDependencies()))).pipe(
+          provideInstanceEffect(dir),
+        ),
+      )
+
+      const calls = yield* NpmTest.calls
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.dir).toBe(configDir)
+      // In tests the binary is "local" (no OPENCODE_VERSION define), so the
+      // version is left unpinned; a release build pins PluginSdkVersion here.
+      expect(calls[0]?.version).toBeUndefined()
+    }).pipe(Effect.provide(testInstanceStoreLayer), Effect.provide(LayerNode.compile(CrossSpawnSpawner.node))),
+  30000,
 )
 
 // Note: deduplication and serialization of npm installs is now handled by the
