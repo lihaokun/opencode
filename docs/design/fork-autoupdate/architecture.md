@@ -1,11 +1,11 @@
 # 架构 — fmcode 自动更新绑定本 fork 的 release
 
-> feature：`fork-autoupdate`；子计划：`fork-1-release-autoupdate`。issue #65。上游调研见 `docs/research/fork-autoupdate-research.md`。实现前置 `fmcode-1-visible-rename` 已落地（`curl|unknown` 方法、`.fmcode/bin` 识别、`upgrade()` stub、`UpgradeNotSupportedError`）——本子计划用进程内替换替换掉那个 stub。
+> feature：`fork-autoupdate`；子计划：`fork-1-release-autoupdate`。issue #65。上游调研见 `docs/research/fork-autoupdate-research.md`（六项决策 2026-10-26 经用户裁决：GitHub 单源、自写比较器、进程内替换、**不做 TTL 缓存**、beta 取比较器最大、手动允许降级）。实现前置 `fmcode-1-visible-rename` 已落地（`curl|unknown` 方法、`.fmcode/bin` 识别、`upgrade()` stub、`UpgradeNotSupportedError`）——本子计划用进程内替换替换掉那个 stub。
 
 ## 1. 范围
 
-改：`upgrade()` 从 stub 变为进程内替换（下载 → 校验 → 原子替换）；`latest()` 从单端点变为双渠道；新增版本比较器与渠道判定；`cli/upgrade.ts` 恢复自动执行（在 `autoupdate` 允许时）；GitHub API 调用加 TTL 缓存。
-不改：`method()`、`getReleaseType` 语义（基线提示）、事件类型（UpdateAvailable/Updated）、`cli/cmd/upgrade.ts` 的手动命令面（保留，走同一 upgrade）、TTL 缓存之外的任何 state。
+改：`upgrade()` 从 stub 变为进程内替换（下载 → 校验 → 原子替换）；`latest()` 从单端点变为双渠道；新增版本比较器与渠道判定；`cli/upgrade.ts` 恢复自动执行（在 `autoupdate` 允许时）。
+不改：`method()`、`getReleaseType` 语义（基线提示）、事件类型（UpdateAvailable/Updated）、`cli/cmd/upgrade.ts` 的手动命令面（保留，走同一 upgrade）、任何持久化 state（**无缓存**——每次检查直查 GitHub，用户裁决）。
 
 ## 2. 核心流程
 
@@ -60,20 +60,6 @@ TUI 启动（cli/upgrade.ts，后台 fork）
 跨模块共享性：模块私有
 ```
 
-```
-数据结构：ChannelCache（state 目录持久化）
-
-字段：
-  - checkedAt: number — epoch ms
-  - stable: string — stable 渠道最新版
-  - beta: string — beta 渠道最新版
-
-类型不变量：
-  - 读时 checkedAt 距今 < TTL(1h) 才使用；否则视为无缓存
-生命周期：写于每次真实 API 查询后；flock 不做（多进程同时查 = 多一次无害请求）
-跨模块共享性：模块私有
-```
-
 ## 4. 模块划分与功能规约
 
 ### 4.1 `installation/version-compare.ts`（新：解析器 + 比较器）
@@ -98,7 +84,7 @@ TUI 启动（cli/upgrade.ts，后台 fork）
 
 latest(channel: "stable" | "beta") -> Effect<string>：
   stable 走 /releases/latest；beta 走 /releases 列表过滤后比较器取最大。
-  TTL 缓存命中时零网络请求。
+  无缓存：每次调用直查（用户裁决；TUI 每次启动一次请求，远低于匿名限额 60/hr/IP）。
 
 upgrade(method, target) -> Effect<void, UpgradeFailedError>：
   method != "curl" → UpgradeFailedError（unknown 不可自升级，与现状一致）
@@ -126,11 +112,11 @@ upgrade(method, target) -> Effect<void, UpgradeFailedError>：
 1. **双渠道零交叉**（issue 已定，论证保留）：beta 之后发的正式版可能版本号更低（fmv2.1 vs fmv3-beta.17），跨渠道自动切换等于随机降级；换渠道 = 手动重装。
 2. **beta 渠道取比较器最大而非列表第一条**：GitHub 按 created_at 排序，rebuild/re-tag 会让时间序与语义序背离。
 3. **stable 渠道用 `/releases/latest`**：GitHub 端点语义天然排除 pre-release/draft，零过滤代码。
-4. **TTL 缓存 1h**：与匿名限额 60/hr/IP 同量级；缓存按渠道分键存两值，跨渠道启动各取所需；不做 flock（并发重复查询无害）。
+4. **不做 TTL 缓存**（用户裁决）：单机用户远碰不到 60/hr/IP 匿名限额，TUI 每启动一次检查一次即可；省掉 state 文件与失效逻辑。若未来限额成为问题，引入条件 = 用户量级 × 检查频率逼近限额，再补缓存。
 5. **staging + 逐文件 rename**：两文件（fmcode、rg）非原子批量，先全部就位于 `<binDir>/.staging-<ver>/` 再逐个 rename，失败窗口收敛到单次 rename 之间；顺序先 fmcode 后 rg（主程序先新）。
 6. **Windows 先改名再放新**：运行中 exe 不可覆盖 → rename 为 `fmcode.exe.old` 后放入新文件，下次启动清理 `.old`；`.old` 清理失败不阻断。
 7. **sha256 校验失败/下载失败 → 原二进制不动**：替换流程的任何前置失败都不触碰现役文件（fail-safe 优先于可用性）。
-8. **升级执行不校验渠道归属**（issue 表第 3 行只约束自动检查；手动 `upgrade <target>` 允许任意可解析版本——用户显式指令优先，但绝不降级由比较器保证……**修订**：手动命令不比较、不阻止降级，显式 target 就是用户意图；自动路径才比较。细化落实两种入口的分叉）。
+8. **自动禁降级、手动允许降级**（用户裁决）：自动路径只在 compareVersion(latest, current) == 1 时行动（I_1）；手动 `upgrade <target>` 是显式指令，允许任意可解析版本含降级与跨渠道——不代用户做主。两入口在细化分叉。
 
 ## 6. 架构正确性论证
 
@@ -141,7 +127,7 @@ upgrade(method, target) -> Effect<void, UpgradeFailedError>：
 - **G3 基线 major/minor 变化只提示** → §4.3 沿用 getReleaseType
 - **G4 升级过程任何失败保留原二进制** → §4.2 校验先行 + staging + rename 原子性
 - **G5 替换后 fmcode 与 rg 版本一致** → 同 release 资产整体替换（staging 同源解压）
-- **G6 匿名限额不被耗尽** → §3 TTL 缓存
+- **G6 匿名限额不被耗尽** → 每次启动至多 1-2 个请求（stable 1 个；beta 1 个列表），远低于 60/hr/IP；无缓存（用户裁决）
 
 ### 关键假设
 
@@ -157,8 +143,10 @@ upgrade(method, target) -> Effect<void, UpgradeFailedError>：
 - I_2: 替换序列中现役二进制要么是旧版要么是新版，不存在中间损坏态——维护方：staging + rename；preservation：rename 同目录原子（POSIX）/ 先改名后放新（Windows）
 - I_3: sha256 不符 ⇒ 替换零步执行——维护方：校验先于解压/移动的流程顺序
 - I_4: 渠道永不交叉——维护方：渠道由当前版本唯一决定，无配置覆盖
+- I_5: 自动路径绝不降级——维护方：cli/upgrade.ts 调用方守卫（I_1 同源）；手动路径不受此限（决策 8）
 
 ## 7. 迁移/兼容
 
-- fmcode-1 的 stub 错误与 `UpgradeNotSupportedError` 类型保留在代码历史中即可，本子计划删除该类型（upgrade 恢复真实错误通道 `UpgradeFailedError`）——TUI 侧对升级失败的展示走 err.message，无 schema 变更。
-- release note 的"关闭自动更新"建议可移除（#65 落地后自动更新安全）；FORK_INSTALL.md 对应段落删除。
+- fmcode-1 的 `UpgradeNotSupportedError` 类型由本子计划删除（upgrade 恢复 `UpgradeFailedError` 真实错误通道）——TUI 侧对升级失败的展示走 err.message，无 schema 变更；httpapi `global.upgrade` 的 500 语义保留（真失败仍 500）。
+- release note 的"关闭自动更新"建议与 FORK_INSTALL.md 对应段落移除（本子计划落地后自动更新安全）。
+- 每次启动 1-2 个 GitHub 请求：TUI 启动延迟敏感——检查在后台 fork 中执行（现状不变），失败静默（现状 catch(() => {}) 不变）。
