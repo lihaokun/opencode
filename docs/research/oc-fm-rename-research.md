@@ -63,15 +63,57 @@ const tmp = path.join(os.tmpdir(), app)
 - `config/tui.ts`：同一套安装逻辑（#67 已改）。
 - `plugin/install.ts`（`opencode plugin add` 等命令写 `package.json` / `node_modules`）。
 
-## 2. 外部参照
+## 2. 方案修订（2026-10-26，用户裁决：只保留 fork release 分发）
+
+用户裁决：**本 fork 只提供从 fork release 下载安装这一种分发方式**。npm/brew/choco/scoop 等包管理器路径不属于本 fork 的分发途径，对应代码应移除（不是"保持现状"）。
+
+### 2.1 受影响代码面（`dev@f9ed5e63ed` 实测）
+
+`packages/opencode/src/installation/index.ts`：
+
+- `Method` 类型收缩：`"curl" | "npm" | "yarn" | "pnpm" | "bun" | "brew" | "scoop" | "choco" | "unknown"` → `"curl" | "unknown"`（unknown 保留给本地开发/未识别路径）。
+- `method()`（174-207 行）：删除 7 个包管理器的 checks 数组与 execPath 排序逻辑；只保留 `.oc-fm/bin`（原 `.opencode/bin`，#66 步骤 1 改名）与 `.local/bin` 两个 curl 识别分支，其余返回 `"unknown"`。
+- `latest()`（208-264 行）：删除 brew（tap/formulae 两分支）、npm/bun/pnpm registry、choco、scoop 共 5 个源；curl/unknown 统一走 GitHub API（#65 改为 `lihaokun/opencode`，双渠道）。
+- `upgrade()`（265-321 行）：删除 npm/pnpm/bun/brew/choco/scoop 六个 case；只保留 curl 进程内替换（#65 重新实现，替换 `upgradeCurl` 的上游脚本方案）。
+- 删除随之无引用的 schema 与 helper：`NpmPackage`、`BrewFormula`、`BrewInfoV2`、`ChocoPackage`、`ScoopManifest`、`getBrewFormula`、`upgradeScriptShell`、`NpmConfig` import。
+
+`packages/opencode/src/cli/cmd/uninstall.ts`：
+
+- method 参数化的包管理器卸载命令映射表（npm/pnpm/bun/yarn/brew/choco/scoop）整体删除；保留 curl 的二进制与 shell PATH 清理。unknown 时只清目录（现状语义不变）。
+
+`packages/opencode/src/cli/cmd/upgrade.ts`：
+
+- `--method` 选项删除（无可选方法）；调用面随 `method()` 收缩自然简化。
+
+`packages/opencode/src/cli/upgrade.ts`（自动更新入口）、server 侧（`httpapi/handlers/global.ts:90-93`）：
+
+- 接口签名收缩后调用面自然简化；`global.upgrade` 的 `method === "unknown"` 400 分支保留（语义不变：本地构建不可自升级）。
+
+### 2.2 不受影响 / 显式保留
+
+- `InstallationVersion`、`InstallationChannel`、`userAgent()`（User-Agent 不改，issue 边界 3）。
+- `getReleaseType`（#65 沿用其语义做基线变化提示）。
+- GitHub release 下载/校验/替换（资产名 `oc-fm-<os>-<arch>`，#66 步骤 1 定名）——唯一升级通道的执行体。
+- fork-release workflow（唯一发布通道，保持）。
+
+### 2.3 与 #65 的关系
+
+本裁决把 issue #65"要点 5"（npm、brew 等不是本 fork 的分发途径，保持现状或直接不更新）从"保持现状"升级为"移除代码"。移除动作归入 **#66 步骤 1** 一并落（method()/upgrade() 的分支面正被 #66 改），#65 设计不再为多包管理器路径留接口。
+
+### 2.4 风险
+
+- 上游同步冲突面：`installation/index.ts` 是上游活跃文件，删 5 个源后每次同步该文件必冲突（手动解，方向明确：保留 fork 形态）。
+- 从 npm/brew 装过官方版的用户切到 fork：卸载官方包不属于 fork 工具链职责（`uninstall` 只清 fork 自己的），FORK_INSTALL.md 写明先卸官方包再装 fork。
+
+## 3. 外部参照
 
 - **Claude Code vs Codex CLI**：各自独立 `~/.claude` / `~/.codex`，互不读写；凭据独立。教训：完全隔离最简单，但本 fork 明确要继承 opencode 的配置/登录（issue 边界 2），不能照抄。
 - **neovim vs vim**：`~/.config/nvim` 存在则 vim 完全忽略 `~/.vimrc`（`:%` 二选一语义），不存在也不复制。与本 issue 的"有 oc-fm 的就用 oc-fm 的，没有就读 opencode 的；从不自动创建/复制"语义一致，可作为行为基准。
 - **oh-my-zsh / zprezto** 的 ZDOTDIR 二选一：同上。
 
-## 3. 方案对比
+## 4. 方案对比
 
-### 3.1 系统目录切换
+### 4.1 系统目录切换
 
 | 方案 | 做法 | 评价 |
 |---|---|---|
@@ -79,7 +121,7 @@ const tmp = path.join(os.tmpdir(), app)
 | B. 按平台路径表 | 各平台显式路径 | `xdg-basedir` 无平台分支，自建表反而引入平台差异 bug 面。否 |
 | C. env 可切换（`OC_FM_HOME` 类） | 运行时按变量选根 | 增加 93 号环境变量与测试矩阵；issue 未要求。否，留作未来 seam |
 
-### 3.2 配置/凭据"二选一"
+### 4.2 配置/凭据"二选一"
 
 | 方案 | 做法 | 评价 |
 |---|---|---|
@@ -91,7 +133,7 @@ const tmp = path.join(os.tmpdir(), app)
 
 初始化时序约束：`global.ts` 顶层 `await mkdir` 前 must 先完成二选一探测，否则 `oc-fm` 侧目录先被创建，下次启动探测结果翻转（"存在 → 只用它"变成永远命中空目录）。这是本设计最尖锐的正确性点：**探测必须先于任何 oc-fm 侧目录创建，且"探测到借用"时不创建 oc-fm 侧目录**。
 
-### 3.3 环境变量前缀
+### 4.3 环境变量前缀
 
 | 方案 | 做法 | 评价 |
 |---|---|---|
@@ -101,11 +143,11 @@ const tmp = path.join(os.tmpdir(), app)
 
 推荐：**入口处别名（B）作为机制 + Flag 模块直查双前缀（A）作为兜底**的组合，细节在细化阶段定。测试隔离变量（`OPENCODE_TEST_HOME` 等 4 个）保持旧名——它们是开发面不是用户面。
 
-### 3.4 数据库名
+### 4.4 数据库名
 
 方案唯一：`database.ts` 的命名函数在渠道逻辑前加 oc-fm 分支 → 固定 `oc-fm.db`。渠道后缀机制保留给上游路径不再触达的死分支还是直接删除，细化阶段定（倾向直接删：fork 不再有"渠道数据库"概念，保留即死代码）。
 
-## 4. 风险与开放问题
+## 5. 风险与开放问题
 
 1. **探测与创建的时序**（见 3.2）——设计核心点，细化阶段必须给逐步推导。
 2. **`opencode plugin add` 写借用目录**：issue 明确借用时不做后台 SDK 安装（#67 已把安装变成按需，正好收敛）；但用户显式 `plugin add` 仍会写。按 issue"写入跟着读取走"，显式操作允许写借用目录，不改。
@@ -115,7 +157,7 @@ const tmp = path.join(os.tmpdir(), app)
 6. **`.opencode-version`**（`session.ts`）：快照版本标记文件，属数据目录内部文件名，不必改（对外不可见）。
 7. **mDNS** `opencode-<port>` / `opencode.local`：对外可见（局域网广播），列入步骤 1 改名清单（`oc-fm-<port>`）。
 
-## 5. 初步推荐（供架构阶段确认）
+## 6. 初步推荐（供架构阶段确认）
 
 - 系统目录：`global.ts` 单点改名 + `Global.Path.config/data` getter 化做二选一（探测先于创建）。
 - 项目级（步骤 2，另行子计划）：`ConfigPaths` 的 `".opencode"`/`"opencode"` 常量提到一处，二选一逻辑同目录级。
