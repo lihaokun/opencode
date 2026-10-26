@@ -1,6 +1,6 @@
 # 架构 — fmcode 改名（与官方 opencode 分离用户可见层）
 
-> feature：`fmcode-rename`；子计划：`fmcode-1-step1`（issue #66 步骤 1 范围）。上游调研见 `docs/research/fmcode-rename-research.md`（本文引用其 §1 基线与裁决、§2 现状、§5 方案，编号一致）。issue #66 原文名 `oc-fm`，2026-10-26 用户裁决更名 `fmcode`。本文重写于 2026-10-26，全部决策已闭合。
+> feature：`fmcode-rename`；子计划：`fmcode-1-visible-rename`（issue #66 步骤 1 范围）。上游调研见 `docs/research/fmcode-rename-research.md`（本文引用其 §1 基线与裁决、§2 现状、§5 方案，编号一致）。issue #66 原文名 `oc-fm`，2026-10-26 用户裁决更名 `fmcode`。本文重写于 2026-10-26，全部决策已闭合。
 
 ## 1. 范围（步骤 1）
 
