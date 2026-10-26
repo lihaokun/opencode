@@ -147,7 +147,7 @@
 
 ### 3.7 不改清单（显式）
 
-- 内部包名 `@opencode-ai/*`、import 路径、源码目录结构（同步冲突面）。
+- 内部包名 `@opencode-ai/*`、import 路径、源码目录结构（暂不改——原同步冲突理由已随"fork 不再与上游同步"基线失效；现理由为纯成本收益：内部名对用户不可见，改名无用户价值。调研 §1.4）。
 - User-Agent `opencode/<version>`（订阅端点兼容性，issue 边界 3）。
 - 上游托管服务调用（models.opencode.ai 等，步骤 3 逐个定）。
 - `OPENCODE_TEST_*`、`OPENCODE_DB`、构建 define 类（`OPENCODE_VERSION`/`OPENCODE_CHANNEL`/`OPENCODE_MODELS_DEV`/`OPENCODE_PLUGIN_SDK_VERSION`）与 server 握手类（`OPENCODE_SERVER_PASSWORD` 等）环境变量——非用户面或跨进程契约，别名表不含它们。

@@ -44,7 +44,7 @@ const tmp = path.join(os.tmpdir(), app)
 - `config/paths.ts:29,35`：向上扫描目标硬编码 `".opencode"`。
 - 全局配置文件：`config.ts:274-276` 读 `Global.Path.config` 下的 `opencode.json(c)`。
 - 硬编码 `".opencode"` 的文件共 13 个（core 2 + opencode 11，含 `session.ts` 的 `.opencode-version` 快照标记、`plugin/install.ts`、`skill/index.ts`、各 cli cmd）；引用 `opencode.json` 字面量的 13 个（含纯文案报错提示，如 `cli/error.ts`、`tui/util/error.ts`）。
-- 内部包名 `@opencode-ai/*`、import 路径、目录结构**不改**（issue 边界 1，同步上游冲突面）。
+- 内部包名 `@opencode-ai/*`、import 路径、目录结构**暂不改**。原边界理由（同步上游冲突面）已随"fork 不再与上游同步"的基线声明（2026-10-26，见 §2）失效；维持不改的理由改为纯成本收益：内部包名对用户不可见，全仓改名只有 churn 没有用户价值。若后续要把代码身份也去 opencode 化，解除本条即可，无外部依赖。
 
 ### 1.5 环境变量
 
@@ -102,8 +102,8 @@ const tmp = path.join(os.tmpdir(), app)
 
 ### 2.4 风险
 
-- 上游同步冲突面：`installation/index.ts` 是上游活跃文件，删 5 个源后每次同步该文件必冲突（手动解，方向明确：保留 fork 形态）。
 - 从 npm/brew 装过官方版的用户切到 fork：卸载官方包不属于 fork 工具链职责（`uninstall` 只清 fork 自己的），FORK_INSTALL.md 写明先卸官方包再装 fork。
+- （2026-10-26 作废一条：原记"上游同步该文件必冲突"——基线声明后 fork 不再与上游同步，同步冲突不再是风险面。）
 
 ## 3. 外部参照
 
