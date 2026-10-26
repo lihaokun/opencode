@@ -33,9 +33,9 @@ const apiLayer = HttpRouter.serve(
   Layer.provide(Layer.mock(MoveSession.Service)({})),
   Layer.provide(
     Layer.mock(Installation.Service)({
-      method: () => Effect.succeed("npm"),
+      method: () => Effect.succeed("curl" as const),
       latest: () => Effect.succeed("9.9.9"),
-      upgrade: () => Effect.void,
+      upgrade: () => Effect.fail(new Installation.UpgradeNotSupportedError()),
     }),
   ),
   Layer.provide(ServerAuth.Config.configLayer({ password: Option.none(), username: "opencode" })),
@@ -43,15 +43,17 @@ const apiLayer = HttpRouter.serve(
 const it = testEffect(apiLayer)
 
 describe("global HttpApi", () => {
-  it.live("upgrades to the requested version", () =>
+  it.live("surfaces the stub failure until #65 lands in-process replacement", () =>
     Effect.gen(function* () {
       const response = yield* HttpClientRequest.post(GlobalPaths.upgrade).pipe(
         HttpClientRequest.bodyJsonUnsafe({ target: "9.9.9" }),
         HttpClient.execute,
       )
 
-      expect(response.status).toBe(200)
-      expect(yield* response.json).toEqual({ success: true, version: "9.9.9" })
+      expect(response.status).toBe(500)
+      const body = (yield* response.json) as { success: boolean; error: string }
+      expect(body.success).toBe(false)
+      expect(body.error).toContain("releases/latest")
     }),
   )
 
