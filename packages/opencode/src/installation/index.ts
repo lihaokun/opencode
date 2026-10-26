@@ -302,10 +302,15 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
             Effect.mapError(() => fail("cannot park the running executable (is another fmcode running?)")),
           )
         }
-        for (const [from, to] of moves) {
+        for (const [index, [from, to]] of moves.entries()) {
           yield* Effect.promise(() => fs.rename(from, to)).pipe(
             Effect.mapError((error) => fail(`replacement failed (${String(error)}); rerun the upgrade`)),
           )
+          // Defensive: the real assets carry 0755 on the binaries, but a packaging
+          // regression that dropped the bit would otherwise brick the install.
+          if (index < 2) {
+            yield* Effect.promise(() => fs.chmod(to, 0o755)).pipe(Effect.orDie)
+          }
         }
 
         // Non-critical cleanup: leftovers must not fail the upgrade.
