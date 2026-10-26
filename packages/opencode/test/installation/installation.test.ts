@@ -8,8 +8,8 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { Installation } from "../../src/installation"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { testEffect } from "../lib/effect"
-import { execSync } from "child_process"
 import { createHash } from "crypto"
+import { gzipSync } from "zlib"
 import fs from "fs"
 import os from "os"
 import path from "path"
@@ -57,7 +57,9 @@ function jsonResponse(body: unknown) {
 
 // Builds a fake release asset on disk and an HTTP handler that serves it, so
 // the real upgrade flow (download -> checksum -> extract -> rename) runs
-// against a constructed tarball with a known sha256.
+// against a constructed tarball with a known sha256. The tarball is written
+// with node's zlib instead of the `tar` CLI: CI's Windows runners have no
+// usable tar for C:\... paths (it parses the drive letter as a remote host).
 function fakeReleaseHandler(options: { corrupt?: boolean }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fmcode-release-"))
   const name = `fmcode-linux-${process.arch}`
@@ -66,9 +68,11 @@ function fakeReleaseHandler(options: { corrupt?: boolean }) {
   fs.writeFileSync(path.join(top, "bin", "fmcode"), "#!/bin/sh\n", { mode: 0o755 })
   fs.writeFileSync(path.join(top, "bin", "rg"), "#!/bin/sh\n", { mode: 0o755 })
   fs.writeFileSync(path.join(top, "package.json"), "{}")
-  const assetPath = path.join(dir, `${name}.tar.gz`)
-  execSync(`tar -czf ${assetPath} -C ${dir} ${name}`)
-  const bytes = fs.readFileSync(assetPath)
+  const bytes = gzipSync(
+    // ustar header + pax is overkill for the fixture: the runtime extraction
+    // shells out to the system tar, which reads plain ustar fine.
+    tarSync(dir, name),
+  )
   let hash = createHash("sha256").update(bytes).digest("hex")
   if (options.corrupt) hash = "0".repeat(64)
   return (request: HttpClientRequest.HttpClientRequest) => {
@@ -77,6 +81,59 @@ function fakeReleaseHandler(options: { corrupt?: boolean }) {
     if (url.endsWith("/sha256sums.txt")) return new Response(`${hash}  ${name}.tar.gz\n`)
     return new Response("not found", { status: 404 })
   }
+}
+
+// Minimal ustar writer: one 512-byte header + 512-padded content per file,
+// two zero blocks at the end. Only regular files with short names are needed.
+function tarSync(root: string, topName: string): Buffer {
+  const blocks: Buffer[] = []
+  const add = (fullPath: string, arcPath: string) => {
+    const content = fs.readFileSync(fullPath)
+    const header = Buffer.alloc(512)
+    header.write(arcPath.slice(0, 100), 0)
+    header.write("0000644\0", 100) // mode
+    header.write("0000000\0", 108) // uid
+    header.write("0000000\0", 116) // gid
+    header.write(content.length.toString(8).padStart(11, "0") + "\0", 124) // size
+    header.write(Math.floor(fs.statSync(fullPath).mtimeMs / 1000).toString(8).padStart(11, "0") + "\0", 136)
+    header.write("        ", 148) // checksum placeholder (spaces)
+    header.write("0", 156) // regular file
+    header.write("ustar\0", 257)
+    header.write("00", 263)
+    let sum = 0
+    for (const byte of header) sum += byte
+    header.write(sum.toString(8).padStart(6, "0") + "\0 ", 148)
+    blocks.push(header, content, Buffer.alloc((512 - (content.length % 512)) % 512))
+  }
+  const walk = (dirPath: string, arcDir: string) => {
+    for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+      const full = path.join(dirPath, entry.name)
+      const arc = arcDir ? `${arcDir}/${entry.name}` : entry.name
+      if (entry.isDirectory()) {
+        const header = Buffer.alloc(512)
+        header.write(arc.slice(0, 100), 0)
+        header.write("0000755\0", 100)
+        header.write("0000000\0", 108)
+        header.write("0000000\0", 116)
+        header.write("00000000000\0", 124)
+        header.write("00000000000\0", 136)
+        header.write("        ", 148)
+        header.write("5", 156)
+        header.write("ustar\0", 257)
+        header.write("00", 263)
+        let sum = 0
+        for (const byte of header) sum += byte
+        header.write(sum.toString(8).padStart(6, "0") + "\0 ", 148)
+        blocks.push(header)
+        walk(full, arc)
+      } else {
+        add(full, arc)
+      }
+    }
+  }
+  walk(root, "")
+  blocks.push(Buffer.alloc(1024))
+  return Buffer.concat(blocks)
 }
 
 function testLayer(httpHandler: (request: HttpClientRequest.HttpClientRequest) => Response) {
