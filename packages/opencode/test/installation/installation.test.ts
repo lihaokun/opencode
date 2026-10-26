@@ -183,7 +183,7 @@ describe("installation", () => {
         Effect.gen(function* () {
           const original = process.execPath
           try {
-            Object.defineProperty(process, "execPath", { value: "/home/u/.fmcode/bin/fmcode", configurable: true })
+            Object.defineProperty(process, "execPath", { value: `/${path.join(".fmcode", "bin", "fmcode")}`.replaceAll("\\", "/"), configurable: true })
             expect(yield* Installation.use.method()).toBe("curl")
           } finally {
             Object.defineProperty(process, "execPath", { value: original, configurable: true })
