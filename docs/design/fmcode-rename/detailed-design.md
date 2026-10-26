@@ -107,7 +107,7 @@
 
 - 单元：env-alias 三态 + 清单外键（子进程形态：`bun -e` 设 FMCODE_* 后 import env-alias，断言 OPENCODE_* 出现/不覆盖）；method() 的 `.fmcode/bin`、`.local/bin`、其他三分支。
 - 回归：installation 测试修订（删包管理器源用例）；全量 config/tui/plugin 套件（Global.Path 消费面零逻辑改动证明）；凭据读写回归（login→读回落 fmcode 侧；opencode 侧 auth.json 存在时 fmcode 读不到它——隔离性负例）。
-- E2E（真实进程，隔离 XDG）：首启建 fmcode 目录；`opencode 侧 auth.json` 存在时 fmcode 侧未登录（隔离负例）；fmcode login → 写 fmcode 侧且 opencode 文件不动；`fmcode --version`/`--help` 文案；dev 构建 `OPENCODE_CHANNEL=dev` → `opencode-dev.db`，模拟 release `latest` → `opencode.db`。
+- E2E（真实进程，隔离 XDG）：首启建 fmcode 七目录；`~/.local/share/opencode/auth.json` 存在时 fmcode 侧未登录（隔离负例，`debug config` 或 providers 命令验证）；凭据写入路径用 `auth` 模块的 set API 在单测覆盖（CLI 登录是交互式 OAuth，不做真实进程自动化）；`fmcode --version`/`--help` 文案；dev 构建 `OPENCODE_CHANNEL=dev` → `opencode-dev.db`，模拟 release `latest` → `opencode.db`。
 - 边际：`OPENCODE_DB` 显式路径（零改动验证）、`FMCODE_CONFIG` 设置后等效 `OPENCODE_CONFIG`、Windows（CI 无 runner 则记录未测面）。
 
 ## 7. 完整性自检 checklist

@@ -144,7 +144,7 @@ ALIASES 清单构成（§调研 5.3 讨论 B 的落地口径）：
 
 ## 6. 迁移（零自动迁移）
 
-- 不写迁移代码。fmcode 首启用自己的空 data/config，会话历史为空、未登录——需重新登录一次（`fmcode auth login` 或对应命令；MCP 服务器重新 OAuth）。
+- 不写迁移代码。fmcode 首启用自己的空 data/config，会话历史为空、未登录——需重新登录一次（登录入口为交互式 OAuth，经 TUI 登录流程或 `fmcode` providers 命令；MCP 服务器重新 OAuth）。
 - 想带会话历史：用户自己移动数据库（README 写明，先退出所有进程）：
 
 ```bash
