@@ -1,8 +1,8 @@
 # 调研报告 — 自动更新绑定本 fork 的 release（#65）
 
-> feature：`fork-autoupdate`；issue #65。按 issue 的"分步"定位：排在 #66 步骤 1 之后实现；本文先行起草路径无关部分（比较器、渠道选择），路径相关部分（进程内替换的落点）引用 #66 的产出。
+> feature：`fork-autoupdate`；子计划：`fork-1-release-autoupdate`；issue #65。本文产出早于 #66 步骤 1 的实现与 fmcode 命名裁决（commit `6ed4929afe`，2026-10-25）；文中 `oc-fm` 一律按 `fmcode` 理解，`opencode` 二进制/资产名按 `fmcode` 理解。#66 步骤 1 已实现（upgrade stub、`curl|unknown` 方法、`.fmcode/bin` 识别），本调研的现状节保留为历史证据，方案节仍然有效，待用户逐条裁决后修订进架构。
 
-## 1. 现状梳理（`dev@f9ed5e63ed` 实测）
+## 1. 现状梳理（`dev@f9ed5e63ed` 实测；fmcode-1 落地后链路已收缩为 curl-only + stub，本节描述的是实现前的历史形态，保留作危害证据）
 
 ### 1.1 现有自动更新链路
 
@@ -35,9 +35,9 @@ bun+semver 实测：
 
 ### 1.4 升级执行面（#66 后的落点）
 
-- 安装目录：`~/.oc-fm/bin`（= `Global.Path.cache/bin`？不——release 安装说明装到 `~/.oc-fm/bin` 独立 PATH 目录；`Global.Path.bin` 是缓存 bin，二者并存。`method()` 识别前者（`.oc-fm/bin`）与 `~/.local/bin`）。
-- 同目录捆绑：`rg`（fork-release 打包 `bin/opencode`（#66 后 `bin/oc-fm`）+ `bin/rg`）。
-- 资产名：`oc-fm-<os>-<arch>.tar.gz` / `.zip`；`sha256sums.txt` 同 release。
+- 安装目录：`~/.fmcode/bin`（release 安装说明装入的独立 PATH 目录；注意 `Global.Path.bin` 是缓存 bin，二者并存，升级目标是前者即 `dirname(process.execPath)`）。`method()` 识别 `.fmcode/bin` 与 `~/.local/bin`（fmcode-1 已实现）。
+- 同目录捆绑：`rg`（实测 v1.18.31-fmv2.1 资产解压为 `bin/fmcode` + `bin/rg` + `package.json`，2026-10-26 下载核验）。
+- 资产名：`fmcode-<os>-<arch>.tar.gz` / `.zip`；`sha256sums.txt` 同 release（实测条目格式 `<hex>␣␣<filename>`，coreutils `sha256sum -c` 兼容）。
 - 平台：5 目标（darwin arm64/x64、linux x64/arm64、windows x64）；Windows zip，其余 tar.gz。
 
 ## 2. 外部参照
@@ -90,8 +90,8 @@ GitHub 匿名 API 限额 60/hr/IP。现状：`upgrade()` 每次 TUI 启动跑一
 ## 4. 风险与开放问题
 
 1. **Windows 自替换**：运行中 exe 无法覆盖——先 `rename` 旧 exe 为 `.old` 再放新文件，下次启动清理 `.old`。需要真实 Windows 验证（本机无，CI 无 windows job for fork-release smoke）——标注为待验证面，README 提供手动重装兜底。
-2. **`rg` 同替换的失败窗口**：两文件非原子批量——先全部就位（`bin/.staging-<ver>/`）再逐个 rename，`rg` 失败窗口极小（rename 间）；替换顺序 opencode 先（最常用）。
+2. **`rg` 同替换的失败窗口**：两文件非原子批量——先全部就位（`bin/.staging-<ver>/`）再逐个 rename，`rg` 失败窗口极小（rename 间）；替换顺序 fmcode 先（最常用）。
 3. **TTL 缓存的存储位置**：state 目录（oc-fm 自己的，#66 后不借用）；跨 TUI/CLI 实例并发写——flock 已有（`EffectFlock`），或接受竞态（多查一次无害）。细化定。
 4. **`getReleaseType` 语义迁移**：基线（上游 semver）major/minor 变化只提示不自动装——现有函数可直接用于解析后的基线域。
 5. **beta 渠道取最大 vs 取列表第一条**：定取比较器最大（§1.2）。
-6. **`opencode upgrade [target]` 手动命令**：保留，target 语义从"任意版本"变为"必须是本渠道内可解析的 fork 版本"（防止手动降级/跨渠道）；跨渠道安装走重装（README）。
+6. **`fmcode upgrade [target]` 手动命令**：保留。target 语义为"可解析的 fork 版本"；是否禁止手动降级/跨渠道为**开放决策**（issue 原文"绝不降级"若按字面适用于手动，则手动也被禁；倾向：自动路径绝不降级、手动显式指令允许——待用户裁决）。跨渠道安装走重装（README）。
