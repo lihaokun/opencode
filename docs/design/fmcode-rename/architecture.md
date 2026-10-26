@@ -100,7 +100,7 @@ issue 边界 2 原要求凭据"有自己就用自己，没有就用 opencode 的
 
 功能描述：进程入口最早期，把已设且目标未设的 FMCODE_X 拷贝为 OPENCODE_X。
 
-前置条件：在任何 OPENCODE_* 读点前执行。实现约束：本模块零 src import；`index.ts` 中置于我们自己的所有 import 之前（外部包如 yargs 的 import 无 env 读点，顺序无涉；首个含 OPENCODE_* 模块级读点的是 `cli/heap.ts` → core/flag，env-alias 必须排在它前面）。
+前置条件：在任何 OPENCODE_* 读点前执行。实现约束：本模块零 src import、**import 即执行拷贝（自带副作用）**——ESM 中全部 import 先于调用方模块体求值，"import 后再调用 apply()"无法覆盖 import 求值期间的读点；`index.ts` 把该 import 置于我们自己的 import 首位（外部包如 yargs 无 env 读点，顺序无涉；首个 env 敏感链是 `cli/heap.ts` → core/flag 模块级 44 键直读）。
 后置条件：对下游所有代码效果等同用户直接设置了 OPENCODE_X。
 不变式：显式 OPENCODE_X 永远胜过 FMCODE_X。
 副作用：写 process.env（仅拷贝项）。
@@ -165,7 +165,7 @@ mv ~/.local/share/opencode/opencode-dev.db* ~/.local/share/fmcode/   # 旧 fork 
 - **G2 数据、缓存、状态目录彻底分离** → §5.1 单常量改名（决策 B：不做目录级借用，fmcode 目录总是创建）
 - **G3 凭据完全隔离（偏离 issue 原文，用户裁决）** → §4：路径直拼，零新代码；配置内容的继承属步骤 2，本步骤不做，README 声明边界
 - **G4 自动更新目标路径与安装位置一致（为 #65 铺路）** → §5.3 method() 识别 + §5.4 安装目录
-- **G5 环境变量渐进迁移** → §5.2 别名表
+- **G5 环境变量渐进迁移** → §5.2 别名表（import 即执行的机制，见实现约束）
 - **G6 分发收敛** → §5.3（调研 §4.2 清单）
 
 ### 模块协作论证

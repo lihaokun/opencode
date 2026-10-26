@@ -52,7 +52,7 @@
 #### 5.2.1 `apply()`
 
 - **功能描述**：把已设且目标未设的 `FMCODE_X` 拷贝为 `OPENCODE_X`。
-- **调用关系**：callers: `index.ts` 首行（import 后立即调用）；callees: `process.env`。
+- **调用关系**：callers: `index.ts`（我们自己的 import 之前声明 import，并在 import 块后、首个 env 敏感模块求值前调用）；callees: `process.env`。注意 ESM 中 import 语句先于模块体求值——`apply()` 不能只在 import 块后调用一次就覆盖"import 求值期间"的读点，因此约束收紧为：**env-alias 的 import 本身不带副作用、apply() 在 index.ts 顶部 import 块之后第一句执行，且任何模块级读 env 的 src 模块（现状：`cli/heap.ts` → core/flag）的 import 必须排在 apply() 的静态 import 之后是无效的**——ESM import 全部先求值，heap.ts 的模块级 Flag 直读发生在 index.ts 任何语句之前。**修正后的方案：env-alias 模块自带副作用（import 即 apply），index.ts 仅需把该 import 放在我们自己 import 的首位。**
 - **实现思路**：
   1. 模块常量 `ALIASES: [string, string][]`（显式清单，按架构 §5.2 收入口径）
   2. 单遍循环：`for (const [fmKey, ocKey] of ALIASES)` → `if (env[fmKey] !== undefined && env[ocKey] === undefined) env[ocKey] = env[fmKey]`
@@ -80,7 +80,7 @@
 - **upgrade()**：只留 curl case；npm/pnpm/bun/brew/choco/scoop case 删除；`upgradeCurl`/`upgradeScriptShell` 删除（#65 重写进程内替换——本步骤 curl case 临时保留还是先删？**决策：本步骤把 upgrade() 收缩为 curl-only 但保留现有 upgradeCurl 实现**（URL 换成不可达？否——upgradeCurl 指向 opencode.ai/install 会装官方版，危害不除）。**最终决策：latest() 改 fork URL；upgrade() 的 curl case 改为返回明确错误 "use the installer script from the release page"**——自动更新入口（cli/upgrade.ts）在 `method === "curl"` 时不再自动执行，等 #65 提供进程内替换。危害即刻消除（不会换回官方版），#65 只需替换这个 stub。
 - **schema/helper 删除**：`NpmPackage`、`BrewFormula`、`BrewInfoV2`、`ChocoPackage`、`ScoopManifest`、`getBrewFormula`、`upgradeScriptShell`、`NpmConfig` import、`httpOk` 若无消费者随之删。
 - **`cli/upgrade.ts`**：`method === "unknown"` → 现状 return（不升级）；`method === "curl"` → 因 upgrade 为 stub，行为改为发 `UpdateAvailable` 事件（notify 语义）后 return——**自动更新在 #65 落地前整体降级为纯提示**，与 release note 现行"autoupdate: false"要求一致但不再危险。
-- **`cli/cmd/upgrade.ts`**：`--method` 选项删除；`target` 手动指定时调 `upgrade` 得到 stub 错误信息（可接受，提示语明确）；无 target 时 `latest()` 返回 fork 最新版并提示"手动安装"，不执行替换。
+- **`cli/cmd/upgrade.ts`**：`--method` 选项与 choices 删除（`detectedMethod` 直用）；`method === "unknown"` 的"仍要安装？"交互随 stub 语义调整——unknown 时直接提示手动安装方式并退出（不再提供绕过）；有 target 或无 target 均走 stub 提示（"从 release 页下载安装"），不执行替换。
 - **uninstall.ts**：映射表删除；`method` 参数保留（curl → 清 binary/shell PATH；unknown → 只清目录）。
 - **正确性论证**（升级链路收敛）：
   - 前置: 决策"release-only 分发"
@@ -101,11 +101,11 @@
 
 ### 5.7 `index.ts` 接线
 
-- 首行：`import { apply as applyEnvAlias } from "./env-alias"; applyEnvAlias()`——必须在 `@/config/config`、Flag 等任何读 env 的 import 之前。评审项：ESM 按序求值，env-alias 无传递 import 才保证"最早"；本模块仅依赖全局 `process`。
+- 我们自己的 import 首位：`import "./env-alias"`——模块 import 时即执行别名拷贝（自带副作用的 import，无导出被依赖）。ESM import 求值先于 index.ts 模块体，因此"import 块内位置"决定相对顺序：env-alias 排在我们 import 的第一位即早于 heap→flag 等全部 env 读点。外部包（yargs 等）import 无 OPENCODE 读点，排前排后无涉。评审项：env-alias 模块零 src import（防传递引入提前读 env 的模块）。
 
 ## 6. 测试计划
 
-- 单元：`apply()` 三态 + 清单外键；method() 的 `.fmcode/bin`、`.local/bin`、其他三分支。
+- 单元：env-alias 三态 + 清单外键（子进程形态：`bun -e` 设 FMCODE_* 后 import env-alias，断言 OPENCODE_* 出现/不覆盖）；method() 的 `.fmcode/bin`、`.local/bin`、其他三分支。
 - 回归：installation 测试修订（删包管理器源用例）；全量 config/tui/plugin 套件（Global.Path 消费面零逻辑改动证明）；凭据读写回归（login→读回落 fmcode 侧；opencode 侧 auth.json 存在时 fmcode 读不到它——隔离性负例）。
 - E2E（真实进程，隔离 XDG）：首启建 fmcode 目录；`opencode 侧 auth.json` 存在时 fmcode 侧未登录（隔离负例）；fmcode login → 写 fmcode 侧且 opencode 文件不动；`fmcode --version`/`--help` 文案；dev 构建 `OPENCODE_CHANNEL=dev` → `opencode-dev.db`，模拟 release `latest` → `opencode.db`。
 - 边际：`OPENCODE_DB` 显式路径（零改动验证）、`FMCODE_CONFIG` 设置后等效 `OPENCODE_CONFIG`、Windows（CI 无 runner 则记录未测面）。
@@ -117,4 +117,4 @@
 - [x] 所有退出点已刻画（alias 无错误路径；mkdir 失败沿现状抛）
 - [x] 所有 callee 调用显式引用其 pre/post（existsSync / process.env / Global.Path / mkdir）
 - [x] 所有循环有终止性论证（alias 单遍有限清单）
-- [x] 所有上游事实显式列出（H1-H4 + Node existsSync 语义 + ESM 求值顺序 + fork-release 渠道变量流向）
+- [x] 所有上游事实显式列出（H1-H4 + ESM import 求值顺序与副作用 import 机制 + fork-release 渠道变量流向）
