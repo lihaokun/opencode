@@ -38,7 +38,7 @@
 
 ### 1.4 数据库名（2026-10-26 用户裁决）
 
-**数据库文件名不改**，保持 `opencode.db`（及现渠道形态），路径区分由 data 目录二选一承担：借用态 `~/.local/share/opencode/opencode.db`、自有态 `~/.local/share/fmcode/opencode.db`，同名不同目录互不覆盖。理由：文件名对用户不可见，改名无用户价值；不改则迁移退化为"移动目录"（一条 `mv`），避免三文件（`-wal`/`-shm`）同步改名的易错操作；`path()` 函数零改动。
+**数据库文件名不改**，保持 `opencode.db`（及现渠道形态），路径区分由 data 目录分离承担（fmcode 的 data 永远是 `~/.local/share/fmcode/`，与 opencode 的互不覆盖）。理由：文件名对用户不可见，改名无用户价值；不改则迁移退化为"移动目录"（一条 `mv`），避免三文件（`-wal`/`-shm`）同步改名的易错操作；`path()` 函数零改动。
 
 连带裁决（选项 b）：fork-release.yml 发布构建的 `OPENCODE_CHANNEL` 从 `dev` 改为 `latest`——release 用户得到干净的 `opencode.db`（"dev" 后缀来自构建渠道变量，对 release 用户有误导），本地 dev 构建保持 `opencode-dev.db`。渠道后缀机制本身保留，`path()` 不动。
 
@@ -95,7 +95,7 @@ const tmp = path.join(os.tmpdir(), app)
 
 ### 2.6 凭据文件
 
-`auth/index.ts:10` → `<data>/auth.json`；`mcp/auth.ts:37` → `<data>/mcp-auth.json`。都在 `Global.Path.data` 下。issue 要求"fmcode 自己的没有就用 opencode 的"；粒度裁决见 §5.2（开放问题）。
+`auth/index.ts:10` → `<data>/auth.json`；`mcp/auth.ts:37` → `<data>/mcp-auth.json`。都在 `Global.Path.data` 下。issue 要求"fmcode 自己的没有就用 opencode 的"；**2026-10-26 用户裁决改为完全隔离：不读、不写 opencode 的凭据文件**（见设计文档架构 §4.2 偏离登记）。
 
 ### 2.7 写入面（跟着读取走的关键点）
 
@@ -106,7 +106,7 @@ const tmp = path.join(os.tmpdir(), app)
 ## 3. 外部参照
 
 - **Claude Code vs Codex CLI**：各自独立 `~/.claude` / `~/.codex`，互不读写；凭据独立。教训：完全隔离最简单，但本 fork 明确要继承 opencode 的配置/登录（issue 边界 2），不能照抄。
-- **neovim vs vim**：`~/.config/nvim` 存在则 vim 完全忽略 `~/.vimrc`（二选一语义），不存在也不复制。与本 issue 的"有 fmcode 的就用 fmcode 的，没有就读 opencode 的；从不自动创建/复制"语义一致，作为行为基准。
+- **neovim vs vim**：`~/.config/nvim` 存在则 vim 完全忽略 `~/.vimrc`（二选一语义），不存在也不复制。与步骤 2 项目/全局配置二选一的既定语义一致，作为行为基准（凭据已于 2026-10-26 裁决为完全隔离，不适用此基准）。
 - **oh-my-zsh / zprezto** 的 ZDOTDIR 二选一：同上。
 
 ## 4. 受影响代码面：分发收敛（§1.2 裁决的实施清单）
@@ -155,19 +155,15 @@ const tmp = path.join(os.tmpdir(), app)
 | B. 按平台路径表 | 各平台显式路径 | `xdg-basedir` 无平台分支，自建表反而引入平台差异 bug 面。否 |
 | C. env 可切换（`FMCODE_HOME` 类） | 运行时按变量选根 | 增加环境变量与测试矩阵；issue 未要求。否，留作未来 seam |
 
-### 5.2 配置/凭据"二选一"——**开放，待用户裁决**
+### 5.2 数据目录与凭据——**已裁决（2026-10-26）：B + 凭据完全隔离**
 
 | 方案 | 做法 | 评价 |
 |---|---|---|
-| A. 目录级整体二选一 | `~/.config/fmcode/` 存在 → 只用它；否则用 `~/.config/opencode/`。数据/凭据同规则 | 粒度粗但语义清晰（neovim 语义）；实现点单点化（`Global.Path.config`/`data` 一处解析，30+ 消费者无感知）。代价：借用时 logs/snapshots 等也混在 opencode 目录。**调研推荐 A** |
-| B. issue 原文 | 数据目录彻底分开（fmcode 首启为空），仅凭据文件（`auth.json`/`mcp-auth.json`）文件级二选一 | 数据目录天然不混；但判断点分散（凭据写入点都要感知借用状态，"新登录写到当前生效的那份"），漏一处即静默分叉 |
-| C. 合并读取 | 两边都读 | issue 明确禁止（互相覆盖、矛盾）。否 |
+| A. 目录级整体二选一 | `~/.config/fmcode/` 存在 → 只用它；否则用 `~/.config/opencode/`。数据/凭据同规则 | 粒度粗但语义清晰；实现点单点化。代价：借用时 logs/snapshots 等也混在 opencode 目录。~~调研推荐~~ **被否** |
+| B. issue 原文（**已选**） | 数据目录彻底分开（fmcode 首启为空），仅凭据文件文件级二选一 | 数据目录天然不混 |
+| C. 合并读取 | 两边都读 | issue 明确禁止。否 |
 
-无论 A/B，实现机制相同（探测先于创建，见 §5.5）；差别只在 data 目录是否整体借用。
-
-关键实现含义：**二选一必须发生在 `Global` 模块内部**（`Path.config` / `Path.data` 的取值处），不能在每个 consumer 里自行判断。`Global.Path` 目前是普通常量对象，需改为模块初始化时一次性解析（`fs.existsSync` 探测）后冻结。
-
-初始化时序约束：`global.ts` 顶层 `await mkdir` 前**必须先完成二选一探测**，否则 fmcode 侧目录先被创建，下次启动探测结果翻转（"存在 → 只用它"变成永远命中空目录）。这是本设计最尖锐的正确性点：**探测必须先于任何 fmcode 侧目录创建，且"探测到借用"时不创建 fmcode 侧目录**。
+**后续追加裁决**：凭据也完全隔离——不读、不写 opencode 的凭据文件（理由：与数据目录语义自洽；官方登录态不自动继承）。issue #66 边界 2 的凭据条款以偏离登记方式落档（架构 §4.2）。`Global` 层因此**无任何探测逻辑**：fmcode 侧目录总是创建，"探测先于创建"约束随借用方案一并作废。
 
 ### 5.3 环境变量前缀
 
@@ -183,13 +179,13 @@ const tmp = path.join(os.tmpdir(), app)
 
 已裁决不改名 + 选项 b（§1.4），无剩余方案对比。
 
-### 5.5 跨方案的正确性约束（探测与创建的时序）
+### 5.5 数据目录语义（已闭合）
 
-无论 §5.2 裁决 A 或 B，`Global` 的解析都满足：探测（`existsSync` fmcode 侧）先于任何 fmcode 侧目录创建；探测到借用时不创建 fmcode 侧目录。首启（fmcode 目录不存在）必得借用态且不创建 ⇒ 下次启动探测结果与首次一致（借用稳定，直到用户显式建目录切换）。
+§5.2 裁决为 B（issue 原文）：data 彻底分开，无目录级借用；凭据亦完全隔离（架构 §4.2）。`Global` 层无探测逻辑——fmcode 侧目录总是创建，不存在"探测先于创建"约束（该约束属已被否决的借用方案）。
 
 ## 6. 风险与开放问题
 
-1. **二选一粒度（§5.2）开放**——data 目录整体借用（方案 A）vs issue 原文的文件级凭据二选一（方案 B），行为差异最大的一项，等用户裁决后修订架构。
+1. ~~二选一粒度（§5.2）~~——已裁决 B（data 彻底分开）；凭据随后裁决为完全隔离（不读不写 opencode 的）。无开放项。
 2. **`plugin add` 写借用目录**：用户显式 `plugin add` 仍会写当前生效的配置目录。按 issue"写入跟着读取走"，显式操作允许写借用目录，不改。
 3. **92 个 env 名的映射完整性**：别名机制若漏名，表现为"设了不生效"——CI 检查保证 `FMCODE_` 名单 ⊆ `OPENCODE_` 名单。
 4. **`uninstall.ts` 语义**：改名后 `fmcode uninstall` 卸载的是 fmcode 自己的目录；官方版的清理不在范围内（也卸不到——目录已分离）。

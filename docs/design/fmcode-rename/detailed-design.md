@@ -6,16 +6,16 @@
 
 覆盖函数/模块：
 
-- `packages/core/src/global.ts` — app 常量改名（trivial）+ 凭据二选一的路径 helper（新）
+- `packages/core/src/global.ts` — app 常量改名（trivial）
 - `packages/opencode/src/env-alias.ts`（新）— 入口别名
-- `packages/opencode/src/auth/index.ts`、`packages/opencode/src/mcp/auth.ts` — 凭据读写接二选一
+- 凭据：零改动（架构 §4 裁决完全隔离，现状路径已是 fmcode 侧直拼）
 - `packages/opencode/src/installation/index.ts` — Method 收缩 + 分发收敛（调研 §4.2）
 - `packages/opencode/src/cli/cmd/uninstall.ts`、`packages/opencode/src/cli/cmd/upgrade.ts` — 随 Method 收缩
 - `packages/opencode/src/server/mdns.ts` — 服务名
 - `packages/opencode/script/build.ts`、`packages/opencode/package.json`、`.github/workflows/fork-release.yml`、`FORK_INSTALL.md` — 产物命名与发布
 - `packages/opencode/src/index.ts` — env-alias 接线（首行）
 
-不涉及：项目级 `.fmcode/`（步骤 2）、TUI 标志/README 主体/上游服务（步骤 3）、`config.ts` legacy 写回（借用决策后不再是借用场景，但写回目标是 fmcode 自己的 config 目录，行为不变，无需改动）。
+不涉及：项目级 `.fmcode/`（步骤 2）、TUI 标志/README 主体/上游服务（步骤 3）、凭据模块（架构 §4 裁决完全隔离，`auth/index.ts`/`mcp/auth.ts` 零改动）。
 
 ## 2. 与已有代码的复用点
 
@@ -27,14 +27,13 @@
 
 ## 3. 错误处理策略
 
-- `existsSync` 对权限异常返回 false（Node 语义）⇒ 凭据判定按"fmcode 无自有文件"处理，天然落入回退分支，无需 try/catch
 - env-alias 无错误路径
 - Installation 收缩后错误面减小（删掉的源各有无关的错误分支）
 - mkdir 失败沿 `global.ts` 顶层 await 抛（现状语义，不改）
 
 ## 4. 数据结构定义
 
-见架构 §3（`GlobalPaths`、`CredentialSource`、`EnvAlias`）。均为模块私有，无新增跨模块共享类型。`CredentialSource` 为函数返回值形状，不导出类型。
+见架构 §3（`GlobalPaths`、`EnvAlias`）。均为模块私有，无新增跨模块共享类型。
 
 ## 5. 模块细化
 
@@ -69,45 +68,9 @@
   - 后置: 架构 §5.2 后置条件成立
   - 副作用论证: 仅 process.env 拷贝项写入
 
-### 5.3 凭据文件级二选一（架构 §4 的实现）
+### 5.3 凭据（零改动确认）
 
-#### 5.3.1 `resolveCredentialPath(filename: string)`（新，放 `core/global.ts` 导出或独立 helper——落点：`opencode/src/credentials.ts` 新文件，因需同时被 auth 与 mcp-auth 消费，且依赖 Global 与 os.homedir）
-
-- **功能描述**：给定凭据文件名，返回当前生效的绝对路径与借用标志。
-- **签名**：`(filename: string) => { effectivePath: string; borrowed: boolean }`（同步、纯探测、无 IO 副作用）
-- **实现思路**（推导连续）：
-  1. `fmPath = join(Global.Path.data, filename)`
-  2. `ocPath = join(xdgData, "opencode", filename)`——直接拼，不经 Global（Global.Path.data 已是 fmcode 侧）
-  3. `borrowed = !existsSync(fmPath) && existsSync(ocPath)`
-  4. `effectivePath = borrowed ? ocPath : fmPath`
-  5. 返回 `{ effectivePath, borrowed }`
-- **分支覆盖**：fm 有（自有，无视 opencode）/ fm 无 ∧ oc 有（借用）/ 都无（自有路径，文件尚未创建）——三分支互斥穷尽。边界：fm 无 ∧ oc 无权限（existsSync=false）→ 自有路径（错误策略 §3）。
-- **退出覆盖**：唯一返回点；无错误路径。
-- **循环刻画**：无循环。
-- **callee 契约**：`existsSync`（false 对不存在/无权限，同步，无副作用）；`Global.Path.data`（I_1：恒 fmcode 侧）。
-- **显式假设链**：xdgData 回退语义（H1）；`borrowed` 逐次判定（架构 §4.2，非冻结）。
-- **正确性论证**：
-  - 前置: H3（触点穷尽在调用侧保证）
-  - 论证: 三分支覆盖枚举了 `existsSync(fm) ∧ existsSync(oc)` 的全部组合；borrowed=true ⇒ ocPath 存在（读必然成功的前提由判定本身建立——判定与读之间无原子性保证，文件被删则读到 ENOENT，与现有"文件中途消失"的错误路径一致，不新增错误面）
-  - 后置: 架构 §3 CredentialSource 不变量成立
-  - 副作用论证: 只读探测，无写
-
-#### 5.3.2 `auth/index.ts` 接线
-
-- **实现思路**：
-  1. `const file = path.join(Global.Path.data, "auth.json")`（10 行）→ `const { effectivePath: file } = resolveCredentialPath("auth.json")`——**逐调用解析**（模块内现有 `file` 是模块常量则改为函数内解析；实现时核对该常量的全部使用点是否都应走二选一——预期是，全部改）
-  2. 读路径（`all()`/`get()` 等）：现有实现全部经 `file`，自动获得回退语义
-  3. 写路径（login/logout/`set()`）：写 `resolveCredentialPath(...).effectivePath`——借用态写 opencode 侧（架构 §4.4 论证），自有态写 fmcode 侧
-- **分支覆盖**：借用读 / 自有读 / 借用写 / 自有写——四路全部经 `effectivePath` 汇合，无新分支逻辑（二选一收敛在路径解析处）。
-- **正确性论证**：
-  - 前置: 5.3.1 后置 + 触点穷尽
-  - 论证: 读写全部经 effectivePath ⇒ 无旁路（评审 grep `auth.json` 字面量确认仅此一处构造）；写不复制不双写 ⇒ I_4
-  - 后置: 架构 §4.1 规约成立
-  - 副作用论证: 与现状相同（单个文件的读写），仅路径来源变化
-
-#### 5.3.3 `mcp/auth.ts` 接线
-
-同 5.3.2，文件名 `mcp-auth.json`（37 行）。
+架构 §4 裁决完全隔离后，`auth/index.ts:10` 与 `mcp/auth.ts:37` 的 `path.join(Global.Path.data, ...)` 在 app 改名后自动指向 `~/.local/share/fmcode/`——**无需任何代码改动**。评审项：grep 两文件确认无 opencode 侧路径构造（I_4）。
 
 ### 5.4 `installation/index.ts` — 分发收敛 + 识别改名
 
@@ -142,16 +105,16 @@
 
 ## 6. 测试计划
 
-- 单元：`resolveCredentialPath` 三分支矩阵（fm 有/无 × oc 有/无，tmpdir + XDG 重定向）；`apply()` 三态 + 清单外键；method() 的 `.fmcode/bin`、`.local/bin`、其他三分支。
-- 回归：installation 测试修订（删包管理器源用例）；全量 config/tui/plugin 套件（Global.Path 消费面零逻辑改动证明）；凭据读写回归（login→读回、借用态读 opencode 文件）。
-- E2E（真实进程，隔离 XDG）：首启建 fmcode 目录；fmcode 无凭据 + opencode 有 → 读到 opencode 的；fmcode login → 写 fmcode 侧且 opencode 文件不动；`fmcode --version`/`--help` 文案；dev 构建 `OPENCODE_CHANNEL=dev` → `opencode-dev.db`，模拟 release `latest` → `opencode.db`。
+- 单元：`apply()` 三态 + 清单外键；method() 的 `.fmcode/bin`、`.local/bin`、其他三分支。
+- 回归：installation 测试修订（删包管理器源用例）；全量 config/tui/plugin 套件（Global.Path 消费面零逻辑改动证明）；凭据读写回归（login→读回落 fmcode 侧；opencode 侧 auth.json 存在时 fmcode 读不到它——隔离性负例）。
+- E2E（真实进程，隔离 XDG）：首启建 fmcode 目录；`opencode 侧 auth.json` 存在时 fmcode 侧未登录（隔离负例）；fmcode login → 写 fmcode 侧且 opencode 文件不动；`fmcode --version`/`--help` 文案；dev 构建 `OPENCODE_CHANNEL=dev` → `opencode-dev.db`，模拟 release `latest` → `opencode.db`。
 - 边际：`OPENCODE_DB` 显式路径（零改动验证）、`FMCODE_CONFIG` 设置后等效 `OPENCODE_CONFIG`、Windows（CI 无 runner 则记录未测面）。
 
 ## 7. 完整性自检 checklist
 
-- [x] 所有函数实现思路推导连续（5.2.1 三步、5.3.1 五步、5.4 逐文件）
-- [x] 所有分支已覆盖（凭据三分支、alias 三态、method 三分支）
-- [x] 所有退出点已刻画（credential 无错误路径；alias 无错误路径；mkdir 失败沿现状抛）
+- [x] 所有函数实现思路推导连续（5.2.1 三步、5.4 逐文件）
+- [x] 所有分支已覆盖（alias 三态、method 三分支）
+- [x] 所有退出点已刻画（alias 无错误路径；mkdir 失败沿现状抛）
 - [x] 所有 callee 调用显式引用其 pre/post（existsSync / process.env / Global.Path / mkdir）
 - [x] 所有循环有终止性论证（alias 单遍有限清单）
 - [x] 所有上游事实显式列出（H1-H4 + Node existsSync 语义 + ESM 求值顺序 + fork-release 渠道变量流向）

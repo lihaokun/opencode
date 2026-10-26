@@ -4,7 +4,7 @@
 
 ## 1. 范围（步骤 1）
 
-改：二进制名、安装目录、数据/缓存/状态目录、环境变量前缀（后备兼容）、凭据文件级二选一、mDNS 名、release 资产名、分发收敛（删包管理器路径，调研 §4.2）。
+改：二进制名、安装目录、数据/缓存/状态目录、环境变量前缀（后备兼容）、mDNS 名、release 资产名、分发收敛（删包管理器路径，调研 §4.2）。
 不改：数据库文件名（调研 §1.4）、内部包名（调研 §1.1）、User-Agent、项目级 `.opencode/`（步骤 2 子计划）、TUI 标志与上游托管服务（步骤 3）。
 
 ## 2. 核心流程
@@ -19,14 +19,12 @@ fmcode 进程启动路径：
       1. 计算目标根：<xdg>/fmcode
       2. mkdir <xdg>/fmcode 侧 config/data/state/cache/tmp（data/config 首启为空——§3 决策 1）
       3. 冻结 Path 常量
-  → 凭据解析（auth / mcp-auth，§4 二选一）
-      读：<data>/auth.json 不存在 → 读 opencode 的 ~/.local/share/opencode/auth.json
-      写：写到"当前生效的那份"（自有则自有；借用则 opencode 的）
+  → 凭据（auth / mcp-auth）：<data>/auth.json 直拼，与 opencode 零交互（§4）
   → 数据库（database.ts）：零改动，<data>/opencode.db（data 已是 fmcode 自己的）
   → 其余服务照旧（全部经 Global.Path 间接取路径）
 ```
 
-与旧稿（借用方案）的本质差别：**Global 层没有二选一探测**——data/config 永远是 fmcode 自己的，目录总是创建；二选一只存在于凭据文件的读写层。
+与旧稿（借用方案）的本质差别：**与 opencode 侧零共享**——data/config 永远是 fmcode 自己的，目录总是创建；凭据也不回退读 opencode 的（§4）。
 
 ## 3. 核心数据结构
 
@@ -38,26 +36,12 @@ fmcode 进程启动路径：
   - data / cache / config / state / tmp / bin / log / repos: string — 解析后的绝对路径（全部 fmcode 侧）
 
 类型不变量：
-  - 所有路径恒为 fmcode 侧，与 opencode 目录无任何交集（凭据文件级二选一除外，归属凭据模块）
+  - 所有路径恒为 fmcode 侧，与 opencode 目录无任何交集
 
 生命周期：
   - 创建：模块首次加载时 mkdir（recursive）并冻结
   - 修改：不允许
 跨模块共享性：跨模块共享（consumer：30+ 处经 Global.Path / Global.Service）
-```
-
-```
-数据结构：CredentialSource（凭据二选一的解析结果，函数返回值，非持久类型）
-
-字段：
-  - effectivePath: string — 当前生效的凭据文件绝对路径
-  - borrowed: boolean — 是否借用 opencode 的
-
-类型不变量：
-  - borrowed == true ⇒ effectivePath 是 opencode 侧路径且该文件存在（探测保证）
-  - borrowed == false ⇒ effectivePath 是 fmcode 侧路径（文件可能尚不存在，写入时创建）
-
-跨模块共享性：模块私有（auth 与 mcp-auth 各自内部）
 ```
 
 ```
@@ -72,46 +56,27 @@ fmcode 进程启动路径：
 跨模块共享性：模块私有（入口一处消费）
 ```
 
-## 4. 凭据文件级二选一（本设计的核心机制）
+## 4. 凭据（2026-10-26 用户裁决：完全隔离）
 
 ### 4.1 规约
 
 ```
-模块名称：凭据二选一（auth.json 与 mcp-auth.json 各一份实现，行为相同）
+模块名称：凭据路径
 
-功能描述：读取时优先 fmcode 自己的凭据文件，不存在则回退 opencode 的；写入写到当前生效的那份。
+功能描述：fmcode 的凭据文件固定为 <data>/auth.json 与 <data>/mcp-auth.json；不读、不写 opencode 侧的任何凭据文件。
 
-前置条件：Global.Path.data 已冻结。
-后置条件：
-  - 读：返回 effectivePath（fmcode 侧优先）的内容或"不存在"
-  - 写：内容落在 effectivePath；从不创建 opencode 侧目录，从不复制/迁移对方文件
-副作用：写时创建所在目录（仅 fmcode 侧；借用时 opencode 侧目录已存在）
+前置条件：Global.Path.data 已冻结（I_1：恒为 fmcode 侧）。
+后置条件：读写路径恒为 fmcode 侧；opencode 侧凭据文件的内容与存在性不被本进程改变。
+副作用：写时创建所在目录（fmcode 侧，已由 Global mkdir）。
 ```
 
-### 4.2 借用状态判定（逐次判定，非进程级冻结）
+### 4.2 与 issue #66 的偏离登记
 
-`borrowed = !existsSync(<data>/auth.json) && existsSync(<opencode data>/auth.json)`
+issue 边界 2 原要求凭据"有自己就用自己，没有就用 opencode 的；默认与官方版共用登录状态"。本裁决按用户明示简化为**完全隔离**（与数据目录语义自洽）：fmcode 首启未登录，登录一次即落入自己的目录；`mcp-auth.json` 同理，MCP 服务器重新走一遍 OAuth。issue 原文不改（保留原始需求记录），以本节与 PR 记录为准。
 
-**逐调用判定**而非模块加载时冻结一次。理由：fmcode 首启 data 为空（决策 B 的直接后果），用户首次 `fmcode` 登录前每次读凭据都应回退 opencode 的；登录写入后 `auth.json` 落在 fmcode 侧，此后读自有文件——这正是"新登录写到当前生效的那份"的语义。冻结会把这个自然流变成"首启那刻借用，永远借用"，写读分裂。
+### 4.3 实现
 
-### 4.3 触点清单（ borrow 感知的全部位置）
-
-| 触点 | 文件 | 读/写 |
-|---|---|---|
-| 用户凭据 | `opencode/src/auth/index.ts:10` | 读 + 写（login/logout/refresh） |
-| MCP 凭据 | `opencode/src/mcp/auth.ts:37` | 读 + 写 |
-
-实测仅此两处（`Global.Path.data` 下凭据文件的全部消费者）。架构评审项：实现时 grep `auth.json`/`mcp-auth.json` 复核清单穷尽。
-
-### 4.4 正确性论证（凭据模块）
-
-- 前置: 决策 B（data 彻底分开）+ 触点清单穷尽
-- 论证:
-  - 读路径：fmcode 有 → 读 fmcode（用户显式登录过，最新语义）；无且 opencode 有 → 读 opencode（继承官方登录，issue 要求）；都无 → 未登录。三分支穷尽且互斥
-  - 写路径：写"当前生效的那份"。若当前生效是借用（fmcode 无自有文件），登录写 opencode 侧——与官方版共存不冲突（官方版也写同一文件，后写覆盖，与两版各自单独运行时的行为一致）；此后 fmcode 读到的仍是 opencode 的文件（fmcode 侧始终无自有文件）——即"借用登录"持续对两版可见，符合直觉
-  - 无迁移：从不复制 opencode 的 auth.json 到 fmcode 侧。借用是持续状态而非一次性引导，复制反而制造两份独立演化的副本
-- 后置: issue 边界 2"凭据同一条规则"全部成立
-- 副作用论证: 写仅落 effectivePath；无目录级副作用
+路径退化为 `path.join(Global.Path.data, "auth.json")` 直拼——与现状代码同构，**零新代码**；旧稿的 borrowed 判定、回退读、触点清单、`resolveCredentialPath`、`CredentialSource` 类型全部不引入。
 
 ## 5. 模块划分与功能规约
 
@@ -123,7 +88,7 @@ fmcode 进程启动路径：
 功能描述：app 常量 "opencode" → "fmcode"；mkdir 全集照旧（fmcode 侧目录总是创建，决策 B）。
 
 前置条件：无（模块加载即执行）。
-后置条件：Path 冻结且全部为 fmcode 侧路径；opencode 侧目录不被创建也不被写入（凭据回退读除外，§4）。
+后置条件：Path 冻结且全部为 fmcode 侧路径；opencode 侧目录不被创建也不被写入。
 不变式：进程内路径恒定；无探测逻辑（与旧稿的本质差别）。
 正确性论证：trivial（字符串常量替换 + mkdir 集合同名切换；无分支变化）。
 ```
@@ -179,7 +144,7 @@ ALIASES 清单构成（§5.3 讨论 B 的落地口径）：
 
 ## 6. 迁移（零自动迁移）
 
-- 不写迁移代码。fmcode 首启用自己的空 data/config，会话历史为空；凭据按 §4 直接回退读 opencode 的，登录状态不受影响。
+- 不写迁移代码。fmcode 首启用自己的空 data/config，会话历史为空、未登录——需重新登录一次（`fmcode auth login` 或对应命令；MCP 服务器重新 OAuth）。
 - 想带会话历史：用户自己移动数据库（README 写明，先退出所有进程）：
 
 ```bash
@@ -198,7 +163,7 @@ mv ~/.local/share/opencode/opencode-dev.db* ~/.local/share/fmcode/
 
 - **G1 与官方版在同一台机器并存，二进制互不覆盖** → §5.4 构建命名 + §5.3 安装识别（`.fmcode/bin`）
 - **G2 数据、缓存、状态目录彻底分离** → §5.1 单常量改名（决策 B：不做目录级借用，fmcode 目录总是创建）
-- **G3 配置与凭据默认继承 opencode 的** → 配置目录级：`Global.Path.config` 仍是 fmcode 自己的目录（首启为空），配置内容继承属步骤 2 的项目/全局配置二选一——**本步骤只做凭据文件级**（§4）；若用户理解"继承"为含配置内容，由 README 说明当前步骤边界
+- **G3 凭据完全隔离（偏离 issue 原文，用户裁决）** → §4：路径直拼，零新代码；配置内容的继承属步骤 2，本步骤不做，README 声明边界
 - **G4 自动更新目标路径与安装位置一致（为 #65 铺路）** → §5.3 method() 识别 + §5.4 安装目录
 - **G5 环境变量渐进迁移** → §5.2 别名表
 - **G6 分发收敛** → §5.3（调研 §4.2 清单）
@@ -206,19 +171,19 @@ mv ~/.local/share/opencode/opencode-dev.db* ~/.local/share/fmcode/
 ### 模块协作论证
 
 G1：构建产物名 fmcode ⇒ 安装到 `~/.fmcode/bin`，与官方 `~/.opencode/bin` 物理分离；method() 识别 `.fmcode/bin` ⇒ 升级目标路径一致，G1 且 G4 成立。
-G2：`app = "fmcode"` ⇒ data/cache/config/state/tmp 全部落 fmcode 侧，进程启动即创建；官方版只碰自己的 opencode 侧目录 ⇒ 两版数据零交集（凭据回退读是只读共享，G3 范畴），G2 成立。
-G3：凭据读按 §4.2 逐次判定——fmcode 无自有文件时回退 opencode ⇒ 官方登录直接可用；写入落 effectivePath ⇒ 两版后写覆盖同一借用文件，行为与各版单独运行一致，G3 成立（配置内容的继承边界在 README 声明）。
+G2：`app = "fmcode"` ⇒ data/cache/config/state/tmp 全部落 fmcode 侧，进程启动即创建；官方版只碰自己的 opencode 侧目录 ⇒ 两版数据零交集，G2 成立。
+G3：凭据路径恒 fmcode 侧（§4.1 后置条件）⇒ opencode 凭据文件不被读也不被写，两版登录状态各自独立演化，G3 成立；代价是 fmcode 首启需重新登录（含 MCP OAuth），已在 §6 迁移与 README 声明。
 
 ### 关键假设
 
 - H1: xdg-basedir 未设 XDG 变量时全平台回退 `$HOME/.local/{share,state}`、`$HOME/.config`、`$HOME/.cache`（源码核实）
-- H2: 官方版与 fmcode 可能同时运行——凭据借用文件的并发写（两版各自 login）以后写覆盖收场，与单版多终端场景无差异；data 目录分离后无其他共享写面
-- H3: 凭据触点清单穷尽（§4.3 两处）——实现时 grep 复核，架构评审项
+- H2: 官方版与 fmcode 可能同时运行——data 分离 + 凭据隔离后，两版间无任何共享写面
+- H3: 凭据文件的全部消费者都在 fmcode 侧路径上（现状代码已如此，零改动即成立；grep 复核作例行评审项）
 - H4: `OPENCODE_` 92 名单当前完整；新增变量须同步别名表或显式标"不收"（CI grep 对齐强制）
 
 ### 模块级 invariant
 
-- I_1: Global.Path 全路径恒为 fmcode 侧（凭据回退读除外）——维护方：core/global.ts 单点；preservation：类型冻结 + 无第二 mkdir 入口
+- I_1: Global.Path 全路径恒为 fmcode 侧——维护方：core/global.ts 单点；preservation：类型冻结 + 无第二 mkdir 入口
 - I_2: 进程内路径恒定——维护方：模块加载一次解析；preservation：不导出可变引用
 - I_3: 显式 OPENCODE_X 优先于 FMCODE_X——维护方：env-alias 单点；preservation：别名仅拷贝缺失目标，下游单一读点
-- I_4: 凭据从不复制、从不双写——维护方：§4 二选一实现；preservation：触点清单穷尽（H3）+ 写仅落 effectivePath
+- I_4: 凭据与 opencode 零交互——维护方：§4 路径直拼；preservation：无任何 opencode 侧路径构造进入凭据模块（评审 grep `opencode` 于 auth/mcp 模块）
