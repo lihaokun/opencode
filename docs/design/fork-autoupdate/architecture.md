@@ -14,7 +14,7 @@ TUI 启动（cli/upgrade.ts，后台 fork）
   → autoupdate 关闭？ → 返回
   → channel = 渠道判定（parseVersion(InstallationVersion).channel）
       stable → "stable"；beta → "beta"；解析失败（本地/PR 构建）→ 不检查，返回
-  → 渠道最新版（带 TTL 缓存）：
+  → 渠道最新版（无缓存，每次直查）：
       stable：GET repos/lihaokun/opencode/releases/latest（天然排除 pre-release）
       beta：  GET repos/lihaokun/opencode/releases?per_page=100 → 过滤 prerelease==true ∧ tag 匹配 fork 模式 → 比较器取最大
   → compareVersion(latest, current) <= 0 ？ → 返回（不降级、不重装）
