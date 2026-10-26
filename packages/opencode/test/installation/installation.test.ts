@@ -9,7 +9,7 @@ import { Installation } from "../../src/installation"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { testEffect } from "../lib/effect"
 import { createHash } from "crypto"
-import { gzipSync } from "zlib"
+import { crc32, gzipSync } from "zlib"
 import fs from "fs"
 import os from "os"
 import path from "path"
@@ -55,85 +55,107 @@ function jsonResponse(body: unknown) {
   })
 }
 
-// Builds a fake release asset on disk and an HTTP handler that serves it, so
+// Builds a fake release asset in memory and an HTTP handler that serves it, so
 // the real upgrade flow (download -> checksum -> extract -> rename) runs
-// against a constructed tarball with a known sha256. The tarball is written
-// with node's zlib instead of the `tar` CLI: CI's Windows runners have no
-// usable tar for C:\... paths (it parses the drive letter as a remote host).
+// against a constructed archive with a known sha256. The archive is written
+// with node's zlib instead of the `tar` CLI (CI's Windows runners have no
+// usable tar for C:\... paths — it parses the drive letter as a remote host),
+// and matches the real asset layout per platform: tar.gz everywhere, zip on
+// win32 (same as the fork-release workflow's matrix).
 function fakeReleaseHandler(options: { corrupt?: boolean }) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fmcode-release-"))
-  const name = `fmcode-linux-${process.arch}`
-  const top = path.join(dir, name)
-  fs.mkdirSync(path.join(top, "bin"), { recursive: true })
-  fs.writeFileSync(path.join(top, "bin", "fmcode"), "#!/bin/sh\n", { mode: 0o755 })
-  fs.writeFileSync(path.join(top, "bin", "rg"), "#!/bin/sh\n", { mode: 0o755 })
-  fs.writeFileSync(path.join(top, "package.json"), "{}")
-  const bytes = gzipSync(
-    // ustar header + pax is overkill for the fixture: the runtime extraction
-    // shells out to the system tar, which reads plain ustar fine.
-    tarSync(dir, name),
-  )
+  const platform = process.platform === "win32" ? "windows" : "linux"
+  const extension = process.platform === "win32" ? ".zip" : ".tar.gz"
+  const name = `fmcode-${platform}-${process.arch}${extension}`
+  const entries: Array<{ name: string; content: Buffer; mode: number }> = [
+    { name: `${name.replace(extension, "")}/bin/fmcode`, content: Buffer.from("#!/bin/sh\n"), mode: 0o755 },
+    { name: `${name.replace(extension, "")}/bin/rg`, content: Buffer.from("#!/bin/sh\n"), mode: 0o755 },
+    { name: `${name.replace(extension, "")}/package.json`, content: Buffer.from("{}"), mode: 0o644 },
+  ]
+  const bytes =
+    extension === ".zip"
+      ? zipSync(entries)
+      : gzipSync(
+          Buffer.concat([
+            ...entries.map((entry) => tarEntry(entry.name, entry.content, entry.mode)),
+            Buffer.alloc(1024), // two zero blocks terminate a ustar stream
+          ]),
+        )
   let hash = createHash("sha256").update(bytes).digest("hex")
   if (options.corrupt) hash = "0".repeat(64)
+  const body = new Uint8Array(bytes)
   return (request: HttpClientRequest.HttpClientRequest) => {
     const url = request.url
-    if (url.endsWith(`/${name}.tar.gz`)) return new Response(bytes)
-    if (url.endsWith("/sha256sums.txt")) return new Response(`${hash}  ${name}.tar.gz\n`)
+    if (url.endsWith(`/${name}`)) return new Response(body)
+    if (url.endsWith("/sha256sums.txt")) return new Response(`${hash}  ${name}\n`)
     return new Response("not found", { status: 404 })
   }
 }
 
 // Minimal ustar writer: one 512-byte header + 512-padded content per file,
-// two zero blocks at the end. Only regular files with short names are needed.
-function tarSync(root: string, topName: string): Buffer {
-  const blocks: Buffer[] = []
-  const add = (fullPath: string, arcPath: string) => {
-    const content = fs.readFileSync(fullPath)
-    const header = Buffer.alloc(512)
-    header.write(arcPath.slice(0, 100), 0)
-    header.write("0000644\0", 100) // mode
-    header.write("0000000\0", 108) // uid
-    header.write("0000000\0", 116) // gid
-    header.write(content.length.toString(8).padStart(11, "0") + "\0", 124) // size
-    header.write(Math.floor(fs.statSync(fullPath).mtimeMs / 1000).toString(8).padStart(11, "0") + "\0", 136)
-    header.write("        ", 148) // checksum placeholder (spaces)
-    header.write("0", 156) // regular file
-    header.write("ustar\0", 257)
-    header.write("00", 263)
-    let sum = 0
-    for (const byte of header) sum += byte
-    header.write(sum.toString(8).padStart(6, "0") + "\0 ", 148)
-    blocks.push(header, content, Buffer.alloc((512 - (content.length % 512)) % 512))
+// terminated by two zero blocks. Only regular files with short names are
+// needed; the runtime extraction shells out to the system tar.
+function tarEntry(name: string, content: Buffer, mode: number): Buffer {
+  const header = Buffer.alloc(512)
+  header.write(name.slice(0, 100), 0)
+  header.write(mode.toString(8).padStart(7, "0") + "\0", 100)
+  header.write("0000000\0", 108) // uid
+  header.write("0000000\0", 116) // gid
+  header.write(content.length.toString(8).padStart(11, "0") + "\0", 124) // size
+  header.write("00000000000\0", 136) // mtime
+  header.write("        ", 148) // checksum placeholder (spaces)
+  header.write("0", 156) // regular file
+  header.write("ustar\0", 257)
+  header.write("00", 263)
+  let sum = 0
+  for (const byte of header) sum += byte
+  header.write(sum.toString(8).padStart(6, "0") + "\0 ", 148)
+  return Buffer.concat([header, content, Buffer.alloc((512 - (content.length % 512)) % 512)])
+}
+
+// Minimal stored (uncompressed) zip writer: local file headers + central
+// directory. CRC-32 comes from zlib.
+function zipSync(entries: Array<{ name: string; content: Buffer; mode: number }>): Buffer {
+  const parts: Buffer[] = []
+  const central: Buffer[] = []
+  let offset = 0
+  for (const entry of entries) {
+    const nameBytes = Buffer.from(entry.name)
+    const crc = crc32(entry.content)
+    const local = Buffer.alloc(30)
+    local.writeUInt32LE(0x04034b50, 0)
+    local.writeUInt16LE(20, 4) // version needed
+    local.writeUInt16LE(0x0800, 6) // UTF-8 names
+    local.writeUInt16LE(0, 8) // stored
+    local.writeUInt32LE(crc, 14)
+    local.writeUInt32LE(entry.content.length, 18)
+    local.writeUInt32LE(entry.content.length, 22)
+    local.writeUInt16LE(nameBytes.length, 26)
+    // External attrs: (mode << 16) | 0 marks a regular file with unix mode.
+    const external = (entry.mode << 16) | 0
+    parts.push(local, nameBytes, entry.content)
+    const dir = Buffer.alloc(46)
+    dir.writeUInt32LE(0x02014b50, 0)
+    dir.writeUInt16LE(20, 4)
+    dir.writeUInt16LE(20, 6)
+    dir.writeUInt16LE(0x0800, 8)
+    dir.writeUInt16LE(0, 10)
+    dir.writeUInt32LE(crc, 16)
+    dir.writeUInt32LE(entry.content.length, 20)
+    dir.writeUInt32LE(entry.content.length, 24)
+    dir.writeUInt16LE(nameBytes.length, 28)
+    dir.writeUInt32LE(external, 38)
+    dir.writeUInt32LE(offset, 42)
+    central.push(dir, nameBytes)
+    offset += local.length + nameBytes.length + entry.content.length
   }
-  const walk = (dirPath: string, arcDir: string) => {
-    for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
-      const full = path.join(dirPath, entry.name)
-      const arc = arcDir ? `${arcDir}/${entry.name}` : entry.name
-      if (entry.isDirectory()) {
-        const header = Buffer.alloc(512)
-        header.write(arc.slice(0, 100), 0)
-        header.write("0000755\0", 100)
-        header.write("0000000\0", 108)
-        header.write("0000000\0", 116)
-        header.write("00000000000\0", 124)
-        header.write("00000000000\0", 136)
-        header.write("        ", 148)
-        header.write("5", 156)
-        header.write("ustar\0", 257)
-        header.write("00", 263)
-        let sum = 0
-        for (const byte of header) sum += byte
-        header.write(sum.toString(8).padStart(6, "0") + "\0 ", 148)
-        blocks.push(header)
-        walk(full, arc)
-      } else {
-        add(full, arc)
-      }
-    }
-  }
-  walk(root, "")
-  blocks.push(Buffer.alloc(1024))
-  return Buffer.concat(blocks)
+  const directory = Buffer.concat(central)
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(entries.length, 8)
+  end.writeUInt16LE(entries.length, 10)
+  end.writeUInt32LE(directory.length, 12)
+  end.writeUInt32LE(offset, 16)
+  return Buffer.concat([...parts, directory, end])
 }
 
 function testLayer(httpHandler: (request: HttpClientRequest.HttpClientRequest) => Response) {
