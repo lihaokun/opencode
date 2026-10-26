@@ -6,9 +6,13 @@ import { Effect, Layer, Stream } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { Installation } from "../../src/installation"
-import { InstallationChannel } from "@opencode-ai/core/installation/version"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { testEffect } from "../lib/effect"
+import { execSync } from "child_process"
+import { createHash } from "crypto"
+import fs from "fs"
+import os from "os"
+import path from "path"
 
 const encoder = new TextEncoder()
 
@@ -51,13 +55,34 @@ function jsonResponse(body: unknown) {
   })
 }
 
-function testLayer(
-  httpHandler: (request: HttpClientRequest.HttpClientRequest) => Response,
-  spawnHandler?: (cmd: string, args: readonly string[]) => string | { code: number; stdout?: string; stderr?: string },
-) {
+// Builds a fake release asset on disk and an HTTP handler that serves it, so
+// the real upgrade flow (download -> checksum -> extract -> rename) runs
+// against a constructed tarball with a known sha256.
+function fakeReleaseHandler(options: { corrupt?: boolean }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fmcode-release-"))
+  const name = `fmcode-linux-${process.arch}`
+  const top = path.join(dir, name)
+  fs.mkdirSync(path.join(top, "bin"), { recursive: true })
+  fs.writeFileSync(path.join(top, "bin", "fmcode"), "#!/bin/sh\n", { mode: 0o755 })
+  fs.writeFileSync(path.join(top, "bin", "rg"), "#!/bin/sh\n", { mode: 0o755 })
+  fs.writeFileSync(path.join(top, "package.json"), "{}")
+  const assetPath = path.join(dir, `${name}.tar.gz`)
+  execSync(`tar -czf ${assetPath} -C ${dir} ${name}`)
+  const bytes = fs.readFileSync(assetPath)
+  let hash = createHash("sha256").update(bytes).digest("hex")
+  if (options.corrupt) hash = "0".repeat(64)
+  return (request: HttpClientRequest.HttpClientRequest) => {
+    const url = request.url
+    if (url.endsWith(`/${name}.tar.gz`)) return new Response(bytes)
+    if (url.endsWith("/sha256sums.txt")) return new Response(`${hash}  ${name}.tar.gz\n`)
+    return new Response("not found", { status: 404 })
+  }
+}
+
+function testLayer(httpHandler: (request: HttpClientRequest.HttpClientRequest) => Response) {
   const spawnerNode = makeGlobalNode({
     service: ChildProcessSpawner.ChildProcessSpawner,
-    layer: mockSpawner(spawnHandler),
+    layer: mockSpawner(),
     deps: [],
   })
   return LayerNode.compile(Installation.node, [
@@ -68,75 +93,91 @@ function testLayer(
 
 describe("installation", () => {
   describe("latest", () => {
-    testEffect(testLayer(() => jsonResponse({ tag_name: "v1.2.3" }))).effect(
-      "reads release version from GitHub releases",
+    testEffect(testLayer(() => jsonResponse({ tag_name: "v1.2.3-fmv1" }))).effect(
+      "stable channel reads releases/latest",
       () =>
         Effect.gen(function* () {
-          const result = yield* Installation.use.latest("curl")
-          expect(result).toBe("1.2.3")
+          const result = yield* Installation.use.latest("stable")
+          expect(result).toBe("1.2.3-fmv1")
         }),
     )
 
-    testEffect(testLayer(() => jsonResponse({ tag_name: "v4.0.0-beta.1" }))).effect(
-      "strips v prefix from GitHub release tag",
+    const betaReleases = [
+      { tag_name: "v1.18.31-fmv3-beta.16", prerelease: true },
+      // Legacy shape: prerelease flag missing but the tag is a beta — grammar wins.
+      { tag_name: "v1.18.31-fmv3-beta.17", prerelease: false },
+      { tag_name: "v1.18.31-fmv2.1", prerelease: false },
+    ]
+    testEffect(testLayer(() => jsonResponse(betaReleases))).effect(
+      "beta channel picks the grammar-greatest beta, ignoring the flag and order",
       () =>
         Effect.gen(function* () {
-          const result = yield* Installation.use.latest("unknown")
-          expect(result).toBe("4.0.0-beta.1")
+          const result = yield* Installation.use.latest("beta")
+          expect(result).toBe("1.18.31-fmv3-beta.17")
         }),
     )
 
-    const ghCalls: string[] = []
-    testEffect(
-      testLayer((request) => {
-        ghCalls.push(request.url)
-        return jsonResponse({ tag_name: "v9.9.9" })
-      }),
-    ).effect("queries the fork's releases/latest regardless of method", () =>
-      Effect.gen(function* () {
-        const result = yield* Installation.use.latest("curl")
-        expect(result).toBe("9.9.9")
-        expect(ghCalls).toContain("https://api.github.com/repos/lihaokun/opencode/releases/latest")
-      }),
-    )
-
-    testEffect(
-      testLayer((request) => {
-        ghCalls.push(request.url)
-        return jsonResponse({ tag_name: "v9.9.9" })
-      }),
-    ).effect("ignores the method argument (single distribution channel)", () =>
-      Effect.gen(function* () {
-        const result = yield* Installation.use.latest("unknown")
-        expect(result).toBe("9.9.9")
-        expect(ghCalls.every((url) => url.includes("repos/lihaokun/opencode/releases/latest"))).toBe(true)
-      }),
+    testEffect(testLayer(() => jsonResponse([{ tag_name: "v1.18.31-fmv2.1", prerelease: false }]))).effect(
+      "beta channel fails when no beta exists",
+      () =>
+        Effect.gen(function* () {
+          const error = yield* Effect.flip(Installation.use.latest("beta"))
+          expect(error.stderr).toContain("no beta release")
+        }),
     )
   })
 
   describe("upgrade", () => {
-    testEffect(testLayer(() => jsonResponse({ tag_name: "v1.0.0" }))).effect(
-      "is a stub that defers to the release page until #65",
-      () =>
-        Effect.gen(function* () {
-          const error = yield* Effect.flip(Installation.use.upgrade("curl", "9.9.9"))
-          expect(error).toBeInstanceOf(Installation.UpgradeNotSupportedError)
-          expect(error.message).toContain("https://github.com/lihaokun/opencode/releases/latest")
-        }),
+    testEffect(
+      testLayer((request) => {
+        // 200 with no line for our asset: the sums file exists but the asset
+        // entry is absent (different-generation sums file).
+        if (request.url.includes("sha256sums.txt")) return new Response("deadbeef  other-asset.tar.gz\n")
+        return new Response("asset")
+      }),
+    ).effect("fails when the checksum entry is missing", () =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(Installation.use.upgrade("curl", "1.18.31-fmv2.1"))
+        expect(error.stderr).toContain("checksum entry")
+      }),
     )
 
-    testEffect(testLayer(() => jsonResponse({ tag_name: "v1.0.0" }))).effect(
-      "stub applies to every method",
-      () =>
-        Effect.gen(function* () {
-          const error = yield* Effect.flip(Installation.use.upgrade("unknown", "9.9.9"))
-          expect(error).toBeInstanceOf(Installation.UpgradeNotSupportedError)
-        }),
+    testEffect(
+      testLayer((request) => {
+        if (request.url.includes("sha256sums.txt")) return new Response("x", { status: 404 })
+        return new Response("asset")
+      }),
+    ).effect("fails when the checksums file cannot be downloaded", () =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(Installation.use.upgrade("curl", "1.18.31-fmv2.1"))
+        expect(error.stderr).toContain("cannot download sha256sums.txt")
+      }),
+    )
+
+    testEffect(
+      testLayer(fakeReleaseHandler({ corrupt: true })),
+    ).effect("leaves the live binary untouched on checksum mismatch", () =>
+      Effect.gen(function* () {
+        const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "fmcode-live-"))
+        const live = path.join(binDir, "fmcode")
+        fs.writeFileSync(live, "#!/bin/sh\necho old\n", { mode: 0o755 })
+        const original = process.execPath
+        try {
+          Object.defineProperty(process, "execPath", { value: live, configurable: true })
+          const error = yield* Effect.flip(Installation.use.upgrade("curl", "1.18.31-fmv2.1"))
+          expect(error.stderr).toContain("checksum mismatch")
+          expect(fs.readFileSync(live, "utf8")).toContain("echo old")
+          expect(fs.readdirSync(binDir).some((entry) => entry.startsWith(".staging-"))).toBe(false)
+        } finally {
+          Object.defineProperty(process, "execPath", { value: original, configurable: true })
+          fs.rmSync(binDir, { recursive: true, force: true })
+        }
+      }),
     )
   })
 
   describe("method", () => {
-    testEffect(testLayer(() => jsonResponse({ tag_name: "v1.0.0" }))).effect(
+    testEffect(testLayer(() => jsonResponse({ tag_name: "v1.0.0-fmv1" }))).effect(
       "reports curl for .fmcode/bin installs",
       () =>
         Effect.gen(function* () {
@@ -150,7 +191,7 @@ describe("installation", () => {
         }),
     )
 
-    testEffect(testLayer(() => jsonResponse({ tag_name: "v1.0.0" }))).effect(
+    testEffect(testLayer(() => jsonResponse({ tag_name: "v1.0.0-fmv1" }))).effect(
       "reports unknown for local dev builds",
       () =>
         Effect.gen(function* () {

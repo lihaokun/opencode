@@ -35,7 +35,7 @@ const apiLayer = HttpRouter.serve(
     Layer.mock(Installation.Service)({
       method: () => Effect.succeed("curl" as const),
       latest: () => Effect.succeed("9.9.9"),
-      upgrade: () => Effect.fail(new Installation.UpgradeNotSupportedError()),
+      upgrade: () => Effect.fail(new Installation.UpgradeFailedError({ stderr: "mocked failure" })),
     }),
   ),
   Layer.provide(ServerAuth.Config.configLayer({ password: Option.none(), username: "opencode" })),
@@ -43,7 +43,7 @@ const apiLayer = HttpRouter.serve(
 const it = testEffect(apiLayer)
 
 describe("global HttpApi", () => {
-  it.live("surfaces the stub failure until #65 lands in-process replacement", () =>
+  it.live("surfaces upgrade failures as a 500 with the error message", () =>
     Effect.gen(function* () {
       const response = yield* HttpClientRequest.post(GlobalPaths.upgrade).pipe(
         HttpClientRequest.bodyJsonUnsafe({ target: "9.9.9" }),
@@ -53,7 +53,7 @@ describe("global HttpApi", () => {
       expect(response.status).toBe(500)
       const body = (yield* response.json) as { success: boolean; error: string }
       expect(body.success).toBe(false)
-      expect(body.error).toContain("releases/latest")
+      expect(body.error).toContain("mocked failure")
     }),
   )
 
