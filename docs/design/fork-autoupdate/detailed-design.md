@@ -47,7 +47,7 @@
   3. 各捕获段转 Number；M 缺省 0；k 缺省 0
   4. `channel = k > 0 ? "beta" : "stable"`
   5. 返回 `{ baseline: {major, minor, patch}, generation: N, ordinal: M, channel, betaNumber: k }`
-- **分支覆盖**：完整匹配 / M 省略 / M+k 都省略 / 仅 k / 前导 v / 非 fork 版本（undefined）/ 前导零（undefined）/ 多余后缀（undefined）。九路输入类覆盖于测试。
+- **分支覆盖**：完整匹配 / M 省略 / M+k 都省略 / 仅 k / 前导 v / 非 fork 版本（undefined）/ 前导零（undefined，待评审项定夺）/ 多余后缀（undefined）。八类输入覆盖于测试。
 - **退出覆盖**：唯一返回点，无错误路径（正则不匹配即 undefined）。
 - **callee 契约**：`String.replace`（首现替换）、`Number`（非法串 NaN——被正则 `\d+` 保证不出现）。
 - **循环刻画**：无循环。
@@ -75,10 +75,10 @@
 ### 5.2 `installation/index.ts` — `latest(channel)`
 
 - **功能描述**：双渠道最新版本号（不带 v 前缀）。
-- **签名**：`latest(channel: "stable" | "beta") -> Effect<string>`（**替换**现有 `latest(method?)` 的参数——调用面共三处：cli/upgrade.ts、cli/cmd/upgrade.ts、server handler 的 info（`global.ts:63` 用 `installation.latest()`? 实测 server `info` 无 latest 调用，`info()` 内部调 `result.latest()`——**改为 `latest("stable")`**；三个调用点全列）。
+- **签名**：`latest(channel: "stable" | "beta") -> Effect<string>`（**替换**现有 `latest(method?)` 的参数语义。调用点核实：cli/upgrade.ts、cli/cmd/upgrade.ts、`info()` 内部（server httpapi `InstallationInfo.latest` 字段——**取 `"stable"`**，管理面展示的"最新版"应为正式渠道）。
 - **实现思路**：
   1. stable：`GET /repos/lihaokun/opencode/releases/latest` → `tag_name` 去 v（现有实现逻辑，仅换 channel 参数语义）
-  2. beta：`GET /repos/lihaokun/opencode/releases?per_page=100` → 数组过滤 `prerelease === true` → 逐条 `parseVersion(tag)`，过滤 undefined → `compareVersion` 归约取最大 → 去 v 返回
+  2. beta：`GET /repos/lihaokun/opencode/releases?per_page=100` → 逐条 `parseVersion(tag_name)`，取 `channel === "beta"` 的条目（**文法过滤是真正的门**——`-beta.k` 后缀即在 beta 渠道；`prerelease === true` 字段作辅助过滤，但注明 fork-release.yml 仅在后期的 release create 才加 `--prerelease`，历史条目可能缺该标记，故文法判定优先）→ `compareVersion` 归约取最大 → 去 v 返回
   3. beta 空集（过滤后无元素）→ `UpgradeFailedError`（die 为 orDie——不可达：仓库既有 beta；防御性 die 与 stable 的 orDie 同型）
 - **分支覆盖**：stable 端点 / beta 端点非空 / beta 过滤后空（die）/ API 非 200（httpOk 抛 → 调用方处理）。
 - **正确性论证**：
@@ -118,7 +118,7 @@
 
 ### 5.4 `downloadToFile(url, dest)`（installation/index.ts 内部 helper）
 
-- **实现思路**：`httpOk.execute(request)` → `response.stream`（Effect 流）逐块写入 `Bun.file(dest).writer()`；完成后关闭 writer；**不做** Content-Length 进度（无 UI 需求）。失败（含中途断流）→ 删除半截文件后上抛。
+- **实现思路**：`httpOk.execute(request)` → `response.stream`（`HttpClientResponse.stream` 属性，`Stream<Uint8Array>`——同型先例 `control-plane/workspace.ts:200`）逐块写入 `Bun.file(dest).writer()`；完成后关闭 writer；**不做** Content-Length 进度（无 UI 需求）。失败（含中途断流）→ 删除半截文件后上抛。（评审项已核：该 API 在 effect 4.0.0-beta.83 存在且有仓库内使用先例。）
 - **分支覆盖**：成功 / 请求失败 / 流中断（partial file 清理）。
 - **正确性论证**：流式写 ⇒ 内存占用 O(chunk)，30MB 级资产不整载（复用点一节的论证）；partial 清理 ⇒ staging 目录不残留半截文件误入步骤 7。
 - **副作用论证**: 写 dest 一个文件。
@@ -149,7 +149,7 @@
 
 - **实现思路**：现状流程保留（latest 取当前渠道、显示 From→To），改动两点：
   1. **不做比较守卫**（决策 8）：`target` 显式给出时直接 `upgrade(method, target)`——允许降级/跨渠道；`parseVersion` 校验 target，undefined → 报错"unknown version format"
-  2. 无 target 时行为 = 自动路径步骤 3-5 的 latest 获取 + 显示（但不做资格门，升级动作照常执行——手动语义：用户敲了命令就是要装）；已是最新 → 现状 "already installed" 提示保留
+  2. 无 target 时行为 = 取当前渠道 latest + 显示（无资格门，升级动作照常执行——手动语义：用户敲了命令就是要装）；**已是最新判定用 `compareVersion(parsed, current) === 0`**（现状代码是字符串相等——`v` 前缀/格式差异会误判，此处显式换比较器）
 - **正确性论证**：手动显式指令优先；`parseVersion` 挡住乱串；stub→实装后此命令自动获得真升级（不改调用形状）。
 
 ### 5.8 清理
@@ -163,7 +163,7 @@
   - 定向回归：issue 两个 semver 反例（`fmv2.2-beta.1 < fmv2.2`、`fmv9 < fmv10`）+ `fmv2 < fmv2.1` + 同 beta 号序 + 跨基线（1.18 < 1.19）
   - parseVersion 输入九类（§5.1.1 分支覆盖表），前导零、pr 后缀、缺 fmv 等负例 → undefined
   - **随机测试（fast-check 或手写种子循环）**：生成随机 ForkVersion 元组，验证性质——反对称（cmp(a,b) = -cmp(b,a)）、传递（cmp(a,b) 与 cmp(b,c) 一致 ⇒ cmp(a,c) 一致）、全序完全性（cmp 三态之一恒真）、正式性（stable(a) ∧ beta(b) ∧ 前四级相等 ⇒ cmp(a,b)=1）
-- **单元（latest）**：mock HTTP——stable 走 `/releases/latest`；beta 过滤 pre-release 后取比较器最大（列表乱序放置验证不依赖排序）；beta 空集行为
+- **单元（latest）**：mock HTTP——stable 走 `/releases/latest`；beta 按**文法**过滤（含一条 `prerelease=false` 但 tag 带 `-beta.k` 的历史形态条目，验证不被字段误杀）后取比较器最大（列表乱序放置验证不依赖排序）；beta 空集行为
 - **单元（upgrade，文件层，tmpdir 真实 fs + mock HTTP/下载）**：校验不符 → 现役文件字节不变（I_3 回归）；解压内容缺 fmcode → 失败；全流程成功 → 三文件内容替换 + staging 清理；Windows 路径（win32 分支在 CI 无 runner 时记录未测面）
 - **回归**：installation 全套、httpapi-global（mock 恢复真升级语义）、cli 套件、config 套件（Global.Path 面）
 - **E2E（真实构建二进制 + 隔离 XDG）**：
@@ -176,7 +176,7 @@
 ## 7. 完整性自检 checklist
 
 - [x] 所有函数实现思路推导连续（5.3 十二步含全部分支与退出；5.6 七步）
-- [x] 所有分支已覆盖（§5.3 十路退出、§5.6 九路、§5.1 九类输入）
+- [x] 所有分支已覆盖（§5.3 十路退出、§5.6 九路、§5.1 八类输入）
 - [x] 所有退出点已刻画（§5.3 仅成功 void / UpgradeFailedError 两类；部分替换失败边界显式声明）
 - [x] 所有 callee 调用显式引用其 pre/post（rename 原子性/EXDEV、fs.rm、CryptoHasher、downloadToFile、extractZip/TarGz）
 - [x] 所有循环有终止性论证（比较器逐级有限；beta 归约有限列表；下载流有限文件）
