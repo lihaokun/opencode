@@ -18,15 +18,15 @@ TUI 启动（cli/upgrade.ts，后台 fork）
       stable：GET repos/lihaokun/opencode/releases/latest（天然排除 pre-release）
       beta：  GET repos/lihaokun/opencode/releases?per_page=100 → 过滤 prerelease==true ∧ tag 匹配 fork 模式 → 比较器取最大
   → compareVersion(latest, current) <= 0 ？ → 返回（不降级、不重装）
-  → 基线（上游 semver）major/minor 变化？ → 只发 UpdateAvailable，返回
-  → autoupdate == true ∧ kind == patch？
+  → kind = getReleaseType(current, latest)（基线域 major/minor/patch）
+  → 自动安装资格 = autoupdate == true ∧ kind == patch
       否 → 发 UpdateAvailable，返回
       是 → upgrade(method, latest)：
         1. 资产名 fmcode-<os>-<arch>.<ext>（ext：win=zip，其余=tar.gz）
         2. 下载 release 资产 + sha256sums.txt（同 release）
         3. sha256 校验资产 → 不符则中止（原二进制不动）
         4. 解压到 <binDir>/.staging-<ver>/
-        5. 逐文件 rename 到 <binDir>/（先 fmcode 后 rg）；Windows：运行中 exe 先 rename 为 .old
+        5. staging 内全部文件 rename 到 <binDir>/（资产内容实测为 bin/fmcode + bin/rg + package.json——整体替换，不做白名单挑选；顺序先 fmcode 后其余）；Windows：运行中 exe 先 rename 为 .old
         6. 清理 staging 与 .old；发 Updated 事件
         任何一步失败 → 清理 staging，保留原二进制，静默（与现状 catch(() => {}) 一致）
 ```
@@ -96,8 +96,8 @@ upgrade(method, target) -> Effect<void, UpgradeFailedError>：
 ```
 模块名称：自动更新入口
 
-行为：渠道由当前版本决定（无跨渠道配置项，issue 已定）；stable 用户从 stable 取、beta 用户从 beta 取；
-比较器判严格更新才行动；基线 major/minor 变化只提示（沿用 getReleaseType）。
+行为：渠道由当前版本解析唯一决定（I_4，无跨渠道配置项）；stable 用户查 stable、beta 用户查 beta；
+比较器判严格更新才行动（I_1/I_5）；基线 major/minor 变化只提示不自动装（沿用 getReleaseType，G3）。
 ```
 
 ### 4.4 不改清单
@@ -105,7 +105,7 @@ upgrade(method, target) -> Effect<void, UpgradeFailedError>：
 - `method()`：`.fmcode/bin` / `.local/bin` → curl，其余 unknown（fmcode-1 已落）。
 - `cli/cmd/upgrade.ts` 手动命令：继续调同一 `upgrade()`——stub 变实装后手动命令自动获得真升级能力；无参数时 `latest()` 取当前渠道。
 - 事件 schema：UpdateAvailable / Updated（properties.version: string）不变。
-- User-Agent、TTL 缓存外的 state、`getReleaseType`。
+- User-Agent、`getReleaseType`、任何持久化 state（无缓存，§1）。
 
 ## 5. 关键设计决策
 
@@ -113,7 +113,7 @@ upgrade(method, target) -> Effect<void, UpgradeFailedError>：
 2. **beta 渠道取比较器最大而非列表第一条**：GitHub 按 created_at 排序，rebuild/re-tag 会让时间序与语义序背离。
 3. **stable 渠道用 `/releases/latest`**：GitHub 端点语义天然排除 pre-release/draft，零过滤代码。
 4. **不做 TTL 缓存**（用户裁决）：单机用户远碰不到 60/hr/IP 匿名限额，TUI 每启动一次检查一次即可；省掉 state 文件与失效逻辑。若未来限额成为问题，引入条件 = 用户量级 × 检查频率逼近限额，再补缓存。
-5. **staging + 逐文件 rename**：两文件（fmcode、rg）非原子批量，先全部就位于 `<binDir>/.staging-<ver>/` 再逐个 rename，失败窗口收敛到单次 rename 之间；顺序先 fmcode 后 rg（主程序先新）。
+5. **staging + 整体 rename**：资产解压出多个文件（fmcode、rg、package.json），非原子批量——先全部就位于 `<binDir>/.staging-<ver>/` 再逐个 rename，失败窗口收敛到单次 rename 之间；顺序先 fmcode 后其余。**不做文件白名单**：资产里有什么就替换什么（新增捆绑文件随升级自动到位），避免"白名单漏新文件"这类漂移。
 6. **Windows 先改名再放新**：运行中 exe 不可覆盖 → rename 为 `fmcode.exe.old` 后放入新文件，下次启动清理 `.old`；`.old` 清理失败不阻断。
 7. **sha256 校验失败/下载失败 → 原二进制不动**：替换流程的任何前置失败都不触碰现役文件（fail-safe 优先于可用性）。
 8. **自动禁降级、手动允许降级**（用户裁决）：自动路径只在 compareVersion(latest, current) == 1 时行动（I_1）；手动 `upgrade <target>` 是显式指令，允许任意可解析版本含降级与跨渠道——不代用户做主。两入口在细化分叉。
@@ -126,13 +126,13 @@ upgrade(method, target) -> Effect<void, UpgradeFailedError>：
 - **G2 绝不降级** → §4.1 比较器（自动路径严格大于才行动）+ §2 流程顺序
 - **G3 基线 major/minor 变化只提示** → §4.3 沿用 getReleaseType
 - **G4 升级过程任何失败保留原二进制** → §4.2 校验先行 + staging + rename 原子性
-- **G5 替换后 fmcode 与 rg 版本一致** → 同 release 资产整体替换（staging 同源解压）
+- **G5 替换后捆绑文件（fmcode/rg/package.json）版本一致** → 同 release 资产整体替换（staging 同源解压、无白名单）
 - **G6 匿名限额不被耗尽** → 每次启动至多 1-2 个请求（stable 1 个；beta 1 个列表），远低于 60/hr/IP；无缓存（用户裁决）
 
 ### 关键假设
 
 - H1: fork release 资产含 `fmcode-<os>-<arch>.<ext>` 与 `sha256sums.txt`，且 sha256sums 条目名与资产名一致（fork-release.yml 现行格式）
-- H2: `dirname(process.execPath)` 可写（curl 安装语义；不可写时 upgrade 失败并保留原样——与现状 stub 失败等价）
+- H2: `dirname(process.execPath)` 可写（curl 安装语义；不可写时 upgrade 失败并保留原样，报 UpgradeFailedError）
 - H3: GitHub API 可达；网络失败沿"静默返回"路径（与现状 catch(() => {}) 一致，不影响使用）
 - H4: sha256sums.txt 格式为 `<hex>  <filename>` 两空格分隔（coreutils sha256sum -c 兼容形态）
 - H5: beta 渠道 per_page=100 内必有最新 beta（发版频率 << 100/页；翻页为细化可选优化）
