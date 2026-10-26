@@ -47,7 +47,7 @@
 - **callee 契约**：mkdir recursive（已存在时成功）。
 - **正确性论证**：trivial（单常量替换；无逻辑分支）。副作用论证：mkdir 集合同名切换，与官方目录零交集（I_1 成立的机械结果）。
 
-### 5.2 `fmcode/src/env-alias.ts`（新）
+### 5.2 `packages/opencode/src/env-alias.ts`（新）
 
 #### 5.2.1 `apply()`
 
