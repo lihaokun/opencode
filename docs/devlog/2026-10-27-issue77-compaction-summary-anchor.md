@@ -42,7 +42,11 @@ issue #77（fermat CCodeVerify 主会话实测）确认了三个独立缺陷的�
 - 定向：compaction 66 pass / 0 fail（×4 稳定）、message-v2 45 pass、prompt 98 pass / 0 fail、tui subagent-list-members 38 pass（含 2 个新 #77 用例）。
 - typecheck：全仓 turbo typecheck 干净（含 tui，强制全量）。
 - 已知 flake（与本改动无关）：prompt.test 与 compaction.test 的 timeout 类用例在共享机高负载下偶发超时（3 文件组合 6 次出现 2 次失败：`shell rejects when another shell is already running`、`loop persists a second provider context overflow after one recovery` 等，全部 >5s timeout 类）。dev 基线复现同样失败（dev 上 prompt.test 单跑也出现 1 fail），与 2026-10-20 devlog 记录的"prompt.test 负载贴限类"同型。两文件直接组合（compaction + message-v2）3 次全绿。
-- 单测验证 `filterCompacted` 失败摘要排除与 summaryIndex 收紧已被既有 processor-effect/prompt 测试间接覆盖（176 pass），新增直接 wire 级回归用例（"摘要进行中插入新消息 → 摘要 parentID 为标记消息"）列入包 2 前的补测清单——本包依赖 latest() 的 tasks 形状测试（已更新断言）覆盖消息来源。
+- 端测（commit `5996d5a82f`，2026-10-27 追加）：两个走真实 prompt loop + fake LLM server 的 wire 级回归，均在修复前代码上验证 RED、修复后 GREEN：
+  1. **跨 run 重锚定**（真正的 #77 窗口）：run 1 的摘要请求被 cancel → arm 以 stop 退出、task 仍 pending；更新的用户消息到来触发 run 2 重消费 task。修复前摘要挂在最新消息上、标记永不结算（RED：settled summaries 数为 2 且 parentID 不带压缩标记）；修复后锚定 task 宿主消息、压缩生效（后续请求不含旧历史、无第二次压缩）。
+  2. **失败摘要排除**：摘要请求以 length finish（error finish）终结 → 该 attempt 留在转录但被 settled 集合排除；重试 run 的摘要请求只序列化旧历史（old-history 请求数恰为 2），失败 attempt 的部分文本不再进入任何请求。
+- 关键测试机制发现（花了一轮探针才确认）：`compaction.create` 会新建一条 user 消息承载 compaction part；同 run 内 willOverflow → create → 下一轮迭代消费时 `lastUser` 就是该新消息（此刻锚定正确）。**真正的偷锚窗口是跨 run 的**：task 消费后 run 退出，更新消息到来触发新 run 消费 pending task，此时修复前的 `lastUser.id` 指向新消息。首版测试把"摘要进行中插入消息"写成同 run 窗口，修复前也 GREEN——RED 验证是必须的，不跑就会把无效测试当回归保护。
+- 摘要以 length finish 终结时留下的 assistant 是 error finish（OutputLengthError），与 cancel（AbortedError）同属"unsettled"集合——两个测试都按 settled（finish && !error）计数，与 filterCompacted/completedCompactions 的谓词一致。
 
 ## 度量
 
@@ -56,7 +60,7 @@ issue #77（fermat CCodeVerify 主会话实测）确认了三个独立缺陷的�
 | 测试通过率     | 定向 277/277（211 组合 + 38 tui + 28 稳定复跑），flake 类失败 dev 基线同现 |
 | 发现 bug 数    | 0（新增）                     |
 | 修复 bug 数    | 3（#77 三根因）               |
-| 迭代轮次       | 实现 1 轮                     |
+| 迭代轮次       | 实现 1 轮 + 端测 1 轮（探针归因跨 run 窗口） |
 
 ## 经验教训
 
