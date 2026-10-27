@@ -100,6 +100,26 @@ jobs:
         working-directory: packages/client
         run: bun run check:generated
 
+      # The binary installs @opencode-ai/plugin@<version> from npm while the
+      # host runs the repo's packages/plugin sources; they must stay identical
+      # (issue #67). A source edit without a version bump fails here.
+      - name: Check plugin SDK drift
+        if: runner.os == 'Linux' && matrix.shard == 1
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          # A missing or all-zeros base (new branch / force push) cannot be
+          # diffed; fall back to running the check so a plugin change never
+          # slips through for lack of a comparable base.
+          if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ] && ! git diff --name-only "$base" HEAD -- packages/plugin | grep -q .; then
+            echo "packages/plugin unchanged — skipping drift check"
+            exit 0
+          fi
+          bun script/check-plugin-drift.ts
+
       - name: Run HttpApi exerciser gates
         if: runner.os == 'Linux' && matrix.shard == 1
         timeout-minutes: 20
