@@ -11,7 +11,7 @@
 > release 构建固定 `OPENCODE_CHANNEL=latest`（决定数据库名 `opencode.db`）；本地从源码构建时不设该变量——它会取当前分支名（dev 分支得到 `opencode-dev.db`，`main` 上得到 `opencode-main.db`），与 release 库互不干扰。
 
 两种安装方式：**从 [Releases](https://github.com/lihaokun/opencode/releases) 下载预编译包**（推荐），或**从源码构建**（想试 `dev` 上还没发版的改动时）。
-注意：装了官方版（`curl … | bash` 或 `npm i -g opencode-ai`）的话，**官方版自己的自动更新**会把它的二进制换回官方新版——官方版与 fmcode 现在目录分离（`~/.opencode/bin` vs `~/.fmcode/bin`），互不覆盖，但两份各自升级。fmcode 自身的自动更新在进程内替换落地前只提示不执行（#65），无需关闭。
+注意：装了官方版（`curl … | bash` 或 `npm i -g opencode-ai`）的话，官方版与 fmcode 目录分离（`~/.opencode/bin` vs `~/.fmcode/bin`），互不覆盖，两份各自升级。fmcode 自身的自动更新只从本 fork 的 release 取版本：正式版跟正式版、beta 跟 beta，两条渠道互不交叉；进程内替换，从不降级，也不跨渠道。无需关闭自动更新（想关仍然支持：config 里 `autoupdate: false` 或环境变量 `OPENCODE_DISABLE_AUTOUPDATE`）。
 
 ---
 
@@ -48,7 +48,7 @@ echo 'export PATH="$HOME/.fmcode/bin:$PATH"' >> ~/.zshrc
 
 macOS 若提示"无法打开"（未签名、未公证）：`xattr -dr com.apple.quarantine ~/.fmcode/bin`。
 
-~~关闭官方自动更新（必须）~~——**此节作废**：目录分离后官方更新器只动 `~/.opencode/bin`，碰不到 fmcode；fmcode 自身的自动更新在进程内替换落地（#65）前只提示不执行，无需关闭。
+~~关闭官方自动更新（必须）~~——**此节作废**：目录分离后官方更新器只动 `~/.opencode/bin`，碰不到 fmcode；fmcode 自身的自动更新只从本 fork 的 release 取版本（正式版跟正式版、beta 跟 beta），无需关闭。
 
 校验：`sha256sum -c sha256sums.txt --ignore-missing`；Windows 用 `Get-FileHash .\fmcode-windows-x64.zip` 与 `sha256sums.txt` 对照。
 
@@ -108,31 +108,14 @@ echo 'export PATH="$HOME/.fmcode/bin:$PATH"' >> ~/.zshrc
 
 若 `~/.local/bin` 里还留着旧的 `opencode`/`fmcode`，一并清理，避免 PATH 顺序命中旧版本。
 
-### 4. 关闭自动更新(无需改代码,二选一)
+### 4. 自动更新（可选关闭）
 
-自动更新的判定在 `upgrade.ts`：`if (config.autoupdate === false || Flag.OPENCODE_DISABLE_AUTOUPDATE) return`。两条都能关，任选其一:
+自动更新只从本 fork 的 release 取版本：正式版（`releases/latest`）跟正式版，beta（tag 带 `-beta.N`）跟 beta，互不交叉；比较用 fork 专用顺序（基线 → 代际 → 序号 → 正式版高于其 beta → beta 号），只在目标严格更新时升级，绝不降级。基线 major/minor 变化只提示不自动装。
 
-#### 方式 A(推荐):全局 config 设 `autoupdate: false`
+想关（二选一）：
 
-opencode 会合并加载 `~/.config/opencode/opencode.json` 和 `opencode.jsonc`。把开关写进 **`opencode.json`**(纯 JSON,不碰 `.jsonc` 里的密钥):
-
-```bash
-mkdir -p ~/.config/opencode
-# 有 jq:
-jq '.autoupdate = false' ~/.config/opencode/opencode.json 2>/dev/null > /tmp/oc.json && mv /tmp/oc.json ~/.config/opencode/opencode.json
-# 没有 jq、且文件不存在时:
-printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "autoupdate": false\n}\n' > ~/.config/opencode/opencode.json
-```
-
-`autoupdate` 取值:`false`(完全关) / `"notify"`(只提示不装) / `true`(默认,自动装)。
-
-#### 方式 B:运行时环境变量 `OPENCODE_DISABLE_AUTOUPDATE`
-
-写进 shell profile（`~/.bashrc` / `~/.zshrc`）——这是**运行时** env(`Flag` 运行时读 `process.env`,所以这个有效；注意它**不能在编译期烧进二进制**，因为读的是动态下标 `process.env[key]`）：
-
-```bash
-echo 'export OPENCODE_DISABLE_AUTOUPDATE=1' >> ~/.bashrc
-```
+- config 里 `autoupdate: false`（`false` 完全关 / `"notify"` 只提示 / `true` 自动装，默认 `true`）
+- 环境变量 `OPENCODE_DISABLE_AUTOUPDATE=1`（或新前缀 `FMCODE_DISABLE_AUTOUPDATE`，旧前缀仍可用）
 
 ---
 
