@@ -2043,6 +2043,213 @@ it.instance("loop accounts for prompt-specific system text before sending", () =
   }),
 )
 
+it.instance(
+  "a run after a cancelled summary re-consumes the task anchored to the marker (#77)",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(preflightCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const oldMarker = "mid-summary-old-history-marker"
+      const currentMarker = "mid-summary-current-marker"
+      const summaryMarker = "mid-summary-summary-marker"
+      const gate = yield* Deferred.make<void>()
+
+      yield* seed(chat.id, { finish: "stop", userText: `${oldMarker}\n${"x".repeat(280_000)}` })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: currentMarker }],
+      })
+      // The summary attempt hangs; cancel the run mid-summary. The task part
+      // survives (only the assistant attempt is removed), so a later run must
+      // re-consume it.
+      yield* llm.pushMatch(
+        (hit) => JSON.stringify(hit.body).includes(oldMarker),
+        reply().wait(deferredAsPromise(gate)).text(summaryMarker).stop(),
+      )
+
+      const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "summary request never started", "5 seconds")
+      yield* prompt.cancel(chat.id)
+      yield* awaitWithTimeout(
+        Fiber.join(run),
+        "cancelled run did not terminate",
+        "10 seconds",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      yield* Effect.sleep("50 millis")
+
+      // A newer user turn arrives while the task is still pending.
+      const later = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "mid-summary-later-arrival-marker" }],
+      })
+      if (later.info.role !== "user") throw new Error("expected a user message")
+
+      // The retry run answers this turn and must anchor the retried summary
+      // to the task's own message — not to this newer turn (#77).
+      yield* llm.pushMatch((hit) => JSON.stringify(hit.body).includes(oldMarker), reply().text(summaryMarker).stop())
+      yield* llm.textMatch(
+        (hit) => JSON.stringify(hit.body).includes("mid-summary-later-arrival-marker"),
+        "later answer",
+      )
+
+      yield* awaitWithTimeout(
+        prompt.loop({ sessionID: chat.id }),
+        "retry run did not terminate",
+        "20 seconds",
+      )
+      const hits = yield* llm.hits
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+
+      // The cancelled attempt stays in the transcript (aborted assistant);
+      // only the settled summary counts for the contract.
+      const summaries = messages.filter(
+        (message) =>
+          message.info.role === "assistant" && message.info.summary && message.info.finish && !message.info.error,
+      )
+      expect(summaries).toHaveLength(1)
+      const anchored = summaries[0]
+      if (!anchored || anchored.info.role !== "assistant") throw new Error("expected one summary assistant")
+      const anchoredParentID = anchored.info.parentID
+      // The summary anchors to a user message carrying the compaction marker —
+      // the one the task rides on, not the newer turn that triggered the retry.
+      const markerUser = messages.find(
+        (message) =>
+          message.info.role === "user" &&
+          anchoredParentID === message.info.id &&
+          message.parts.some((part) => part.type === "compaction"),
+      )
+      expect(markerUser).toBeDefined()
+      expect(anchoredParentID).not.toBe(later.info.id)
+      expect(markerUser?.info.id).not.toBe(later.info.id)
+      // The retried summary request still serializes the old history only.
+      const summaryBodies = hits.filter((hit) => JSON.stringify(hit.body).includes(oldMarker))
+      expect(summaryBodies.length).toBeGreaterThanOrEqual(1)
+      for (const hit of summaryBodies) {
+        expect(JSON.stringify(hit.body)).not.toContain("mid-summary-later-arrival-marker")
+      }
+      // And the compaction settles: the later turn is answered from the
+      // summary, without the old history and without a second compaction.
+      const finalBody = JSON.stringify(hits.at(-1)?.body)
+      expect(finalBody).toContain(summaryMarker)
+      expect(finalBody).toContain("mid-summary-later-arrival-marker")
+      expect(finalBody).not.toContain(oldMarker)
+      expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
+    }),
+  30_000,
+)
+
+it.instance(
+  "a failed summary is excluded from history and its retry stays anchored to the marker (#77)",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(preflightCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const oldMarker = "failed-summary-old-history-marker"
+      const currentMarker = "failed-summary-current-marker"
+      const lateMarker = "failed-summary-late-arrival-marker"
+      const summaryMarker = "failed-summary-summary-marker"
+      const gate = yield* Deferred.make<void>()
+
+      yield* seed(chat.id, { finish: "stop", userText: `${oldMarker}\n${"x".repeat(280_000)}` })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: currentMarker }],
+      })
+      // First summary attempt is held mid-stream; a late user turn arrives
+      // before the attempt ends (#77's cancelled 210k-char reasoning stayed
+      // in context). The attempt then fails terminally (non-retryable
+      // overflow), so the arm stops its run with the task still pending.
+      yield* llm.pushMatch(
+        (hit) => JSON.stringify(hit.body).includes(oldMarker),
+        reply().wait(deferredAsPromise(gate)).text("aborted summary prefix").length(),
+      )
+
+      const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "summary request never started", "5 seconds")
+      const lateSubmitted = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: lateMarker }],
+      })
+      if (lateSubmitted.info.role !== "user") throw new Error("expected a user message")
+      const late = lateSubmitted.info
+
+      // Settle the held summary with a length finish: the attempt ends
+      // terminally, the arm breaks its run, and the task stays pending.
+      yield* Deferred.succeed(gate, void 0)
+
+      // The next run re-consumes the pending task and answers the late turn.
+      yield* llm.pushMatch((hit) => JSON.stringify(hit.body).includes(oldMarker), reply().text(summaryMarker).stop())
+      yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes(lateMarker), "late answer")
+      const retryRun = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Fiber.join(retryRun),
+        "retry run did not terminate",
+        "20 seconds",
+      )
+
+      const hits = yield* llm.hits
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+
+      // The length-truncated attempt carries an error finish — excluded from
+      // the settled set. Exactly one settled summary remains, and it anchors
+      // to a user message carrying the compaction marker (the task's host),
+      // not to the late arrival that triggered the retry run.
+      const summaries = messages.filter(
+        (message) =>
+          message.info.role === "assistant" && message.info.summary && message.info.finish && !message.info.error,
+      )
+      expect(summaries).toHaveLength(1)
+      const retry = summaries[0]
+      if (!retry || retry.info.role !== "assistant") throw new Error("expected one settled summary")
+      expect(retry.parts).toContainEqual(expect.objectContaining({ type: "text", text: summaryMarker }))
+      const retryParentID = retry.info.parentID
+      const markerUser = messages.find(
+        (message) =>
+          message.info.role === "user" &&
+          retryParentID === message.info.id &&
+          message.parts.some((part) => part.type === "compaction"),
+      )
+      expect(markerUser).toBeDefined()
+      expect(retryParentID).not.toBe(late.id)
+      // The failed attempt never reaches any later request…
+      const lateBodies = hits.filter((hit) => JSON.stringify(hit.body).includes(lateMarker))
+      expect(lateBodies.length).toBeGreaterThanOrEqual(1)
+      for (const hit of lateBodies) {
+        expect(JSON.stringify(hit.body)).not.toContain("aborted summary prefix")
+      }
+      // …and there is exactly one summary-bearing request against the old
+      // history: the failed first attempt must not have been serialized into
+      // the retry's input.
+      const oldHistoryRequests = hits.filter((hit) => JSON.stringify(hit.body).includes(oldMarker))
+      expect(oldHistoryRequests).toHaveLength(2)
+      // …and the retried summary still carries only the old history + marker.
+      expect(JSON.stringify(hits[1]?.body)).toContain(oldMarker)
+      expect(JSON.stringify(hits[1]?.body)).not.toContain(lateMarker)
+      expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
+      // The retried summary settled the same marker: the late turn is then
+      // answered from compacted history, without the old past re-appearing
+      // and without a second compaction.
+      const finalLateBody = JSON.stringify(hits.at(-1)?.body)
+      expect(finalLateBody).toContain(summaryMarker)
+      expect(finalLateBody).toContain(lateMarker)
+      expect(finalLateBody).not.toContain(oldMarker)
+    }),
+  30_000,
+)
+
 withOversizedTool.instance("loop excludes disabled tools from preflight payload sizing", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
