@@ -440,6 +440,25 @@ describe("contextUsage", () => {
     })
     expect(readout).toEqual({ tokens: 101, pct: undefined })
   })
+
+  test("skips compaction summaries — the summary request reports the pre-compaction size (#77)", () => {
+    const readout = contextUsage({
+      messages: [
+        assistant({ input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } }),
+        { ...assistant({ input: 90_000, output: 500, reasoning: 0, cache: { read: 0, write: 0 } }), summary: true },
+      ],
+      providers,
+    })
+    expect(readout).toEqual({ tokens: 110, pct: "1%" })
+  })
+
+  test("summary-only session yields no readout", () => {
+    const readout = contextUsage({
+      messages: [{ ...assistant({ input: 90_000, output: 500, reasoning: 0, cache: { read: 0, write: 0 } }), summary: true }],
+      providers,
+    })
+    expect(readout).toBeUndefined()
+  })
 })
 
 // §5.3 layer 3: random trees. Seeded, so a failure names its case. Checked

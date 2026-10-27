@@ -2759,10 +2759,15 @@ export function lastCompleted(messages: { role: string; time: { created: number;
  * assistant message's token aggregate — what the conversation currently
  * occupies — plus its percentage of the model's context limit. Sessions without
  * a scoring assistant message yield undefined, which callers render as no readout.
+ * Compaction summaries are skipped: right after a compaction the newest
+ * assistant is the summary request itself, whose input is the entire old
+ * history — reading it would report the pre-compaction size until the next
+ * real step lands (#77).
  */
 export function contextUsage(input: {
   messages: {
     role: string
+    summary?: boolean
     tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
     providerID?: string
     modelID?: string
@@ -2771,7 +2776,7 @@ export function contextUsage(input: {
 }): { tokens: number; pct: string | undefined } | undefined {
   for (let i = input.messages.length - 1; i >= 0; i--) {
     const item = input.messages[i]!
-    if (item.role !== "assistant" || !item.tokens || item.tokens.output <= 0) continue
+    if (item.role !== "assistant" || item.summary || !item.tokens || item.tokens.output <= 0) continue
     const tokens =
       item.tokens.input + item.tokens.output + item.tokens.reasoning + item.tokens.cache.read + item.tokens.cache.write
     if (tokens <= 0) return undefined
