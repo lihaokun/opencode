@@ -262,7 +262,13 @@ describe("installation", () => {
         Effect.gen(function* () {
           const original = process.execPath
           try {
-            Object.defineProperty(process, "execPath", { value: `/${path.join(".fmcode", "bin", "fmcode")}`.replaceAll("\\", "/"), configurable: true })
+            // The install prefix is built with path.join, so its separators
+            // follow the runner's platform (backslashes on win32); keep the
+            // fixture in the same form instead of forcing POSIX slashes.
+            Object.defineProperty(process, "execPath", {
+              value: path.resolve(path.sep, path.join(".fmcode", "bin", "fmcode")),
+              configurable: true,
+            })
             expect(yield* Installation.use.method()).toBe("curl")
           } finally {
             Object.defineProperty(process, "execPath", { value: original, configurable: true })
