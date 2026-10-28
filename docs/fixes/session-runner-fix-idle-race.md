@@ -2,6 +2,8 @@
 
 > 对应 issue #32（lihaokun/opencode）。本文档按 workflow §7.1 八部分组织；第一至五部分修复前完成，第六至八部分修复前列计划、修复后回填。
 
+> **后记（2026-10-28，issue #85）**：本修复的正确性论证只覆盖了 `Runner` 内部状态机在 `SynchronizedRef` 上的全序，有两点未进入论证范围，后来都成了 #85 的根因：(1) `SessionRunState.onIdle` 在临界区**之外**把 runner 从 map 删除——排队者已持有 runner 引用，Idle 转换后它在被删除的 runner 上起跑（孤儿），下一条消息新建第二个 runner，同一会话出现两条循环；(2) `shouldReArm` 在临界区内整表加载会话历史——会话 22k 消息时锁被持有数秒，上述窗口随之从毫秒放大到秒级。两点的修复见 `docs/fixes/session-run-state-fix-two-loops.md`；本页其余内容保持原样，作为历史记录。
+
 ## 第一部分：现象与复现
 
 ### 现象

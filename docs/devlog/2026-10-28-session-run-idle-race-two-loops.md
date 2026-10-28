@@ -1,0 +1,45 @@
+# 开发日志 — 2026-10-28 session runner 收尾竞态双循环（issue #85）
+
+## 做了什么
+
+修复 `SessionRunState` 与 `Runner` 的收尾竞态：一个 run 结束、另一个写入方已排队时，旧代码把 idle 转换放在 `Runner` 临界区之外执行（`SessionRunState.onIdle` 删 map + 发 idle 状态），排队者在"已转换 Idle"与"onIdle 执行完"之间起跑——在一个服务已不认识的 runner 上运行（孤儿），下一条消息新建第二个 runner，同一会话两条循环互相把对方当"没说完"，反复输出占位回复（10-08 与 10-27 两次事故，9-52 条重叠 assistant 消息）。
+
+四处改动：
+
+1. `run-state.ts`：不再删 map（One Runner per session，进程生命周期）；钩子必须"按 sessionID 参数化、执行时现读持久化状态"作为复用不变量写入注释。
+2. `runner.ts`：`finishRun` 的 `yield* idle` 移入 `SynchronizedRef.modifyEffect` 的 pf 体内——**关键实现细节**：`modifyEffect` 返回的 action 在信号量释放之后才执行（`Effect.flatten` 在 `withPermit` 之外），写进返回的 action 等于没修；第一版就写错，被自己新加的 runner 级 RED 用例当场抓住。
+3. `message-v2.ts` + `prompt.ts`：re-arm 谓词从整表加载（22k 消息数秒，#62）换成单行索引查询 `MessageV2.latestRole`（"最新消息是不是 user"，与 `compareChronology` 的 `(time_created, id)` 全序逐点等价），临界区锁持有时间降到毫秒级；加了 2000 消息规模下 <500ms 的成本上界用例。
+4. `prompt.ts` runLoop：第二道防线——本循环已产出 assistant 后，若最新 assistant"无 finish ∧ 属最新 turn ∧ 非本循环所创"则 break 不发请求。`step > 0` 豁免首迭代（shell 留下的无 finish assistant 由后续 loop 合法接管，被"shell completion resumes queued loop callers"用例抓住过误杀）。
+
+## 关键决策
+
+- **不删 runner 而非"删+锁后重取"**：后者要把 map 查找塞进 Runner 信号量（依赖倒置）；不删的代价只是每会话一个小对象。
+- **测试锚点换了三次**：先锚 status 读数（"运行中不得读 idle"）——实测不可靠：status.get 的 idle 既是"被删"也是"从未 set"的默认值，且预修复的越带 idle 实际落在 run 收尾附近；再锚 idle 事件计数——事件投递时序在测试 harness 里漂移；最终 run-state 层锚 **join 语义**（第三个 caller 的返回值 + executions 计数，对"第二个 runner 出现"敏感），runner 层锚 **onIdle 完成先于排队者 work 启动** 的顺序断言。两级都修复前 RED / 修复后 GREEN。
+- **成本上界用例规模**：2000 条而非 issue 里的 2 万——单测要快，且 2000 已足以让"整表加载"超时、让"单行查询"毫秒级，判别力相同。
+
+## 踩过的坑
+
+- `SynchronizedRef.modifyEffect` 的语义陷阱（见上）——返回值里的 effect 不是临界区的一部分。
+- `Effect.gen` 惰性求值：作为 work 传入的 gen body 每次 run 都重新执行，`let watching` 翻转后重启的 work 能看到新值——测试靠这个驱动 re-arm 路径，但也要注意闭包捕获的是"执行时"的变量。
+- `Fiber.await` 返回的是 Exit 作为值（`joinExit.value` 而非 `joinExit`）。
+- stash 验证 RED 时 `git stash push -- <path>` 的 pathspec 解析受 cwd 影响（在 package 子目录里用相对路径才对）；且 bun 测试有随机调度成分，单次绿/红不能定论，关键判定都跑了多轮。
+- 会话级"两条循环"在测试 harness 里难以确定性复现完整的"孤儿→第二个 runner→并发"链（delete 的落地时机依赖调度细节）；确定性 RED 拆到了 runner 层（顺序断言），run-state 层用对第二个 runner 敏感的 join 判据兜底。
+
+## 端到端验证
+
+- `test:httpapi` 三段门禁全绿：coverage 209/0、auth 209/0、effect 209/0（effect 段在共享机需 >590s，单独复跑完成）。
+- 大会话实测（一次性脚本 `script/validate-rearm-large-session.ts`，真 SQLite，20k 消息实写）：旧谓词整表加载 **1342ms** vs 新谓词 `latestRole` **2.0ms**（~670×），与事故画像（秒级锁持有）吻合。脚本未纳入常规套件（fill 20k 需 19s，不适合单测）。
+
+## 度量
+
+| 指标           | 数值                   |
+| -------------- | ---------------------- |
+| 新增代码行数   | ~90（src：runner +3 / run-state +7 / message-v2 +21 / prompt +31 含守卫与注释） |
+| 修改代码行数   | ~15                    |
+| 删除代码行数   | ~12                    |
+| 涉及文件数     | 4 src + 3 test + 3 docs |
+| 新增测试用例数 | 8（runner 1 / run-state 2 / latestRole 5） |
+| 测试通过率     | 定向套件全绿（runner 31 + run-state 2 + message-v2 45 + pagination 60 + prompt 98/99 skip1）；全套件见验证记录 |
+| 发现 bug 数    | 2（idle 写在 action 里等于没修；守卫首迭代误杀 shell assistant） |
+| 修复 bug 数    | 2                      |
+| 迭代轮次       | 设计 1 / 实现 1 / 测试锚点 3 / 修复 2 |

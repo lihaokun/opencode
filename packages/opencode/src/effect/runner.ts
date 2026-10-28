@@ -95,9 +95,13 @@ export const make = <A, E = never>(
             return [complete(done, exit), { _tag: "Running", run }] as const
           }
         }
+        // The idle transition runs INSIDE the critical section — a value
+        // yielded from the returned action would execute after the semaphore
+        // is released (#85: an out-of-band idle lets a queued caller start
+        // its run before SessionRunState has published the session status).
+        yield* idle
         return [
           Effect.gen(function* () {
-            yield* idle
             yield* complete(done, exit)
           }),
           { _tag: "Idle" } as const,

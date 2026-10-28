@@ -633,4 +633,66 @@ describe("Runner", () => {
       expect(yield* Ref.get(ran)).toBe(1)
     }),
   )
+
+  // #85: with the idle transition running outside the critical section, a
+  // caller queued on the semaphore starts its work while onIdle is still
+  // executing — under SessionRunState, onIdle's first act is deleting the
+  // runner from the map, so the running work is orphaned and the next
+  // message builds a second loop for the same session. The idle side effect
+  // must complete inside the critical section, before any queued caller can
+  // start.
+  it.live(
+    "runs the idle transition before a queued caller's work starts",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const order: string[] = []
+      const hold = yield* Deferred.make<void>()
+      let armed = false
+      const runner = Runner.make<string>(s, {
+        onIdle: Effect.gen(function* () {
+          order.push("onIdle-start")
+          // Stands in for SessionRunState's onIdle (map delete + status
+          // publish): slow enough that a queued caller could slip past it.
+          yield* Effect.sleep("50 millis")
+          order.push("onIdle-end")
+        }),
+        shouldReArm: Effect.suspend(() =>
+          armed ? Deferred.await(hold).pipe(Effect.as(false)) : Effect.succeed(false),
+        ),
+      })
+
+      const f1 = yield* runner
+        .ensureRunning(
+          Effect.gen(function* () {
+            order.push("work-1")
+            return "one"
+          }),
+        )
+        .pipe(Effect.forkChild)
+      while (!order.includes("work-1")) yield* Effect.yieldNow
+
+      // Queue a caller while the predicate holds the critical section.
+      armed = true
+      const f2 = yield* runner
+        .ensureRunning(
+          Effect.gen(function* () {
+            order.push("work-2")
+            return "two"
+          }),
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Deferred.succeed(hold, void 0)
+      yield* Fiber.await(f1)
+      yield* Fiber.await(f2)
+
+      // The queued work may only begin after the previous run's idle
+      // transition has fully completed.
+      const work2 = order.indexOf("work-2")
+      const idleEnd = order.indexOf("onIdle-end")
+      expect(work2).toBeGreaterThanOrEqual(0)
+      expect(idleEnd).toBeGreaterThanOrEqual(0)
+      expect(idleEnd).toBeLessThan(work2)
+    }),
+  )
 })

@@ -419,6 +419,117 @@ describe("MessageV2.stream", () => {
   )
 })
 
+describe("MessageV2.latestRole", () => {
+  it.instance("returns undefined for an empty session", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        expect(yield* MessageV2.latestRole(sessionID)).toBeUndefined()
+      }),
+    ),
+  )
+
+  it.instance("returns user when the latest message is a user", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        yield* fill(sessionID, 2)
+        yield* session.updateMessage({
+          id: MessageID.ascending(),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() + 100 },
+          agent: "test",
+          model: { providerID: "test", modelID: "test" },
+          tools: {},
+          mode: "",
+        } as unknown as SessionV1.Info)
+        expect(yield* MessageV2.latestRole(sessionID)).toBe("user")
+      }),
+    ),
+  )
+
+  it.instance("returns assistant when the latest message is an assistant", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        yield* fill(sessionID, 1)
+        const session = yield* SessionNs.Service
+        yield* session.updateMessage({
+          id: MessageID.ascending(),
+          sessionID,
+          role: "assistant",
+          parentID: MessageID.ascending(),
+          time: { created: Date.now() + 100 },
+          mode: "build",
+          agent: "build",
+          path: { cwd: "/tmp", root: "/tmp" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: "test",
+          providerID: "test",
+        } as unknown as SessionV1.Info)
+        expect(yield* MessageV2.latestRole(sessionID)).toBe("assistant")
+      }),
+    ),
+  )
+
+  // Same-millisecond tie: the id breaks the tie, matching the SQL order
+  // (desc time_created, desc id) and compareChronology.
+  it.instance("breaks same-timestamp ties by id", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        const now = Date.now()
+        const first = MessageID.ascending()
+        yield* session.updateMessage({
+          id: first,
+          sessionID,
+          role: "user",
+          time: { created: now },
+          agent: "test",
+          model: { providerID: "test", modelID: "test" },
+          tools: {},
+          mode: "",
+        } as unknown as SessionV1.Info)
+        const second = MessageID.ascending()
+        yield* session.updateMessage({
+          id: second,
+          sessionID,
+          role: "assistant",
+          parentID: first,
+          time: { created: now },
+          mode: "build",
+          agent: "build",
+          path: { cwd: "/tmp", root: "/tmp" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: "test",
+          providerID: "test",
+        } as unknown as SessionV1.Info)
+        expect(yield* MessageV2.latestRole(sessionID)).toBe("assistant")
+      }),
+    ),
+  )
+
+  // Cost guard (#85): this runs inside finishRun's critical section, so it
+  // must stay O(1) pages even on a large session. The fill helper writes one
+  // row per call; two thousand rows is well past any plausible session for a
+  // unit test while keeping the suite fast.
+  it.instance("stays fast on a large session", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        yield* fill(sessionID, 2000)
+        const start = performance.now()
+        const role = yield* MessageV2.latestRole(sessionID)
+        const elapsed = performance.now() - start
+        expect(role).toBe("user")
+        // Generous bound for slow CI: a full-session load takes seconds at
+        // this size; the indexed single-row read is milliseconds.
+        expect(elapsed).toBeLessThan(500)
+      }),
+    ),
+  )
+})
+
 describe("MessageV2.parts", () => {
   it.instance("returns parts for a message", () =>
     withSession(({ sessionID }) =>
