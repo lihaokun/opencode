@@ -20,15 +20,15 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Effect, Layer, Latch } from "effect"
+import { Effect } from "effect"
+import { MessageID, PartID } from "@/session/schema"
 import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "@/session/session"
-import { SessionPrompt } from "@/session/prompt"
+import { MessageV2 } from "@/session/message-v2"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
-import { MessageV2 } from "@/session/message-v2"
 import { InstanceBootstrap } from "@/project/bootstrap"
 import { InstanceStore } from "@/project/instance-store"
 import { withTmpdirInstance } from "../test/fixture/fixture"
@@ -57,8 +57,8 @@ const fillLarge = (sessionID: string) =>
     const now = Date.now()
     const users = COUNT / 2
     for (let i = 0; i < users; i++) {
-      const uid = `msg_bulk_u${i}`
-      const aid = `msg_bulk_a${i}`
+      const uid = MessageID.make(`msg_bulk_u${i}`)
+      const aid = MessageID.make(`msg_bulk_a${i}`)
       const t = now - (users - i) * 10
       yield* db
         .insert(MessageTable)
@@ -73,18 +73,17 @@ const fillLarge = (sessionID: string) =>
             model: { providerID: "test", modelID: "test" },
             time: { created: t },
           } as never,
-        })
+        } as never)
         .run()
       yield* db
         .insert(PartTable)
         .values({
-          id: `prt_bulk_u${i}`,
+          id: PartID.make(`prt_bulk_u${i}`),
           message_id: uid,
           session_id: sessionID,
           time_created: t,
-          time_updated: t,
           data: { type: "text", text: `u${i} ${"x".repeat(50)}` } as never,
-        })
+        } as never)
         .run()
       yield* db
         .insert(MessageTable)
@@ -92,7 +91,6 @@ const fillLarge = (sessionID: string) =>
           id: aid,
           session_id: sessionID,
           time_created: t + 1,
-          time_updated: t + 1,
           data: {
             role: "assistant",
             parentID: uid,
@@ -106,18 +104,17 @@ const fillLarge = (sessionID: string) =>
             time: { created: t + 1 },
             finish: "stop",
           } as never,
-        })
+        } as never)
         .run()
       yield* db
         .insert(PartTable)
         .values({
-          id: `prt_bulk_a${i}`,
+          id: PartID.make(`prt_bulk_a${i}`),
           message_id: aid,
           session_id: sessionID,
           time_created: t + 1,
-          time_updated: t + 1,
           data: { type: "text", text: `a${i} ${"y".repeat(50)}` } as never,
-        })
+        } as never)
         .run()
     }
   }).pipe(Effect.orDie)
