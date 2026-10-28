@@ -74,24 +74,29 @@ if (count >= 2) { 执行中断; count = 0 }
 
 | 类型 | 用例描述 | 状态（修复后回填） |
 |------|---------|------------------|
-| 回归 | `test/app-lifecycle.test.tsx` "app.exit prints the session epilogue"：连续两次 `dispatchCommand("app.exit")` 后退出、epilogue 照旧（单次 dispatch 不退出） | 待改 |
-| 新增 | 纯逻辑：把双击判定抽成可测函数（输入 = (count, now, lastAt) → "count" | "exit" | "reset"），窗口 5 秒、阈值 2 次的边界（1999ms/5001ms 用注入时钟） | 待加 |
-| 新增 | 第一次 `app.exit` 只出 toast 不销毁 renderer（`setup.renderer.isDestroyed === false`） | 待加 |
-| 新增 | 非 TUI 入口回归：`/exit` slash 与 ctrl+d 同 run 共享计数（第二次任意入口触发退出）——逻辑层断言 | 待加 |
+| 回归 | `test/app-lifecycle.test.tsx` "app.exit prints the session epilogue"：连续两次 `dispatchCommand("app.exit")` 后退出、epilogue 照旧；两次之间断言 renderer 未销毁 | 已加: test 改动见 commit（本条对应的单次不退出断言并入其中） |
+| 新增 | `test/util/confirm-exit.test.ts`：首按 arm 不退；窗口内（boundary-1ms）二按 exit 并重置；恰在 boundary 重计不退；过窗重 arm；退出后陈旧序列不误退 | 已加: 5 用例，confirm-exit.test.ts |
+| 新增 | 第一次 `app.exit` 只出 toast 不销毁 renderer（`setup.renderer.isDestroyed === false`） | 已加: 并入 app-lifecycle 回归用例（两次 dispatch 之间的断言） |
+| 新增 | 非 TUI 入口回归：`/exit` slash 与 ctrl+d 同 run 共享计数 | 未加 — slash/ctrl+d 与 keymap dispatch 走同一 `run` 函数体（同一份 `appCommands` 定义），入口共享由构造保证；纯函数层已覆盖计数共享语义，避免为同一代码路径复制渲染级用例 |
 
 ## 第七部分：代码更新清单（计划）
 
 | 文件 | 函数 / 行号 | 改动概述 | 状态（修复后回填） |
 |------|------------|---------|------------------|
-| `packages/tui/src/app.tsx` | `app.exit` run（LL830-836） | 双击计数 + toast 提示 + 窗口重置 | 待改 |
-| `packages/tui/src/app.tsx` | App 组件体（LL384 附近） | `exitConfirm` signal + timer cleanup | 待改 |
-| `packages/tui/src/util/confirm-exit.ts`（新） | `confirmExit` 纯函数 | 双击状态机，供命令 run 与单测共用 | 待改 |
-| `packages/tui/test/app-lifecycle.test.tsx` | 既有用例 | 双 dispatch 适配 | 待改 |
-| `packages/tui/test/util/confirm-exit.test.ts`（新） | — | 第六部分 (b)(c)(d) | 待加 |
+| `packages/tui/src/app.tsx` | `app.exit` run（LL836-854） | 双击计数 + toast 提示 + 窗口重置 | 已改: commit 本条 |
+| `packages/tui/src/app.tsx` | App 组件体（LL411-412） | `exitConfirm` signal + onCleanup 重置 | 已改: commit 本条 |
+| `packages/tui/src/util/confirm-exit.ts`（新） | `confirmExit` 纯函数 | 双击状态机（注入时钟），供命令 run 与单测共用 | 已加: commit 本条 |
+| `packages/tui/test/app-lifecycle.test.tsx` | 既有用例 | 双 dispatch 适配 + fixture 补 `/session/dummy`、`/part` 端点 | 已改: commit 本条 |
+| `packages/tui/test/util/confirm-exit.test.ts`（新） | — | 状态机边界用例 | 已加: commit 本条 |
 
 ## 第八部分：文档更新清单（计划）
 
 | 文档路径 | 要改什么 | 状态（修复后回填） |
 |---------|---------|------------------|
-| `docs/devlog/2026-10-28-tui-esc-exit-message-menu.md` | 三合一修复 devlog（含度量段） | 待加 |
+| `docs/devlog/2026-10-28-tui-esc-exit-message-menu.md` | 三合一修复 devlog（含度量段） | 待加（三步全完后统一写） |
 | 无契约文档涉及 — keybind 定义、命令名、退出通道均未变更；仅命令内部交互时序变化。`app_exit` 的 description（"Exit the application"）仍准确。 | — | — |
+
+### 实施记录（回填）
+
+- 纯函数抽到 `util/confirm-exit.ts`（注入时钟，5 秒窗口 = `EXIT_CONFIRM_WINDOW_MS`，阈值 2）。
+- 实施中发现（测试同步的正当理由）：原回归用例在第一次 dispatch 后即退出，从未驱动过 session 路由的 `session.get`。双击改造让 app 在两次按键之间继续存活，暴露了 fixture 缺口——mock fetch 不认识 `GET /session/dummy`，session 路由报 "Session not found" → `navigate home` → Session 卸载 → epilogue 被 `onCleanup` 清掉。这是**测试夹具缺口**（用例未覆盖 app 存活期的真实请求），非产品代码缺陷；修法是在 fixture override 补 `/session/dummy` 与 `/part` 两个端点，产品代码零改动。符合 §5.4「测试用例编写错误 — 修正用例」路径。

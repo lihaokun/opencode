@@ -65,19 +65,21 @@ test("app.exit prints the session epilogue after scoped cleanup", async () => {
   const core = await import("@opentui/core")
   mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
   const events = createEventSource()
+  const demoSession = {
+    id: "dummy",
+    title: "Demo session",
+    slug: "dummy",
+    projectID: "project",
+    directory,
+    version: "0.0.0-test",
+    time: { created: 0, updated: 0 },
+  }
   const calls = createFetch((url) => {
-    if (url.pathname === "/session")
-      return json([
-        {
-          id: "dummy",
-          title: "Demo session",
-          slug: "dummy",
-          projectID: "project",
-          directory,
-          version: "0.0.0-test",
-          time: { created: 0, updated: 0 },
-        },
-      ])
+    if (url.pathname === "/session") return json([demoSession])
+    // The app now lives past the first app.exit press, so the session route's
+    // own session.get fires; without this it errors and navigates home.
+    if (url.pathname === "/session/dummy") return json(demoSession)
+    if (url.pathname === "/part") return json([])
   })
   const originalWrite = process.stdout.write.bind(process.stdout)
   let stdout = ""
@@ -115,6 +117,10 @@ test("app.exit prints the session epilogue after scoped cleanup", async () => {
     await ready
     await setup.renderOnce()
     await setup.renderOnce()
+    // Two-press exit confirmation: the first dispatch only arms the guard.
+    api?.keymap.dispatchCommand("app.exit")
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(setup.renderer.isDestroyed).toBe(false)
     api?.keymap.dispatchCommand("app.exit")
     await task
 
