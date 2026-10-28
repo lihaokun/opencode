@@ -3088,6 +3088,75 @@ it.instance("cancel records MessageAbortedError on interrupted process", () =>
   }),
 )
 
+// Abort without cascade keeps descendant background jobs running (#87). The
+// job here is a stand-in for a delegation: same metadata shape AgentLifecycle
+// writes (job id = child session id, parentSessionId = caller), which is what
+// the transitive scan in cancelBackgroundJobs matches on.
+it.instance("cancel with cascade false leaves descendant background jobs running", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const background = yield* BackgroundJob.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.hang
+    yield* user(chat.id, "hello")
+
+    const childDone = yield* Deferred.make<string>()
+    const child = yield* sessions.create({ parentID: chat.id, title: "subagent" })
+    yield* background.start({
+      id: child.id,
+      type: "agent",
+      title: "look around",
+      metadata: { parentSessionId: chat.id, sessionId: child.id },
+      run: Deferred.await(childDone),
+    })
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* waitForBusy(chat.id)
+    yield* prompt.cancel(chat.id, { cascade: false })
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isSuccess(exit)).toBe(true)
+
+    const status = (yield* background.get(child.id))?.status
+    expect(status).toBe("running")
+    yield* Deferred.succeed(childDone, "done")
+  }),
+)
+
+it.instance("cancel with default options still cascades to descendant background jobs", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const background = yield* BackgroundJob.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.hang
+    yield* user(chat.id, "hello")
+
+    const childDone = yield* Deferred.make<string>()
+    const child = yield* sessions.create({ parentID: chat.id, title: "subagent" })
+    yield* background.start({
+      id: child.id,
+      type: "agent",
+      title: "look around",
+      metadata: { parentSessionId: chat.id, sessionId: child.id },
+      run: Deferred.await(childDone),
+    })
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* waitForBusy(chat.id)
+    yield* prompt.cancel(chat.id)
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isSuccess(exit)).toBe(true)
+
+    const status = (yield* background.get(child.id))?.status
+    expect(status).toBe("cancelled")
+  }),
+)
+
 raceNoLLMServer.instance(
   "finalizes assistant when cancelled before processor creation completes",
   () =>
