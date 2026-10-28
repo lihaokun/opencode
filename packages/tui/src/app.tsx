@@ -86,6 +86,7 @@ import * as TuiAudio from "./audio"
 import { win32DisableProcessedInput, win32FlushInputBuffer } from "./terminal-win32"
 import { destroyRenderer } from "./util/renderer"
 import { cliErrorMessage, errorFormat } from "./util/error"
+import { confirmExit, EXIT_CONFIRM_WINDOW_MS, type ExitConfirmState } from "./util/confirm-exit"
 
 registerOpencodeSpinner()
 
@@ -407,6 +408,8 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     }),
   )
   const [ready, setReady] = createSignal(false)
+  const [exitConfirm, setExitConfirm] = createSignal<ExitConfirmState>({ count: 0, firstAt: undefined })
+  onCleanup(() => setExitConfirm({ count: 0, firstAt: undefined }))
   props.pluginHost
     .start({
       api,
@@ -831,7 +834,22 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         title: "Exit the app",
         slashName: "exit",
         slashAliases: ["quit", "q"],
-        run: () => exit(),
+        run: () => {
+          // Two-press confirmation, same shape as the esc interrupt: one
+          // ctrl+c with an empty input only shows the hint, a second press
+          // inside the window exits.
+          const decision = confirmExit(exitConfirm(), Date.now(), EXIT_CONFIRM_WINDOW_MS)
+          setExitConfirm(decision.next)
+          if (decision.decision === "exit") {
+            exit()
+            return
+          }
+          toast.show({
+            variant: "info",
+            message: "Press ctrl+c again to exit",
+            duration: EXIT_CONFIRM_WINDOW_MS,
+          })
+        },
         category: "System",
       },
       {
