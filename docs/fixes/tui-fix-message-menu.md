@@ -97,27 +97,33 @@ messageMouseAction(input: { button: number; selectionText?: string | undefined }
 
 | 类型 | 用例描述 | 状态（修复后回填） |
 |------|---------|------------------|
-| 新增（纯函数） | `messageMouseAction`：左键（有无选中）→ none；右键有选中 → copy；右键无选中 → menu；中键 → none | 待加 |
-| 新增（纯函数） | `revertConfirmMessage`：n=1 单数措辞、n>1 复数、stale 追加 7 天警告行、非 stale 无警告 | 待加 |
-| 新增（渲染） | 右键无选中在消息上 → 菜单打开且首项 Copy；左键单击 → 无菜单 | 待加 |
-| 新增（渲染） | 菜单选 Revert → 先出现 Confirm Revert；Cancel 关闭且未调用 revert；Confirm 后 revert 被调用 | 待加 |
+| 新增（纯函数） | `messageMouseAction`：左键（有无选中）→ none；右键有选中 → copy；右键无选中 → menu；中键/滚轮 → none | 已加: test/routes/message-mouse.test.ts，8 用例 |
+| 新增（纯函数） | `revertConfirmMessage`：n=1 单数措辞、n>1 复数、stale 追加 7 天警告行、非 stale 无警告 | 已加: test/routes/message-mouse.test.ts（与决策器同文件） |
+| 新增（渲染） | 菜单顺序 Copy < Fork < Revert（默认选中 Copy） | 已加: test/cli/tui/dialog-message.test.tsx "menu lists Copy first, not Revert" |
+| 新增（渲染） | 选 Revert → 先出现 Confirm Revert 且未调用 revert；确认后 revert 才被调用（经真实 SDK client + stub fetch 断言 POST /session/{id}/revert） | 已加: "choosing Revert opens a confirm dialog and only reverts after confirm" |
+| 新增（渲染） | Confirm 上选 Cancel → 不调用 revert | 已加: "canceling the confirm dialog leaves the session untouched" |
+| 新增（渲染） | 确认文案含消息数与 `<leader>r`；超 7 天消息追加 snapshot 警告 | 已加: "confirm copy names the count..." + "stale messages add the snapshot warning..." |
 
-渲染测试经 `@opentui/core/testing` 的 `createMockMouse`（`node_modules/@opentui/core/testing/mock-mouse.d.ts`）驱动真实事件路径。
+**渲染测试实现备注**：真实事件经 `@opentui/solid` 的 `testRender` + `mockInput`（键盘驱动菜单）走真实 DialogSelect/DialogConfirm/keymap 链路；`createMockMouse` 对消息行的命中测试需要消息行渲染坐标（完整 app 级 harness），决策器的鼠标键语义已由纯函数层覆盖（button 来自同一个 `MouseEvent.button` 字段），故消息行的"左键不弹菜单"以决策器纯函数 + 右键分支渲染路径组合覆盖。revert 断言走真实 hey-api client（`SDKProvider` 注入 stub fetch），非直接 mock 组件依赖。
 
 ## 第七部分：代码更新清单（计划）
 
 | 文件 | 函数 / 行号 | 改动概述 | 状态（修复后回填） |
 |------|------------|---------|------------------|
-| `packages/tui/src/routes/session/message-mouse.ts`（新） | `messageMouseAction` | 纯函数决策器 | 待加 |
-| `packages/tui/src/routes/session/index.tsx` | `UserMessage` onMouseUp（LL1216-1227、1385） | 接 MouseEvent → 决策器三分支 | 待改 |
-| `packages/tui/src/routes/session/dialog-message.tsx` | options 数组（LL21-106） | 重排 Copy/Fork/Revert；Revert 加 DialogConfirm；接 `revertConfirmMessage` | 待改 |
-| `packages/tui/src/routes/session/dialog-message.tsx` | `revertConfirmMessage`（新纯函数，可放同文件导出） | 确认文案三态 | 待加 |
-| `packages/tui/test/routes/message-mouse.test.ts`（新） | — | 第六部分纯函数用例 | 待加 |
-| `packages/tui/test/routes/dialog-message.test.tsx`（新） | — | 渲染用例 | 待加 |
+| `packages/tui/src/routes/session/message-mouse.ts`（新） | `messageMouseAction` | 纯函数决策器 | 已加: commit 本条 |
+| `packages/tui/src/routes/session/index.tsx` | `UserMessage` onMouseUp（约 LL1220-1250） | 接 MouseEvent → 决策器三分支（copy 走 `Selection.copy`） | 已改: commit 本条 |
+| `packages/tui/src/routes/session/dialog-message.tsx` | options 数组 | 重排 Copy/Fork/Revert；Revert 加 DialogConfirm；新增 `revertConfirmMessage` + `revertedCount`（该消息之后的消息条数） | 已改: commit 本条 |
+| `packages/tui/test/routes/message-mouse.test.ts`（新） | — | 纯函数用例（决策器 5 组 + 文案 3 态） | 已加: commit 本条 |
+| `packages/tui/test/cli/tui/dialog-message.test.tsx`（新） | — | 渲染用例 5 个（顺序/确认门/取消/文案/stale 警告） | 已加: commit 本条 |
 
 ## 第八部分：文档更新清单（计划）
 
 | 文档路径 | 要改什么 | 状态（修复后回填） |
 |---------|---------|------------------|
-| `docs/devlog/2026-10-28-tui-esc-exit-message-menu.md` | 三合一修复 devlog（含度量段） | 待加 |
-| 无契约文档涉及 — 菜单项集合未增减（仅排序 + 确认层），keybind/revert API/snapshot 保留期均未变更；7 天口径直接引用 snapshot 既有 `prune = "7.days"`，不新增契约。 | — | — |
+| `docs/devlog/2026-10-28-tui-esc-exit-message-menu.md` | 三合一修复 devlog（含度量段） | 待加（三步全完后统一写） |
+| 无契约文档涉及 — 菜单项集合未增减（仅排序 + 确认层），keybind/revert API/snapshot 保留期均未变更；7 天口径在 `SNAPSHOT_RETENTION_MS` 注释中引用 snapshot 的 `prune = "7.days"`（`packages/opencode/src/snapshot/index.ts:23`），不新增契约。 | — | — |
+
+### 实施记录（回填）
+
+- 渲染测试调试中确认的一个 harness 要点：`SDKProvider` 不传 `fetch` 时会用全局 fetch 发真实请求（floating promise 静默失败），stub 必须经 `SDKProvider` 的 `fetch` prop 注入，让组件走真实 hey-api client 路径。
+- 时间线菜单（`dialog-timeline.tsx`）复用同一 `DialogMessage`，重排与确认层自动生效，无需单独改动（issue 方案第 4 条由构造满足）。
