@@ -25,6 +25,7 @@ import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner } from "../../component/spinner"
 import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
 import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
+import type { MouseEvent } from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
 import type {
   AssistantMessage,
@@ -78,6 +79,8 @@ import { collapseToolOutput } from "../../util/collapse-tool-output"
 import { usePluginRuntime } from "../../plugin/runtime"
 import { DialogRetryAction } from "../../component/dialog-retry-action"
 import { getRevertDiffFiles } from "../../util/revert-diff"
+import * as Selection from "../../util/selection"
+import { messageMouseAction } from "./message-mouse"
 import { compareMessageToRevert, earliestMessage, latestMessage } from "../../util/session"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
@@ -1215,8 +1218,21 @@ export function Session() {
                       <Match when={message.role === "user"}>
                         <UserMessage
                           index={index()}
-                          onMouseUp={() => {
-                            if (renderer.getSelection()?.getSelectedText()) return
+                          onMouseUp={(event) => {
+                            // Issue #69: left click is for focus and selection
+                            // only; right click copies a selection or opens the
+                            // message menu when nothing is selected.
+                            const action = messageMouseAction({
+                              button: event.button,
+                              selectionText: renderer.getSelection()?.getSelectedText(),
+                            })
+                            if (action === "none") return
+                            if (action === "copy") {
+                              Selection.copy(renderer, toast, clipboard)
+                              event.preventDefault()
+                              event.stopPropagation()
+                              return
+                            }
                             dialog.replace(() => (
                               <DialogMessage
                                 messageID={message.id}
@@ -1316,7 +1332,7 @@ export function Session() {
 function UserMessage(props: {
   message: UserMessage
   parts: Part[]
-  onMouseUp: () => void
+  onMouseUp: (event: MouseEvent) => void
   index: number
   pending?: number
 }) {
