@@ -48,6 +48,9 @@
 
 ### 2.3 必须修改的既有代码
 
+> **子计划 2 增补**：`session/session.ts` 的 `patch` 按会话加信号量串行化（读、合并、发布），
+> 见子计划 2 §5.2.0；`session/run-state.ts` 的 `cancel` 返回是否命中在跑的 run，见 §5.4.2。
+
 **A. 深度与权限**
 
 | 位置 | 改动 |
@@ -901,6 +904,9 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
 #### 5.5.6 `rosterReminder(messages, session) -> Effect<void>`  *（面向父）*
 
+> **子计划 2 撤销**：末尾段的进度视图（§5.5.9）每步刷新且不占历史，本函数的注入在子计划 2 的 commit 3 删除，
+> 保留 `AGENT_ROSTER_SENTINEL` 供旧记录识别。以下为撤销前的设计。
+
 - **功能描述**：把当前直接子列表作为**落盘** reminder 注入上下文。
   **边沿触发（状态变化）、回合边界投递**。
 - **调用点**：既有 reminder 阶段（`prompt.ts:1206`）。注意该点位于 `runLoop` 的
@@ -1032,18 +1038,20 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   `agentRun` → 渲染 key: value 行（run 行三种写法：在跑 / 空闲有记录 / 从未跑过；非子会话省略）。
 - 正确性论证：解析范围与权限键与 `agent_list` 相同，故不暴露它之外的信息。副作用：无。
 
-#### 5.5.9 末尾段子 agent 节  *（子计划 2）*
+#### 5.5.9 末尾段进度视图  *（子计划 2）*
 
-- 见子计划 2 §5.3：`runLoop` 组装 tail 时采集直接子的状态投影与 `agentRun`，纯函数 `StepTail.renderSubagents`
-  渲染在跑计数与最近 5 步内的 run 开始 / 结束（至多 8 行，超出保留最近的）；门与花名册相同（无子或
-  `agent_list` deny 不附带）。不写入历史、不进压缩输入、缓存断点跳过（机制已在 `step-tail` 分支落地）。
+- 见子计划 2 §4.5、§5.3：`runLoop` 组装 tail 时以一次 SQL 取全部直接子的 id / metadata / time_updated，
+  状态来自内存投影；纯函数 `StepTail.renderSubagents` 渲染时钟与自身位置、总览、在跑列表（开始早的在前）、
+  窗口内结束列表（结束晚的在前），各至多 10 行；窗口取 10 分钟与上一步开始以来的较长者。门与被撤销的
+  花名册相同（无子或 `agent_list` deny 不附带）。不写入历史、不进压缩输入、缓存断点跳过。
 
 ### 5.6 停止钩子  *（子计划 2，#81）*
 
 - 见子计划 2 §5.1：`runLoop` 的正常退出分支在 `break` 前触发 `experimental.session.stop`；阻止时落库一条
   合成用户消息（text = reason，metadata `stop_hook`）并继续同一次 run；连续阻止达 `stop_hook_block_cap`
-  （默认 8）强制放行，任一步调用工具即清零；钩子抛错或无理由按放行。出错退出、人中断、agent_stop、
-  结构化输出结束不触发。主会话与子 agent 同一分支，宿主不区分。
+  （默认 8，0 即不调用钩子）强制放行，任一步调用工具即清零，计数随 re-arm 保留；钩子抛错（defect，
+  `catchAllCause`）或无理由按放行；无超时；多插件后写者胜。出错退出、权限或提问被拒、输出截断、人中断、
+  agent_stop、结构化输出结束、到达步数上限均不触发。主会话与子 agent 同一分支，宿主不区分。
 
 ## 6. 完整性自检 checklist
 

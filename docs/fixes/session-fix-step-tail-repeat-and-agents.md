@@ -175,17 +175,15 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 
 ### 4.4 #75 run 记录
 
-- 子 agent 会话（有 `parentID`）的元数据增加 `agentRun`：
+> 2026-10-29：本节与 4.9 按子计划 `agentmgmt-2-run-state`（§4.1、§4.2、§4.5）修订；冲突时以子计划为准。
 
-  ```text
-  { number, started_at, woken_by?, ended_at?, outcome? }   // outcome: completed | failed | stopped
-  ```
-
-- **开始**：`loop()` 包装的工作开始时，若上一个 run 已关闭（有 `ended_at`）或尚无记录，则 `number + 1`，写入 `started_at` 与 `woken_by`，清除 `ended_at`、`outcome`；若上一个 run 未关闭（同一 run 的 re-arm），保持不变。
-- **结束**：工作退出时，若成功退出且有未消费的消息（re-arm，与 `reportRunEnd` 的判断一致），不关闭；否则写入 `ended_at` 与 `outcome`（被中断为 `stopped`）。
-- **woken_by**：首次 run 记创建者（父）；此后取唤醒本 run 的最新用户消息的来源：agent 消息与子 agent 的结束报告（二者都带发送方标记）记发送方 session、名字与类型；人经 TUI 发送记 `user`；其余记 `system`。2026-10-23 决定：结束报告唤醒的 run 记为发报告的子 agent，不记 `system`。
+- 子 agent 会话（有 `parentID`）的元数据增加 `agentRun`：当前 run 的 `{ number, started_at, woken_by, ended_at?, outcome? }` 加上一个 run 的结束 `previous?: { number, ended_at, outcome }`。结局四种：completed、failed、stopped、lost。
+- **开始**：`loop()` 包装的工作开始时，由 work 闭包的标志区分新 run 与 re-arm（runner 续跑重执行同一个 work）。新 run 时 `number + 1`，写入 `started_at` 与 `woken_by`，上一条记录的结束移入 `previous`；遗留的打开记录（崩溃或结束写失败）先关为 `lost`。re-arm 不写。
+- **结束**：工作退出时在同一个 `onExit` 里只读一次 re-arm 判据，再依次关闭记录、发报告。成功退出且有未消费的消息则不关闭；否则写入 `ended_at` 与 `outcome`（被中断为 `stopped`）。
+- **woken_by**：首次 run 记创建者（父）；此后取唤醒本 run 的最新用户消息的来源：agent 消息与子 agent 的结束报告（二者都带发送方标记）记发送方 session、名字与类型；人经 TUI 的 agent-message 路由记 `user`；其余记 `system`。
 - **agent 消息打标记**（#73 的服务端部分）：`AgentInbox.deliver` 投递 agent 发送方的消息时，文本部件增加 `metadata: { kind: "agent_message", sender, sender_name, sender_agent }`；人经 TUI 发进子会话的头行部件带 `{ kind: "user_message" }`；结束报告的部件在既有 `agent_notification` 之上增加发送方三字段。模型看到的文本不变；TUI 的展示改动仍在 #73 另做。
-- **run 结束的定义**（#81，2026-10-23 并入）：循环正常退出且插件钩子 `experimental.session.stop` 放行。钩子阻止则落库一条合成用户消息（理由）并在同一 run 内继续，不加号、不关闭记录、不发报告。详见子计划 `agentmgmt-2-run-state` §4.4。
+- **会话 patch 加锁**：`Session.patch` 原本无锁、整行后写者胜，run 记录会被每条消息投递时的 `touch` / `setAgentModel` 覆盖；子计划 2 在 `Session.patch` 内按会话串行化。
+- **run 结束的定义**（#81，2026-10-23 并入）：循环正常退出且插件钩子 `experimental.session.stop` 放行。钩子阻止则落库一条合成用户消息（理由）并在同一 run 内继续，不加号、不关闭记录、不发报告。详见子计划 §4.4。
 
 ### 4.5 #75 结束报告
 
@@ -217,22 +215,17 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 - 末尾计数行：`showing 50 of 394 (10 running, 384 idle)`。
 - 不带参数时默认上限 50，这是对现有输出的有意改变。
 
-### 4.9 #75 末尾段的子 agent 节
+### 4.9 #75 末尾段的进度视图
 
-- 仅当会话有直接子 agent 时附带。
-- 第一行：`Your subagents running now: N`。
-- 变化列表：窗口起点为本 run 内往前第 5 步的开始时间（不足 5 步时为 run 开始时间）。对每个直接子 agent，若其 `agentRun.started_at` 或 `ended_at` 落在窗口内，生成一行；最多 8 行，超出时写 `… and N more changes`，保留最近的。
-
-  ```text
-  Changes in your last 5 steps:
-    03:41:18  cw-b333  run 5 ended (completed)
-    03:41:27  cw-b333  run 6 started (your message)
-  ```
-
+- 仅当会话有直接子 agent 且 `agent_list` 权限非 deny 时附带。
+- 第一行：当前时间（带日期与时区）与自身位置，如 `Now: 2026-10-27T19:54:07+08:00. You are in run 6, step 12.`
+- 总览行：`Your subagents: 9 direct, 8 running, 1 idle.`
+- 在跑列表：每行 session_id、名字、run 号、开始时间、唤醒来源、最后活动时间；上一个 run 在窗口内结束时附 `; run 5 ended 19:49:18 (completed)`。开始早的在前，最多 10 行，超出写 `… and N more running`。
+- 窗口内结束、现在空闲的列表：每行 session_id、名字、run 号、结束时间、结局。结束晚的在前，最多 10 行，超出写 `… and N more finished`。
+- 窗口取"最近 10 分钟"与"上一步开始以来"中更长者。
 - 来源标注取 `woken_by`：本会话发送为 `your message`，其他 agent 为其名字，人为 `user`，其余为 `system`。
-- 现有写入历史的花名册保持不变。
-
-**设计落点**：4.4–4.9 的详细设计、不变量与测试在 `docs/design/agent-management/subplans/agentmgmt-2-run-state.md`；本文档与之冲突时以子计划为准。
+- 数据采集每步一次 SQL（按 parent_id 取直接子的元数据与更新时间），状态来自内存投影，不读历史。
+- 写入历史的花名册在进度视图上线后撤销（2026-10-29 决定；原"最近 5 步的变化列表"方案同时撤销）。
 
 ## 第五部分：正确性论证
 

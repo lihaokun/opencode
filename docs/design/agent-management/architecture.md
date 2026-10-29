@@ -395,7 +395,8 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
 ```
 
 ```
-数据结构：SubagentRoster
+数据结构：SubagentRoster（**子计划 2 撤销**：末尾段的进度视图每步刷新且不占历史，二者重叠；
+  commit 3 删除注入，保留 sentinel 常量供旧记录识别。以下为撤销前的定义。）
 
 字段：
   - text: string — 渲染成一行的直接子列表
@@ -420,24 +421,26 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
 ```
 
 ```
-数据结构：AgentRun（子计划 2 §4.1）
+数据结构：AgentRun（子计划 2 §4.1，2026-10-29 修订）
 
-存放：Session.Info.metadata["agentRun"]，只对有 parentID 的会话写入；只保留最近一次 run。
+存放：Session.Info.metadata["agentRun"]，只对有 parentID 的会话写入；只保留当前 run 与上一个 run 的结束。
 
 字段：
-  - number: PositiveInt — 第几次 run，从 1 起
+  - number: PositiveInt — 当前 run 的编号，从 1 起
   - started_at: number — 开始的 epoch ms
   - woken_by: WakeSource — 唤醒来源
   - ended_at?: number — 关闭的 epoch ms
-  - outcome?: "completed" | "failed" | "stopped"
+  - outcome?: "completed" | "failed" | "stopped" | "lost"
+  - previous?: { number, ended_at, outcome } — 上一个 run 的结束
 
 类型不变量：
-  - ended_at 存在 ⇔ outcome 存在；ended_at ≥ started_at
-  - number 只在上一个 run 已关闭或无记录的开始时加一；re-arm 与钩子阻止不加（子计划 2 I5）
-  - 写入方只有 SessionPrompt.loop 的 work 包装；setMetadata 是整体替换，写前重读（子计划 2 H6）
+  - ended_at 存在 ⇔ outcome 存在；ended_at ≥ started_at；previous.number = number − 1
+  - number 只在新 run 开始时加一；新 run 与 re-arm 的区分来自 loop() 的 work 闭包标志，不来自记录（子计划 2 I5）
+  - lost 只由新 run 开始时关闭遗留的打开记录产生（崩溃或结束写失败），没有报告
+  - 写入方只有 SessionPrompt.loop 的 work 包装；Session.patch 按会话串行（子计划 2 H6/H6b/H6c，I11）
 
 跨模块共享性：跨模块共享 — producer: SessionPrompt.loop；consumer: M5（agent_status / agent_list /
-  agent_send / 末尾段子 agent 节）、reportRunEnd、M4 renderTermination
+  agent_send / 末尾段进度视图）、reportRunEnd、M4 renderTermination
 ```
 
 ```
@@ -448,7 +451,8 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
   - session? / name? / agent? — kind = agent 时的发送方
 
 推导：首次 run 的来源是创建者（父）；此后取唤醒消息首个 text part 的 metadata：
-  agent_message 或 agent_notification ⇒ agent（含子 agent 的结束报告）；user_message ⇒ user；其余 ⇒ system。
+  agent_message 或 agent_notification ⇒ agent（含子 agent 的结束报告）；user_message ⇒ user（只有 TUI 的
+  agent-message 路由打这个标记）；其余 ⇒ system（含人经普通 prompt 端点发进子会话的消息）。
 渲染：从会话 S 看，session = S ⇒ `your message`；其他 agent ⇒ 其名字或 session id；user；system。
 ```
 
@@ -458,7 +462,7 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
   agent 发送方的消息          { kind: "agent_message", sender, sender_name?, sender_agent? }
   人经 TUI 发进子会话的头行   { kind: "user_message" }
   子 agent 的结束报告         既有 { kind: "agent_notification", summary } + sender 三字段
-  钩子阻止后的继续消息        { kind: "stop_hook", reason }，part 为 synthetic
+  钩子阻止后的继续消息        { kind: "stop_hook", reason }，part 为 synthetic（TUI 渲染见 #90）
 
 类型不变量：模型可见文本逐字不变；只供 TUI 识别与 WakeSource 推导；旧记录无标记，读者容忍缺失。
 ```
@@ -729,9 +733,10 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
   - agent_list 有 status / relation / query / limit 参数，默认上限 50，末尾一行计数；每行带 run 号与最近活动时间
   - agent_send 的返回在 deliver 之前取目标状态与 agentRun 的快照，空闲目标写 "starts run N+1 (sent …)"，
     在跑目标写 "is in run N (started …)"（子计划 2 §4.6）
-  - **末尾段子 agent 节**：有直接子且 agent_list 非 deny 的会话，每步请求末尾附在跑计数与最近 5 步内
-    直接子的 run 开始 / 结束（至多 8 行）；不写入历史、不进压缩输入、缓存断点跳过（子计划 2 §4.5；
-    机制见 `docs/fixes/session-fix-step-tail-repeat-and-agents.md` §4.1）
+  - **末尾段进度视图**：有直接子且 agent_list 非 deny 的会话，每步请求末尾附一张快照——当前时间与自身
+    run 号 / 步号、直接子的总数与在跑 / 空闲数、在跑列表（开始早的在前，至多 10 行，带上一个 run 的结束）、
+    10 分钟内（至少上一步以来）结束的列表（结束晚的在前，至多 10 行）；不写入历史、不进压缩输入、缓存断点
+    跳过；数据采集每步一次 SQL（子计划 2 §4.5；机制见 `docs/fixes/session-fix-step-tail-repeat-and-agents.md` §4.1）
   - **`task` 工具已删除**：运行时 tool ID 只剩 `agent`，不保留隐藏可执行别名。
     旧权限配置键 `task` 在读取时规范化为 `agent`；历史 transcript 的 `task` tool part
     继续在展示层可读；旧插件新发起的 `task` 调用按未知工具处理
@@ -746,7 +751,7 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
   - `agent` 经 `ctx.ask({ permission: "agent", patterns: [subagent_type], always: ["*"] })` 求值；
     默认 `*: allow` 使其不弹窗，但 deny 与显式 ask 仍生效
   - agent_list / agent_send / agent_stop 不新增逐次确认
-  - **roster 注入（面向父）**：在**回合边界**求值——命中"最后一条 user message 之后尚无
+  - **roster 注入（面向父，子计划 2 撤销，由末尾段进度视图取代）**：在**回合边界**求值——命中"最后一条 user message 之后尚无
     assistant message"（即 `idle→running`）或"可见历史含 compaction part 且其后无 roster"；
     命中后渲染当前直接子列表，与可见历史中最近一条比较，不同或不存在则**落盘**一条。
     无直接子不注入；调用者 `agent_list` 为 deny 不注入
@@ -1177,8 +1182,12 @@ Rely-Guarantee 条件：
 12. **run 记录只保留最近一次**（子计划 2）。历史 run 的起止时间不保留；记账失败的 run 在记录里缺号，
     `agent_status` 如实显示缺失。记录存于会话元数据，没有索引，不供查询。
 13. **停止钩子不触发于结构化输出的 run**，也不提供 `additionalContext` 非阻止反馈（子计划 2 §1）。
-14. **会话元数据在运行中只有一个写入方**（子计划 2 H6）。以后任何在运行中改元数据的代码都要先读后写，
-    并与 run 记录的写入串行，否则互相覆盖。
+14. **`Session.patch` 曾无锁、整行后写者胜**（子计划 2 H6）。运行中并发 patch 同一会话的写入方有 `touch`、
+    `setAgentModel`、`setTitle` 与 HTTP `session.update`；子计划 2 在 `Session.patch` 内按会话串行化（I11）。
+    HTTP `session.update` 以客户端旧副本整体替换元数据仍会抹掉 `agentRun` 等键，保持替换语义，读者容忍缺失。
+15. **没有默认步数上限**（子计划 2 §6 第 13 点）。上游 V1/V2、Claude Code 交互模式均无默认；`steps` 为按 agent
+    的选择项。到达上限的那一步不询问停止钩子。
+16. **停止钩子无超时，多插件后写者胜**；阻止后的继续消息在 TUI 不可见（#90）。
 ### 实现阶段未自动化覆盖的三项
 
 以下三条按设计成立，但**没有自动化测试**，只靠代码审读保证。列出来是为了让它们可见，
