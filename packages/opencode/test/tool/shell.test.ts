@@ -78,6 +78,7 @@ const ctx = {
   agent: "build",
   abort: AbortSignal.any([]),
   messages: [],
+  visibleInput: {},
   metadata: () => Effect.void,
   ask: () => Effect.void,
 }
@@ -1193,6 +1194,77 @@ describe("tool.shell truncation", () => {
         expect(lines.length).toBe(lineCount)
         expect(lines[0]).toBe("1")
         expect(lines[lineCount - 1]).toBe(String(lineCount))
+      }),
+    ),
+  )
+})
+
+describe("tool.shell visibleInput", () => {
+  it.live("permission patterns derive from visibleInput.command while spawn runs params.command", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const bash = yield* initShell()
+        const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+        // Simulates the updatedInput contract: execution gets the wrapped
+        // command, the visible layer keeps the model-emitted one.
+        const wrappedCtx: Tool.Context = {
+          ...ctx,
+          visibleInput: { command: "echo visible" },
+          ask: (req) =>
+            Effect.sync(() => {
+              requests.push(req)
+              throw new Error("stop after permission")
+            }),
+        }
+        const exit = yield* bash.execute({ command: "echo wrapped -- real" }, wrappedCtx).pipe(Effect.exit)
+        // The permission scan ran against the visible command and the ask
+        // short-circuits execution, so the process must never spawn.
+        expect(exit._tag).toBe("Failure")
+        expect(requests.length).toBe(1)
+        expect(requests[0].permission).toBe("bash")
+        expect(requests[0].patterns).toContain("echo visible")
+        expect(requests[0].patterns).not.toContain("echo wrapped -- real")
+        if ((requests[0].metadata as { command?: string }).command !== undefined) {
+          expect((requests[0].metadata as { command?: string }).command).toBe("echo visible")
+        }
+      }),
+    ),
+  )
+
+  it.live("spawn uses params.command when permission is allowed", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const bash = yield* initShell()
+        const wrappedCtx: Tool.Context = {
+          ...ctx,
+          visibleInput: { command: "echo visible" },
+        }
+        const result = yield* bash.execute({ command: "echo wrapped -- real" }, wrappedCtx)
+        expect(result.metadata.exit).toBe(0)
+        expect(result.output).toContain("wrapped -- real")
+        expect(result.metadata.output).toContain("wrapped -- real")
+        // title (persisted, user-visible) carries the executed command
+        expect(result.title).toBe("echo wrapped -- real")
+      }),
+    ),
+  )
+
+  it.live("visibleInput defaults keep legacy behavior when it equals params", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+        yield* run(
+          {
+            command: "echo hello",
+          },
+          capture(requests),
+        )
+        expect(requests.length).toBe(1)
+        expect(requests[0].permission).toBe("bash")
+        expect(requests[0].patterns).toContain("echo hello")
       }),
     ),
   )

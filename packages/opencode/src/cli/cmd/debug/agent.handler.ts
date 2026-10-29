@@ -178,6 +178,7 @@ const createToolContext = Effect.fn("Cli.debug.agent.createToolContext")(functio
     agent: agent.name,
     abort: new AbortController().signal,
     messages: [],
+    visibleInput: {},
     metadata: () => Effect.void,
     ask(req: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">) {
       return Effect.sync(() => {

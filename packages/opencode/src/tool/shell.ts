@@ -617,14 +617,20 @@ export const ShellTool = Tool.define(
               }
               const timeout = params.timeout ?? defaultTimeoutMs
               const ps = Shell.ps(shell)
+              // Permission scanning keys on the model-visible command: user
+              // rules are authored against what the model emitted, and a
+              // plugin's execution-layer rewrite (updatedInput) must not
+              // change what gets asked or matched.
+              const visibleCommand =
+                typeof ctx.visibleInput.command === "string" ? ctx.visibleInput.command : params.command
               yield* Effect.scoped(
                 Effect.gen(function* () {
-                  const tree = yield* Effect.acquireRelease(parse(params.command, ps), (tree) =>
+                  const tree = yield* Effect.acquireRelease(parse(visibleCommand, ps), (tree) =>
                     Effect.sync(() => tree.delete()),
                   )
                   const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
                   if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
-                  yield* ask(ctx, scan, params)
+                  yield* ask(ctx, scan, { command: visibleCommand })
                 }),
               )
 

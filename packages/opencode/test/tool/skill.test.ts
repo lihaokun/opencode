@@ -20,6 +20,7 @@ const baseCtx: Omit<Tool.Context, "ask"> = {
   agent: "build",
   abort: AbortSignal.any([]),
   messages: [],
+  visibleInput: {},
   metadata: () => Effect.void,
 }
 

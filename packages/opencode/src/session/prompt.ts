@@ -408,6 +408,7 @@ const layer = Layer.effect(
           // automatic one would wake it a second time.
           extra: { bypassAgentCheck: true, promptOps, notifyOnFinish: !task.command },
           messages: msgs,
+          visibleInput: taskArgs,
           metadata: (val: { title?: string; metadata?: Record<string, any> }) =>
             Effect.gen(function* () {
               part = yield* sessions.updatePart({
@@ -951,6 +952,7 @@ const layer = Layer.effect(
                     messageID: info.id,
                     extra: { bypassCwdCheck: true, ...extra },
                     messages: [],
+                    visibleInput: args,
                     metadata: () => Effect.void,
                     ask: () => Effect.void,
                   })

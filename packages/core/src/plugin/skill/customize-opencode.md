@@ -375,7 +375,9 @@ export default (async ({ client, project, directory, $ }) => {
       // cfg is the live merged config; mutate fields here.
     },
     "tool.execute.before": async (input, output) => {
-      // mutate output.args before the tool runs
+      // mutate output.args before the tool runs, or set output.updatedInput to
+      // replace what the tool executes while the model-visible input stays as
+      // the model emitted it (session transcript + permission checks)
     },
   }
 }) satisfies Plugin
@@ -387,6 +389,16 @@ Hook surface (mutate `output` in place; return `void`):
 - `config(cfg)`: once on init with the merged config
 - `chat.message`, `chat.params`, `chat.headers`
 - `tool.execute.before`, `tool.execute.after`
+  - `tool.execute.before` supports two rewriting modes: mutate `output.args` in
+    place (legacy; the mutation is visible to the model and permission rules),
+    or set `output.updatedInput` (execution-layer only). `updatedInput` replaces
+    the executed args wholesale, must satisfy the tool's parameter schema, and
+    keeps `args` as what the model sees and what permission patterns match —
+    e.g. wrap a command in a sandbox without teaching the model the wrapper.
+    Built-in and plugin tools reject invalid rewrites with a schema-invalid
+    tool error; MCP tools have no core-side schema (server-side validation
+    applies). Not honored by the MCP resource tools or synthetic agent
+    delegations.
 - `tool.definition`
 - `command.execute.before`
 - `shell.env`

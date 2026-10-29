@@ -17,7 +17,7 @@ import { Effect } from "effect"
 import { MessageV2 } from "./message-v2"
 import { Session } from "./session"
 import { SessionProcessor } from "./processor"
-import { PartID } from "./schema"
+import { PartID, SessionID } from "./schema"
 import { EffectBridge } from "@/effect/bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -61,6 +61,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     abort: options.abortSignal!,
     messageID: input.processor.message.id,
     callID: options.toolCallId,
+    visibleInput: args,
     extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },
     agent: input.agent.name,
     messages: input.messages,
@@ -106,12 +107,16 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         return run.promise(
           Effect.gen(function* () {
             const ctx = context(args, options)
-            yield* plugin.trigger(
+            const hook = yield* plugin.trigger<
               "tool.execute.before",
-              { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
-              { args },
-            )
-            const result = yield* item.execute(args, ctx)
+              { tool: string; sessionID: SessionID; callID?: string },
+              { args: Record<string, unknown>; updatedInput?: unknown }
+            >("tool.execute.before", { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID }, { args })
+            let params: Record<string, unknown> = hook.args
+            if (hook.updatedInput !== undefined) {
+              params = isRecord(hook.updatedInput) ? hook.updatedInput : { value: hook.updatedInput }
+            }
+            const result = yield* item.execute(params, ctx)
             const output = {
               ...result,
               attachments: result.attachments?.map((attachment) => ({
@@ -402,14 +407,18 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       run.promise(
         Effect.gen(function* () {
           const ctx = context(args, opts)
-          yield* plugin.trigger(
+          const hook = yield* plugin.trigger<
             "tool.execute.before",
-            { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
-            { args },
-          )
+            { tool: string; sessionID: string; callID: string },
+            { args: Record<string, unknown>; updatedInput?: unknown }
+          >("tool.execute.before", { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId }, { args })
+          let params: Record<string, unknown> = hook.args
+          if (hook.updatedInput !== undefined) {
+            params = isRecord(hook.updatedInput) ? hook.updatedInput : { value: hook.updatedInput }
+          }
           const result: Awaited<ReturnType<NonNullable<typeof execute>>> = yield* Effect.gen(function* () {
             yield* ctx.ask({ permission: key, metadata: {}, patterns: ["*"], always: ["*"] })
-            return yield* Effect.promise(() => execute(args, opts))
+            return yield* Effect.promise(() => execute(params, opts))
           }).pipe(
             Effect.withSpan("Tool.execute", {
               attributes: {
