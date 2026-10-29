@@ -657,8 +657,9 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
 #### 5.4.7 `stop(caller, target) -> Effect<StopOutcome, NotAChild | AgentNotFound>`
 
-> **子计划 2 修订**：步骤 4 的通知正文加一行 `run: <n>, stopped at <ISO+tz>`；被取消 fiber 的 `onExit`
-> 尚未关闭记录时写 `stop requested at <now>`，不等待（子计划 2 §5.4.2）。
+> **子计划 2 修订**：`SessionRunState.cancel` 返回取消前状态；步骤 4 的通知正文加一行，三分支——取消前在跑且记录已关为
+> stopped：`run: <n>, stopped at <ISO+tz>`；取消前在跑但记录未关闭或结局不是 stopped：`run: <n>, stop requested at <now>`，
+> 不等待；取消前空闲：`run: <n> had already ended at … (<结局>); nothing was running`（子计划 2 §5.4.2）。
 
 - **功能描述**：自底向上**无条件**取消目标子树；只向 `notify_boundary` 发一条 cancelled 通知。
 - **调用关系**：callers: M5 `agent_stop`；callees: M4 `plan`、`SessionRunState.cancel`、
@@ -835,11 +836,11 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
 #### 5.5.3 `agent_send(params, ctx) -> Effect<string>`
 
-> **子计划 2 修订**：步骤 5 之前取目标状态投影与 `agentRun` 的快照；步骤 6 的 Accepted 渲染按快照分四种：
-> 空闲有记录 `was idle; this message starts run N+1 (sent …). Its run N ended at … (<outcome>); that report
-> reaches you as a separate message.`、空闲无记录（省第二句）、在跑 `is in run N (started …); it reads this at
-> its next step.`、非子会话（只写 running / idle）；末尾恒加 `Current state of one agent: agent_status(target="…").`；
-> 既有三句保留。成立性论证见子计划 2 §5.4.3。
+> **子计划 2 修订**：步骤 5 之前取目标状态投影与 `agentRun` 的快照；步骤 6 的 Accepted 渲染按快照分六种：
+> 空闲且记录已关闭 `was idle; this message starts run N+1 (sent …). Its run N ended at … (<outcome>); …`、空闲无记录
+> （省第二句）、空闲且记录未关闭（崩溃遗留，写 cut off 并预告 N+1）、在跑且记录未关闭 `is in run N (started …); it
+> reads this at its next step.`、在跑且记录已关闭或缺失（不预告号）、非子会话（只写 running / idle）；末尾恒加
+> `Current state of one agent: agent_status(target="…").`；既有三句保留。成立性论证见子计划 2 §5.4.3。
 
 - **实现思路**：
   1. caller 取自 `ctx.sessionID`。
@@ -878,8 +879,8 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
 #### 5.5.5 `visibleTools(session: Session.Info) -> Effect<ToolName[]>`
 
-> **子计划 2 修订**：两个分支都把 `agent_status` 与 `agent_list` 并列；注册表的权限过滤对 `agent_status`
-> 以 `agent_list` 的键求值（子计划 2 §5.5.2，I9）。
+> **子计划 2 修订**：两个分支都把 `agent_status` 与 `agent_list` 并列；权限隐藏经 `Permission.disabled` 的
+> 别名表 `agent_status → agent_list`（不是注册表的 `visibleTools`，那只管 code-mode 的 MCP 目录；子计划 2 §5.5.2，I9）。
 
 - **功能描述**：按调用者深度决定向模型暴露哪些 Agent 工具。
 - **调用点**：`session/tools.ts` 的 `SessionTools.resolve`，**不是工具执行期**。
@@ -1035,7 +1036,8 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 #### 5.5.8 `agent_status(params, ctx) -> Effect<string>`  *（子计划 2）*
 
 - 见子计划 2 §5.5.1：`resolveTarget(caller, target, "neighbor")` → `agent_list` 权限求值 → 读取会话、状态投影、
-  `agentRun` → 渲染 key: value 行（run 行三种写法：在跑 / 空闲有记录 / 从未跑过；非子会话省略）。
+  `agentRun` → 渲染 key: value 行（run 行五种写法：在跑且记录未关闭 / 在跑且记录已关闭或缺失 / 空闲且已关闭 /
+  空闲且未关闭（cut off）/ 从未跑过；非子会话省略；在跑时另有 last step 行）。
 - 正确性论证：解析范围与权限键与 `agent_list` 相同，故不暴露它之外的信息。副作用：无。
 
 #### 5.5.9 末尾段进度视图  *（子计划 2）*

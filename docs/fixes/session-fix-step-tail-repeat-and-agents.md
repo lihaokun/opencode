@@ -193,19 +193,22 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 
 ### 4.6 #75 agent_send 返回
 
-投递后读取目标的状态与 `agentRun`：
+在投递**之前**读取目标的状态投影与 `agentRun` 作为快照（投递是立即 fork 的，之后读会读到混合状态），按快照分六种措辞（原文见子计划 §4.6）：
 
-- 目标空闲：`ses_xxx (cw-b333) was idle; this message starts run 6 (sent <时间>). Its run 5 ended at <时间> (completed); that report reaches you as a separate message.`（无上一个 run 时省略第二句）。写 "starts" 而不写 "started at"：投递只到"已接受"，不能宣称已开始（2026-10-23 决定）；状态与记录的快照在投递之前读取。
-- 目标在跑：`ses_xxx (cw-b333) is in run 5 (started <时间>); it reads this at its next step.`
-- 目标没有 `agentRun`（如主会话）：只写 `running` 或 `idle`。
+- 目标空闲、记录已关闭：`ses_xxx (cw-b333) was idle; this message starts run 6 (sent <时间>). Its run 5 ended at <时间> (completed); that report reaches you as a separate message.`（stopped / lost 的第二句不假定停止者是调用者）
+- 目标空闲、无记录：第二句省略，首次写 `starts run 1`
+- 目标空闲、记录未关闭（崩溃遗留）：写 `was cut off … will be recorded as lost`，仍预告 N+1
+- 目标在跑、记录未关闭：`ses_xxx (cw-b333) is in run 5 (started <时间>); it reads this at its next step.`
+- 目标在跑、记录已关闭或缺失：`is running (its run record is not updated yet)`，不预告号
+- 目标没有 `agentRun` 也不是子会话（如主会话）：只写 `running` 或 `idle`
 - 末尾一行：`Current state of one agent: agent_status(target="ses_xxx").`
 
 ### 4.7 #75 新增 agent_status
 
 - 参数：`target`（必填，session id 或名字）。
-- 返回：session id、名字、类型、关系、状态（running / idle）、run 编号、本次 run 开始时间或上次 run 的结束时间与结果、工作目录。
+- 返回：session id、名字、类型、关系、状态（running / idle）、run 行（五种写法：在跑且记录未关闭 / 在跑且记录已关闭或缺失 / 空闲且已关闭 / 空闲且未关闭即 cut off / 从未跑过）、上一个 run 的结束与结局、在跑时的最后一步时间、工作目录。
 - 可查范围与 agent_list 相同（自己、父、直接子、兄弟），复用 `AgentTree.resolveTarget(scope: "neighbor")`。
-- **权限与可见性跟随 agent_list**：工具表中 agent_list 被权限禁用或因深度移除时，agent_status 一并移除；执行时按 `agent_list` 的规则求值。
+- **权限与可见性跟随 agent_list**：工具表中按深度与 `Permission.disabled` 的别名表（`agent_status → agent_list`）同生同灭；执行时按 `agent_list` 的规则求值。
 
 ### 4.8 #75 agent_list 过滤与上限
 
@@ -234,7 +237,7 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 3. **跨步计数不改变运行语义**：只追加文本，不拦截、不改变 run 的结束条件；每次 run 开始时状态为空，跨 run 不累计。增量更新与 3.2 的定义在每步相等（"相同加一、不同清零"等价于末尾最长连续段长度）。
 4. **run 编号单调且与报告一致**：编号只在上一个 run 关闭后的新开始时加一；re-arm 的判断与 `reportRunEnd` 使用同一个 `hasUnconsumedTurn`，因此每份报告的编号就是该次关闭的 run 的编号；agent_send 在目标空闲时预告的"run N+1"即投递触发的下一次开始。
 5. **权限一致**：agent_status 的可见性与执行权限都由 agent_list 的规则决定，禁用 agent_list 的配置不会经 agent_status 泄露同样的信息。
-6. **不变量保持**：结束报告的触发条件、`hasLiveDescendant`、花名册注入与 #53 的行为均不改变，只增加报告中的属性。
+6. **不变量保持**：结束报告的触发条件、`hasLiveDescendant` 与 #53 的行为均不改变，只增加报告中的属性；写入历史的花名册在进度视图上线后撤销（子计划 2 commit 3），其信息由每步的进度视图承担。
 
 ## 第六部分：测试用例清单（计划）
 

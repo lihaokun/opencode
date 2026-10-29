@@ -724,7 +724,7 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 
 前置条件（Requires）：
   - 工具调用发生在某个 Session 的工具执行上下文中，调用者 SessionID 可知
-  - roster 注入发生在 runLoop 的 reminder 阶段，可见历史与 Session 可知
+  - roster 注入发生在 runLoop 的 reminder 阶段，可见历史与 Session 可知（子计划 2 撤销 roster，改为每步末尾段进度视图，入参为状态投影与直接子的会话行）
 
 后置条件（Ensures）：
   - 对模型暴露且仅暴露 agent / agent_list / agent_send / agent_stop / agent_status（调研 §12、§18）
@@ -762,14 +762,14 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 不变式（Invariants）：
   - 权限判定先于任何副作用；判定失败的调用不写入任何消息、不中断任何执行
 
-副作用：委托给 M1–M4；roster 注入写入一条 synthetic part
+副作用：委托给 M1–M4；roster 注入写入一条 synthetic part（子计划 2 后：不再写入 synthetic part；进度视图不落盘）
 ```
 
 **权限的不对称**：`agent_send` 可发给任一邻居，`agent_stop` 只能停直接子。
 理由是破坏性不同——投递一条消息由接收方自行决定如何处理；停止则单方面中断对方的执行。
 
-**roster 为什么在 M5**：它是模型看得见的东西，与四个工具同属"对模型暴露的表面"。
-它不是新的执行机制，只是把 M1+M2 已有的读取结果按既有 reminder 通道呈现。
+**roster 为什么在 M5**（子计划 2 已撤销 roster，本段理由同样适用于取代它的末尾段进度视图）：它是模型看得见的
+东西，与五个工具同属"对模型暴露的表面"。它不是新的执行机制，只是把 M1+M2 已有的读取结果呈现给模型。
 
 ### 4.6 工具 schema
 
@@ -961,9 +961,9 @@ G2 「查询指定 Agent」        → M1 resolveTarget + M2 + agentRun → M5 a
 G7 「run 结束前把关」        → SessionPrompt.runLoop 退出分支 + Plugin（子计划 2 §4.4）
 G8 「run 身份」              → SessionPrompt.loop 的 work 包装写 agentRun；M5 与 reportRunEnd 读（子计划 2）
 G3 「邻居间任意方向消息」    → M3 AgentInbox（主）
-G4 「停止并保留上下文」      → M4（主）+ M1（直接子判定 + 后代展开）+ M5（roster 兜信息）
+G4 「停止并保留上下文」      → M4（主）+ M1（直接子判定 + 后代展开）+ M5（roster 兜信息）（子计划 2 后由末尾段进度视图兜信息）
 G5 「身份统一」              → M5（表面约束）+ M1（身份与名称解析）
-G6 「独立工作目录」          → M4 §4.4.1（准备）+ M5（在初始消息与 roster 中呈现）
+G6 「独立工作目录」          → M4 §4.4.1（准备）+ M5（在初始消息与 roster 中呈现）（子计划 2 后 roster 改为进度视图）
 ```
 
 ### 模块协作论证
@@ -982,7 +982,7 @@ running 时现有 loop 在下一个 provider turn 边界重读历史读到它，
 **强度限定**：G3 成立到"投递已被接受并调度"这一强度，**不到"必被处理"**——
 受 issue #32 的 lost-wake 窗口影响（§10 缺口 5），且 `Accepted` 本身不保证已持久化。
 这是既有渠道的既有强度，本 feature 不加强也不削弱。roster（§4.5）把"通知丢了"的后果
-从无声挂起降级为一轮延迟，但那是缓解不是保证。
+从无声挂起降级为一轮延迟，但那是缓解不是保证。（子计划 2 后该缓解由末尾段进度视图承担，每步刷新。）
 
 **G4**：M4 的后置条件给出"终止执行、不删除任何 Session 与历史、可恢复、幂等"。
 "等待方不被静默挂起"这一半由两件事共同给出：
@@ -1179,8 +1179,8 @@ Rely-Guarantee 条件：
     再派生子 Agent 的情形。
 11. **重名不可恢复**。两个并发创建产生同名后，二者从此只能用 `session_id` 寻址；
     本 feature 不提供改名。
-12. **run 记录只保留最近一次**（子计划 2）。历史 run 的起止时间不保留；记账失败的 run 在记录里缺号，
-    `agent_status` 如实显示缺失。记录存于会话元数据，没有索引，不供查询。
+12. **run 记录只保留当前 run 与上一个 run 的结束**（子计划 2）。再往前的起止时间不保留；记账失败的 run 在下一次
+    新 run 开始时关为 `lost`，`agent_status` 如实显示。记录存于会话元数据，没有索引，不供查询。
 13. **停止钩子不触发于结构化输出的 run**，也不提供 `additionalContext` 非阻止反馈（子计划 2 §1）。
 14. **`Session.patch` 曾无锁、整行后写者胜**（子计划 2 H6）。运行中并发 patch 同一会话的写入方有 `touch`、
     `setAgentModel`、`setTitle` 与 HTTP `session.update`；子计划 2 在 `Session.patch` 内按会话串行化（I11）。
