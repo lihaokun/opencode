@@ -393,6 +393,8 @@ Hook surface (mutate `output` in place; return `void`):
 - `permission.ask`
 - `experimental.chat.messages.transform`, `experimental.chat.system.transform`,
   `experimental.session.compacting`, `experimental.compaction.autocontinue`,
+  `experimental.session.stop` (block a run from ending; the reason becomes
+  the next user message, capped by `stop_hook_block_cap`),
   `experimental.text.complete`
 
 Special object-shaped (not callbacks): `tool: { my_tool: { ... } }`,

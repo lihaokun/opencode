@@ -6,6 +6,7 @@ import type {
   Provider,
   Permission,
   UserMessage,
+  AssistantMessage,
   Message,
   Part,
   Config as SDKConfig,
@@ -323,6 +324,33 @@ export interface Hooks {
       overflow: boolean
     },
     output: { enabled: boolean },
+  ) => Promise<void>
+  /**
+   * Called when a session's run is about to end because the model gave a final
+   * answer with no tool calls, before anything reports the run as over.
+   * `decision: "block"` with a `reason` keeps the run going: the reason is
+   * written as the next user message and the model continues in the same run.
+   *
+   * - Not called for runs that end on an error, a denied permission or question,
+   *   a truncated output, an interruption, agent_stop, structured output, or the
+   *   configured step limit.
+   * - `continuations` is how many times in a row the run has been kept going
+   *   since the model's last tool call or the last user message the hook did
+   *   not write; once it reaches `stop_hook_block_cap` (default 8) the run ends
+   *   without asking. `0` disables the hook.
+   * - Several plugins share `output`: the last one to write wins. There is no
+   *   timeout; how long the hook takes is the plugin's responsibility.
+   * - A block without a reason counts as allow.
+   */
+  "experimental.session.stop"?: (
+    input: {
+      sessionID: string
+      parentID?: string
+      agent: string
+      message: { info: AssistantMessage; parts: Part[] }
+      continuations: number
+    },
+    output: { decision: "allow" | "block"; reason?: string },
   ) => Promise<void>
   "experimental.text.complete"?: (
     input: { sessionID: string; messageID: string; partID: string },

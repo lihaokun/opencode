@@ -1209,6 +1209,91 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
+    // The stop hook (issue #81; subplan agentmgmt-2-run-state §5.1.2): asked when
+    // the model gave a final answer, before the run settles. "continue" means
+    // a plugin blocked the stop and its reason is now the next user message;
+    // "exit" means the run may end. Runs that end on an error, a refusal, a
+    // truncation, an interruption or the step limit never get here.
+    type StopDecision = { decision: "allow" | "block"; reason?: string }
+    // A fresh object per call: plugins mutate it in place.
+    const allow = (): StopDecision => ({ decision: "allow" })
+    const stopGate = Effect.fn("SessionPrompt.stopGate")(function* (input: {
+      sessionID: SessionID
+      parentID: SessionID | undefined
+      user: SessionV1.User
+      message: SessionV1.WithParts
+      continuations: number
+      cap: number
+      lastStepReached: boolean
+    }) {
+      // Step S1: the configured step limit is a hard edge; a block would need
+      // one more step past it.
+      if (input.lastStepReached) {
+        yield* Effect.logInfo("stop hook skipped at step limit", { "session.id": input.sessionID })
+        return "exit" as const
+      }
+      // Step S2: the cap on consecutive continuations; a cap of 0 never asks.
+      if (input.continuations >= input.cap) {
+        yield* Effect.logInfo("stop hook cap reached", {
+          "session.id": input.sessionID,
+          continuations: input.continuations,
+        })
+        return "exit" as const
+      }
+      // Step S3: a plugin that throws cannot be repaired from here, so its
+      // failure allows the stop. Plugins share the output; the last write wins.
+      const output = yield* plugin
+        .trigger(
+          "experimental.session.stop",
+          {
+            sessionID: input.sessionID,
+            parentID: input.parentID,
+            agent: input.user.agent,
+            message: input.message,
+            continuations: input.continuations,
+          },
+          allow(),
+        )
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("stop hook failed", { "session.id": input.sessionID, cause }).pipe(Effect.as(allow())),
+          ),
+        )
+      // Step S4: allow, or a block with nothing to say, ends the run.
+      if (output.decision !== "block") return "exit" as const
+      const reason = output.reason?.trim() ?? ""
+      if (reason.length === 0) {
+        yield* Effect.logWarning("stop hook blocked without a reason", { "session.id": input.sessionID })
+        return "exit" as const
+      }
+      // Step S5: the reason becomes the next user message, synthetic like the
+      // compaction continue message, and the same run goes on.
+      const now = Date.now()
+      const message = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: input.sessionID,
+        time: { created: now },
+        agent: input.user.agent,
+        model: input.user.model,
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: message.id,
+        sessionID: input.sessionID,
+        type: "text",
+        text: reason,
+        synthetic: true,
+        metadata: { kind: AgentManagement.STOP_HOOK_METADATA_KIND, reason },
+        time: { start: now, end: now },
+      })
+      yield* Effect.logInfo("stop hook blocked", {
+        "session.id": input.sessionID,
+        continuations: input.continuations + 1,
+      })
+      return "continue" as const
+    })
+
     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
@@ -1221,6 +1306,11 @@ const layer = Layer.effect(
         // purpose: a repeat across runs may be the agent's own choice.
         let previousStep: StepTail.StepSignature | undefined
         let repeat = StepTail.NO_REPEAT
+        // Stop hook state. The count is cleared at the top of the loop by any
+        // user message the hook did not write, and below by a tool call.
+        let continuations = 0
+        let lastStepReached = false
+        const stopHookCap = (yield* config.get()).stop_hook_block_cap ?? 8
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1233,6 +1323,16 @@ const layer = Layer.effect(
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+          // Step S6: a user message the hook did not write is a new stop
+          // attempt, whether a re-arm consumed it or it landed mid-run and is
+          // read here; only the hook's own continuation carries the count.
+          const continuation = msgs
+            .findLast((msg) => msg.info.id === lastUser.id)
+            ?.parts.some(
+              (part) => part.type === "text" && part.metadata?.kind === AgentManagement.STOP_HOOK_METADATA_KIND,
+            )
+          if (!continuation) continuations = 0
 
           const lastAssistantBelongsToLatestTurn =
             lastAssistant !== undefined &&
@@ -1257,6 +1357,8 @@ const layer = Layer.effect(
             lastAssistantMsg?.parts.some(
               (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
             ) ?? false
+          // Step S6: a tool call resets the stop hook's continuation count.
+          if (hasToolCalls) continuations = 0
 
           if (
             lastAssistant?.finish &&
@@ -1274,6 +1376,21 @@ const layer = Layer.effect(
                 tool: orphan.tool,
                 callID: orphan.callID,
               })
+            }
+            if (lastAssistantMsg) {
+              const gate = yield* stopGate({
+                sessionID,
+                parentID: session.parentID,
+                user: lastUser,
+                message: lastAssistantMsg,
+                continuations,
+                cap: stopHookCap,
+                lastStepReached,
+              })
+              if (gate === "continue") {
+                continuations += 1
+                continue
+              }
             }
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
             break
@@ -1327,6 +1444,9 @@ const layer = Layer.effect(
           }
           const maxSteps = agent.steps ?? Infinity
           const isLastStep = step >= maxSteps
+          // Step S6: remembered for the exit branch, which runs at the top of
+          // the next iteration where this step's locals are gone.
+          if (isLastStep) lastStepReached = true
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(FSUtil.Service, fsys),

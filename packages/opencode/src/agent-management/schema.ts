@@ -109,6 +109,14 @@ export const METADATA_AGENT_NOTIFY = "agentNotify"
 export const NOTIFICATION_METADATA_KIND = "agent_notification"
 
 /**
+ * TextPart.metadata.kind of the user message the run loop writes when the
+ * experimental.session.stop hook blocks a stop: the plugin's reason, which the
+ * model reads as its next instruction. Synthetic, so the TUI hides it today
+ * (issue #90 renders it from this kind).
+ */
+export const STOP_HOOK_METADATA_KIND = "stop_hook"
+
+/**
  * Instance names must not be mistakable for a SessionID, because target
  * resolution short-circuits on this prefix before doing any name lookup.
  */

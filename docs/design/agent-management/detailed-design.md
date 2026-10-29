@@ -1051,7 +1051,8 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
 - 见子计划 2 §5.1：`runLoop` 的正常退出分支在 `break` 前触发 `experimental.session.stop`；阻止时落库一条
   合成用户消息（text = reason，metadata `stop_hook`）并继续同一次 run；连续阻止达 `stop_hook_block_cap`
-  （默认 8，0 即不调用钩子）强制放行，任一步调用工具即清零，计数随 re-arm 保留；钩子抛错（defect，
+  （默认 8，0 即不调用钩子）不再询问、直接结束，任一步调用工具或出现钩子之外的新用户消息（run 中途插入的
+  steer、re-arm 消费的输入）即清零（子计划 2 §6 第 17 点）；钩子抛错（defect，
   `catchAllCause`）或无理由按放行；无超时；多插件后写者胜。出错退出、权限或提问被拒、输出截断、人中断、
   agent_stop、结构化输出结束、到达步数上限均不触发。主会话与子 agent 同一分支，宿主不区分。
 

@@ -18,6 +18,7 @@ import { LSP } from "@/lsp/lsp"
 import { MCP } from "../../src/mcp"
 import { Permission } from "../../src/permission"
 import { Plugin } from "../../src/plugin"
+import type { Hooks } from "@opencode-ai/plugin"
 import { Provider as ProviderSvc } from "@/provider/provider"
 import { Env } from "../../src/env"
 import { Git } from "../../src/git"
@@ -195,6 +196,54 @@ const oversizedToolPlugin = Layer.succeed(
   }),
 )
 
+// Issue #81 (subplan agentmgmt-2-run-state §5.1): a plugin whose stop decisions
+// are scripted per test. Module-level on purpose: the layer is built once per
+// `it` instance, so each test resets the script before it runs.
+type StopHookInput = Parameters<NonNullable<Hooks["experimental.session.stop"]>>[0]
+type StopHookOutput = Parameters<NonNullable<Hooks["experimental.session.stop"]>>[1]
+type StopHookHandler = (input: StopHookInput, output: StopHookOutput) => void | Promise<void>
+const stopHook = {
+  handlers: [] as StopHookHandler[],
+  calls: [] as StopHookInput[],
+  // The LLM queue and this plugin are shared by every test in the group, and a
+  // parent's forked run on a notice outlives the test that started it. Scoping
+  // the script to one session keeps that run from reading the next test's
+  // decisions.
+  only: undefined as SessionID | undefined,
+  reset(handlers: StopHookHandler[], only?: SessionID) {
+    stopHook.handlers = handlers
+    stopHook.calls = []
+    stopHook.only = only
+  },
+}
+// Blocks with each reason in turn, then allows. An empty string is a block
+// with nothing to say, which the loop treats as allow.
+function blocks(reasons: string[]): StopHookHandler {
+  let index = 0
+  return (_input, output) => {
+    const reason = reasons[index++]
+    if (reason === undefined) return
+    output.decision = "block"
+    output.reason = reason
+  }
+}
+const stopHookPlugin = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    init: () => Effect.void,
+    list: () => Effect.succeed([]),
+    trigger: ((name: string, input: unknown, output: unknown) =>
+      name === "experimental.session.stop" &&
+      (stopHook.only === undefined || (input as StopHookInput).sessionID === stopHook.only)
+        ? Effect.promise(async () => {
+            stopHook.calls.push(input as StopHookInput)
+            for (const handler of stopHook.handlers) await handler(input as StopHookInput, output as StopHookOutput)
+            return output
+          })
+        : Effect.succeed(output)) as Plugin.Interface["trigger"],
+  }),
+)
+
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
 
 const promptRoot = LayerNode.group([
@@ -253,7 +302,7 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
 function makeHttp(input?: {
   mcpInstructions?: MCP.ServerInstructions[]
   processor?: "blocking"
-  plugin?: "oversized-tool"
+  plugin?: "oversized-tool" | "stop-hook"
 }) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
@@ -268,6 +317,9 @@ function makeHttp(input?: {
   if (input?.plugin === "oversized-tool") {
     return LayerNode.compile(root, [...replacements, [Plugin.node, oversizedToolPlugin]])
   }
+  if (input?.plugin === "stop-hook") {
+    return LayerNode.compile(root, [...replacements, [Plugin.node, stopHookPlugin]])
+  }
   return LayerNode.compile(root, replacements)
 }
 
@@ -277,6 +329,7 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 
 const it = testEffect(makeHttp())
 const withOversizedTool = testEffect(makeHttp({ plugin: "oversized-tool" }))
+const withStopHook = testEffect(makeHttp({ plugin: "stop-hook" }))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -5082,3 +5135,401 @@ it.instance("waits for the child's own agents before reporting", () =>
     expect(seen).toEqual([{ sessionID: child.id, caller: parent.id, status: "settled" }])
   }),
 )
+
+// ---------------------------------------------------------------------------
+// Issue #81: the stop hook (subplan agentmgmt-2-run-state §5.1.4)
+// ---------------------------------------------------------------------------
+
+function stopHookCfg(cap?: number) {
+  return (url: string) => ({ ...providerCfg(url), ...(cap === undefined ? {} : { stop_hook_block_cap: cap }) })
+}
+
+function stepLimitCfg(url: string) {
+  return { ...providerCfg(url), agent: { build: { steps: 1 } } }
+}
+
+// The last user message of each request the scripted model received.
+const lastUserTexts = Effect.fn("test.lastUserTexts")(function* () {
+  const llm = yield* TestLLMServer
+  return (yield* llm.inputs).map((body) => {
+    const last = Array.isArray(body.messages) ? body.messages.at(-1) : undefined
+    return last?.role === "user" && typeof last.content === "string" ? last.content : undefined
+  })
+})
+
+const waitForIdle = (sessionID: SessionID) =>
+  pollWithTimeout(
+    Effect.gen(function* () {
+      const status = yield* SessionStatus.Service
+      return (yield* status.get(sessionID)).type === "idle" ? (true as const) : undefined
+    }),
+    `session ${sessionID} never went idle`,
+    "10 seconds",
+  )
+
+const stopHookParts = Effect.fn("test.stopHookParts")(function* (sessionID: SessionID) {
+  const sessions = yield* Session.Service
+  return (yield* sessions.messages({ sessionID }))
+    .flatMap((msg) => msg.parts)
+    .filter(
+      (part): part is SessionV1.TextPart =>
+        part.type === "text" && part.metadata?.kind === AgentManagement.STOP_HOOK_METADATA_KIND,
+    )
+})
+
+withStopHook.instance(
+  "the stop hook keeps a subagent's run going with its reasons, and the parent hears once after it allows",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(stopHookCfg())
+      const prompt = yield* SessionPrompt.Service
+      const parent = yield* (yield* Session.Service).create({ title: "root", permission: allowAll })
+      const child = yield* subagent(parent.id)
+      stopHook.reset([blocks(["check the tests first", "now update the docs"])], child.id)
+      yield* user(child.id, "go")
+      yield* llm.text("first answer")
+      yield* llm.text("second answer")
+      yield* llm.text("third answer")
+      yield* llm.text("the parent read the notice")
+
+      const result = yield* prompt.loop({ sessionID: child.id })
+
+      expect(result.info.role).toBe("assistant")
+      expect(stopHook.calls.map((call) => call.continuations)).toEqual([0, 1, 2])
+      // `agent` is the turn's agent: the user() helper writes a build turn into
+      // the explore child, and the hook reports what the model ran as.
+      expect(stopHook.calls[0]).toMatchObject({ sessionID: child.id, parentID: parent.id, agent: "build" })
+      expect(stopHook.calls[0]?.message.info.role).toBe("assistant")
+      expect((yield* lastUserTexts()).slice(0, 3)).toEqual(["go", "check the tests first", "now update the docs"])
+      expect(
+        (yield* stopHookParts(child.id)).map((part) => [part.text, part.synthetic, part.metadata?.reason]),
+      ).toEqual([
+        ["check the tests first", true, "check the tests first"],
+        ["now update the docs", true, "now update the docs"],
+      ])
+      // Exactly one report, and only after the hook allowed: the three child
+      // requests precede the parent's run on the notice.
+      yield* awaitNotices(parent.id, 1)
+      yield* awaitWithTimeout(llm.wait(4), "the parent never ran on the notice", "5 seconds")
+      expect(yield* notices(parent.id)).toHaveLength(1)
+      expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "third answer" }))
+      yield* waitForIdle(parent.id)
+    }),
+  15_000,
+)
+
+withStopHook.instance(
+  "the stop hook is asked at most the configured number of times in a row",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(stopHookCfg(2))
+      stopHook.reset([blocks(["one", "two", "three", "four"])])
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* (yield* Session.Service).create({ title: "capped", permission: allowAll })
+      yield* user(chat.id, "go")
+      yield* llm.text("a")
+      yield* llm.text("b")
+      yield* llm.text("c")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(stopHook.calls.map((call) => call.continuations)).toEqual([0, 1])
+      expect(yield* llm.calls).toBe(3)
+      expect(result.info.role === "assistant" && result.info.finish).toBe("stop")
+
+      // The next message starts a new run and with it a fresh attempt: the hook
+      // is asked again, up to the cap again.
+      yield* user(chat.id, "more")
+      yield* llm.text("d")
+      yield* llm.text("e")
+      yield* llm.text("f")
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(stopHook.calls.map((call) => call.continuations)).toEqual([0, 1, 0, 1])
+      expect(yield* llm.calls).toBe(6)
+    }),
+  15_000,
+)
+
+withStopHook.instance("a cap of zero never asks the stop hook", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(stopHookCfg(0))
+    stopHook.reset([blocks(["never read"])])
+    const prompt = yield* SessionPrompt.Service
+    const chat = yield* (yield* Session.Service).create({ title: "off", permission: allowAll })
+    yield* user(chat.id, "go")
+    yield* llm.text("a")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    expect(stopHook.calls).toHaveLength(0)
+    expect(yield* llm.calls).toBe(1)
+  }),
+)
+
+withStopHook.instance(
+  "a tool call resets the stop hook's continuation count",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(stopHookCfg())
+      stopHook.reset([blocks(["go on", "again"])])
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* (yield* Session.Service).create({ title: "reset", permission: allowAll })
+      yield* user(chat.id, "go")
+      yield* llm.text("a")
+      yield* llm.tool("glob", { pattern: "*.nothing-here" })
+      yield* llm.text("b")
+      yield* llm.text("c")
+
+      yield* prompt.loop({ sessionID: chat.id })
+
+      // The second stop comes right after a tool step, so it is asked as a fresh
+      // attempt; the third is one continuation into that attempt.
+      expect(stopHook.calls.map((call) => call.continuations)).toEqual([0, 0, 1])
+      expect(yield* llm.calls).toBe(4)
+    }),
+  15_000,
+)
+
+// A message that lands mid-run is read by this same run, not by a re-arm, so
+// the count has to clear here too: a new message is a new attempt.
+withStopHook.instance(
+  "a message that lands mid-run makes the next stop a fresh attempt",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(stopHookCfg())
+      stopHook.reset([blocks(["go on", "again"])])
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* (yield* Session.Service).create({ title: "landed", permission: allowAll })
+      yield* user(chat.id, "go")
+      yield* llm.text("a")
+      // The answer to the first reason is held open while the message lands.
+      const release = defer<void>()
+      yield* llm.hold("b", release.promise)
+      yield* llm.text("c")
+      yield* llm.text("d")
+
+      const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(2), "the second request never arrived", "5 seconds")
+      yield* user(chat.id, "while you were answering")
+      release.resolve()
+      yield* awaitWithTimeout(Fiber.join(run), "the run never finished", "10 seconds")
+
+      // The stops after "a" and after "c" are both fresh; the one after "d" is
+      // the first continuation of the second attempt.
+      expect(stopHook.calls.map((call) => call.continuations)).toEqual([0, 0, 1])
+      expect(yield* lastUserTexts()).toEqual(["go", "go on", "while you were answering", "again"])
+      expect(yield* llm.calls).toBe(4)
+    }),
+  15_000,
+)
+
+withStopHook.instance("a hook that throws, or blocks without a reason, lets the run end", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(stopHookCfg())
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+
+    stopHook.reset([
+      () => {
+        throw new Error("plugin broke")
+      },
+    ])
+    const broken = yield* sessions.create({ title: "throws", permission: allowAll })
+    yield* user(broken.id, "go")
+    yield* llm.text("a")
+    const first = yield* prompt.loop({ sessionID: broken.id })
+    expect(stopHook.calls).toHaveLength(1)
+    expect(first.info.role === "assistant" && first.info.finish).toBe("stop")
+
+    stopHook.reset([blocks([""])])
+    const silent = yield* sessions.create({ title: "no reason", permission: allowAll })
+    yield* user(silent.id, "go")
+    yield* llm.text("b")
+    const second = yield* prompt.loop({ sessionID: silent.id })
+    expect(stopHook.calls).toHaveLength(1)
+    expect(second.info.role === "assistant" && second.info.finish).toBe("stop")
+    expect(yield* llm.calls).toBe(2)
+  }),
+)
+
+withStopHook.instance("runs that end on an error, a truncation or the step limit are not gated", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(stopHookCfg())
+    stopHook.reset([blocks(["never read"])])
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+
+    // A content filter is a terminal assistant error: the loop leaves through
+    // the error branch, before the exit branch that asks the hook.
+    const failed = yield* sessions.create({ title: "error", permission: allowAll })
+    yield* user(failed.id, "go")
+    yield* llm.push(reply().contentFilter())
+    const errored = yield* prompt.loop({ sessionID: failed.id })
+    expect(errored.info.role === "assistant" && errored.info.error?.name).toBe("ContentFilterError")
+    expect(stopHook.calls).toHaveLength(0)
+
+    const truncated = yield* sessions.create({ title: "length", permission: allowAll })
+    yield* user(truncated.id, "go")
+    yield* llm.push(reply().text("cut").length())
+    const result = yield* prompt.loop({ sessionID: truncated.id })
+    expect(result.info.role === "assistant" && result.info.finish).toBe("length")
+    expect(stopHook.calls).toHaveLength(0)
+  }),
+)
+
+withStopHook.instance("the step limit ends the run without asking the stop hook", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(stepLimitCfg)
+    stopHook.reset([blocks(["never read"])])
+    const prompt = yield* SessionPrompt.Service
+    const chat = yield* (yield* Session.Service).create({ title: "limited", permission: allowAll })
+    yield* user(chat.id, "go")
+    yield* llm.text("a")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    expect(stopHook.calls).toHaveLength(0)
+    expect(yield* llm.calls).toBe(1)
+  }),
+)
+
+withStopHook.instance("with several plugins the last one to write the decision wins", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(stopHookCfg())
+    stopHook.reset([
+      blocks(["keep going"]),
+      (_input, output) => {
+        output.decision = "allow"
+      },
+    ])
+    const prompt = yield* SessionPrompt.Service
+    const chat = yield* (yield* Session.Service).create({ title: "plugins", permission: allowAll })
+    yield* user(chat.id, "go")
+    yield* llm.text("a")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    expect(stopHook.calls).toHaveLength(1)
+    expect(yield* llm.calls).toBe(1)
+  }),
+)
+
+// T8: random runs under a random cap, one instance per seed so each gets its
+// own cap. A step is a tool call, a final answer (the hook is asked), or a
+// final answer with a message landing while it streams, which the loop reads
+// in the same run instead of stopping. The scripted hook blocks until its
+// reasons run out; streaks may pass the cap. The oracle is the definition: the
+// count clears on a tool step and on a landed message, grows by one per block,
+// and at the cap the run ends unasked. The child never goes idle before an
+// ask, and the parent hears once, after the last one.
+for (let n = 0; n < 12; n++) {
+  const next = rng(7100 + n)
+  const cap = 1 + Math.floor(next() * 8)
+  const steps: Array<"tool" | "text" | "steer"> = []
+  const reasons: string[] = []
+  const expected: number[] = []
+  let count = 0
+  while (true) {
+    const roll = next()
+    const kind = steps.length >= 14 ? "text" : roll < 0.25 ? "tool" : roll < 0.4 ? "steer" : "text"
+    steps.push(kind)
+    if (kind !== "text") {
+      count = 0
+      continue
+    }
+    if (count >= cap) break
+    expected.push(count)
+    if (steps.length >= 14 || next() >= 0.7) break
+    reasons.push(`reason ${n}-${reasons.length}`)
+    count += 1
+  }
+
+  withStopHook.instance(
+    `stop hook continuations over a random run match the definition and the parent hears once (seed ${7100 + n})`,
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(stopHookCfg(cap))
+        const prompt = yield* SessionPrompt.Service
+        const events = yield* EventV2Bridge.Service
+        const parent = yield* (yield* Session.Service).create({ title: `root ${n}`, permission: allowAll })
+        const child = yield* subagent(parent.id)
+        let idle = 0
+        const off = yield* events.listen((event) => {
+          if (
+            event.type === SessionStatus.Event.Idle.type &&
+            (event.data as { sessionID: string }).sessionID === child.id
+          )
+            idle += 1
+          return Effect.void
+        })
+        // What each ask saw: idle events on the child so far, and when it was.
+        const asks: { idle: number; at: number }[] = []
+        stopHook.reset(
+          [
+            () => {
+              asks.push({ idle, at: Date.now() })
+            },
+            blocks(reasons),
+          ],
+          child.id,
+        )
+        yield* user(child.id, `go ${n}`)
+        const gates = steps.map(() => defer<void>())
+        for (const [index, step] of steps.entries()) {
+          // Distinct patterns: repeated tool steps would put a step tail where
+          // the request's last user message is read below.
+          if (step === "tool") yield* llm.tool("glob", { pattern: `*.nothing-${n}-${index}` })
+          else if (step === "steer") yield* llm.hold(`text ${n}`, gates[index]!.promise)
+          else yield* llm.text(`text ${n}`)
+        }
+        yield* llm.text(`parent ${n}`)
+
+        const run = yield* prompt.loop({ sessionID: child.id }).pipe(Effect.forkChild)
+        for (const [index, step] of steps.entries()) {
+          if (step !== "steer") continue
+          yield* awaitWithTimeout(llm.wait(index + 1), `request ${index + 1} never arrived`, "10 seconds")
+          yield* user(child.id, `landed ${n}-${index}`)
+          gates[index]!.resolve()
+        }
+        yield* awaitWithTimeout(Fiber.join(run), "the run never finished", "30 seconds")
+
+        const plan = `cap ${cap} steps ${steps.join(",")}`
+        expect(
+          stopHook.calls.map((call) => call.continuations),
+          plan,
+        ).toEqual(expected)
+        expect(
+          (yield* stopHookParts(child.id)).map((part) => part.text),
+          plan,
+        ).toEqual(reasons)
+        // Each request's last user message: the prompt, then whichever came
+        // last of the hook's reason and a landed message; after a tool step
+        // the request ends with the tool result instead. Every final answer
+        // but the last was blocked, so reasons line up with the text steps.
+        const lastTexts: (string | undefined)[] = []
+        let lastText = `go ${n}`
+        let blocked = 0
+        for (const [index, step] of steps.entries()) {
+          lastTexts.push(steps[index - 1] === "tool" ? undefined : lastText)
+          if (step === "steer") lastText = `landed ${n}-${index}`
+          if (step === "text" && blocked < reasons.length) lastText = reasons[blocked++]!
+        }
+        expect((yield* lastUserTexts()).slice(0, steps.length), plan).toEqual(lastTexts)
+        expect(
+          asks.map((ask) => ask.idle),
+          plan,
+        ).toEqual(asks.map(() => 0))
+
+        const [notice] = yield* awaitNotices(parent.id, 1)
+        expect(notice.info.time.created, plan).toBeGreaterThanOrEqual(asks.at(-1)!.at)
+        yield* awaitWithTimeout(llm.wait(steps.length + 1), "the parent never ran on the notice", "5 seconds")
+        expect(yield* notices(parent.id), plan).toHaveLength(1)
+        yield* waitForIdle(child.id)
+        yield* waitForIdle(parent.id)
+        expect(idle, plan).toBeGreaterThanOrEqual(1)
+        yield* off
+      }),
+    60_000,
+  )
+}

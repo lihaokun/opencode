@@ -219,8 +219,10 @@ input：
   - agent: string — 本会话当前绑定的 agent 定义名
   - message: { info: AssistantMessage, parts: Part[] } — 模型的最终回答（SDK v2 已导出 AssistantMessage，
     `sdk/js/src/v2/gen/types.gen.ts:336`）；对应 Claude Code 的 last_assistant_message
-  - continuations: NonNegativeInt — 本次 runLoop 调用内连续被阻止的次数；> 0 即 Claude Code 的 stop_hook_active。
-    re-arm 是新一次 runLoop 调用（消费了新输入），计数从 0 起；模型调用工具也清零
+  - continuations: NonNegativeInt — 连续被阻止的次数；> 0 即 Claude Code 的 stop_hook_active。
+    清零规则（§6 第 17 点）：循环顶部最新的用户消息不是钩子写的继续消息（parts 里没有
+    metadata.kind = "stop_hook" 的 text part）即清零——覆盖 re-arm 消费的新输入，也覆盖 run 中途插入、
+    在同一次 runLoop 内被读到的消息（steer）；模型调用工具也清零
 
 output（默认 { decision: "allow" }）：
   - decision: "allow" | "block"
@@ -243,7 +245,7 @@ output（默认 { decision: "allow" }）：
   理由（#90 跟进）。
 
 上限：连续阻止达到 cfg.stop_hook_block_cap（默认 8）后本次不再询问钩子，直接退出并记日志；
-  任一步包含工具调用即清零。0 表示钩子根本不被调用。
+  任一步包含工具调用、或出现钩子之外的新用户消息即清零。0 表示钩子根本不被调用。
   两条规则的出处：Claude Code hooks 文档（https://code.claude.com/docs/en/hooks，2026-10-23 读取）：
   "Claude Code applies an 8-consecutive-continuation cap … The count of consecutive continuations resets
   each time Claude calls a tool."
@@ -396,7 +398,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 #### 5.1.2 `runLoop` 正常退出分支的把关（`prompt.ts:1259-1279`）
 
-- runLoop 级状态：`continuations = 0`、`lastStepReached = false`。在循环顶部、`hasToolCalls` 求得为真时 `continuations = 0`；每步在 `isLastStep` 为真时置 `lastStepReached = true`。
+- runLoop 级状态：`continuations = 0`、`lastStepReached = false`。循环顶部两处清零：`MessageV2.latest(msgs).user` 的 parts 里没有 `metadata.kind = "stop_hook"` 的 text part 时 `continuations = 0`（钩子之外的新输入：steer 与 re-arm 消费的输入）；`hasToolCalls` 求得为真时 `continuations = 0`。每步在 `isLastStep` 为真时置 `lastStepReached = true`。
 - 把关插在 `yield* Effect.logInfo("exiting loop", …)`（1278）之前：
   1. `lastStepReached` → 记日志 `stop hook skipped at step limit` → 退出。
   2. `cap = cfg.stop_hook_block_cap ?? 8`；`continuations >= cap` → 记日志 `stop hook cap reached` → 退出。`cap = 0` 时钩子因此根本不被调用。
@@ -407,24 +409,24 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 - **正确性论证**：
   - 前置：进入该分支即模型给出了最终回答且没有待执行的工具调用；出错退出分支（1241-1248）与步内 `break` 的各路径（1478-1511）都不经此处（4.4 的"不触发"清单）。
   - 论证：阻止时落库的用户消息使下一轮顶部 `lastAssistantBelongsToLatestTurn` 为假（H8），退出条件不成立，循环继续；这一切都在同一次 `runLoop` 调用内，故 `loop()` 的 `onExit`（run 记录关闭与 `reportRunEnd`）与 runner 的 `onIdle` 都尚未发生——这就是 I7。
-  - **终止性（如实陈述）**：钩子只限制"连续"阻止：每一段不含工具调用、不含新输入的退出尝试至多询问钩子 `cap` 次、阻止 `cap` 次；模型一调用工具计数清零，re-arm（新输入）是新一次 runLoop 调用也从 0 起，所以"阻止、调工具、再阻止"或"到顶、新消息、再阻止"的往复不受上限约束，与 Claude Code 相同（它的 stop_hook_active 以一次停止尝试为单位）。默认没有步数上限（`agent.steps ?? Infinity`），`MAX_STEPS_PROMPT` 只是在最后一步追加提示文本、不撤工具。整体终止性不劣于现状：现状就是模型自己决定何时停。
+  - **终止性（如实陈述）**：钩子只限制"连续"阻止：每一段不含工具调用、不含新输入的退出尝试至多询问钩子 `cap` 次、阻止 `cap` 次；模型一调用工具计数清零，钩子之外的新用户消息（steer，或 re-arm 消费的输入）也清零，所以"阻止、调工具、再阻止"或"到顶、新消息、再阻止"的往复不受上限约束，与 Claude Code 相同（它的 stop_hook_active 以一次停止尝试为单位）。steer 必须清零的原因：它在同一次 runLoop 内被读到——下一轮顶部 `lastAssistantBelongsToLatestTurn` 为假，直接进入下一步——不是新一次调用；若只按调用计，模型回答完 steer 再停时会沿用上一段的计数。默认没有步数上限（`agent.steps ?? Infinity`），`MAX_STEPS_PROMPT` 只是在最后一步追加提示文本、不撤工具。整体终止性不劣于现状：现状就是模型自己决定何时停。
   - 与末尾段的关系：继续消息不是工具调用，重复计数的"上一步"签名不变；它作为新的 `lastUser` 不影响任何已发送前缀。
   - 后置：放行 ⇒ 既有退出路径逐字不变；阻止 ⇒ 历史多一条合成用户消息、run 号不变、父未收到报告。
   - 副作用论证：至多写入一条用户消息与一个 part。
 
 #### 5.1.3 配置键 `stop_hook_block_cap`（`core/src/v1/config/config.ts:84` 旁）
 
-- `Schema.optional(NonNegativeInt)`，描述写明默认 8、0 表示不调用钩子、调用工具即清零。
+- `Schema.optional(NonNegativeInt)`，描述写明默认 8、0 表示不调用钩子、调用工具或新用户消息即清零。
 - **正确性论证**：trivial。
 
 #### 5.1.4 测试
 
 - 脚本化 LLM：最终回答 → 假插件阻止两次再放行 → 请求数为 3，中间两次请求的最后一条用户消息文本等于理由，父（若为子 agent）只收到一份报告，报告在放行之后。
-- 上限：`stop_hook_block_cap: 2` 时第三次不再询问钩子；一步含工具调用后计数清零（再阻止两次仍生效）；`0` 时钩子调用次数为 0；到顶后新消息 re-arm 再次询问钩子。
+- 上限：`stop_hook_block_cap: 2` 时第三次不再询问钩子，到顶后新消息开始的下一次 run 再次询问、再次到顶；一步含工具调用后计数清零（再阻止两次仍生效）；run 中途插入的消息被同一次 runLoop 读到后，下一次停止从 0 起；`0` 时钩子调用次数为 0。
 - 钩子抛错、阻止无理由 → 放行且 run 正常结束。
 - 出错退出、权限被拒退出、`length` 退出、步数上限均不触发钩子（钩子被调用次数为 0），且父仍收到报告。
 - 多插件：后一个把 block 改回 allow 时放行（文档化行为的回归）。
-- T8（随机）：随机阻止序列（每段连续阻止长度 < cap，穿插工具调用步与 re-arm），断言父恰收到一份报告且在最后一次放行之后；每次阻止请求的最后一条用户消息等于当次 reason；每段连续阻止次数永不超过 cap；阻止期间 `SessionStatus` 事件序列无 idle。
+- T8（随机，每个种子一个实例以取随机 cap）：随机 cap（1–8）与随机步序列——工具步、最终回答（询问钩子）、带中途插入新消息的最终回答（steer，不询问，同一 run 内继续）——钩子按脚本连续阻止，阻止长度可超过 cap；参照实现按定义推进：工具步与 steer 清零，阻止加一，达到 cap 时不询问即退出。断言：每次询问的 `continuations` 等于参照值；每个请求的最后一条用户消息等于当时最新的 reason 或插入消息；落库的 stop_hook part 序列等于 reason 序列；每次询问之前子会话没有 idle 事件；父恰收到一份报告，报告的创建时间不早于最后一次询问；run 结束后子会话有 idle 事件。re-arm 由上面的定值用例覆盖（新一次 run 从 0 起）。
 
 ### 5.2 commit 2：patch 加锁、run 记录与消息标记
 
@@ -628,6 +630,10 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 2026-10-29（第二轮审查后，按常规判断处置，未再逐点征求确认）：
 
 16. **续跑遇已关闭记录即新 run**（N1）：`onExit` 的读与 runner 的读不一致时，续跑开 run N+1 并以 N+1 报告，不出现同号两份报告，也不静默。**锁获取 30 秒超时即 die**（N2），作为重入与卡死的守卫；H6c 改为已核对的五个监听者清单。**"最后活动"改为"最后一步"**（N3），来自状态投影的置位时间，不落盘。**`cancel` 返回取消前状态**（N4），第一分支要求结局为 stopped。**work 先置 busy 再开记录**（N5）。**崩溃遗留以 cut off 行出现在已结束列表且不受窗口限制**（N6）。**直接用 `Session.children`**（N7）。**`agent_status` run 行五种**（N8）。**`lastStepReached` 用 runLoop 级标志**（N9）。**视图上界 30 行**（N10）。**`continuations` 按 runLoop 调用计、re-arm 从 0 起**（D-e，与 Claude Code 的 stop_hook_active 以一次停止尝试为单位一致）。**窗口首步用 run 开始时间**（D-a）。**stopped / lost 的第二句不假定停止者是调用者**（D-b）。**在跑列表排序键 `started_at ?? time_created`**（D-c）。
+
+2026-10-30（commit 1 实施中发现，按常规判断处置）：
+
+17. **清零规则改为"钩子之外的新用户消息"**，取代第 16 点 D-e 的"按 runLoop 调用计、re-arm 从 0 起"。原因：run 中途插入的消息（steer）在同一次 runLoop 内被读到——下一轮顶部 `lastAssistantBelongsToLatestTurn` 为假，直接进入下一步——不是新一次调用；按调用计时，模型回答完 steer 再停，计数沿用上一段，违背"新输入就是新的停止尝试"。新规则：循环顶部最新用户消息的 parts 没有 `stop_hook` 标记即清零；re-arm 消费的输入没有标记，自然落入其中。与 Claude Code 的 stop_hook_active 仍一致。T8 随之扩成随机 cap、可超上限的阻止、中途插入消息、询问前无 idle 与报告时序的断言。
 
 与 #75 原文的差异：末尾段内容记 INFO 日志而不是写进助手消息的元数据（修正方案文档 §4.1）；`agent_send` 的措辞按第 4 点改；"最近 5 步的变化"按第 8 点改为快照。
 
