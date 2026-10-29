@@ -195,8 +195,24 @@ export function args(file: string, command: string, cwd: string) {
     ]
   }
   if (n === "cmd") return ["/c", command]
-  if (ps(file)) return ["-NoProfile", "-Command", command]
+  if (ps(file)) return ["-NoProfile", "-Command", psExitWrapped(command)]
   return ["-c", command]
+}
+
+/**
+ * PowerShell folds a native command's non-zero exit into its own exit code:
+ * `pwsh -Command "app"` exits 1 when `app` exits 7 (or 0 after a later
+ * successful statement), so callers cannot distinguish failure from success.
+ * Appending `exit $LASTEXITCODE` propagates the last native exit code
+ * verbatim; with no native command having run, `$LASTEXITCODE` is null and
+ * `exit` yields 0 — matching POSIX shells, where a pure builtin success also
+ * exits 0. A statement separator (`;`) would parse differently when the user
+ * command ends in a block or trailing pipe, so the wrapper goes on its own
+ * line. A terminating PowerShell exception (which exits 1 regardless) never
+ * reaches the wrapper — that stays pwsh's own behavior.
+ */
+export function psExitWrapped(command: string) {
+  return `${command}\nexit $LASTEXITCODE`
 }
 
 let defaultPreferred: string | undefined
