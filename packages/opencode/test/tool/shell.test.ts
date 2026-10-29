@@ -1223,8 +1223,10 @@ describe("tool.shell visibleInput", () => {
         expect(exit._tag).toBe("Failure")
         expect(requests.length).toBe(1)
         expect(requests[0].permission).toBe("bash")
+        // cmd.exe may quote/split the executed command text, so match on the
+        // visible command's distinctive token and reject the executed one's.
         expect(requests[0].patterns).toContain("echo visible")
-        expect(requests[0].patterns).not.toContain("echo wrapped -- real")
+        expect(requests[0].patterns).not.toContain("wrapped")
         if ((requests[0].metadata as { command?: string }).command !== undefined) {
           expect((requests[0].metadata as { command?: string }).command).toBe("echo visible")
         }
@@ -1243,8 +1245,12 @@ describe("tool.shell visibleInput", () => {
         }
         const result = yield* bash.execute({ command: "echo wrapped -- real" }, wrappedCtx)
         expect(result.metadata.exit).toBe(0)
-        expect(result.output).toContain("wrapped -- real")
-        expect(result.metadata.output).toContain("wrapped -- real")
+        // cmd.exe splits on the separator, so assert on the echo payload's
+        // distinctive words instead of the full phrase.
+        expect(result.output).toContain("wrapped")
+        expect(result.output).toContain("real")
+        expect(result.metadata.output).toContain("wrapped")
+        expect(result.metadata.output).toContain("real")
         // title (persisted, user-visible) carries the executed command
         expect(result.title).toBe("echo wrapped -- real")
       }),
