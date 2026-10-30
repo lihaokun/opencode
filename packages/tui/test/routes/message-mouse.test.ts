@@ -28,6 +28,20 @@ describe("messageMouseAction", () => {
     expect(messageMouseAction({ button: MIDDLE })).toBe<MessageMouseAction>("none")
   })
 
+  test("a press already consumed by copy-on-select does not open the menu", () => {
+    // Copy-on-select copies and clears the selection on the right-button
+    // down; the later up must not also open the menu (review of PR #88).
+    expect(
+      messageMouseAction({ button: RIGHT, consumedByCopy: true }),
+    ).toBe<MessageMouseAction>("none")
+    expect(
+      messageMouseAction({ button: RIGHT, selectionText: "selected", consumedByCopy: true }),
+    ).toBe<MessageMouseAction>("none")
+    expect(
+      messageMouseAction({ button: RIGHT, consumedByCopy: false }),
+    ).toBe<MessageMouseAction>("menu")
+  })
+
   test("wheel buttons do nothing", () => {
     expect(messageMouseAction({ button: 4 })).toBe<MessageMouseAction>("none")
     expect(messageMouseAction({ button: 5 })).toBe<MessageMouseAction>("none")
@@ -35,17 +49,17 @@ describe("messageMouseAction", () => {
 })
 
 describe("revertConfirmMessage", () => {
-  test("singular wording for one message", () => {
+  test("singular wording for one message names it as included", () => {
     const text = revertConfirmMessage({ reverted: 1, stale: false })
-    expect(text).toContain("the 1 message after this one")
+    expect(text).toContain("1 message (starting with this one)")
     expect(text).toContain("<leader>r")
     expect(text).toContain("/redo")
     expect(text).not.toContain("7 days")
   })
 
-  test("plural wording for several messages", () => {
+  test("plural wording for several messages names them as included", () => {
     const text = revertConfirmMessage({ reverted: 3, stale: false })
-    expect(text).toContain("the 3 messages after this one")
+    expect(text).toContain("3 messages (starting with this one)")
     expect(text).not.toContain("7 days")
   })
 

@@ -39,7 +39,7 @@ const userMessage = (overrides: Partial<Message> = {}): Message =>
     ...overrides,
   }) as Message
 
-async function mountDialogMessage(input: { messages: Message[] }) {
+async function mountDialogMessage(input: { messages: Message[]; openMessageID?: string }) {
   const revertCalls: string[] = []
   const tmp = await tmpdir()
   const state = path.join(tmp.path, "state")
@@ -93,7 +93,7 @@ async function mountDialogMessage(input: { messages: Message[] }) {
                     <SdkModule.SDKProvider url="http://test" fetch={stubFetch}>
                       <SyncModule.SyncContext.Provider value={syncStub}>
                         <DialogModule.DialogProvider>
-                          <Opener messageID={input.messages[0]!.id} />
+                          <Opener messageID={input.openMessageID ?? input.messages[0]!.id} />
                           <box width={80} height={20} />
                         </DialogModule.DialogProvider>
                       </SyncModule.SyncContext.Provider>
@@ -158,16 +158,9 @@ test("choosing Revert opens a confirm dialog and only reverts after confirm", as
 
   try {
     await chooseRevert(app)
-    // One Enter can light up both the menu submit and the fresh confirm
-    // dialog's return binding (the replace happens inside the same event), so
-    // poll: if the revert already landed the requirement is met vacuously;
-    // otherwise the confirm dialog must be on screen first.
-    await Bun.sleep(100)
-    if (revertCalls.length === 0) {
-      await wait(app, () => app.captureCharFrame().includes("Confirm Revert"))
-      expect(revertCalls).toEqual([])
-      app.mockInput.pressEnter()
-    }
+    await wait(app, () => app.captureCharFrame().includes("Confirm Revert"))
+    expect(revertCalls).toEqual([])
+    app.mockInput.pressEnter()
     await wait(app, () => revertCalls.length === 1)
     expect(revertCalls[0]).toContain("/session/ses_1/revert")
   } finally {
@@ -183,14 +176,11 @@ test("canceling the confirm dialog leaves the session untouched", async () => {
 
   try {
     await chooseRevert(app)
-    await Bun.sleep(100)
-    if (revertCalls.length === 0) {
-      await wait(app, () => app.captureCharFrame().includes("Confirm Revert"))
-      // Move to Cancel, then press return: nothing is reverted.
-      app.mockInput.pressKey("ARROW_LEFT")
-      await Bun.sleep(30)
-      app.mockInput.pressEnter()
-    }
+    await wait(app, () => app.captureCharFrame().includes("Confirm Revert"))
+    // Move to Cancel, then press return: nothing is reverted.
+    app.mockInput.pressKey("ARROW_LEFT")
+    await Bun.sleep(30)
+    app.mockInput.pressEnter()
     await Bun.sleep(100)
     expect(revertCalls).toEqual([])
   } finally {
@@ -208,8 +198,51 @@ test("confirm copy names the count and the undo key", async () => {
     await chooseRevert(app)
     await wait(app, () => app.captureCharFrame().includes("Confirm Revert"))
     const frame = app.captureCharFrame()
-    expect(frame).toContain("2 messages after this one")
+    expect(frame).toContain("3 messages (starting with this one)")
     expect(frame).toContain("<leader>r")
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("single-message session counts the message itself, not zero", async () => {
+  // Review of PR #88: the server deletes the selected message too (the
+  // revert boundary lands on it), so a one-message session must say
+  // "1 message (starting with this one)" — not "0 messages after this one".
+  const mounted = await mountDialogMessage({ messages: [userMessage()] })
+  const { app } = mounted
+
+  try {
+    await chooseRevert(app)
+    await wait(app, () => app.captureCharFrame().includes("Confirm Revert"))
+    const frame = app.captureCharFrame()
+    expect(frame).toContain("1 message (starting with this one)")
+    expect(frame).not.toContain("0 messages")
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("interleaved turns count assistants from the selected message on", async () => {
+  // Review of PR #88: the deletion set includes assistants after the
+  // boundary, so user/assistant/user/assistant from the selection = 4.
+  const mounted = await mountDialogMessage({
+    messages: [
+      userMessage(),
+      userMessage({ id: "msg_2" }),
+      userMessage({ id: "msg_3" }),
+      userMessage({ id: "msg_4" }),
+    ],
+    openMessageID: "msg_2",
+  })
+  const { app } = mounted
+
+  try {
+    await chooseRevert(app)
+    await wait(app, () => app.captureCharFrame().includes("Confirm Revert"))
+    // Selected msg_2 (index 1 of 4): msgs 2..4 are removed.
+    const frame = app.captureCharFrame()
+    expect(frame).toContain("3 messages (starting with this one)")
   } finally {
     app.renderer.destroy()
   }

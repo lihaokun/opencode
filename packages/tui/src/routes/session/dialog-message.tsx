@@ -17,8 +17,8 @@ const SNAPSHOT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 export function revertConfirmMessage(input: { reverted: number; stale: boolean }) {
   const base =
     input.reverted === 1
-      ? "This will remove the 1 message after this one and restore the file changes made in it."
-      : `This will remove the ${input.reverted} messages after this one and restore the file changes made in them.`
+      ? "This will remove 1 message (starting with this one) and restore the file changes made in it."
+      : `This will remove ${input.reverted} messages (starting with this one) and restore the file changes made in them.`
   const recover = "You can restore with <leader>r (or /redo) before sending a new message."
   const staleLine = input.stale
     ? " This message is older than 7 days: its snapshot may have been pruned, and file changes may not be restorable."
@@ -37,13 +37,15 @@ export function DialogMessage(props: {
   const route = useRoute()
   const clipboard = useClipboard()
 
-  // Messages after this one, excluding itself — the count the revert will
-  // remove, matching what the revert banner reports.
+  // Server-side deletion set: the revert boundary lands on this message (it
+  // is a user message — the timeline and the message row only offer user
+  // messages), and cleanup removes it and everything after it, assistants
+  // included. The count must match what actually gets deleted.
   const revertedCount = createMemo(() => {
     const all = sync.data.message[props.sessionID] ?? []
     const index = all.findIndex((x) => x.id === props.messageID)
     if (index === -1) return 0
-    return all.length - index - 1
+    return all.length - index
   })
 
   const revert = async (dialog: DialogContext) => {

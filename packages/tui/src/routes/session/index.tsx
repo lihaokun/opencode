@@ -24,7 +24,7 @@ import { SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner } from "../../component/spinner"
 import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
-import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
+import { BoxRenderable, MouseButton, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
 import type { MouseEvent } from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
 import type {
@@ -203,6 +203,9 @@ export function Session() {
     setEpilogue(sessionEpilogue({ title, sessionID: session()?.id }))
   })
   onCleanup(() => setEpilogue())
+  // Set on a right-button down whose copy-on-select already consumed the
+  // press; the matching up clears it instead of opening the message menu.
+  let rightPressCopied = false
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const descendants = createMemo(() => {
     const rootID = session()?.parentID ?? session()?.id
@@ -1218,6 +1221,17 @@ export function Session() {
                       <Match when={message.role === "user"}>
                         <UserMessage
                           index={index()}
+                          onMouseDown={(event) => {
+                            // With copy-on-select enabled (Windows default),
+                            // the global right-button down copies and clears
+                            // the selection. If it did, this press is spent:
+                            // remember it so the matching up does not also
+                            // open the menu (review of PR #88).
+                            rightPressCopied =
+                              event.button === MouseButton.RIGHT &&
+                              Boolean(renderer.getSelection()?.getSelectedText()) &&
+                              Selection.copy(renderer, toast, clipboard)
+                          }}
                           onMouseUp={(event) => {
                             // Issue #69: left click is for focus and selection
                             // only; right click copies a selection or opens the
@@ -1225,7 +1239,9 @@ export function Session() {
                             const action = messageMouseAction({
                               button: event.button,
                               selectionText: renderer.getSelection()?.getSelectedText(),
+                              consumedByCopy: rightPressCopied,
                             })
+                            rightPressCopied = false
                             if (action === "none") return
                             if (action === "copy") {
                               Selection.copy(renderer, toast, clipboard)
@@ -1332,6 +1348,7 @@ export function Session() {
 function UserMessage(props: {
   message: UserMessage
   parts: Part[]
+  onMouseDown: (event: MouseEvent) => void
   onMouseUp: (event: MouseEvent) => void
   index: number
   pending?: number
@@ -1398,6 +1415,7 @@ function UserMessage(props: {
             onMouseOut={() => {
               setHover(false)
             }}
+            onMouseDown={props.onMouseDown}
             onMouseUp={props.onMouseUp}
             paddingTop={1}
             paddingBottom={1}
