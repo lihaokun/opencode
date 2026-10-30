@@ -33,6 +33,8 @@
 
 ### 出错代码路径
 
+> 以下行号为**出错时（基座 `d9d7de31fb`）**的行号，描述的是修复前状态，随本 PR 修复已改变；保留作为根因分析的历史坐标。
+
 - `packages/opencode/src/effect/runner.ts:98-104` — `finishRun` Idle 分支：新状态 `{_tag:"Idle"}` 在临界区内生效，`yield* idle`（发 idle 状态）作为 action **锁外**执行
 - `packages/opencode/src/session/run-state.ts:63-66` — `onIdle`：`data.runners.delete(sessionID)` + `status.set(idle)`，在 Runner 锁外跑
 - `packages/opencode/src/session/run-state.ts:59-61` / `98` — 写入方先从 map 取 runner 引用、再在 runner 信号量上排队；取引用与排队之间无原子性
@@ -83,8 +85,8 @@
 
 1. **`packages/opencode/src/session/run-state.ts` — 不再删除 runner。** `onIdle` 去掉 `data.runners.delete(sessionID)`，只保留 `status.set(idle)`。不选"删表 + 等待者锁后重取"方案：那需要把 map 查找塞进 Runner 的信号量临界区（依赖倒置，Runner 不该知道 map 的存在），而"不删"的代价只是每个跑过的会话保留一个小对象（按本进程跑过的会话数线性增长，无 per-run 增长；instance 关闭时的 finalizer 本就遍历 `runner.cancel`，语义不变）。
 2. **`packages/opencode/src/effect/runner.ts` — `idle` 移入临界区。** `finishRun` 的 Idle 分支改为在 `modifyEffect` 体内先 `yield* idle` 再返回 Idle 状态，保证"转 Idle + 发 idle 状态"原子地先于任何排队者起跑，消除"运行中闪 idle"的状态竞态。`SessionStatus.set` 内部只读 `InstanceState` map + 发事件，不回调 runner 锁，无死锁风险。重整分支不调 `idle`，不变。
-3. **`packages/opencode/src/session/message-v2.ts` + `prompt.ts` — 谓词降为单行查询。** 关键观察：`compareChronology` 即 `(time_created, id)` 全序，与 `MessageV2.page` 的 SQL 排序（`desc(time_created), desc(id)`）完全一致，且 `info()` 用 `row.time_created` 覆盖 JSON 内嵌的 `time.created`。因此「最新 user 晚于最新 assistant」**等价于「按持久化序的最新一条消息 role 为 user」**（max(user, assistant) 中较大者即全序意义下的最新消息）。新增 `MessageV2.latestRoleEffect`（或等价导出）：单行索引查询（`limit 1`，命中 `message_session_time_created_id_idx`），毫秒级。`prompt.ts` 的 `hasUnconsumedTurn` 换用它，fail-closed 语义与 `reportRunEnd` 的复用自动受益。边界：空会话（无消息）→ `false`（现谓词 `user` 为 undefined 时同样为假）；只有 user 无 assistant → 最新消息 role 为 user → `true`（现谓词 `!assistant` 分支同样为真）——语义逐点等价。
-4. **`packages/opencode/src/session/prompt.ts` — runLoop 顶部第二道防线。** runLoop 闭包内维护 `Set<MessageID>` 记录本循环创建的 assistant（每次 `sessions.updateMessage(msg)` 落库前记入，`prompt.ts:1351` 处）。顶部退出检查处新增：`lastAssistant` 无 `finish` ∧ 属于最新 turn ∧ **不在本循环集合内** → 记 warning 日志 + break（不发起 provider 请求）。必须带 `lastAssistantBelongsToLatestTurn` 收窄：否则 processor stop / compaction stop 留下无 finish 的旧 assistant 后，用户新消息触发的合法新循环会在第一轮被误杀。这道防线把"若再出现并行"的后果从"刷屏"降为"一轮重叠"，不替代修 1-3。
+3. **`packages/opencode/src/session/message-v2.ts` + `prompt.ts` — 谓词降为单行查询。** 关键观察：`compareChronology` 即 `(time_created, id)` 全序，与 `MessageV2.page` 的 SQL 排序（`desc(time_created), desc(id)`）完全一致，且 `info()` 用 `row.time_created` 覆盖 JSON 内嵌的 `time.created`。因此「最新 user 晚于最新 assistant」**等价于「按持久化序的最新一条消息 role 为 user」**（max(user, assistant) 中较大者即全序意义下的最新消息）。新增 `MessageV2.latestRole`：单行索引查询（`limit 1`，命中 `message_session_time_created_id_idx`），毫秒级。`prompt.ts` 的 `hasUnconsumedTurn` 换用它，fail-closed 语义与 `reportRunEnd` 的复用自动受益。边界：空会话（无消息）→ `false`（现谓词 `user` 为 undefined 时同样为假）；只有 user 无 assistant → 最新消息 role 为 user → `true`（现谓词 `!assistant` 分支同样为真）——语义逐点等价。
+4. **`packages/opencode/src/session/prompt.ts` — runLoop 顶部第二道防线。** runLoop 闭包内维护 `Set<MessageID>` 记录本循环创建的 assistant（每次 `sessions.updateMessage(msg)` 落库前记入，`ownAssistants.add(msg.id)` 紧邻 `updateMessage` 之前）。顶部退出检查处新增：`lastAssistant` 无 `finish` ∧ 属于最新 turn ∧ **不在本循环集合内** → 记 warning 日志 + break（不发起 provider 请求）。必须带 `lastAssistantBelongsToLatestTurn` 收窄：否则 processor stop / compaction stop 留下无 finish 的旧 assistant 后，用户新消息触发的合法新循环会在第一轮被误杀。这道防线把"若再出现并行"的后果从"刷屏"降为"一轮重叠"，不替代修 1-3。
 5. **`packages/opencode/src/effect/runner.ts` — 临界区内的通知失败隔离 + 全部 idle 转换点入锁（review 轮追加）。** 修 2 把 `yield* idle` 放进 pf 体内后引入了新失败面：pf 内未隔离的 defect 会让 `modifyEffect` 整体不提交——ref 停留 Running、返回的 `complete(done)` 不执行，joiner 与后续所有 caller 永久挂死（review #1，基座下同场景仅首个 caller 挂、状态已提交可恢复；本 PR head 下全挂，是比基座更差的失败放大）。因此 (a) idle 通知经 `safeIdle`（`catchCause → logError`）隔离，保证状态转换与 waiter 结算无条件落地；(b) `shouldReArm` 同样隔离并 fail-closed（defect 视为不 re-arm，与生产谓词自身的 fail-closed 语义一致）；(c) `finishShell` 与 `idleIfCurrent`（cancel）两处遗留的锁外 idle 同型修复——"idle 发布全部在临界区内"才成为完整不变量，否则 review 补充项里 `shell idle-start → 新 work busy → 旧 shell idle` 的乱序仍在；(d) `idleIfCurrent` 改为仅当状态已是 Idle 才发（cancel 提交 Idle 后被中断 run 的 finishRun 对非 Running 早退，此处补发；若新 run 已先入则不发，避免迟到 idle 覆盖新 run 的 busy）。
 
 ### 为什么这样修（根因如何被消除）
@@ -155,19 +157,19 @@
 | `packages/opencode/src/session/prompt.ts` | `hasUnconsumedTurn` | 谓词从 `filterCompactedEffect`（整表加载）换为 `MessageV2.latestRole(sessionID) === "user"`，fail-closed 语义不变 | 已改: `ad1e1bb052`（safeIdle/finishShell/idleIfCurrent 部分：`ae462ca435`） |
 | `packages/opencode/src/session/prompt.ts` | `runLoop` | 新增 `ownAssistants: Set<MessageID>`（本循环创建的 assistant，落库前记入）；顶部守卫：`step > 0 ∧ lastAssistant 无 finish ∧ 属最新 turn ∧ 非本循环所创` → log warning + break。`step > 0` 豁免首迭代——shell 命令留下的无 finish assistant 由后续 loop 合法接管（"shell completion resumes queued loop callers" 用例抓住过首版误杀） | 已改: `ad1e1bb052`（safeIdle/finishShell/idleIfCurrent 部分：`ae462ca435`） |
 | `packages/opencode/test/effect/runner.test.ts` | 新增 5 用例 | 原有 idle 转换先于排队者 work 启动 1 例；review 轮追加 defecting idle hook / defecting re-arm predicate / finishShell 顺序 / cancel 顺序 4 例 | 已加: `ad1e1bb052`（review 轮追加部分：`ae462ca435`） |
-| `packages/opencode/test/session/run-state.test.ts` | 新增文件，3 用例 | 会话级 runner 串行契约 + 收尾窗口 idle 顺序（review 后重写）+ re-arm 双轮执行无中间 idle（复审轮 #1 再重写） | 已加: `ad1e1bb052`（review 轮 `ae462ca435`，复审轮重写随下一提交） |
-| `packages/opencode/test/effect/runner.pbt.test.ts` | 新增文件，1 PBT 用例（复审轮 #3） | 种子化有限随机调度下的 join/结算/不卡死性质 | 已加: 随复审轮提交 |
-| `packages/opencode/test/session/messages-pagination.test.ts` | 新增 6 用例 | latestRole 正确性 4 例 + 成本上界 1 例 + 随机历史等价 PBT 1 例（复审轮 #3） | 已加: `ad1e1bb052`（PBT 随复审轮提交） |
-| `packages/opencode/script/validate-rearm-large-session.ts` | header 说明更正（复审轮 #2） | "runs the REAL prompt.loop"改为查询基准说明——脚本实际只做 fill + 两个谓词查询计时，full-loop 端到端由回归套件承担 | 已改: 随复审轮提交 |
+| `packages/opencode/test/session/run-state.test.ts` | 新增文件，3 用例 | 会话级 runner 串行契约 + 收尾窗口 idle 顺序（review 后重写）+ re-arm 双轮执行无中间 idle（复审轮 #1 再重写） | 已加: `ad1e1bb052`（review 轮 `ae462ca435`，复审轮重写 `3de4e775fd`） |
+| `packages/opencode/test/effect/runner.pbt.test.ts` | 新增文件，1 PBT 用例（复审轮 #3） | 种子化有限随机调度下的 join/结算/不卡死性质 | 已加: `3de4e775fd` |
+| `packages/opencode/test/session/messages-pagination.test.ts` | 新增 6 用例 | latestRole 正确性 4 例 + 成本上界 1 例 + 随机历史等价 PBT 1 例（复审轮 #3） | 已加: `ad1e1bb052`（PBT `3de4e775fd`） |
+| `packages/opencode/script/validate-rearm-large-session.ts` | header 说明更正（复审轮 #2） | "runs the REAL prompt.loop"改为查询基准说明——脚本实际只做 fill + 两个谓词查询计时，full-loop 端到端由回归套件承担 | 已改: `3de4e775fd` |
 
 ## 第八部分：文档更新清单
 
 | 文档路径 | 要改什么 | 状态（修复后回填） |
 |---------|---------|------------------|
 | `docs/fixes/session-runner-fix-idle-race.md`（#32 文档） | 追加"后记"节：指出其论证未覆盖 map 删除时机与锁持有时间，指向本文档 | 已改: `ad1e1bb052` |
-| `docs/fixes/`（本文档） | 第六/七部分回填实际状态 | 已改（随本提交） |
+| `docs/fixes/`（本文档） | 第六/七部分回填实际状态；第六部分 PBT/取舍行与复审轮验证节（复审轮） | 已改（`ad1e1bb052` 初版 + `ae462ca435`/`3de4e775fd` 逐轮回填） |
 | `CLAUDE.md` 已知限制与注意事项 | 回写教训：跨层资源生命周期（表删除）必须与状态转换同临界区，或干脆不删；临界区内谓词的长度是锁持有时间上界，随数据规模增长会把窄窗口放大成事故；泛型 Runner 钩子必须"执行时现读持久化状态"才可复用；`SynchronizedRef.modifyEffect` 返回的 action 在锁外执行 | 已改: `ae462ca435`（CLAUDE.md 在本仓库 gitignore 内，仅本地生效，教训已入行） |
-| `docs/devlog/2026-10-28-session-run-idle-race-two-loops.md` | 新增开发日志（含度量段） | 已改: `ad1e1bb052` + review 轮 append `2b8850b9c3` |
+| `docs/devlog/2026-10-28-session-run-idle-race-two-loops.md` | 新增开发日志（含度量段） | 已改: `ad1e1bb052` 初版 + `2b8850b9c3` review 轮 append + `3de4e775fd` 脚本措辞更正 + 复审轮 append 随对齐提交 |
 
 > 本仓库尚无 Runner / SessionRunState 的契约文档（`docs/design/`、`docs/research/` 不存在）；本修复不改变 schema/枚举/对外 API。行为契约变更（会话级串行不变量显式化、runner 生命周期改为 process-lifetime、循环顶部守卫语义）以本文档第四部分为首次记载，issue #85 为分析底稿。
 

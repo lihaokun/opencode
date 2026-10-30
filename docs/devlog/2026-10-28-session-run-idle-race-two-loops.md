@@ -57,3 +57,17 @@ reviewer 提出三项 + 我们自查补两项，全部确认属实并修复（co
 - **会话级 status 断言对"post-lock onIdle vs 排队者续跑"的交错不敏感**：pre-fix 下 post-lock onIdle 的续跑先于排队者 acquire 完成（探针实测 `work2-start, busy-set, read=busy`——busy 后到覆盖 stale idle），所以重写后的 run-state 顺序用例在 pre-fix 也绿。确定性 RED 只能锚在 runner 层（顺序断言）。cancel 用例还有一个时序前提：cancel 与下次调用**顺序**执行不 RED（post-lock action 天然先完成），必须 cancel 临界区在途时并发排队。
 - **`it.instance` 的裸 `bun test` 5s 默认超时**：`bunfig.toml` 注释明确说 timeout 不从 bunfig 解析，必须靠 package script 的 `--timeout 30000`。2000 行 fill + 查询的用例在裸 `bun test` 下必超时（共享机负载 >5s），CI 路径（`bun run test`）稳定绿——排查时先看调用方式再怀疑代码。
 - **"失败隔离"是"入临界区"的伴随义务**：把副作用搬进临界区必须同时回答"副作用 defect 怎么办"——不提交状态比迟到副作用更糟。`EventV2.notify` 对非 durable 事件不隔离 listener，插件 hook 同步 throw 可达，防御纵深必要。
+
+## 复审轮（2026-10-30，PR #89 复审后）
+
+reviewer 复审三项，全部确认属实并修复（commit `3de4e775fd`）：
+
+1. **re-arm 测试从未 re-arm**（复审 #1，P2）：首版把标志在 work 体内先翻转，谓词读到的是翻转后的 false——全程只执行一次，断言在零 re-arm 下恒真（reviewer 隔离副本加 `executions===2` 实测 1）。重写：谓词从谓词侧翻转、第二次 execution 挂 Deferred、窗口断言 busy + executions===2 + caller 拿首轮结果。判别力：谓词恒 false 时 executions===2 失败（sed 副本验证）。
+2. **验收记录与产物对齐**（复审 #2，P3）：脚本 header 初版按设想写"runs the REAL prompt.loop"、落地砍成查询基准后忘改——改为查询基准说明；修复文档七/八部分回填实际 commit。
+3. **PBT 补齐**（复审 #3）：手写 mulberry32 LCG（不引 fast-check），Runner 种子化调度 8 seeds + latestRole 随机历史等价 15 组。
+
+### 复审轮踩过的坑
+
+- **测试断言恒真而不自知**：work 体内翻转标志 → 谓词读后值 → re-arm 分支从未执行。自查法：给关键路径测试加执行次数断言，并对每个"覆盖了 X"的测试做一次 falsification（强制 X 不发生，看断言是否失败）。reviewer 靠隔离副本加计数断言抓出，自审三轮未发现。
+- **falsify 必须精确 checkout 目标版本**：`git stash` 回退到的是 HEAD（已含修复）；楔死缺陷只存在于中间版本 `ad1e1bb052`（idle 进 pf 无隔离），基座 `d9d7de31fb`（idle 在返回 action）不会楔死——用 `git show <sha>:<path>` 取目标版本再跑。
+- **`bun test` 的 it.instance 默认 5s 超时**：bunfig 不解析 timeout，必须走 package script 的 `--timeout 30000`（CI 路径）。裸 `bun test <file>` 下 fill 类用例必超时，先查调用方式再怀疑代码。
