@@ -433,14 +433,14 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 #### 5.2.0 `Session.patch` 按会话串行化（`session.ts:826-839`）
 
 - 在 Session 层维护 `Map<SessionID, { gate: Semaphore(1), waiting }>`，`patch` 整体包在 `gate.withPermits(1)` 里：读行、合并、`publish(Updated)`。照 `summary.ts:185-205` 的写法；条目在无等待者时清理。
-- **守卫**：`withPermits` 的获取经 `Effect.timeoutOrElse({ duration: "30 seconds", orElse: die("Session.patch lock held too long or re-entered: <sessionID>") })`。正常锁持有毫秒级（一次行读 + 一次事务写 + 同步监听者，见 H6c），不会触发；未来的重入或卡死变成带会话 id 的 defect。
+- **守卫**：`gate.take(1)` 经 `Effect.timeoutOrElse({ duration, orElse: die("Session.patch lock held too long or re-entered: <sessionID>") })`，再以 `acquireUseRelease` 包住读、合并、发布与 `release(1)`；只对获取计时，持有不计时。时长默认 30 秒，环境变量 `OPENCODE_SESSION_PATCH_LOCK_MS` 可改（测试缩短用，运行时不需要设）。正常锁持有毫秒级（一次行读 + 一次事务写 + 同步监听者，见 H6c），不会触发；未来的重入或卡死变成带会话 id 的 defect。
 - **调用关系**：callers: `touch` / `setTitle` / `setMetadata` / `setAgentModel` / `setPermission` / `setRevert` 等既有方法（全部经 `patch`）；callees: `get`、`events.publish`。
 - **正确性论证**：
   - 前置：H6b——`publish` 返回时投影已写完；H6c——现状没有同步监听者回头 patch 同一会话。
   - 论证：同一会话的 patch 串行 ⇒ 每次 `get` 读到上一次 patch 的投影结果 ⇒ 合并基于最新行 ⇒ 没有旧快照覆盖（I11）。不同会话的 patch 互不阻塞。锁只覆盖 patch，正常执行路径不拿锁。
   - 后置：对任意并发 patch 序列，最终行等于某个串行执行的结果。
   - 副作用论证：无新副作用；超时守卫只在异常时 die。
-- 测试：T9（随机）——对同一会话并发执行随机的 `setTitle` / `setMetadata` / `touch` / `setAgentModel` 序列，断言最终行的每个字段等于最后一次写该字段的值；重入守卫——注册一个在 `Updated` 事件里 patch 同一会话的 `listen` 监听者，断言 patch 在超时（测试里缩短）后以带会话 id 的 defect 结束而不是永久挂起；锁时长——单次 patch 的锁持有 < 50 ms。
+- 测试：T9（随机）——对同一会话并发执行随机的 `setTitle` / `setMetadata` / `touch` / `setAgentModel` 序列；`session.updated` 在锁内按序发布，所以事件序列就是锁选定的串行顺序，断言相邻两行之间至多一个被写字段变化（丢失的更新表现为某字段回退到旧值）且最终行等于最后一个事件的行——这等价于"每个字段等于最后一次写它的值"；重入守卫——注册一个在 `Updated` 事件里 patch 同一会话的 `listen` 监听者，断言 patch 在超时（测试里缩短）后以带会话 id 的 defect 结束而不是永久挂起；锁时长——单次 patch 的锁持有 < 50 ms。
 
 #### 5.2.1 `agent-management/run.ts`（新，纯函数）
 
@@ -450,7 +450,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
   - `previous` 存在且无 `ended_at`（仅当 `fresh`：遗留打开）→ 先把它关为 `{ number, ended_at: now, outcome: "lost" }` 放入 `previous` 字段；否则 `previous` 字段 = 上一条的 `{ number, ended_at, outcome }`（若上一条存在）。
   - 返回 `{ number: (previous?.number ?? 0) + 1, started_at: now, woken_by, previous? }`。
 - `end(current: AgentRun | undefined, now, outcome) -> AgentRun | undefined`：`current` 缺失或已有 `ended_at` → `undefined`（调用方记警告）；否则返回补上 `ended_at` / `outcome` 的副本。
-- `outcomeOf(exit) -> RunOutcome`：`classifyExit` 三分类的映射表（completed→completed、failed→failed、cancelled→stopped）；`lost` 只由 `begin` 产生。
+- `outcomeOf(kind) -> RunOutcome`：`classifyExit` 三分类的映射表（completed→completed、failed→failed、cancelled→stopped），入参是分类结果的 `kind`，分类本身在 `onExit` 里只做一次；`lost` 只由 `begin` 产生。
 - `wakeSource(message: WithParts | undefined, number, parent) -> WakeSource`：按 4.2 规则 1–4。
 - `formatInstant(ms)`（带本地时区偏移的 ISO 8601）、`formatClock(ms)`（HH:MM:SS）、`describeSource(source, viewer)`（4.2 渲染规则）。
 - **正确性论证**：
@@ -476,8 +476,9 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
     Effect.onExit((exit) =>
       Effect.gen(function* () {
         const unconsumed = Exit.isSuccess(exit) && (yield* hasUnconsumedTurn(id)) // 只读一次（H10）
-        yield* recordRunEnd(session, exit, unconsumed)
-        if (notify) yield* reportRunEnd(session, parentID, exit, unconsumed)
+        const outcome = unconsumed ? undefined : classifyExit(id, exit, limits) // 分类也只做一次
+        if (outcome) yield* recordRunEnd(id, outcomeOf(outcome.kind))
+        if (notify) yield* reportRunEnd(session, parentID, outcome)
       }),
     ),
   )
@@ -485,9 +486,9 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
   **必须是一个 `onExit` 内顺序调用**，不能挂两个 `onExit`（后挂的先跑，报告会读到未关闭的记录）。
 
-- `recordRunStart(session, fresh)`：重读会话元数据；`wokenBy = wakeSource(latest user, (previous?.number ?? 0) + 1, parent)`；`next = begin(previous, now, wokenBy, fresh)`；`next` 存在才 `setMetadata({ ...metadata, agentRun: next })`。
-- `recordRunEnd(session, exit, unconsumed)`：`unconsumed` 为真 → 不关闭（runner 将 re-arm，同一 run 继续）；否则 `outcome = outcomeOf(exit)`；重读元数据；`next = end(current, now, outcome)`；存在才写回，缺失记警告。
-- `reportRunEnd` 改为接收 `unconsumed`，不再自己读 `hasUnconsumedTurn`。
+- `recordRunStart(id, parentID, fresh)`：重读会话元数据；唤醒消息经 `sessions.messages({ limit: 1 })` 取最新一行（不加载历史）；`wokenBy = wakeSource({ number: (previous?.number ?? 0) + 1, parent, message })`；`next = begin(previous, now, wokenBy, fresh)`；`next` 存在才 `setMetadata({ ...metadata, agentRun: next })`。任何失败记警告，run 照常。
+- `recordRunEnd(id, outcome)`：只在 `unconsumed` 为假时调用（为真则 runner 将 re-arm，同一 run 继续，不关闭）；重读元数据；`next = end(current, now, outcome)`；存在才写回，缺失记警告。
+- `reportRunEnd` 改为接收 `onExit` 已分类的 `outcome`（`undefined` 表示有未消费的消息、不是真的结束），不再自己读 `hasUnconsumedTurn`，也不再自己分类。
 - **正确性论证**：
   - 前置：runner 对一次 run 恰执行一次 work，re-arm 重跑同一 work（H9）；runner 自己在临界区内再读一次 `hasUnconsumedTurn` 决定是否 re-arm（H10）。
   - 论证：新 run 与 re-arm 由闭包标志区分，与记录状态无关，崩溃或写失败不能让新 run 被误判为 re-arm（I5）。`onExit` 内只读一次，记录关闭与报告看到同一个答案：要么都认为 run 继续（都不动），要么都认为 run 结束（先关闭，后报告读到已关闭的记录，I6）。
@@ -505,13 +506,13 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 #### 5.2.4 `SessionStatus` 带时间（`status.ts`）
 
-- `Info` 增 `at: number`（最近一次 `set` 的 epoch ms），内存投影，不落盘。`set` 时写 `Date.now()`。
+- 投影条目类型 `Projected = Info & { at?: number }`（最近一次 `set` 的 epoch ms），`get` / `list` 返回它；`set` 时存 `{ ...status, at: Date.now() }`，发布的事件仍只带 `status`。实施时的调整：`Info` 是 schema 包的线上契约（`session.status` 事件载荷），给它加字段会改公开事件与 SDK，而这个时间只在内存里有意义，所以不动 `Info`，只扩投影条目；空闲缺省没有 `at`。
 - **正确性论证**：trivial（内存字段）；每步顶部的 `set busy` 使在跑会话的 `at` 就是最后一步开始时间（H12）。
 
 #### 5.2.5 测试
 
 - run 记录：首次 run 为 1 且 `woken_by` 为父；agent_send 唤醒的 run 加一且来源为发送方，`previous` 为上一个 run 的结束；结束报告唤醒祖辈时来源为发报告的子；人经 agent-message 路由唤醒为 user，经普通 prompt 端点为 system；re-arm（记录打开）不加号；`agent_stop` 记 `stopped`；钩子阻止不加号、不写 `ended_at`；遗留打开记录在新 run 开始时关为 `lost` 且新 run 号加一；结束写失败后的下一次 run 仍加一；续跑窗口（消息落在 `onExit` 读与 runner 读之间，用 Deferred 控制）产生 run N 报告与 run N+1 报告各一份；新 run 启动的头几毫秒内状态已是 busy。
-- T3（随机，run 层）：随机事件序列（向空闲 / 在跑的子发送、完成 / 失败 / 被停、re-arm、续跑窗口、并发多子、随机注入一次"结束写失败"），经真实 `loop` 执行，断言：每个子的 run 号严格递增且每次只加一；每份报告的 run 号等于该时刻已关闭的 run，且同号报告至多一份；`ended_at ≥ started_at`；写失败的那次 run 在下一次开始时被记为 lost；agent_send 预告的 run 号与该子的下一份报告一致。
+- T3（随机，run 层）：两个子并发、各自顺序跑 2–4 次 run，8 个种子。每次 run 随机取唤醒来源（父 / agent 消息 / TUI 路由 / 普通 prompt）、结局（完成 / length 失败 / 挂住时被取消）与形态之一：普通；中途插入消息（同一 run 读到）；最后一轮结束时插入消息（content-filter 收尾，runner re-arm，同一 run 继续）；续跑窗口（在关闭记录的 `session.updated` 监听里插消息，恰落在 `onExit` 与 runner 两次读之间，run N 关闭、run N+1 开启）；结束写失败（测试用一层包装的 Session.Service 让关闭记录的 `setMetadata` 死一次，走真实的 catch 分支）；另随机在 run 前写入崩溃遗留的打开记录。经真实 `loop` 执行，断言：每个子的 run 号严格 +1，re-arm 不加号，续跑窗口加一号且两份报告；`woken_by` 符合四条规则；`ended_at ≥ started_at`；写失败与遗留的记录在下一次开始时被关为 lost；报告份数 = 完成与失败的 run 数（被取消的不报）；每条记录打开时会话已是 busy（INV-13）。报告对号（INV-6）与 agent_send 预告（INV-6b）要等 commit 4 给报告加 run 属性，届时扩 T3。
 
 ### 5.3 commit 3：末尾段进度视图
 

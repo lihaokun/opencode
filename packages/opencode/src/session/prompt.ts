@@ -49,6 +49,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { AGENT_TOOL_ID } from "@/tool/agent"
 import { AgentManagement } from "@/agent-management/schema"
 import { AgentDelegation } from "@/agent-management/delegation"
+import { AgentRun } from "@/agent-management/run"
 import { AgentEvent } from "@opencode-ai/schema/agent-event"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -1685,20 +1686,110 @@ const layer = Layer.effect(
         Effect.provideService(Database.Service, database),
       )
 
+    // Step S11: a run opens its record (subplan agentmgmt-2-run-state §5.2.2).
+    // Failures are logged and the run goes on: the record is bookkeeping, and
+    // a run that cannot write it is still a run. begin closes a leftover open
+    // record as lost and writes nothing for a re-arm over an open one.
+    const recordRunStart = Effect.fn("SessionPrompt.recordRunStart")(function* (
+      sessionID: SessionID,
+      parentID: SessionID,
+      fresh: boolean,
+    ) {
+      yield* Effect.gen(function* () {
+        const current = yield* sessions.get(sessionID)
+        const previous = AgentRun.read(current.metadata)
+        const parent = yield* sessions.get(parentID)
+        const name = parent.metadata?.[AgentManagement.METADATA_AGENT_NAME]
+        // The message that woke this run is the latest one, and only its first
+        // text part's metadata is read: one row and its parts.
+        const latest = (yield* sessions.messages({ sessionID, limit: 1 }))[0]
+        const next = AgentRun.begin(
+          previous,
+          Date.now(),
+          AgentRun.wakeSource({
+            number: (previous?.number ?? 0) + 1,
+            parent: {
+              id: parentID,
+              ...(typeof name === "string" ? { name } : {}),
+              ...(parent.agent === undefined ? {} : { agent: parent.agent }),
+            },
+            message: latest,
+          }),
+          fresh,
+        )
+        if (!next) return
+        yield* sessions.setMetadata({
+          sessionID,
+          metadata: { ...current.metadata, [AgentManagement.METADATA_AGENT_RUN]: next },
+        })
+      }).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("run record not opened", { "session.id": sessionID, cause })),
+      )
+    })
+
+    // Step S12: a run closes its record. Missing or already closed is logged:
+    // the open write failed, and begin accounts for it at the next start.
+    const recordRunEnd = Effect.fn("SessionPrompt.recordRunEnd")(function* (
+      sessionID: SessionID,
+      outcome: AgentManagement.RunOutcome,
+    ) {
+      yield* Effect.gen(function* () {
+        const current = yield* sessions.get(sessionID)
+        const next = AgentRun.end(AgentRun.read(current.metadata), Date.now(), outcome)
+        if (!next) {
+          return yield* Effect.logWarning("run record missing or already closed at run end", {
+            "session.id": sessionID,
+            outcome,
+          })
+        }
+        yield* sessions.setMetadata({
+          sessionID,
+          metadata: { ...current.metadata, [AgentManagement.METADATA_AGENT_RUN]: next },
+        })
+      }).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("run record not closed", { "session.id": sessionID, cause })),
+      )
+    })
+
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       const parentID = session.parentID
-      // A subagent reports to its parent at the end of every run. Hooked on the
-      // work itself rather than on the idle event: the runner executes the work
-      // exactly once per run (a re-arm is the next run, and joined callers only
-      // share the result), whereas idle can be published more than once for one
-      // run and also for a session that never ran.
-      const work =
-        parentID && session.metadata?.[AgentManagement.METADATA_AGENT_NOTIFY] === true
-          ? runLoop(input.sessionID).pipe(Effect.onExit((exit) => reportRunEnd(session, parentID, exit)))
-          : runLoop(input.sessionID)
+      const notify = session.metadata?.[AgentManagement.METADATA_AGENT_NOTIFY] === true
+      // A subagent's runs are recorded on its session, and reported to its
+      // parent when it was created to report. Hooked on the work itself rather
+      // than on the idle event: the runner executes the work once per run and
+      // re-executes the same work object on a re-arm (H9), whereas idle can be
+      // published more than once for one run and also for a session that
+      // never ran. `started` lives in this closure for the same reason: the
+      // first execution opens a run, every later one continues it (Step S10).
+      let started = false
+      const work = parentID
+        ? Effect.gen(function* () {
+            const fresh = !started
+            started = true
+            // Busy before the record opens, or a reader in between sees an
+            // open record on an idle session and calls the run cut off (H9b).
+            yield* status.set(input.sessionID, { type: "busy" })
+            yield* recordRunStart(input.sessionID, parentID, fresh)
+            return yield* runLoop(input.sessionID)
+          }).pipe(
+            Effect.onExit((exit) =>
+              Effect.gen(function* () {
+                // One read of the re-arm predicate for both the record and the
+                // report, so they agree on whether this run is over (H10). A
+                // message landing between this read and the runner's own is the
+                // continuation window: the record closes here, and the re-arm
+                // that follows opens the next number (§6, point 16).
+                const unconsumed = Exit.isSuccess(exit) && (yield* hasUnconsumedTurn(input.sessionID))
+                const outcome = unconsumed ? undefined : classifyExit(input.sessionID, exit, yield* truncate.limits())
+                if (outcome) yield* recordRunEnd(input.sessionID, AgentRun.outcomeOf(outcome.kind))
+                if (notify) yield* reportRunEnd(session, parentID, outcome)
+              }),
+            ),
+          )
+        : runLoop(input.sessionID)
       return yield* state.ensureRunning(
         input.sessionID,
         lastAssistant(input.sessionID),
@@ -1736,21 +1827,17 @@ const layer = Layer.effect(
     const reportRunEnd = Effect.fn("SessionPrompt.reportRunEnd")(function* (
       child: Session.Info,
       parentID: SessionID,
-      exit: Exit.Exit<SessionV1.WithParts>,
+      outcome: AgentDelegation.Outcome | undefined,
     ) {
+      // No outcome: a message landed inside the run's last iteration and the
+      // runner starts the next run straight away (#32). The child is not
+      // stopping, so there is nothing to report yet; that run reports.
+      if (!outcome) return
       const settled = events.publish(AgentEvent.Delegation, {
         sessionID: child.id,
         caller: parentID,
         status: "settled",
       })
-      // A message that landed inside the run's last iteration makes the runner
-      // start the next run straight away (#32): the child is not stopping, so
-      // there is nothing to report yet. Same predicate the runner uses, read
-      // just before it does; a message arriving in between only means the
-      // next run reports too, never that none does.
-      if (Exit.isSuccess(exit) && (yield* hasUnconsumedTurn(child.id))) return
-      const limits = yield* truncate.limits()
-      const outcome = classifyExit(child.id, exit, limits)
       if (outcome.kind === "cancelled") return yield* settled
       // A stop with one of its own agents still running is not the end of the
       // child's work either: that agent reports to it when it finishes, which
@@ -1761,6 +1848,7 @@ const layer = Layer.effect(
       // The summary's wording is owned here: the TUI displays it verbatim and
       // never re-derives it from state or description.
       const description = child.metadata?.[AgentManagement.METADATA_AGENT_DESCRIPTION] ?? child.title
+      const name = child.metadata?.[AgentManagement.METADATA_AGENT_NAME]
       const summary = outcome.kind === "completed" ? `Agent completed: ${description}` : `Agent failed: ${description}`
       // Forked: the parent's run is awaited so that `settled` means the result
       // has been read, and awaiting it here would keep the child busy for as
@@ -1793,8 +1881,15 @@ const layer = Layer.effect(
                 text: outcome.text,
               }),
               // The TUI renders one line from this metadata and never parses
-              // the model-facing text above.
-              metadata: { kind: AgentManagement.NOTIFICATION_METADATA_KIND, summary },
+              // the model-facing text above. The sender is for the record of
+              // the parent's next run, which this report wakes (Step S13).
+              metadata: {
+                kind: AgentManagement.NOTIFICATION_METADATA_KIND,
+                summary,
+                sender: child.id,
+                ...(typeof name === "string" ? { sender_name: name } : {}),
+                ...(child.agent === undefined ? {} : { sender_agent: child.agent }),
+              },
             },
           ],
         })

@@ -1,4 +1,5 @@
 import { Effect, Schema } from "effect"
+import { PositiveInt } from "@opencode-ai/core/schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { SessionPrompt } from "../session/prompt"
 import { SessionID } from "../session/schema"
@@ -115,6 +116,79 @@ export const NOTIFICATION_METADATA_KIND = "agent_notification"
  * (issue #90 renders it from this kind).
  */
 export const STOP_HOOK_METADATA_KIND = "stop_hook"
+
+/**
+ * TextPart.metadata.kind of a message from another agent — agent_send traffic
+ * and the cancellation notice — with the sender alongside it: `sender`
+ * (SessionID), `sender_name?`, `sender_agent?`. The model-facing text is
+ * unchanged; the TUI reads the kind (#73) and the run record reads the sender.
+ */
+export const AGENT_MESSAGE_METADATA_KIND = "agent_message"
+
+/**
+ * TextPart.metadata.kind of the header line a human's message gets when it
+ * arrives through the TUI's agent-message route. No fields: there is no sender
+ * session.
+ */
+export const USER_MESSAGE_METADATA_KIND = "user_message"
+
+/**
+ * Every part kind this feature writes. The TUI holds its own copy of these
+ * literals (it cannot import this file); the two are held together by fixture
+ * tests on both sides.
+ */
+export const PART_KINDS = {
+  agent_notification: NOTIFICATION_METADATA_KIND,
+  stop_hook: STOP_HOOK_METADATA_KIND,
+  agent_message: AGENT_MESSAGE_METADATA_KIND,
+  user_message: USER_MESSAGE_METADATA_KIND,
+} as const
+
+/**
+ * Session metadata key of the run record (subplan agentmgmt-2-run-state §4.1):
+ * a subagent's current run and the end of the one before it. Only
+ * SessionPrompt.loop writes it, at run start and run end; the agent tools, the
+ * step tail and the run-end report read it. Readers tolerate its absence —
+ * sessions from before it existed, and an HTTP session.update that replaced
+ * the metadata wholesale.
+ */
+export const METADATA_AGENT_RUN = "agentRun"
+
+export const RUN_OUTCOMES = ["completed", "failed", "stopped", "lost"] as const
+export type RunOutcome = (typeof RUN_OUTCOMES)[number]
+export const WAKE_KINDS = ["agent", "user", "system"] as const
+
+/** Who woke a run. `session` is present exactly when `kind` is "agent". */
+export const WakeSource = Schema.Struct({
+  kind: Schema.Literals(WAKE_KINDS),
+  session: Schema.optional(SessionID),
+  name: Schema.optional(Schema.String),
+  agent: Schema.optional(Schema.String),
+})
+export type WakeSource = typeof WakeSource.Type
+
+/** The end of a run: what the record keeps of the one before the current. */
+export const RunEnd = Schema.Struct({
+  number: PositiveInt,
+  ended_at: Schema.Finite,
+  outcome: Schema.Literals(RUN_OUTCOMES),
+})
+export type RunEnd = typeof RunEnd.Type
+
+/**
+ * `ended_at` and `outcome` are present together or not at all; `lost` is only
+ * ever written when a new run finds the record still open (the process died or
+ * the end write failed), and no report corresponds to it.
+ */
+export const AgentRun = Schema.Struct({
+  number: PositiveInt,
+  started_at: Schema.Finite,
+  woken_by: WakeSource,
+  ended_at: Schema.optional(Schema.Finite),
+  outcome: Schema.optional(Schema.Literals(RUN_OUTCOMES)),
+  previous: Schema.optional(RunEnd),
+})
+export type AgentRun = typeof AgentRun.Type
 
 /**
  * Instance names must not be mistakable for a SessionID, because target

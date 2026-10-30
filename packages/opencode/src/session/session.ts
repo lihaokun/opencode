@@ -40,7 +40,7 @@ import { SessionID, MessageID, PartID } from "./schema"
 
 import type { Provider } from "@/provider/provider"
 import { Global } from "@opencode-ai/core/global"
-import { Effect, Layer, Option, Context, Schema, Types } from "effect"
+import { Duration, Effect, Layer, Option, Context, Schema, Semaphore, Types } from "effect"
 import { NonNegativeInt, optional } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -823,7 +823,41 @@ const layer: Layer.Layer<
       return session
     })
 
+    // Patches of one session run one at a time. A patch is read, merge, publish
+    // over the whole row, so two in flight would each write the other's stale
+    // fields back (subplan agentmgmt-2-run-state §5.2.0, I11). Sessions do not
+    // wait on each other, and an entry goes once nobody is waiting on it.
+    const locks = new Map<SessionID, { gate: Semaphore.Semaphore; waiting: number }>()
     const patch = (sessionID: SessionID, info: Patch) =>
+      Effect.gen(function* () {
+        const entry = locks.get(sessionID) ?? { gate: Semaphore.makeUnsafe(1), waiting: 0 }
+        locks.set(sessionID, entry)
+        entry.waiting += 1
+        // Step S8: taking the permit is bounded. Holding it is milliseconds —
+        // one row read, one transaction, the synchronous listeners — so a wait
+        // this long is a listener patching the session it was just told about
+        // (publish awaits its listeners, so that never returns on its own) or
+        // a wedge, and either is a defect worth naming the session in.
+        yield* Effect.acquireUseRelease(
+          entry.gate.take(1).pipe(
+            Effect.timeoutOrElse({
+              duration: patchLockTimeout(),
+              orElse: () => Effect.die(new Error(`Session.patch lock held too long or re-entered: ${sessionID}`)),
+            }),
+          ),
+          () => applyPatch(sessionID, info),
+          () => entry.gate.release(1),
+        ).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              entry.waiting -= 1
+              if (entry.waiting === 0 && locks.get(sessionID) === entry) locks.delete(sessionID)
+            }),
+          ),
+        )
+      })
+
+    const applyPatch = (sessionID: SessionID, info: Patch) =>
       Effect.gen(function* () {
         const current = yield* get(sessionID)
         const next = {
@@ -1109,6 +1143,12 @@ function listByProject(
       Effect.orDie,
       Effect.map((rows) => rows.map(fromRow)),
     )
+}
+
+// Thirty seconds unless a test shortens it; see the comment at Session.patch.
+function patchLockTimeout() {
+  const ms = Number(process.env["OPENCODE_SESSION_PATCH_LOCK_MS"])
+  return Duration.millis(Number.isFinite(ms) && ms > 0 ? ms : 30_000)
 }
 
 export const node = LayerNode.make({

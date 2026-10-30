@@ -2,13 +2,15 @@ import { describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Deferred, Effect, Exit, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Layer } from "effect"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideInstance, tmpdirScoped } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { GlobalBus } from "@/bus/global"
@@ -280,6 +282,132 @@ describe("Session", () => {
 
       expect(created.metadata).toBeUndefined()
       expect(saved.metadata).toBeUndefined()
+    }),
+  )
+})
+
+// Subplan agentmgmt-2-run-state §5.2.0: a patch is read-merge-publish over the
+// whole row, so patches of one session have to run one at a time or each
+// writes the other's stale fields back (I11).
+describe("Session.patch serializes writes to one session", () => {
+  function rng(seed: number) {
+    let state = seed >>> 0
+    return () => {
+      state = (state + 0x6d2b79f5) >>> 0
+      let t = state
+      t = Math.imul(t ^ (t >>> 15), t | 1)
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+  }
+
+  // T9: random concurrent patches. Every `session.updated` is published inside
+  // the lock, in lock order, so the sequence of published rows is the serial
+  // order the lock chose. A lost update shows up as a field reverting to an
+  // older value between two consecutive rows: the row that lost it was merged
+  // from a stale read. So between neighbours at most one of the fields the ops
+  // write may change, and the final row is the last published one.
+  it.instance("concurrent patches of one session never lose a field (T9)", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const source = yield* EventV2Bridge.Service
+      for (let n = 0; n < 6; n++) {
+        const next = rng(9100 + n)
+        const info = yield* session.create({ title: "racy" })
+        const rows: SessionNs.Info[] = []
+        const unsubscribe = yield* source.listen((event) => {
+          if (event.type !== SessionNs.Event.Updated.type) return Effect.void
+          const data = event.data as { sessionID: string; info: SessionNs.Info }
+          if (data.sessionID === info.id) rows.push(data.info)
+          return Effect.void
+        })
+        const ops = Array.from({ length: 3 + Math.floor(next() * 10) }, (_, i) => {
+          const roll = next()
+          if (roll < 0.3) return session.setTitle({ sessionID: info.id, title: `title ${i}` })
+          if (roll < 0.6) return session.setMetadata({ sessionID: info.id, metadata: { note: `meta ${i}` } })
+          if (roll < 0.8) return session.touch(info.id)
+          return session.setAgentModel({
+            sessionID: info.id,
+            agent: `agent ${i}`,
+            model: { providerID: ProviderV2.ID.make("p"), id: ModelV2.ID.make(`m${i}`) },
+            time: Date.now(),
+          })
+        })
+        yield* Effect.all(ops, { concurrency: "unbounded", discard: true })
+        yield* unsubscribe
+
+        expect(rows, `seed ${9100 + n}`).toHaveLength(ops.length)
+        let previous = info
+        for (const row of rows) {
+          const changed = [
+            row.title !== previous.title,
+            row.metadata?.note !== previous.metadata?.note,
+            row.agent !== previous.agent,
+          ].filter(Boolean).length
+          expect(changed, `seed ${9100 + n}: a row reverted a field`).toBeLessThanOrEqual(1)
+          previous = row
+        }
+        expect(yield* session.get(info.id)).toEqual(previous)
+        yield* session.remove(info.id)
+      }
+    }),
+  )
+
+  // The guard (H6c): publish awaits its listeners, so a listener that patches
+  // the session it was just told about waits on the permit the outer patch
+  // holds. The bounded take turns that into a defect naming the session,
+  // instead of a wedge; the outer patch's row is already projected by then.
+  it.instance("a listener patching the session it was told about dies after the timeout instead of hanging", () =>
+    Effect.gen(function* () {
+      const saved = process.env["OPENCODE_SESSION_PATCH_LOCK_MS"]
+      process.env["OPENCODE_SESSION_PATCH_LOCK_MS"] = "300"
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (saved === undefined) delete process.env["OPENCODE_SESSION_PATCH_LOCK_MS"]
+          else process.env["OPENCODE_SESSION_PATCH_LOCK_MS"] = saved
+        }),
+      )
+      const session = yield* SessionNs.Service
+      const source = yield* EventV2Bridge.Service
+      const info = yield* session.create({ title: "reentrant" })
+      const nested = yield* Deferred.make<Exit.Exit<void>>()
+      let fired = false
+      const unsubscribe = yield* source.listen((event) => {
+        if (fired || event.type !== SessionNs.Event.Updated.type) return Effect.void
+        if ((event.data as { sessionID: string }).sessionID !== info.id) return Effect.void
+        fired = true
+        return session.setTitle({ sessionID: info.id, title: "from the listener" }).pipe(
+          Effect.exit,
+          Effect.flatMap((exit) => Deferred.succeed(nested, exit)),
+          Effect.asVoid,
+        )
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const started = Date.now()
+      yield* session.setTitle({ sessionID: info.id, title: "outer" }).pipe(Effect.exit)
+      const inner = yield* awaitWithTimeout(Deferred.await(nested), "the nested patch never settled", "5 seconds")
+
+      expect(Exit.isFailure(inner)).toBe(true)
+      if (Exit.isFailure(inner)) expect(Cause.pretty(inner.cause)).toContain(`re-entered: ${info.id}`)
+      expect(Date.now() - started).toBeLessThan(5_000)
+      expect((yield* session.get(info.id)).title).toBe("outer")
+      yield* session.remove(info.id)
+    }),
+  )
+
+  // Expectations §8: the lock is held for one row read, one transaction and
+  // the synchronous listeners.
+  it.instance("one patch holds the lock for well under 50 ms", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const info = yield* session.create({ title: "quick" })
+      // Warm the path once; the first call pays for lazy initialisation.
+      yield* session.touch(info.id)
+      const started = performance.now()
+      yield* session.setTitle({ sessionID: info.id, title: "timed" })
+      expect(performance.now() - started).toBeLessThan(50)
+      yield* session.remove(info.id)
     }),
   )
 })

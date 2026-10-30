@@ -27,7 +27,7 @@
 | Session.metadata.agentRun.outcome                 | `RunOutcome`（可选）                                                                                                                                                       | 主契约 §4.1   | 同上                                        | §3 枚举                                |
 | Session.metadata.agentRun.previous                | `{ number, ended_at, outcome }`（可选）                                                                                                                                    | 主契约 §4.1   | 同上                                        | previous.number = number − 1           |
 | WakeSource.kind / session / name / agent          | `kind` 见 §3；`session: SessionID`（kind = agent 时必填）；`name?`、`agent?: string`                                                                                       | 主契约 §4.2   | 同上                                        | kind = agent ⇒ session 必填            |
-| SessionStatus.Info.at                             | `number`（最近一次 set 的 epoch ms，内存）                                                                                                                                 | 主契约 §5.2.4 | `session/status.ts`                         | 每步置 busy 时更新（H12）              |
+| SessionStatus.Projected.at                        | `number`（最近一次 set 的 epoch ms，内存；线上 `Info` 不变）                                                                                                               | 主契约 §5.2.4 | `session/status.ts`                         | 每步置 busy 时更新（H12）              |
 | TextPart.metadata（agent 消息）                   | `{ kind: "agent_message", sender, sender_name?, sender_agent? }`                                                                                                           | 主契约 §4.3   | `agent-management/inbox.ts`                 | 模型文本不变（INV-10）                 |
 | TextPart.metadata（agent-message 路由的头行）     | `{ kind: "user_message" }`                                                                                                                                                 | 主契约 §4.3   | 同上                                        | 同上                                   |
 | TextPart.metadata（结束报告）                     | 既有 `{ kind: "agent_notification", summary }` + `sender, sender_name?, sender_agent?`                                                                                     | 主契约 §4.3   | `session/prompt.ts` reportRunEnd            | 同上；TUI 只读 summary                 |
@@ -51,7 +51,7 @@
 | agent_list 参数                                   | `{ status?, relation?, query?, limit? }`，limit 缺省 50                                                                                                                    | 主契约 §4.7   | 同上                                        | schema；§3 枚举                        |
 | agent_list 列                                     | `session_id / name / agent_type / relation / status / run / last / title / workdir`；`last` 为 ISO 或空                                                                    | 主契约 §4.7   | 同上                                        | 测试表头与行                           |
 | agent_list 计数行                                 | `showing <shown> of <total> (<running> running, <idle> idle)`                                                                                                              | 主契约 §4.7   | 同上                                        | 按截断前集合统计                       |
-| `Session.patch` 锁                                | 每会话一个 `Semaphore(1)`，覆盖读、合并、发布；获取超时 30 s 即 die                                                                                                        | 主契约 §5.2.0 | `session/session.ts`                        | INV-11；重入守卫测试                   |
+| `Session.patch` 锁                                | 每会话一个 `Semaphore(1)`，覆盖读、合并、发布；获取超时 30 s 即 die（`OPENCODE_SESSION_PATCH_LOCK_MS` 可改，测试用）                                                       | 主契约 §5.2.0 | `session/session.ts`                        | INV-11；重入守卫测试                   |
 
 ## 3. 枚举值（机械化）
 
@@ -84,7 +84,7 @@
 **会话 patch 加锁（commit 2）**
 
 - S8 `Session.patch` 在每会话信号量内执行读、合并、发布；获取超时 30 s 即 die；重入守卫测试（监听者内 patch 同一会话须在缩短的超时后以 defect 结束）
-- S9 `SessionStatus.Info.at`：每次 `set` 记时间
+- S9 `SessionStatus.Projected.at`：每次 `set` 记时间，事件不带
 
 **run 记录（commit 2，`loop` 的 work 包装）**
 
@@ -147,16 +147,16 @@
 
 > **框架声明**：仓库未引入 property-based 框架。沿用 `step-tail` 分支的做法：种子化随机生成 + 按定义重算的参照实现，一次失败即报种子。
 
-- **INV-5（= I5）** 任意事件序列（发送到空闲 / 在跑的子、完成 / 失败 / 被停、re-arm、续跑窗口、并发多子、钩子阻止、随机注入一次结束写失败）经真实 `loop` 执行后，每个子的 run 号序列严格递增且每次只加一；普通 re-arm 与钩子阻止不改变它；写失败的那次 run 在下一次开始时被记为 lost 且号不重复。—— T3
-- **INV-6（= I6）** 每份结束报告与停止通知的 run 号等于发出时该子已关闭的 run；同号报告至多一份；`ended ≥ started`；记录未关闭时报告无属性。—— T3
-- **INV-6b** `agent_send` 对空闲且记录已关闭的目标预告的 run 号等于该子的下一份报告的 run 号。—— T3
+- **INV-5（= I5）** 任意事件序列（发送到空闲的子、中途插入消息、re-arm、续跑窗口、完成 / 失败 / 被停、并发多子、崩溃遗留的打开记录、注入一次结束写失败）经真实 `loop` 执行后，每个子的 run 号序列严格递增且每次只加一；普通 re-arm 不改变它，续跑窗口加一；写失败与遗留的记录在下一次开始时被记为 lost 且号不重复；每条记录打开时会话已是 busy。—— T3（钩子阻止不加号由定值用例覆盖）
+- **INV-6（= I6）** 每份结束报告与停止通知的 run 号等于发出时该子已关闭的 run；同号报告至多一份；`ended ≥ started`；记录未关闭时报告无属性。—— T3（commit 4 给报告加 run 属性后扩入；commit 2 的 T3 只断言报告份数）
+- **INV-6b** `agent_send` 对空闲且记录已关闭的目标预告的 run 号等于该子的下一份报告的 run 号。—— T3（同上，commit 4）
 - **INV-7（= I7）** 对任意步序列（工具步、询问钩子的最终回答、带中途插入新消息的最终回答）与任意 cap（1–8），钩子连续阻止长度不限：父收到的报告恰一份，其创建时间不早于最后一次询问；每次询问的 `continuations` 等于按定义推进的参照值；每个请求的最后一条用户消息文本等于当时最新的 reason 或插入消息；每次询问之前子会话的 `SessionStatus` 事件序列中没有 idle。—— T8
 - **INV-7b** 每段连续无工具、无新输入的退出尝试中询问与阻止次数 ≤ cap；一步含工具调用或钩子之外的新用户消息后计数从 0 重新累积。—— T8（steer、超 cap 的阻止）；定值用例（新 run 再次询问）
 - **INV-8（= I8）** 相邻两步请求的历史部分逐字相同（R1 扩展到带进度视图的会话）；视图文本不出现在会话历史与压缩输入中。
 - **INV-8b** 随机生成子集合（状态、记录、创建时间、最后一步时间）与窗口：在跑列表恰等于投影 running 的子按 `started_at ?? created` 升序取前 10；已结束列表恰等于空闲且（已关闭且 `ended_at ≥ windowStart`，或未关闭）的子按 `ended_at ?? started_at` 降序取前 10；省略计数等于被截去的数量；同一输入两次渲染文本相同。—— T7
 - **INV-9（= I9）** 对权限规则形态 {无规则、`agent_list: deny` 通配、`agent_list` 具体 pattern 的 deny（`Permission.disabled` 只认 `pattern === "*"`，故不隐藏）、`agent_status: deny`} × 深度 {< limit, ≥ limit} 的全部组合，工具表中 `agent_status ∈ tools ⇔ agent_list ∈ tools`；`agent_list` 通配 deny 时 `agent_status` 执行被拒。—— 枚举
 - **INV-10（= I10）** 对任意发送方字段，`render()` 的输出与基线逐字相同；四条路径的 metadata 形状固定。—— 枚举
-- **INV-11（= I11）** 对同一会话的任意并发 patch 序列（随机的 setTitle / setMetadata / touch / setAgentModel），最终行每个字段等于最后一次写该字段的值；无字段丢失。—— T9
+- **INV-11（= I11）** 对同一会话的任意并发 patch 序列（随机的 setTitle / setMetadata / touch / setAgentModel），锁内按序发布的 `session.updated` 行序列中相邻两行至多一个被写字段变化（丢失的更新表现为字段回退），最终行等于最后一个事件的行；即每个字段等于最后一次写该字段的值。—— T9
 - **INV-12** `agent_list` 结果 ⊆ 过滤后的邻居集合 ⊆ 邻居；计数行与过滤后集合的统计一致；行数 ≤ limit；排序满足"在跑在前，其余按 last 倒序，并列按 id"。—— T4
 - **INV-13** 新 run 启动后任一时刻，`状态 idle ∧ 记录打开` 只在崩溃遗留下出现：随机启动与查询交错，断言 agent_send / agent_status 从不对刚启动的 run 输出 cut off。—— T3
 

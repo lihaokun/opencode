@@ -116,10 +116,20 @@ const layer = Layer.effect(
       // escaping; the user header is a fixed string — no fields, so no
       // escaping, and no reply instruction, because the human is watching this
       // transcript and the target answers in place.
+      // Step S13: each carries its marker in metadata — the kind the TUI will
+      // read (#73), and for an agent the sender the run record reads. The text
+      // is the same as before the markers (I10).
       const parts =
         message.kind === "agent"
-          ? [{ type: "text" as const, text: render(message.message) }]
-          : [{ type: "text" as const, text: USER_MESSAGE_HEADER }, ...message.message.parts]
+          ? [{ type: "text" as const, text: render(message.message), metadata: senderMetadata(message.message) }]
+          : [
+              {
+                type: "text" as const,
+                text: USER_MESSAGE_HEADER,
+                metadata: { kind: AgentManagement.USER_MESSAGE_METADATA_KIND },
+              },
+              ...message.message.parts,
+            ]
 
       // Step P4: deliverAsync, not prompt — it does the fork *and* the switch
       // to the target's instance. Doing the fork here instead left the target
@@ -144,6 +154,16 @@ const layer = Layer.effect(
     return Service.of({ deliver })
   }),
 )
+
+/** The marker and the sender on an agent message's text part (subplan agentmgmt-2-run-state §4.3). */
+function senderMetadata(message: AgentManagement.AgentMessage) {
+  return {
+    kind: AgentManagement.AGENT_MESSAGE_METADATA_KIND,
+    sender: message.sender,
+    ...(message.sender_name === undefined ? {} : { sender_name: message.sender_name }),
+    ...(message.sender_agent === undefined ? {} : { sender_agent: message.sender_agent }),
+  }
+}
 
 export const node = LayerNode.make({
   service: Service,
