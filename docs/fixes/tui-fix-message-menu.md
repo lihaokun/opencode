@@ -127,3 +127,13 @@ messageMouseAction(input: { button: number; selectionText?: string | undefined }
 
 - 渲染测试调试中确认的一个 harness 要点：`SDKProvider` 不传 `fetch` 时会用全局 fetch 发真实请求（floating promise 静默失败），stub 必须经 `SDKProvider` 的 `fetch` prop 注入，让组件走真实 hey-api client 路径。
 - 时间线菜单（`dialog-timeline.tsx`）复用同一 `DialogMessage`，重排与确认层自动生效，无需单独改动（issue 方案第 4 条由构造满足）。
+
+### Review 修复记录（PR #88 review，2026-10-29）
+
+Review 提出三条，逐条核实后全部成立，修复如下：
+
+1. **[P2] 确认框计数与实际删除不一致** — 原口径 `all.length - index - 1`（不含所选、含 assistant）两个都错。服务端 `SessionRevert`：无 partID 时边界落在所选 user 消息上（`revert.ts:58` 边界=lastUser=它自己），`cleanup` 的无 partID 分支用 `order >= 0`（`revert.ts:130`）把边界消息本身也删掉。修复：`revertedCount` 改为 `all.length - index`（含所选、含 assistant），文案改为 "N message(s) (starting with this one)"。补两条 reviewer 点名的渲染用例：单条 user 消息会话（断言 "1 message (starting with this one)"、非 "0 messages"）、多条消息选中间一条（断言含自身计数）。原注释 "matching what the revert banner reports" 删除——横幅以 user 轮次计数是既有独立行为（`index.tsx` revertRevertedMessages），与确认框的"实际删除数"语义不同，本次不动、不暗示对齐。
+2. **[P2] copy-on-select 下右键复制后仍弹菜单** — 原判断"down 阶段 stopPropagation 使 copy 分支走不到"错误：`stopPropagation` 不影响后续 up 事件，up 到达时选区已被 down 的复制清空 → 走 menu 分支。修复：决策器增加 `consumedByCopy` 入参；消息行新增 `onMouseDown`——右键 down 且全局复制成功时置 `rightPressCopied`，对应 up 消费该标记返回 none。测试：纯函数用例 3 断言 + 既有语义不变。
+3. **测试放宽分支** — `if (revertCalls.length === 0)` 是调试"同键双发"疑虑的遗留；事后证明双发是早期 harness 未注入 fetch stub 造成的假象（真实断言：第一次 Enter 后必须见 Confirm 且 calls=0，二次确认后才 =1）。删除两个放宽分支，连跑 3 轮全绿。
+
+复查教训：fix 文档第四部分的交互推理（"down 的 stopPropagation 足以…"）当时没有用两事件链验证支撑；对事件对（down/up）的行为声明，测试必须覆盖完整事件序列，单事件单测发现不了这类缺口。
