@@ -528,6 +528,12 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
   const completed = new Set<string>()
   let retain: MessageID | undefined
   for (const msg of msgs) {
+    // A summary that ended in error or was cancelled never satisfied its
+    // compaction marker. Keeping it in the model projection would feed the
+    // failed attempt's reasoning and partial text back into the next request
+    // and into the next summary's input (#77) — drop it here; the transcript
+    // still keeps it for inspection.
+    if (msg.info.role === "assistant" && msg.info.summary && (!msg.info.finish || msg.info.error)) continue
     result.push(msg)
     if (retain) {
       if (msg.info.id === retain) break
@@ -562,6 +568,8 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
           index > compactionIndex &&
           msg.info.role === "assistant" &&
           msg.info.summary &&
+          msg.info.finish &&
+          !msg.info.error &&
           msg.info.parentID === compaction.info.id,
       )
     : -1
@@ -600,7 +608,9 @@ export function latest(msgs: WithParts[]) {
   const tasks = msgs.flatMap((m) =>
     finished && compareChronology(m.info, finished) <= 0
       ? []
-      : m.parts.filter((p): p is CompactionPart | SubtaskPart => p.type === "compaction" || p.type === "subtask"),
+      : m.parts.filter((p): p is CompactionPart | SubtaskPart => p.type === "compaction" || p.type === "subtask").map(
+          (p) => ({ part: p, message: m.info }),
+        ),
   )
   return { user, assistant, finished, tasks }
 }

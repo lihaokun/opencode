@@ -780,7 +780,7 @@ describe("MessageV2.filterCompacted", () => {
     ),
   )
 
-  it.instance("skips assistant with error even if marked as summary", () =>
+  it.instance("excludes an error summary from the projection without completing the marker (#77)", () =>
     withSession(({ sessionID }) =>
       Effect.gen(function* () {
         const u1 = yield* addUser(sessionID, "hello")
@@ -794,24 +794,28 @@ describe("MessageV2.filterCompacted", () => {
         yield* addUser(sessionID, "retry")
 
         const result = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
-        // Error assistant doesn't add to completed, so compaction boundary never triggers
-        expect(result).toHaveLength(3)
+        // The failed summary is dropped from the model projection (#77: its
+        // reasoning/partial text must not reach the next request) and does not
+        // complete the marker — only u1 and the retry turn remain.
+        expect(result).toHaveLength(2)
+        expect(result.map((item) => item.info.role)).toEqual(["user", "user"])
       }),
     ),
   )
 
-  it.instance("skips assistant without finish even if marked as summary", () =>
+  it.instance("excludes an unfinished summary from the projection without completing the marker (#77)", () =>
     withSession(({ sessionID }) =>
       Effect.gen(function* () {
         const u1 = yield* addUser(sessionID, "hello")
         yield* addCompactionPart(sessionID, u1)
 
-        // summary=true but no finish
+        // summary=true but no finish — an in-flight attempt, same exclusion.
         yield* addAssistant(sessionID, u1, { summary: true })
         yield* addUser(sessionID, "next")
 
         const result = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
-        expect(result).toHaveLength(3)
+        expect(result).toHaveLength(2)
+        expect(result.map((item) => item.info.role)).toEqual(["user", "user"])
       }),
     ),
   )
