@@ -43,3 +43,17 @@
 | 发现 bug 数    | 2（idle 写在 action 里等于没修；守卫首迭代误杀 shell assistant） |
 | 修复 bug 数    | 2                      |
 | 迭代轮次       | 设计 1 / 实现 1 / 测试锚点 3 / 修复 2 |
+
+## review 轮（2026-10-29，PR #89 review 后）
+
+reviewer 提出三项 + 我们自查补两项，全部确认属实并修复（commit `ae462ca435`）：
+
+1. **idle hook defect 卡死 runner**（review #1，P2）：`yield* idle` 移入 `modifyEffect` pf 体内后，未隔离的 defect 会让整个修改不提交——ref 停留 Running、Deferred 永不完成、后续调用全部 join 死 run。基座下同场景仅首个 caller 挂（状态已提交可恢复），PR head 下全挂，是比基座更差的失败放大。修：`safeIdle`（`catchCause → logError`）+ `shouldReArm` fail-closed 隔离。
+2. **run-state idle 顺序用例空转**（review #2，P2）：原用例一次 `ensureRunning`、无排队者、`watching` 未读、断言的 `"idle"` 是新 session 默认值——修复前后皆绿。重写为"写入方置 busy 并存活过 idle 转换"的契约守卫 + 新增 re-arm 无中间 idle 契约用例；文档同步更正。
+3. **finishShell / idleIfCurrent 同型锁外 idle**（review 补充 + 自查）：两处遗留的返回-action 锁外 idle 一并移入临界区（`idleIfCurrent` 仅在状态仍 Idle 时补发，不覆盖新 run 的 busy）。
+
+### review 轮踩过的坑
+
+- **会话级 status 断言对"post-lock onIdle vs 排队者续跑"的交错不敏感**：pre-fix 下 post-lock onIdle 的续跑先于排队者 acquire 完成（探针实测 `work2-start, busy-set, read=busy`——busy 后到覆盖 stale idle），所以重写后的 run-state 顺序用例在 pre-fix 也绿。确定性 RED 只能锚在 runner 层（顺序断言）。cancel 用例还有一个时序前提：cancel 与下次调用**顺序**执行不 RED（post-lock action 天然先完成），必须 cancel 临界区在途时并发排队。
+- **`it.instance` 的裸 `bun test` 5s 默认超时**：`bunfig.toml` 注释明确说 timeout 不从 bunfig 解析，必须靠 package script 的 `--timeout 30000`。2000 行 fill + 查询的用例在裸 `bun test` 下必超时（共享机负载 >5s），CI 路径（`bun run test`）稳定绿——排查时先看调用方式再怀疑代码。
+- **"失败隔离"是"入临界区"的伴随义务**：把副作用搬进临界区必须同时回答"副作用 defect 怎么办"——不提交状态比迟到副作用更糟。`EventV2.notify` 对非 durable 事件不隔离 listener，插件 hook 同步 throw 可达，防御纵深必要。
