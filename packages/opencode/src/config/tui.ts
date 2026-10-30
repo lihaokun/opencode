@@ -16,7 +16,8 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CurrentWorkingDirectory } from "./tui-cwd"
 import { ConfigPlugin } from "@/config/plugin"
 import { TuiKeybind } from "@opencode-ai/tui/config/keybind"
-import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
+import { InstallationLocal, PluginSdkVersion } from "@opencode-ai/core/installation/version"
+import { Glob } from "@opencode-ai/core/util/glob"
 import { makeRuntime } from "@opencode-ai/core/effect/runtime"
 import { Filesystem } from "@/util/filesystem"
 import { ConfigVariable } from "@/config/variable"
@@ -231,15 +232,24 @@ const layer = Layer.effect(
     const directory = yield* CurrentWorkingDirectory
     const npm = yield* Npm.Service
     const data = yield* loadState({ directory })
+    // Only `.opencode` dirs (or OPENCODE_CONFIG_DIR) with local plugin files
+    // consume the @opencode-ai/plugin SDK — skip the install otherwise (#67).
+    const installDirs: string[] = []
+    for (const dir of data.dirs) {
+      const files = yield* Effect.promise(() =>
+        Glob.scan("{plugin,plugins}/*.{ts,js}", { cwd: dir, absolute: true, dot: true }),
+      ).pipe(Effect.catch(() => Effect.succeed([] as string[])))
+      if (files.length > 0) installDirs.push(dir)
+    }
     const deps = yield* Effect.forEach(
-      data.dirs,
+      installDirs,
       (dir) =>
         npm
           .install(dir, {
             add: [
               {
                 name: "@opencode-ai/plugin",
-                version: InstallationLocal ? undefined : InstallationVersion,
+                version: InstallationLocal ? undefined : PluginSdkVersion,
               },
             ],
           })
