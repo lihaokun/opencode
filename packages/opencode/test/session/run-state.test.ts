@@ -223,13 +223,12 @@ describe("SessionRunState", () => {
       }),
   )
 
-  // The re-arm branch restarts the same work without going idle: the original
-  // caller settles with the FIRST execution's result (its Deferred completed
-  // at the re-arm point, the #32 contract), the restart runs to its own
-  // finish. The intermediate transition must NOT publish idle — the work's
-  // busy marking survives the restart, proving no status event flipped it.
+  // The re-arm branch restarts the same work WITHOUT going idle: two
+  // executions must occur, the original caller settles with the FIRST
+  // execution's result (its Deferred completed at the re-arm point — the #32
+  // contract), and no idle may be published while the restart is live.
   it.instance(
-    "re-arming keeps the session busy across the restart (no intermediate idle)",
+    "re-arming runs the work twice with no intermediate idle and settles the caller with the first result",
     () =>
       Effect.gen(function* () {
         const run = yield* SessionRunState.Service
@@ -237,40 +236,76 @@ describe("SessionRunState", () => {
         const sessions = yield* Session.Service
         const session = yield* sessions.create({ title: "rearm no idle" })
 
-        // First execution: flip the flag so the finish predicate returns true
-        // (re-arm); second execution: let it return false (settle).
-        let firstExecution = true
+        // Predicate: true on the first finish (re-arm), false on the second
+        // (settle). Reading a flag the work body itself clears makes the
+        // sequence execution-order dependent (the body runs before the
+        // predicate sees the value) — flip it from the PREDICATE side instead:
+        // arm while the first finish is being decided, disarm once asked.
+        let armed = true
+        const shouldReArm = Effect.suspend(() => {
+          if (!armed) return Effect.succeed(false)
+          armed = false
+          return Effect.succeed(true)
+        })
+
+        let executions = 0
+        // First execution marks busy (as runLoop does) and settles instantly;
+        // the restart must actually happen — the second execution holds the
+        // session busy until released, giving the observation below a stable
+        // window in which any intermediate idle would be visible.
+        const releaseSecond = yield* Deferred.make<void>()
         const work: Work = Effect.suspend(() => {
-          if (!firstExecution) {
-            return Effect.succeed({ info: { role: "assistant", id: "second" } as never, parts: [] })
+          executions += 1
+          if (executions === 1) {
+            return Effect.gen(function* () {
+              yield* status.set(session.id, { type: "busy" })
+              return yield* succeedAs("first")
+            })
           }
-          firstExecution = false
           return Effect.gen(function* () {
-            yield* status.set(session.id, { type: "busy" })
-            return yield* succeedAs("first")
+            yield* Deferred.await(releaseSecond)
+            return yield* succeedAs("second")
           })
         })
-        const shouldReArm = Effect.suspend(() => Effect.succeed(firstExecution))
 
         const fiber = yield* run
           .ensureRunning(session.id, Effect.die("no interrupt"), work, shouldReArm)
           .pipe(Effect.forkChild)
 
-        // The caller shares the first run's exit; the restart runs behind it.
+        // The caller shares the first run's exit and settles while the
+        // restart is still held.
         const exit = yield* awaitWithTimeout(Fiber.await(fiber), "caller never settled", "5 seconds")
         expect(Exit.isSuccess(exit) && exit.value.info.id === "first").toBe(true)
-        // Give the restarted execution time to run and settle: if any
-        // intermediate idle had been published, the busy set by the first
-        // execution would have been overwritten (idle clears the map entry)
-        // and the final idle of the restart would have re-cleared it — we
-        // can't observe the middle directly, but the restart itself is
-        // observable via the runner state settling and a final idle below.
-        yield* Effect.sleep("200 millis")
 
-        // The restart ran (predicate returned false the second time, so the
-        // run settled): the session ends idle after the second finish.
-        expect((yield* status.get(session.id)).type).toBe("idle")
-        expect(firstExecution).toBe(false)
+        // The restart is live: give the second execution time to start and
+        // block on its gate, then observe. A busy session here proves the
+        // first finish's transition did not go idle; an idle here would mean
+        // the restart published one.
+        yield* awaitWithTimeout(
+          pollWithTimeout(
+            Effect.sync(() => (executions === 2 ? ("started" as const) : undefined)),
+            "the restarted work never ran",
+            "5 seconds",
+          ),
+          "restarted work never ran",
+          "8 seconds",
+        )
+        yield* Effect.sleep("50 millis")
+        expect((yield* status.get(session.id)).type).toBe("busy")
+        // Exactly two executions: one run, one restart.
+        expect(executions).toBe(2)
+
+        // Release the restart; the second finish settles the session idle.
+        yield* Deferred.succeed(releaseSecond, void 0)
+        yield* awaitWithTimeout(
+          pollWithTimeout(
+            Effect.map(status.get(session.id), (info) => (info.type === "idle" ? ("idle" as const) : undefined)),
+            "the restart never settled the session idle",
+            "5 seconds",
+          ),
+          "restart never settled",
+          "8 seconds",
+        )
       }),
   )
 })

@@ -28,7 +28,7 @@
 ## 端到端验证
 
 - `test:httpapi` 三段门禁全绿：coverage 209/0、auth 209/0、effect 209/0（effect 段在共享机需 >590s，单独复跑完成）。
-- 大会话实测（一次性脚本 `script/validate-rearm-large-session.ts`，真 SQLite，20k 消息实写）：旧谓词整表加载 **1342ms** vs 新谓词 `latestRole` **2.0ms**（~670×），与事故画像（秒级锁持有）吻合。脚本未纳入常规套件（fill 20k 需 19s，不适合单测）。
+- 大会话查询基准（一次性脚本 `script/validate-rearm-large-session.ts`，真 SQLite，20k 消息实写；实测对象是新旧谓词查询本身，非 full-loop）：旧谓词整表加载 **1342ms** vs 新谓词 `latestRole` **2.0ms**（~670×），与事故画像（秒级锁持有）吻合。脚本未纳入常规套件（fill 20k 需 19s，不适合单测）。
 
 ## 度量
 

@@ -1,20 +1,19 @@
 /**
- * One-off validation for #85's performance half: on a session with 20k+
+ * Query benchmark for #85's performance half: on a session with 20k
  * persisted messages, the re-arm predicate (hasUnconsumedTurn) must cost
- * milliseconds, not seconds. Runs the REAL prompt.loop against a REAL
- * SQLite database inside a tmpdir instance, with a scripted LLM server:
+ * milliseconds, not seconds. Fills a real SQLite database inside a tmpdir
+ * instance, then times both predicate implementations against it:
  *
  *   1. bulk-fill the session with ~20k messages (real DB writes)
- *   2. run one full prompt.loop turn (real runLoop, real finishRun)
- *   3. the scripted server's final reply triggers a content-filter break —
- *      the same in-iteration-break shape as #32's regression — so the run
- *      ends through finishRun's critical section and the re-arm predicate
- *      is evaluated against the full-size session
- *   4. measure the wall time of the turn and compare against the old
- *      full-load predicate cost (approximated by running
- *      MessageV2.filterCompactedEffect on the same session)
+ *   2. OLD: MessageV2.filterCompactedEffect — the full-load predicate
+ *      (paged stream + hydrate of every message's parts)
+ *   3. NEW: MessageV2.latestRole — the single indexed row the fixed
+ *      hasUnconsumedTurn runs inside finishRun's critical section
  *
- * Prints timings; asserts the new predicate stays under 500ms.
+ * This is a query benchmark, not a full prompt.loop run: the loop's
+ * end-to-end behavior is covered by the runner/run-state regression suites;
+ * what needed one-off measurement was the predicate's cost at incident
+ * scale. Prints timings; asserts the new predicate stays under 500ms.
  */
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
