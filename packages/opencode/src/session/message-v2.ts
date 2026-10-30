@@ -508,6 +508,27 @@ export function parts(messageID: MessageID) {
   })
 }
 
+// The role of the chronologically latest message, or undefined for an empty
+// session. `compareChronology` is exactly the (time_created, id) order this
+// query sorts by, and info() overlays row.time_created onto the JSON's
+// time.created — so "the latest message is a user" is equivalent to "the
+// latest user is newer than the latest assistant" without loading the
+// session (#62: the full load costs seconds on large sessions; this is one
+// indexed row).
+export const latestRole = Effect.fn("MessageV2.latestRole")(function* (sessionID: SessionID) {
+  const { db } = yield* Database.Service
+  const row = yield* db
+    .select({ data: MessageTable.data })
+    .from(MessageTable)
+    .where(eq(MessageTable.session_id, sessionID))
+    .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+    .limit(1)
+    .get()
+    .pipe(Effect.orDie)
+  if (!row) return undefined
+  return (row.data as Info).role
+})
+
 export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: SessionID; messageID: MessageID }) {
   const { db } = yield* Database.Service
   const row = yield* db

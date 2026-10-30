@@ -9,6 +9,19 @@ import { MessageID, PartID, type SessionID } from "../../src/session/schema"
 
 import { NotFoundError } from "@/storage/storage"
 import { testEffect } from "../lib/effect"
+
+/** mulberry32: deterministic seeded LCG for finite-random histories. */
+const lcg = (seed: number) => {
+  let s = seed >>> 0
+  return () => {
+    s = (s + 0x6d2b79f5) >>> 0
+    let t = s
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Identifier } from "../../src/id/id"
@@ -414,6 +427,194 @@ describe("MessageV2.stream", () => {
 
         const result = yield* MessageV2.stream(sessionID)
         expect(result).toHaveLength(1)
+      }),
+    ),
+  )
+})
+
+describe("MessageV2.latestRole", () => {
+  it.instance("returns undefined for an empty session", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        expect(yield* MessageV2.latestRole(sessionID)).toBeUndefined()
+      }),
+    ),
+  )
+
+  it.instance("returns user when the latest message is a user", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        yield* fill(sessionID, 2)
+        yield* session.updateMessage({
+          id: MessageID.ascending(),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() + 100 },
+          agent: "test",
+          model: { providerID: "test", modelID: "test" },
+          tools: {},
+          mode: "",
+        } as unknown as SessionV1.Info)
+        expect(yield* MessageV2.latestRole(sessionID)).toBe("user")
+      }),
+    ),
+  )
+
+  it.instance("returns assistant when the latest message is an assistant", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        yield* fill(sessionID, 1)
+        const session = yield* SessionNs.Service
+        yield* session.updateMessage({
+          id: MessageID.ascending(),
+          sessionID,
+          role: "assistant",
+          parentID: MessageID.ascending(),
+          time: { created: Date.now() + 100 },
+          mode: "build",
+          agent: "build",
+          path: { cwd: "/tmp", root: "/tmp" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: "test",
+          providerID: "test",
+        } as unknown as SessionV1.Info)
+        expect(yield* MessageV2.latestRole(sessionID)).toBe("assistant")
+      }),
+    ),
+  )
+
+  // Same-millisecond tie: the id breaks the tie, matching the SQL order
+  // (desc time_created, desc id) and compareChronology.
+  it.instance("breaks same-timestamp ties by id", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        const now = Date.now()
+        const first = MessageID.ascending()
+        yield* session.updateMessage({
+          id: first,
+          sessionID,
+          role: "user",
+          time: { created: now },
+          agent: "test",
+          model: { providerID: "test", modelID: "test" },
+          tools: {},
+          mode: "",
+        } as unknown as SessionV1.Info)
+        const second = MessageID.ascending()
+        yield* session.updateMessage({
+          id: second,
+          sessionID,
+          role: "assistant",
+          parentID: first,
+          time: { created: now },
+          mode: "build",
+          agent: "build",
+          path: { cwd: "/tmp", root: "/tmp" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: "test",
+          providerID: "test",
+        } as unknown as SessionV1.Info)
+        expect(yield* MessageV2.latestRole(sessionID)).toBe("assistant")
+      }),
+    ),
+  )
+
+  // Cost guard (#85): this runs inside finishRun's critical section, so it
+  // must stay O(1) pages even on a large session. The fill helper writes one
+  // row per call; two thousand rows is well past any plausible session for a
+  // unit test while keeping the suite fast.
+  it.instance("stays fast on a large session", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        yield* fill(sessionID, 2000)
+        const start = performance.now()
+        const role = yield* MessageV2.latestRole(sessionID)
+        const elapsed = performance.now() - start
+        expect(role).toBe("user")
+        // Generous bound for slow CI: a full-session load takes seconds at
+        // this size; the indexed single-row read is milliseconds.
+        expect(elapsed).toBeLessThan(500)
+      }),
+    ),
+  )
+
+  // Seeded finite-random histories (workflow §5.3 random-test layer): for a
+  // random legal history — arbitrary interleavings of roles, timestamp
+  // collisions, out-of-order wall-clock writes, and JSON-embedded times that
+  // disagree with the persisted column — `latestRole` must equal the role of
+  // the (time_created, id) maximum recomputed independently. That maximum is
+  // exactly what `compareChronology` orders by, so this mechanizes the
+  // equivalence claim in the #85 fix (single-row query ≡ latest-user-vs-
+  // assistant comparison over the full history).
+  it.instance("matches the (time_created, id) maximum on random histories", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        const rand = lcg(20261030)
+
+        const histories: Array<Array<{ role: "user" | "assistant"; t: number; json?: number }>> = [
+          [], // empty
+          [{ role: "user", t: 100 }], // user-only
+          [{ role: "assistant", t: 100 }], // assistant-only
+        ]
+        for (let h = 0; h < 12; h++) {
+          const size = 1 + Math.floor(rand() * 30)
+          const history: Array<{ role: "user" | "assistant"; t: number; json?: number }> = []
+          // Timestamps drawn from a small window (collisions likely), written
+          // in random order relative to their values (out-of-order inserts).
+          let clock = 1000
+          for (let i = 0; i < size; i++) {
+            clock += Math.floor(rand() * 3) // often equal → id tie-break
+            history.push({
+              role: rand() < 0.5 ? "user" : "assistant",
+              t: clock,
+              ...(rand() < 0.3 ? { json: clock + Math.floor(rand() * 100) } : {}),
+            })
+          }
+          histories.push(history)
+        }
+
+        // One session accumulates every history; the oracle tracks the
+        // running (t, id) max across all writes, so insertion order vs
+        // timestamp order is fully arbitrary.
+        let maxKey: { role: "user" | "assistant"; t: number; id: string } | undefined
+        for (const history of histories) {
+          for (const m of history) {
+            const id = MessageID.ascending()
+            yield* session.updateMessage({
+              id,
+              sessionID,
+              role: m.role,
+              // json deliberately disagreeing with the persisted column:
+              // info() must overlay row.time_created, not trust the JSON.
+              time: { created: m.json ?? m.t },
+              ...(m.role === "assistant"
+                ? {
+                    parentID: MessageID.ascending(),
+                    mode: "build",
+                    agent: "build",
+                    path: { cwd: "/tmp", root: "/tmp" },
+                    cost: 0,
+                    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                    modelID: "test",
+                    providerID: "test",
+                  }
+                : { agent: "test", model: { providerID: "test", modelID: "test" }, tools: {}, mode: "" }),
+            } as unknown as SessionV1.Info)
+            // Independent oracle: (t, id) lexicographic max over all writes.
+            // MessageID.ascending() is monotonic, so later writes have larger
+            // ids — for equal t the later write wins.
+            if (!maxKey || m.t > maxKey.t || (m.t === maxKey.t && id > maxKey.id)) {
+              maxKey = { role: m.role, t: m.t, id }
+            }
+          }
+        }
+        const role = yield* MessageV2.latestRole(sessionID)
+        expect(role).toBe(maxKey?.role)
       }),
     ),
   )
