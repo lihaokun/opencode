@@ -1105,6 +1105,21 @@ describe("tool.shell abort", () => {
     ),
   )
 
+  // A NATIVE command's exit code, not a shell keyword: this is what PowerShell's
+  // -Command folding destroys (`app` exits 7, pwsh exits 1) and what
+  // Shell.psExitWrapped restores. Runs on every discovered shell so the
+  // wrapper is exercised against real pwsh/powershell on Windows CI.
+  each("propagates a native command's non-zero exit code", (item) =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const text = `${bin} -e ${evalarg(`process.exit(7)`)}`
+        const result = yield* run({ command: PS.has(item.label) ? `& ${text}` : text })
+        expect(result.metadata.exit).toBe(7)
+      }),
+    ),
+  )
+
   it.live("streams metadata updates progressively", () =>
     runIn(
       projectRoot,

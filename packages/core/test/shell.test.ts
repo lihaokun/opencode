@@ -63,6 +63,28 @@ describe("shell", () => {
     expect(zsh.at(-1)).toBe("/tmp")
   })
 
+  // ps(file) keys on the extension-stripped win32 basename, so the args()
+  // branch itself is only reachable on Windows; the wrapper is a pure
+  // function and is asserted everywhere.
+  test("PowerShell command wrapper appends the $LASTEXITCODE exit", () => {
+    expect(Shell.psExitWrapped("app")).toBe("app\nexit $LASTEXITCODE")
+    expect(Shell.psExitWrapped(`bun -e "process.exit(7)"`)).toBe(
+      `bun -e "process.exit(7)"\nexit $LASTEXITCODE`,
+    )
+  })
+
+  if (process.platform === "win32") {
+    test("PowerShell args carry the exit wrapper", () => {
+      const shell = Bun.which("pwsh") || Bun.which("powershell")
+      if (!shell) return
+      const args = Shell.args(shell, `bun -e "process.exit(7)"`, "/tmp")
+      expect(args[0]).toBe("-NoProfile")
+      expect(args[1]).toBe("-Command")
+      expect(args[2]).toContain(`bun -e "process.exit(7)"`)
+      expect(args[2].endsWith("exit $LASTEXITCODE")).toBe(true)
+    })
+  }
+
   if (process.platform === "win32") {
     test("rejects blacklisted shells case-insensitively", async () => {
       await withShell("NU.EXE", async () => {
