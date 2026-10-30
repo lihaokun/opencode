@@ -20,7 +20,7 @@ const MAX_RECORD_BYTES = 64 * 1024
 const MAX_SUBMATCHES = 100
 
 const RawMatch = Schema.Struct({
-  type: Schema.Literal("match"),
+  type: Schema.Literals(["match", "context"]),
   data: Schema.Struct({
     path: Schema.Struct({ text: Schema.String }),
     lines: Schema.Struct({ text: Schema.String }),
@@ -73,13 +73,39 @@ export interface GrepInput {
   readonly file?: string
   readonly include?: string
   readonly limit: number
+  readonly offset?: number
+  readonly mode?: "content" | "files_with_matches" | "count"
+  readonly insensitive?: boolean
+  readonly before?: number
+  readonly after?: number
   readonly signal?: AbortSignal
 }
+
+export interface GrepCount {
+  readonly path: string
+  readonly count: number
+}
+
+/** One rendered row of content-mode output; `context` rows are the -A/-B/-C neighborhood of a match. */
+export interface GrepRow {
+  readonly path: string
+  readonly line: number
+  readonly text: string
+  readonly context: boolean
+}
+
+export type GrepResult =
+  | { readonly mode: "content"; readonly rows: readonly GrepRow[]; readonly total: number; readonly hasMore: boolean }
+  | { readonly mode: "files_with_matches"; readonly files: readonly string[]; readonly total: number; readonly hasMore: boolean }
+  | { readonly mode: "count"; readonly counts: readonly GrepCount[]; readonly total: number; readonly hasMore: boolean }
 
 export interface Interface {
   readonly find: (input: FindInput) => Effect.Effect<readonly Entry[], Error>
   readonly glob: (input: GlobInput) => Effect.Effect<readonly Entry[], Error>
+  /** Legacy line-oriented grep returning schema Matches (used by filesystem search). */
   readonly grep: (input: GrepInput) => Effect.Effect<readonly Match[], Error | InvalidPatternError>
+  /** Full-featured search: output modes, context lines, case handling, pagination. */
+  readonly search: (input: GrepInput) => Effect.Effect<GrepResult, Error | InvalidPatternError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Ripgrep") {}
@@ -99,6 +125,7 @@ const layer = Layer.effect(
       readonly cwd: string
       readonly args: string[]
       readonly limit: number
+      readonly offset?: number
       readonly signal?: AbortSignal
       readonly parse: (line: string) => Effect.Effect<A | undefined, Error>
       readonly pattern?: string
@@ -114,21 +141,27 @@ const layer = Layer.effect(
             Effect.forkScoped,
           )
           let observed = 0
+          const offset = input.offset ?? 0
           const rows = yield* Stream.decodeText(handle.stdout).pipe(
             Stream.splitLines,
             Stream.filter((line) => line.length > 0),
             Stream.mapEffect(input.parse),
             Stream.filter((row): row is A => row !== undefined),
             Stream.tap((row) => {
-              if (!input.onItem || observed++ >= input.limit) return Effect.void
+              if (!input.onItem || observed++ >= input.limit + offset) return Effect.void
               return input.onItem(row)
             }),
-            Stream.take(input.limit + 1),
+            Stream.take(input.limit + offset + 1),
             Stream.runCollect,
             Effect.map((chunk) => [...chunk]),
           )
-          const truncated = rows.length > input.limit
-          if (truncated) return { items: rows.slice(0, input.limit), truncated, partial: false }
+          // `total` is the FULL entry count, not the page slice: the tool layer
+          // renders "total" in beyond-window messages, and a page-length number
+          // there would read as "0 results exist". One past the window when the
+          // stream was cut at limit+offset+1, else the whole list.
+          const truncated = rows.length > input.limit + offset
+          const total = truncated ? input.limit + offset + 1 : rows.length
+          if (truncated) return { items: rows.slice(offset, offset + input.limit), total, truncated, partial: false }
 
           const code = yield* handle.exitCode
           const stderr = yield* Fiber.join(stderrFiber)
@@ -138,7 +171,7 @@ const layer = Layer.effect(
           if (code !== 0 && code !== 1 && code !== 2) {
             return yield* failure(stderr.trim() || `ripgrep failed with code ${code}`)
           }
-          return { items: code === 1 ? [] : rows, truncated: false, partial: code === 2 }
+          return { items: rows.slice(offset, offset + input.limit), total, truncated: false, partial: code === 2 }
         }),
       )
       const abortable = input.signal ? program.pipe(Effect.raceFirst(waitForAbort(input.signal))) : program
@@ -277,8 +310,171 @@ const layer = Layer.effect(
             }),
           ),
         ),
+      search: (input) => {
+        const mode = input.mode ?? "content"
+        if (mode !== "content") {
+          return run<string | GrepCount>({
+            cwd: input.cwd,
+            limit: input.limit,
+            offset: input.offset,
+            signal: input.signal,
+            pattern: input.pattern,
+            args: [
+              "--no-config",
+              "--hidden",
+              "--no-messages",
+              ...(input.include ? [`--glob=${input.include}`] : []),
+              "--glob=!**/.git/**",
+              ...(input.insensitive ? ["-i"] : []),
+              mode === "files_with_matches" ? "--files-with-matches" : "--count-matches",
+              "--",
+              input.pattern,
+              input.file ?? ".",
+            ],
+            parse: (line) => {
+              if (mode === "files_with_matches") return Effect.succeed(normalizeEntryPath(line))
+              // A single-file target prints a bare count without the path prefix.
+              const bare = /^(\d+)$/u.exec(line)
+              if (bare && input.file) return Effect.succeed({ path: input.file, count: Number(bare[1]) })
+              const index = line.lastIndexOf(":")
+              if (index === -1) return Effect.fail(failure(`Invalid ripgrep count output: ${line}`))
+              return Effect.succeed({
+                path: normalizeEntryPath(line.slice(0, index)),
+                count: Number(line.slice(index + 1)),
+              })
+            },
+          }).pipe(
+            Effect.map((result) =>
+              mode === "files_with_matches"
+                ? {
+                    mode,
+                    files: result.items as readonly string[],
+                    total: result.total,
+                    hasMore: result.truncated,
+                  }
+                : {
+                    mode,
+                    counts: result.items as readonly GrepCount[],
+                    total: result.total,
+                    hasMore: result.truncated,
+                  },
+            ),
+          )
+        }
+
+        // Content mode. Context records (type:"context", emitted for -A/-B/-C)
+        // ride with their match group; offset/limit count MATCH records — context
+        // rows are never counted or split across the window boundary.
+        const before = input.before ?? 0
+        const after = input.after ?? 0
+        const contextLines = before + after
+        const wanted = input.offset ?? 0
+        // Row budget: each match emits itself plus at most `contextLines`
+        // context records; the margin absorbs rg's cross-group context
+        // de-duplication so the bound never cuts inside the match window.
+        const rowLimit = contextLines > 0 ? (wanted + input.limit) * (2 + contextLines) + 64 : wanted + input.limit + 1
+
+        return run<RawRow>({
+          cwd: input.cwd,
+          limit: rowLimit,
+          signal: input.signal,
+          pattern: input.pattern,
+          args: [
+            "--no-config",
+            "--json",
+            "--hidden",
+            "--no-messages",
+            ...(input.include ? [`--glob=${input.include}`] : []),
+            "--glob=!**/.git/**",
+            ...(input.insensitive ? ["-i"] : []),
+            ...(before > 0 ? ["-B", String(before)] : []),
+            ...(after > 0 ? ["-A", String(after)] : []),
+            "--",
+            input.pattern,
+            input.file ?? ".",
+          ],
+          parse: (line) =>
+            (Buffer.byteLength(line, "utf8") > MAX_RECORD_BYTES
+              ? Effect.fail(failure(`Ripgrep JSON record exceeded ${MAX_RECORD_BYTES} bytes`))
+              : Effect.try({
+                  try: () => JSON.parse(line) as unknown,
+                  catch: (cause) => failure("Invalid ripgrep JSON output", cause),
+                })
+            ).pipe(
+              Effect.flatMap((json) => {
+                if (
+                  !json ||
+                  typeof json !== "object" ||
+                  !("type" in json) ||
+                  (json.type !== "match" && json.type !== "context")
+                )
+                  return Effect.succeed(undefined)
+                return Schema.decodeUnknownEffect(RawMatch)(json).pipe(
+                  Effect.map((match) => ({
+                    path: { text: match.data.path.text.replace(/^\.[\\/]/, "") },
+                    line_number: match.data.line_number,
+                    absolute_offset: match.data.absolute_offset,
+                    lines: match.data.lines,
+                    submatches: match.data.submatches.slice(0, MAX_SUBMATCHES),
+                    context: match.type === "context",
+                  })),
+                  Effect.mapError((cause) => failure("Invalid ripgrep match output", cause)),
+                )
+              }),
+            ),
+        }).pipe(
+          Effect.map((result) => {
+            // Window by MATCH records: leading context records are held until
+            // their match is admitted; the first match beyond the window ends
+            // the walk and its leading context is dropped (rg de-duplicates
+            // shared context lines, so at most one side of the boundary loses
+            // context — matches themselves are never lost).
+            const page: RawRow[] = []
+            let seen = 0
+            let hasMore = false
+            let pending: RawRow[] = []
+            for (const row of result.items) {
+              if (row.context) {
+                pending.push(row)
+                continue
+              }
+              seen += 1
+              if (seen > wanted + input.limit) {
+                hasMore = true
+                break
+              }
+              if (seen > wanted) page.push(...pending, row)
+              pending = []
+            }
+            if (!hasMore) page.push(...pending)
+
+            const rows = page.map((row) => ({
+              path: normalizeEntryPath(row.path.text),
+              line: row.line_number,
+              text:
+                row.lines.text.length > 2_000
+                  ? row.lines.text.slice(0, 2_000).replace(/[\uD800-\uDBFF]$/, "") + "..."
+                  : row.lines.text,
+              context: row.context,
+            }))
+            return { mode: "content" as const, rows, total: seen, hasMore }
+          }),
+        )
+      }
     })
   }),
 )
+
+const normalizeEntryPath = (line: string) =>
+  line.replace(/^(?:\.[\\/])+/u, "").replace(/^[\\/]+/u, "").replaceAll("\\", "/")
+
+type RawRow = {
+  path: { text: string }
+  line_number: number
+  absolute_offset: number
+  lines: { text: string }
+  submatches: readonly unknown[]
+  context: boolean
+}
 
 export const node = makeGlobalNode({ service: Service, layer: layer, deps: [RipgrepBinary.node, AppProcess.node] })

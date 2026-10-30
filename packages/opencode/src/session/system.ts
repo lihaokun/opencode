@@ -11,6 +11,7 @@ import PROMPT_GPT from "./prompt/gpt.txt"
 import PROMPT_ASTRA from "./prompt/gpt-astra.txt"
 import PROMPT_KIMI from "./prompt/kimi.txt"
 import PROMPT_META from "./prompt/meta.txt"
+import PROMPT_SHARED from "./prompt/shared-behavior.txt"
 
 import PROMPT_CODEX from "./prompt/codex.txt"
 import PROMPT_TRINITY from "./prompt/trinity.txt"
@@ -28,26 +29,37 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 export function provider(model: Provider.Model) {
   if (model.api.id.includes("muse")) {
     const name = model.api.id.includes("muse-glimmer") ? "Muse Glimmer" : "Muse Spark"
-    return [PROMPT_META.replaceAll("{{MODEL_NAME}}", name)]
+    return PROMPT_META.replaceAll("{{MODEL_NAME}}", name)
   }
-  if (model.api.id.includes("gpt-4") || model.api.id.includes("o1") || model.api.id.includes("o3"))
-    return [PROMPT_BEAST]
+  if (model.api.id.includes("gpt-4") || model.api.id.includes("o1") || model.api.id.includes("o3")) {
+    return PROMPT_BEAST
+  }
   if (model.api.id.includes("gpt")) {
-    if (model.api.id.includes("gpt-6")) return [PROMPT_ASTRA]
-    if (model.api.id.includes("codex")) {
-      return [PROMPT_CODEX]
-    }
-    return [PROMPT_GPT]
+    if (model.api.id.includes("gpt-6")) return PROMPT_ASTRA
+    if (model.api.id.includes("codex")) return PROMPT_CODEX
+    return PROMPT_GPT
   }
-  if (model.api.id.includes("gemini-")) return [PROMPT_GEMINI]
-  if (model.api.id.includes("claude")) return [PROMPT_ANTHROPIC]
-  if (model.api.id.toLowerCase().includes("trinity")) return [PROMPT_TRINITY]
+  if (model.api.id.includes("gemini-")) return PROMPT_GEMINI
+  if (model.api.id.includes("claude")) return PROMPT_ANTHROPIC
+  if (model.api.id.toLowerCase().includes("trinity")) return PROMPT_TRINITY
   if (
     model.api.id.toLowerCase().includes("kimi") ||
     ["kimi-for-coding", "moonshotai", "moonshotai-cn"].includes(model.providerID)
   )
-    return [PROMPT_KIMI]
-  return [PROMPT_DEFAULT]
+    return PROMPT_KIMI
+  return PROMPT_DEFAULT
+}
+
+/**
+ * The shared working agreement closes every model template (single-source
+ * invariant): the model-template route is the only path that must carry it,
+ * and explicit agent prompts keep their opt-out via the preparePayload
+ * ternary. Appended by the caller, after the template, so the agreement
+ * wins any residual per-template conflict and stays inside the cache-stable
+ * prefix.
+ */
+export function systemSections(model: Provider.Model) {
+  return [provider(model), PROMPT_SHARED]
 }
 
 export interface Interface {

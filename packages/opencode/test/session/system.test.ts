@@ -5,6 +5,8 @@ import type { Agent } from "../../src/agent/agent"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Skill } from "../../src/skill"
 import { Permission } from "../../src/permission"
+import PROMPT_DEFAULT from "../../src/session/prompt/default.txt"
+import PROMPT_TRINITY from "../../src/session/prompt/trinity.txt"
 import type { Provider } from "../../src/provider/provider"
 import { SystemPrompt } from "../../src/session/system"
 import { MCP } from "../../src/mcp"
@@ -86,7 +88,7 @@ const it = testEffect(
 describe("session.system", () => {
   test("selects the Meta prompt for Muse Spark model IDs", () => {
     for (const id of ["meta/muse-spark-preview", "muse-spark-1.1", "muse-spark-1.2"]) {
-      const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)[0]
+      const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)
       expect(prompt).toContain("powered by Muse Spark,")
       expect(prompt).toContain("using Meta Muse Spark.")
       expect(prompt).not.toContain("{{MODEL_NAME}}")
@@ -95,7 +97,7 @@ describe("session.system", () => {
 
   test("selects the Meta prompt for Muse Glimmer model IDs", () => {
     for (const id of ["meta/muse-glimmer", "meta/muse-glimmer-30b", "muse-glimmer-30b"]) {
-      const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)[0]
+      const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)
       expect(prompt).toContain("powered by Muse Glimmer,")
       expect(prompt).toContain("using Meta Muse Glimmer.")
       expect(prompt).not.toContain("{{MODEL_NAME}}")
@@ -104,8 +106,38 @@ describe("session.system", () => {
 
   test("selects the Kimi prompt for official provider model IDs", () => {
     for (const providerID of ["kimi-for-coding", "moonshotai", "moonshotai-cn"]) {
-      const prompt = SystemPrompt.provider({ providerID, api: { id: "k3" } } as Provider.Model)[0]
+      const prompt = SystemPrompt.provider({ providerID, api: { id: "k3" } } as Provider.Model)
       expect(prompt).toContain("# Prompt and Tool Use")
+    }
+  })
+
+  test("appends the shared working agreement to every model template", () => {
+    const models = [
+      { api: { id: "meta/muse-spark-preview" } },
+      { api: { id: "gpt-4" } },
+      { api: { id: "gpt-6" } },
+      { api: { id: "gpt-5-codex" } },
+      { api: { id: "gemini-2" } },
+      { api: { id: "claude-x" } },
+      { api: { id: "trinity" } },
+      { api: { id: "k3" } },
+      { api: { id: "anything-else" } },
+    ] as Provider.Model[]
+    for (const model of models) {
+      const [template, shared] = SystemPrompt.systemSections(model)
+      expect(shared.startsWith("# Working agreement")).toBe(true)
+      expect(template).not.toContain("# Working agreement")
+    }
+  })
+
+  test("drops the hard brevity, no-explanation and no-comment rules from default and trinity", () => {
+    for (const prompt of [PROMPT_DEFAULT, PROMPT_TRINITY]) {
+      expect(prompt).not.toContain("fewer than 4 lines")
+      expect(prompt).not.toContain("One word answers are best")
+      expect(prompt).not.toContain("just stop")
+      expect(prompt).not.toContain("DO NOT ADD ***ANY***")
+      expect(prompt).not.toContain("prefer to use the agent tool")
+      expect(prompt).toContain("Do not poll or ask an agent whether it has finished")
     }
   })
 

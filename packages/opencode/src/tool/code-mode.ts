@@ -158,13 +158,7 @@ const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: 
           onprogress: () => {},
         },
       )
-      if (raw.isError)
-        throw new Error(
-          raw.content
-            .flatMap((item) => (item.type === "text" ? [item.text] : []))
-            .filter((text) => text.trim())
-            .join("\n\n") || "MCP tool returned an error",
-        )
+      if (raw.isError) throw new Error(McpCatalog.callToolErrorMessage(raw))
       return raw
     })
   }).pipe(

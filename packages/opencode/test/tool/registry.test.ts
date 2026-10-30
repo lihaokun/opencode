@@ -173,6 +173,34 @@ describe("tool.registry", () => {
     }),
   )
 
+  // The background shell tools ride the same builtin list as bash itself. A
+  // regression here would strand run_in_background callers: the start text
+  // points them at shell_output, and a missing registration means the model
+  // never sees that tool at all.
+  it.instance("exposes shell_output and shell_kill alongside bash", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agent = yield* Agent.Service
+      const build = yield* agent.get("build")
+      if (!build) throw new Error("build agent not found")
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: build,
+      })
+      const ids = tools.map((tool) => tool.id)
+
+      expect(ids).toContain("bash")
+      expect(ids).toContain("shell_output")
+      expect(ids).toContain("shell_kill")
+
+      const output = tools.find((tool) => tool.id === "shell_output")
+      const kill = tools.find((tool) => tool.id === "shell_kill")
+      expect(output?.description).toContain("run_in_background")
+      expect(kill?.description).toContain("run_in_background")
+    }),
+  )
+
   it.instance("loads tools from .opencode/tool (singular)", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance

@@ -50,6 +50,32 @@ describe("McpCatalog.convertTool", () => {
   })
 })
 
+describe("McpCatalog.callToolErrorMessage", () => {
+  test("structuredContent-only error carries the JSON", () => {
+    const structuredContent = { code: 3007, detail: "quota exceeded" }
+    expect(
+      McpCatalog.callToolErrorMessage({ isError: true, content: [], structuredContent } as any),
+    ).toBe(JSON.stringify(structuredContent))
+  })
+
+  test("text and structuredContent are joined", () => {
+    const structuredContent = { detail: "disk full" }
+    expect(
+      McpCatalog.callToolErrorMessage({
+        isError: true,
+        content: [{ type: "text", text: "write failed" }],
+        structuredContent,
+      } as any),
+    ).toBe(`write failed\n\n${JSON.stringify(structuredContent)}`)
+  })
+
+  test("neither text nor structuredContent keeps the stable fallback", () => {
+    expect(McpCatalog.callToolErrorMessage({ isError: true, content: [] } as any)).toBe(
+      "MCP tool returned an error",
+    )
+  })
+})
+
 test("preserves output schema validation across paginated tool discovery", async () => {
   const server = new Server({ name: "pagination", version: "1.0.0" }, { capabilities: { tools: {} } })
   server.setRequestHandler(ListToolsRequestSchema, ({ params }) =>

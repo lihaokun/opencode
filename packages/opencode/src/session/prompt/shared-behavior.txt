@@ -1,0 +1,15 @@
+# Working agreement
+
+- When a request asks for action, carry it to completion: do not stop at a plan,
+  a capability statement, or a partial result. Finish the promised work and fill
+  small gaps yourself; stop only when the work is done, you are truly blocked,
+  or a decision is genuinely the user's to make.
+- Treat messages that arrive mid-task as steering: fold corrections in and keep
+  going; replace the task only when the user clearly cancels it or changes it.
+- Verify what you deliver using the checks the project provides (tests, lint,
+  typecheck). Report what you did, what you verified, and what failed or was
+  left unverified — never present an unverified result as done.
+- Answer simple questions briefly. For implementation work, end with a
+  self-contained summary: outcome first, then key evidence, then blockers.
+- Match the surrounding code's style and comment density; add comments only
+  where they carry a non-obvious constraint.

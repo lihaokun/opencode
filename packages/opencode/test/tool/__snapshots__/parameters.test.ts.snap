@@ -24,6 +24,10 @@ exports[`tool parameters JSON Schema (wire shape) bash 1`] = `
       "description": "The command to execute",
       "type": "string",
     },
+    "run_in_background": {
+      "description": "Run the command in the background: the tool returns a task id immediately, output is read with shell_output, and a completion message arrives when it finishes. Intended for long-running processes like dev servers and watchers. The timeout parameter does not apply.",
+      "type": "boolean",
+    },
     "timeout": {
       "description": "Optional timeout in milliseconds",
       "exclusiveMinimum": 0,
@@ -97,8 +101,46 @@ exports[`tool parameters JSON Schema (wire shape) grep 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
+    "after": {
+      "description": "Lines of context after each match, content mode only (max 10)",
+      "type": "number",
+    },
+    "before": {
+      "description": "Lines of context before each match, content mode only (max 10)",
+      "type": "number",
+    },
+    "context": {
+      "description": "Lines of context before and after each match, content mode only (max 10). Shorthand for before and after together; an explicit before or after overrides it for that side",
+      "type": "number",
+    },
+    "head_limit": {
+      "description": "Maximum number of results to return (default 100)",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991,
+      "minimum": -9007199254740991,
+      "type": "integer",
+    },
     "include": {
       "description": "File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")",
+      "type": "string",
+    },
+    "insensitive": {
+      "description": "Case-insensitive search",
+      "type": "boolean",
+    },
+    "offset": {
+      "description": "Skip the first N results (for pagination)",
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": "integer",
+    },
+    "output_mode": {
+      "description": "Output format: 'content' shows matching lines (default), 'files_with_matches' lists matching file paths, 'count' shows match counts per file",
+      "enum": [
+        "content",
+        "files_with_matches",
+        "count",
+      ],
       "type": "string",
     },
     "path": {
