@@ -15,9 +15,10 @@ import { SessionID } from "../session/schema"
 export type AgentStatus = "running" | "idle"
 
 /**
- * How many Agents an injected roster or neighbour snapshot will name.
+ * How many Agents the neighbour snapshot will name. (The roster that shared
+ * this cap is retired; the step tail's view has its own, StepTail.LIST_ROWS.)
  *
- * The lists exist so a reader knows it has company and who that is; enumerating
+ * The list exists so a reader knows it has company and who that is; enumerating
  * everyone is agent_list's job and reaching anyone is agent_send's. Ten keeps a
  * widely fanned-out session from trading one unbounded list for a longer one,
  * and sits at the same order of magnitude as the task prompt it travels with.

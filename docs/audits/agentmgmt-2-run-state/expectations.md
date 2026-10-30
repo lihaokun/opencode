@@ -99,7 +99,7 @@
 **进度视图（commit 3）**
 
 - S14 门：无直接子或 `agent_list` deny → 不附带
-- S15 采集：`Session.children` 一次 SQL；状态投影给 running 与 last step；`windowStart = min(now − 10min, previousStepStart)`，首步用 run 开始；失败整节省略
+- S15 采集：`Session.children` 一次 SQL；状态投影 `list()` 一次给 running 与 last step；`windowStart = min(now − 10min, previousStepStart)`，首步用 run 开始；失败整节省略
 - S16 渲染：在跑升序（`started_at ?? created`）、已结束降序（`ended_at ?? started_at`）、cut off 行不受窗口限制、各 10 行、省略行、上一个 run 的分号句；节序在重复计数之前
 - S17 删除花名册注入（`applyAgentRoster` 调用与实现），保留 sentinel 常量
 
@@ -162,7 +162,7 @@
 
 ## 8. 性能契约（机械化）
 
-- 进度视图每步的数据采集 = 一次 SQL（`Session.children`，按 parent_id）+ 直接子数次内存状态查找；不读历史、不读消息、不算 depth。单测断言：构造 600 个直接子的会话，一步内对 `message` / `part` 表零查询（经 Database 层的查询计数器或 Drizzle 日志钩子观测，实现时二选一并写明），采集耗时上界 50 ms。
+- 进度视图每步的数据采集 = 一次 SQL（`Session.children`，按 parent_id）+ 一次内存状态投影拷贝；不读历史、不读消息、不算 depth。单测断言：构造 600 个直接子的会话，采集只调用一次 `Session.children`，采集加渲染耗时上界 50 ms。观测点是 Session.Interface 边界而不是 SQL：Database 层没有查询计数器也没有 Drizzle 日志钩子，而采集函数的参数类型是 `Pick<Interface, "children">`，它能到达存储的路只有这一条，`children` 本身是一条 `where parent_id = ?`。
 - 进度视图文本 ≤ 30 行。
 - run 记录每次 run 写两次，不按步写；`SessionStatus.at` 是内存写。
 - `Session.patch` 的锁持有时间 = 一次行读 + 一次事务写 + 同步监听者（分享同步的缓存读与入队、事件桥的同步转发、HTTP 事件流入队）；单测断言单次 patch 的锁持有 < 50 ms；获取超时 30 s。

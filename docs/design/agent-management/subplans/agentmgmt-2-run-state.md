@@ -523,9 +523,9 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
   1. `running = children.filter(c => c.running)`，按 `run?.started_at ?? created` 升序、并列按 id；取前 10；超出记 `omittedRunning`。
   2. `finished = children.filter(c => !c.running && (c.run?.ended_at !== undefined ? c.run.ended_at >= windowStart : c.run !== undefined))`——已关闭的按窗口筛，未关闭的（cut off）不筛；按 `ended_at ?? started_at` 降序、并列按 id；取前 10；超出记 `omittedFinished`。
   3. 渲染 4.5 的格式：时钟与自身位置；总览行；在跑列表（每行 id、名字、run 号、since、来源、last step；若 `run.previous.ended_at >= windowStart` 附分号句）；已结束列表（已关闭行 / cut off 行）；省略行。
-  4. 两个列表都为空时只返回时钟行与总览行。
+  4. 两个列表都为空时只返回总览行（时钟行由调用方按"随任一节出现"的规则加在整段最前）。已结束列表的标题：窗口恰为 10 分钟时写 `Finished in the last 10 minutes, now idle:`，更长时写 `Finished since HH:MM:SS, now idle:`。在跑而记录缺失或已关闭（开始写入未完成、已失败，或续跑窗口）的行写 `running (run record not updated yet)`，与 agent_send 的措辞一致。
 - **正确性论证**：纯函数；行数上界 30；排序有确定的第二键（id）；`finished` 的筛选条件与 4.5 定义逐字对应；cut off 行不受窗口限制故崩溃遗留可见直到被新 run 关闭。
-- 测试：无子时上层不调用；有子无变化只有时钟与总览；在跑按开始时间升序、无记录的按创建时间混排、超 10 截断保留最早的；已结束按结束时间降序、超 10 截断保留最新的；cut off 行出现且不受窗口限制；上一个 run 在窗口内时附带分号句、不在窗口内不带；四种结局各一例；来源四种各一例；名字缺省时省略；主会话第一行无 run 号。
+- 测试（`step-tail.test.ts`）：无子返回空；有子无变化只有总览；在跑按开始时间升序、无记录的按创建时间混排、记录已关闭的写 not updated yet、超 10 截断保留最早的；已结束按结束时间降序、超 10 截断保留最新的；cut off 行出现且不受窗口限制；上一个 run 在窗口内时附带分号句、不在窗口内不带；四种结局；来源三种；名字转义后仍是一行；标题两种；主会话第一行无 run 号；窗口取 10 分钟与上一步开始的较早者。
 
 #### 5.3.2 `runLoop` 中的数据采集（`prompt.ts:1434` 组装 tail 处）
 
@@ -533,17 +533,17 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 - 采集（`catchAll` 到 `undefined` → 整节省略）：
   1. 权限门：`Permission.evaluate(AGENT_LIST_TOOL_ID, "*", merged)` 为 deny → 不附带（与 `reminders.ts:94-97` 同一规则）。
   2. **一次 SQL**：`sessions.children(id)`（`session.ts:688-696`，`where parent_id = ?`，一次查询、一次 hydrate）。为空 → 不附带。
-  3. 对每行：`status = yield* status.get(id)`（内存）→ `running = status.type ∈ {busy, retry}`、`lastStep = status.at`；`run = metadata.agentRun`；名字 = `metadata.agentName`；`created = time.created`。
+  3. 状态投影取一次 `status.list()`（内存，一次拷贝；实施时从逐子 `get` 改为一次 `list`：600 个子时逐次 Effect 调用的开销就占去大半预算），对每行：`running = type ∈ {busy, retry}`、`lastStep = at`；`run = metadata.agentRun`；名字 = `metadata.agentName`；`created = time.created`。采集放在 `StepTail.collectSubagents({ sessions, status, parentID })`，服务经参数显式传入（`Pick<Interface, "children">` / `Pick<Interface, "list">`），它能到达存储的路只有 `children` 这一条。
   4. `windowStart = min(now − 10 min, previousStepStart)`。
   5. 自身位置：子会话取自己的 `agentRun.number`（本步开始时已写），主会话无；步号 = `step`。
 - `tail = StepTail.render([renderSubagents(...), renderRepeat(repeat)])`。
 - 同一 commit 删除 `applyAgentRoster` 的注入与调用（`reminders.ts:56-153`、`prompt.ts:1335-1339`），保留 `AGENT_ROSTER_SENTINEL`；相关测试改为断言不再注入。
 - **正确性论证**：
-  - 读取量：一次 SQL 加 N 次内存查找，N 为直接子数；不读消息、不读部件、不算 depth。606 个子 agent 也是一次几毫秒的查询加一次 JSON 解析（expectations §8 的断言）。
+  - 读取量：一次 SQL 加一次内存投影拷贝，N 为直接子数；不读消息、不读部件、不算 depth。600 个直接子实测采集加渲染在负载 12 的机器上仍在 50 ms 内（expectations §8 的断言）。
   - 窗口的保底项保证"任何结束至少被下一步看到一次"：结束时间 ≥ 上一步开始 ⇒ 在本步窗口内；第一步用 run 开始时间，run 开始前结束的由 10 分钟项覆盖。
   - 权限门与被删除的花名册同一条规则，信息暴露面不变。
   - 副作用：无（只读）。
-- 测试：无子不附带；`agent_list` deny 不附带；进度视图与重复计数共存且节序正确；30 分钟长步后结束的子在下一步可见；run 第一步的窗口用 run 开始时间；相邻两步请求的历史部分逐字相同（扩展 R1）；花名册不再写入历史；采集对 `message` / `part` 表零查询。
+- 测试（`prompt.test.ts`）：无子不附带；`agent_list` deny 不附带；进度视图与重复计数共存且节序正确（视图在前，重复计数收尾）；相邻三步请求的历史部分逐字相同（扩展 R1），视图与时钟都不进历史；花名册不再写入历史；600 个直接子的采集只调一次 `children`、不超过 50 ms。"30 分钟长步"与"首步用 run 开始"无法在真实时钟下集成验证，由 `StepTail.windowStart` 的单元测试与 `runLoop` 里 `previousStepStart` 的初值、每步更新两行代码承担。
 - T7（随机）：随机生成子集合（状态、run 记录、创建时间、最后一步时间）与窗口，断言两个列表恰等于按 4.5 定义计算的集合、顺序满足定义、行数 ≤ 10、省略计数正确；相邻步之间同一输入产出同一文本。
 
 ### 5.4 commit 4：报告、停止通知与 `agent_send`

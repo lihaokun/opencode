@@ -627,9 +627,9 @@ When set to `deny`, the subagent is removed from the `agent` tool description en
 
 The three companion tools take their own keys: `agent_list` for reading the Agent
 tree, `agent_send` for messaging another Agent, and `agent_stop` for stopping
-one. Denying `agent_list` also withholds the subagent roster and the neighbour
-snapshot, so a subagent that cannot list other Agents is not told about them by
-another route.
+one. Denying `agent_list` also withholds the step tail's view of the subagents
+and the neighbour snapshot, so a subagent that cannot list other Agents is not
+told about them by another route.
 
 :::note
 `permission.task` was this key's name before the tool was renamed. It is still

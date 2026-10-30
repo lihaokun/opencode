@@ -2659,6 +2659,18 @@ it.instance("glob tool keeps instance context during prompt runs", () =>
   }),
 )
 
+// The step tail is the request's last user message: the clock line, then the
+// sections. These tests script the repeat section, so that is what they read.
+function repeatTail(body: Record<string, unknown>) {
+  const last = Array.isArray(body.messages) ? body.messages.at(-1) : undefined
+  if (last?.role !== "user" || typeof last.content !== "string" || !last.content.startsWith("Now: ")) return undefined
+  const content: string = last.content
+  return content
+    .split("\n\n")
+    .slice(1)
+    .find((section) => section.startsWith("Your last step"))
+}
+
 // Fix doc session-fix-step-tail-repeat-and-agents, R1: the fermat storm, one
 // identical failing edit per step. Each request ends with the count of the
 // repeats so far, and no copy of the tail lands in the history. The history part
@@ -2703,11 +2715,7 @@ it.instance(
 
       const requests = (yield* llm.inputs).map((body) => {
         const messages = Array.isArray(body.messages) ? body.messages.map((message) => JSON.stringify(message)) : []
-        const last = Array.isArray(body.messages) ? body.messages.at(-1) : undefined
-        const tail =
-          last?.role === "user" && typeof last.content === "string" && last.content.startsWith("Your last step")
-            ? last.content
-            : undefined
+        const tail = repeatTail(body)
         return { tail, history: tail ? messages.slice(0, -1) : messages }
       })
       const once =
@@ -2728,6 +2736,7 @@ it.instance(
       }
       const stored = JSON.stringify(yield* MessageV2.filterCompactedEffect(session.id))
       expect(stored).not.toContain("Your last step")
+      expect(stored).not.toContain("Now: ")
     }),
   30_000,
 )
@@ -2767,12 +2776,7 @@ it.instance(
 
       yield* prompt.loop({ sessionID: session.id })
 
-      const tails = (yield* llm.inputs).map((body) => {
-        const last = Array.isArray(body.messages) ? body.messages.at(-1) : undefined
-        return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("Your last step")
-          ? last.content
-          : undefined
-      })
+      const tails = (yield* llm.inputs).map(repeatTail)
       expect(tails).toEqual([
         undefined,
         undefined,
@@ -2878,12 +2882,7 @@ const runOutcomes = Effect.fn("test.runOutcomes")(function* (plan: readonly Step
   yield* llm.pushMatch((hit) => JSON.stringify(hit.body).includes(id), ...items, reply().text(`done ${id}`).stop())
   const before = (yield* llm.inputs).length
   yield* prompt.loop({ sessionID: session.id })
-  const actual = (yield* llm.inputs).slice(before).map((body) => {
-    const last = Array.isArray(body.messages) ? body.messages.at(-1) : undefined
-    return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("Your last step")
-      ? last.content
-      : undefined
-  })
+  const actual = (yield* llm.inputs).slice(before).map(repeatTail)
 
   // The definition: count the trailing run of completed steps whose calls equal
   // the previous completed step's calls. Equal edits here always fail the same
@@ -3204,15 +3203,14 @@ it.instance("a command subtask carries the subagent's result, in one message", (
 
     // One message about the delegation reaches the parent — the summary. The
     // automatic completion notice is not registered for this path, and if it
-    // were it would also wake the parent a second time. The subagent roster is
-    // a separate mechanism and is filtered out here rather than counted.
+    // were it would also wake the parent a second time. The roster that once
+    // rode along is retired (subplan agentmgmt-2-run-state §4.5): nothing
+    // else is written into the transcript.
     const synthetic = msgs
       .filter((item) => item.info.role === "user")
       .flatMap((item) => item.parts)
-      .filter(
-        (part): part is SessionV1.TextPart =>
-          part.type === "text" && part.synthetic === true && !part.text.startsWith(AGENT_ROSTER_SENTINEL),
-      )
+      .filter((part): part is SessionV1.TextPart => part.type === "text" && part.synthetic === true)
+    expect(synthetic.some((part) => part.text.startsWith(AGENT_ROSTER_SENTINEL))).toBe(false)
     expect(synthetic).toHaveLength(1)
     expect(synthetic[0].text).toContain("Summarize the agent result")
   }),
@@ -3350,10 +3348,7 @@ it.instance("a command subtask whose agent never started reports the failure", (
     const synthetic = msgs
       .filter((item) => item.info.role === "user")
       .flatMap((item) => item.parts)
-      .filter(
-        (part): part is SessionV1.TextPart =>
-          part.type === "text" && part.synthetic === true && !part.text.startsWith(AGENT_ROSTER_SENTINEL),
-      )
+      .filter((part): part is SessionV1.TextPart => part.type === "text" && part.synthetic === true)
     expect(synthetic).toHaveLength(0)
   }),
 )
@@ -5611,6 +5606,191 @@ withFailingMetadata.instance(
       }
     }),
   300_000,
+)
+
+// ---------------------------------------------------------------------------
+// The subagent view (subplan agentmgmt-2-run-state §4.5, §5.3.2): the end of
+// every step shows the parent the clock, who is running and who finished
+// lately — built each step and never stored.
+// ---------------------------------------------------------------------------
+
+const lastUserContent = (body: Record<string, unknown>) => {
+  const last = Array.isArray(body.messages) ? body.messages.at(-1) : undefined
+  return last?.role === "user" && typeof last.content === "string" ? last.content : undefined
+}
+
+it.instance("each step ends with the clock and the subagent view, and the history stays identical (INV-8)", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const status = yield* SessionStatus.Service
+    const parent = yield* sessions.create({ title: "root", permission: allowAll })
+    const running = yield* subagent(parent.id)
+    const finished = yield* subagent(parent.id)
+    const now = Date.now()
+    yield* sessions.setMetadata({
+      sessionID: running.id,
+      metadata: {
+        ...running.metadata,
+        [AgentManagement.METADATA_AGENT_NAME]: "cw-1",
+        [AgentManagement.METADATA_AGENT_RUN]: {
+          number: 2,
+          started_at: now - 30_000,
+          woken_by: { kind: "agent", session: parent.id },
+          previous: { number: 1, ended_at: now - 60_000, outcome: "completed" },
+        },
+      },
+    })
+    yield* status.set(running.id, { type: "busy" })
+    yield* sessions.setMetadata({
+      sessionID: finished.id,
+      metadata: {
+        ...finished.metadata,
+        [AgentManagement.METADATA_AGENT_RUN]: {
+          number: 1,
+          started_at: now - 120_000,
+          woken_by: { kind: "system" },
+          ended_at: now - 90_000,
+          outcome: "failed",
+        },
+      },
+    })
+    yield* user(parent.id, "check on them")
+    // The same call twice: the third request carries the repeat section too,
+    // after the view.
+    yield* llm.tool("glob", { pattern: "*.nothing-view" })
+    yield* llm.tool("glob", { pattern: "*.nothing-view" })
+    yield* llm.text("all good")
+
+    yield* prompt.loop({ sessionID: parent.id })
+
+    const inputs = yield* llm.inputs
+    expect(inputs).toHaveLength(3)
+    for (const [index, body] of inputs.entries()) {
+      const tail = lastUserContent(body)
+      expect(tail, `request ${index + 1}`).toMatch(
+        new RegExp(
+          `^Now: \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[+-]\\d{2}:\\d{2}\\. You are at step ${index + 1}\\.\\n\\n`,
+        ),
+      )
+      expect(tail).toContain("Your subagents: 2 direct, 1 running, 1 idle.")
+      expect(tail).toContain(
+        `  ${running.id}  cw-1  run 2 since ${AgentRun.formatClock(now - 30_000)} (your message), last step `,
+      )
+      expect(tail).toContain(`; run 1 ended ${AgentRun.formatClock(now - 60_000)} (completed)`)
+      expect(tail).toContain("Finished in the last 10 minutes, now idle:")
+      expect(tail).toContain(`  ${finished.id}  run 1 ended ${AgentRun.formatClock(now - 90_000)} (failed)`)
+    }
+    const third = lastUserContent(inputs[2]!)!
+    expect(third.indexOf("Your subagents:")).toBeLessThan(third.indexOf("Your last step repeated the tool calls"))
+    expect(third.endsWith("the results were identical too: 1 time in a row.")).toBe(true)
+    // Each request is the one before plus the step, byte for byte, with each
+    // tail outside the history.
+    const histories = inputs.map((body) =>
+      Array.isArray(body.messages) ? body.messages.slice(0, -1).map((message) => JSON.stringify(message)) : [],
+    )
+    for (const index of [1, 2]) {
+      expect(histories[index]!.slice(0, histories[index - 1]!.length), `request ${index + 1}`).toEqual(
+        histories[index - 1]!,
+      )
+      expect(histories[index]!.length).toBeGreaterThan(histories[index - 1]!.length)
+    }
+    const stored = JSON.stringify(yield* sessions.messages({ sessionID: parent.id }))
+    expect(stored).not.toContain("Your subagents")
+    expect(stored).not.toContain("Now: ")
+  }),
+)
+
+it.instance("no view without children, and none for a parent denied agent_list", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const denied = yield* sessions.create({
+      title: "root",
+      permission: [...allowAll, { permission: "agent_list", pattern: "*", action: "deny" }],
+    })
+    const child = yield* subagent(denied.id)
+    yield* user(denied.id, "look")
+    yield* llm.text("nothing to see")
+    yield* prompt.loop({ sessionID: denied.id })
+    expect(lastUserContent((yield* llm.inputs)[0]!)).toBe("look")
+
+    yield* user(child.id, "work")
+    yield* llm.text("worked")
+    yield* prompt.loop({ sessionID: child.id })
+    expect(lastUserContent((yield* llm.inputs)[1]!)).toBe("work")
+  }),
+)
+
+// Expectations §8: the collection is one query over the session table and the
+// in-memory projection. The collector can only reach the store through
+// `children` (its parameter type), so the count is of that call; the Database
+// layer exposes no query hook to count SQL by table.
+it.instance(
+  "collecting the view over 600 children is one call to children and well under 50 ms",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const parent = yield* sessions.create({ title: "wide" })
+      const now = Date.now()
+      const ids = yield* Effect.forEach(
+        Array.from({ length: 600 }, (_, i) => i),
+        (i) =>
+          sessions
+            .create({
+              parentID: parent.id,
+              title: `c${i}`,
+              ...(i % 3 === 0
+                ? {
+                    metadata: {
+                      [AgentManagement.METADATA_AGENT_RUN]: {
+                        number: 1,
+                        started_at: now - i * 1_000,
+                        woken_by: { kind: "system" },
+                        ended_at: now - i * 500,
+                        outcome: "completed",
+                      },
+                    },
+                  }
+                : {}),
+            })
+            .pipe(Effect.map((created) => created.id)),
+      )
+      yield* Effect.forEach(
+        ids.filter((_, i) => i % 2 === 0),
+        (id) => status.set(id, { type: "busy" }),
+      )
+
+      const calls: string[] = []
+      const started = performance.now()
+      const children = yield* StepTail.collectSubagents({
+        sessions: {
+          children: (id) => {
+            calls.push("children")
+            return sessions.children(id)
+          },
+        },
+        status,
+        parentID: parent.id,
+      })
+      const text = StepTail.renderSubagents({
+        now: Date.now(),
+        children,
+        windowStart: Date.now() - StepTail.WINDOW_MS,
+        viewer: parent.id,
+      })
+      const elapsed = performance.now() - started
+
+      expect(calls).toEqual(["children"])
+      expect(children).toHaveLength(600)
+      expect(text).toContain("Your subagents: 600 direct, 300 running, 300 idle.")
+      expect(text?.split("\n").length).toBeLessThanOrEqual(25)
+      expect(elapsed).toBeLessThan(50)
+    }),
+  60_000,
 )
 
 // ---------------------------------------------------------------------------

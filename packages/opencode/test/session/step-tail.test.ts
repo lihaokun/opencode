@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { StepTail } from "../../src/session/step-tail"
+import { AgentRun } from "../../src/agent-management/run"
+import type { AgentManagement } from "../../src/agent-management/schema"
+import { SessionID } from "../../src/session/schema"
 
 type Call = { tool: string; input: Record<string, unknown>; status: "completed" | "error"; result: string }
 
@@ -182,6 +185,254 @@ describe("step tail on random step sequences", () => {
         previous = current
         expect(repeat, `seed ${9100 + n} step ${s}`).toEqual(oracle(steps))
       }
+    }
+  })
+})
+
+// The subagent view (subplan agentmgmt-2-run-state §4.5, §5.3.1).
+
+const now = 1_700_000_000_000
+const viewer = SessionID.make("ses_viewer")
+const other = SessionID.make("ses_other")
+const clock = AgentRun.formatClock
+const id = (n: number) => SessionID.make(`ses_${String(n).padStart(4, "0")}`)
+const system = { kind: "system" as const }
+
+function child(n: number, extra: Partial<StepTail.Child>): StepTail.Child {
+  return { id: id(n), created: now - 3_600_000 + n * 1_000, running: false, ...extra }
+}
+
+function closed(number: number, endedAgo: number, outcome: AgentManagement.RunOutcome = "completed") {
+  return { number, started_at: now - endedAgo - 1_000, woken_by: system, ended_at: now - endedAgo, outcome }
+}
+
+function open(number: number, startedAgo: number, woken_by: AgentManagement.WakeSource = system) {
+  return { number, started_at: now - startedAgo, woken_by }
+}
+
+function view(children: StepTail.Child[], windowStart = now - StepTail.WINDOW_MS) {
+  return StepTail.renderSubagents({ now, children, windowStart, viewer })
+}
+
+describe("step tail: clock and window", () => {
+  test("the clock line names the run for a subagent and only the step for a main session", () => {
+    expect(StepTail.renderClock({ now, run: 6, step: 12 })).toBe(
+      `Now: ${AgentRun.formatInstant(now)}. You are in run 6, step 12.`,
+    )
+    expect(StepTail.renderClock({ now, step: 3 })).toBe(`Now: ${AgentRun.formatInstant(now)}. You are at step 3.`)
+  })
+
+  test("the window reaches back ten minutes, or to the previous step's start when that is earlier", () => {
+    expect(StepTail.windowStart(now, now - 1_000)).toBe(now - StepTail.WINDOW_MS)
+    expect(StepTail.windowStart(now, now - 30 * 60_000)).toBe(now - 30 * 60_000)
+  })
+})
+
+describe("step tail: subagent view", () => {
+  test("nothing without children", () => {
+    expect(view([])).toBeUndefined()
+  })
+
+  test("the overview alone when nobody is running and nobody finished inside the window", () => {
+    expect(view([child(1, { run: closed(1, 20 * 60_000) }), child(2, {})])).toBe(
+      "Your subagents: 2 direct, 0 running, 2 idle.",
+    )
+  })
+
+  test("running rows: longest-running first, with the source, the last step and the previous run inside the window", () => {
+    const a = child(1, {
+      running: true,
+      lastStep: now - 5_000,
+      name: "cw-a",
+      run: {
+        ...open(2, 30_000, { kind: "agent", session: viewer }),
+        previous: { number: 1, ended_at: now - 60_000, outcome: "completed" },
+      },
+    })
+    const b = child(2, {
+      running: true,
+      lastStep: now - 1_000,
+      run: open(1, 10_000, { kind: "agent", session: other, name: "cw-b" }),
+    })
+    // No record yet: sorted by creation, which is long ago here.
+    const c = child(3, { running: true, lastStep: now - 2_000 })
+    // A closed record under a running child is the continuation window.
+    const d = child(4, { running: true, lastStep: now - 3_000, run: closed(1, 4_000) })
+    expect(view([b, d, a, c])).toBe(
+      [
+        "Your subagents: 4 direct, 4 running, 0 idle.",
+        "Running now:",
+        `  ${c.id}  running (run record not updated yet), last step ${clock(now - 2_000)}`,
+        `  ${a.id}  cw-a  run 2 since ${clock(now - 30_000)} (your message), last step ${clock(now - 5_000)}; run 1 ended ${clock(now - 60_000)} (completed)`,
+        `  ${b.id}  run 1 since ${clock(now - 10_000)} (cw-b), last step ${clock(now - 1_000)}`,
+        `  ${d.id}  running (run record not updated yet), last step ${clock(now - 3_000)}`,
+      ].join("\n"),
+    )
+  })
+
+  test("the previous run is left out when it ended before the window", () => {
+    const a = child(1, {
+      running: true,
+      lastStep: now,
+      run: { ...open(2, 30_000), previous: { number: 1, ended_at: now - 20 * 60_000, outcome: "failed" } },
+    })
+    expect(view([a])).toBe(
+      [
+        "Your subagents: 1 direct, 1 running, 0 idle.",
+        "Running now:",
+        `  ${a.id}  run 2 since ${clock(now - 30_000)} (system), last step ${clock(now)}`,
+      ].join("\n"),
+    )
+  })
+
+  test("finished rows: newest first, the four outcomes, and a cut-off run whatever the window", () => {
+    const rows = [
+      child(1, { run: closed(3, 60_000, "stopped") }),
+      child(2, { run: closed(1, 30_000, "failed") }),
+      child(3, { run: closed(2, 120_000, "lost") }),
+      child(4, { run: closed(5, 20 * 60_000, "completed") }),
+      child(5, { name: "cw-e", run: open(4, 25 * 60_000) }),
+    ]
+    expect(view(rows)).toBe(
+      [
+        "Your subagents: 5 direct, 0 running, 5 idle.",
+        "Finished in the last 10 minutes, now idle:",
+        `  ${id(2)}  run 1 ended ${clock(now - 30_000)} (failed)`,
+        `  ${id(1)}  run 3 ended ${clock(now - 60_000)} (stopped)`,
+        `  ${id(3)}  run 2 ended ${clock(now - 120_000)} (lost)`,
+        `  ${id(5)}  cw-e  run 4 cut off since ${clock(now - 25 * 60_000)} (not yet recorded as lost)`,
+      ].join("\n"),
+    )
+  })
+
+  test("the heading names the window's start when it reaches past ten minutes", () => {
+    const start = now - 30 * 60_000
+    expect(view([child(1, { run: closed(1, 15 * 60_000) })], start)).toBe(
+      [
+        "Your subagents: 1 direct, 0 running, 1 idle.",
+        `Finished since ${clock(start)}, now idle:`,
+        `  ${id(1)}  run 1 ended ${clock(now - 15 * 60_000)} (completed)`,
+      ].join("\n"),
+    )
+  })
+
+  test("past ten of either, the newest running and the oldest finished are counted, not listed", () => {
+    const running = Array.from({ length: 12 }, (_, i) => child(i + 1, { running: true, run: open(1, (i + 1) * 1_000) }))
+    const finished = Array.from({ length: 12 }, (_, i) => child(i + 20, { run: closed(1, (i + 1) * 1_000) }))
+    const lines = view([...running, ...finished])!.split("\n")
+    expect(lines[0]).toBe("Your subagents: 24 direct, 12 running, 12 idle.")
+    expect(lines.slice(1, 13)).toEqual([
+      "Running now:",
+      ...running
+        .slice(2)
+        .reverse()
+        .map((row) => `  ${row.id}  run 1 since ${clock(row.run!.started_at)} (system)`),
+      "  … and 2 more running",
+    ])
+    expect(lines.slice(13)).toEqual([
+      "Finished in the last 10 minutes, now idle:",
+      ...finished.slice(0, 10).map((row) => `  ${row.id}  run 1 ended ${clock(row.run!.ended_at!)} (completed)`),
+      "  … and 2 more finished",
+    ])
+    expect(lines).toHaveLength(25)
+  })
+
+  test("a name is escaped, so a row stays one line", () => {
+    const text = view([child(1, { name: "a]\nb", run: closed(1, 1_000) })])!
+    expect(text.split("\n")).toHaveLength(3)
+    expect(text).toContain(`  ${id(1)}  a\\]\\nb  run 1 ended`)
+  })
+
+  // T7 (INV-8b): random children and windows against the definition. The
+  // running list is the running children by start (or creation) ascending,
+  // the finished list the idle children whose record is open or ended inside
+  // the window, by end (or start) descending; ten rows each, the rest counted.
+  test("T7: random children and windows match the definition", () => {
+    const outcomes: AgentManagement.RunOutcome[] = ["completed", "failed", "stopped", "lost"]
+    for (let n = 0; n < 12; n++) {
+      const next = rng(9500 + n)
+      const count = Math.floor(next() * 41)
+      const children = Array.from({ length: count }, (_, i) => {
+        const running = next() < 0.4
+        const roll = next()
+        const started_at = now - Math.floor(next() * 3_600_000)
+        const number = 1 + Math.floor(next() * 5)
+        const run =
+          roll < 0.2
+            ? undefined
+            : roll < 0.4
+              ? { number, started_at, woken_by: system }
+              : {
+                  number,
+                  started_at,
+                  woken_by: system,
+                  ended_at: started_at + Math.floor(next() * (now - started_at)),
+                  outcome: outcomes[Math.floor(next() * 4)]!,
+                }
+        const previous =
+          run && run.number > 1 && next() < 0.3
+            ? {
+                number: run.number - 1,
+                ended_at: now - Math.floor(next() * 20 * 60_000),
+                outcome: "completed" as const,
+              }
+            : undefined
+        return child(i, {
+          running,
+          ...(running ? { lastStep: now - Math.floor(next() * 60_000) } : {}),
+          ...(next() < 0.5 ? { name: `n${i}` } : {}),
+          ...(run ? { run: { ...run, ...(previous ? { previous } : {}) } } : {}),
+        })
+      })
+      const windowStart =
+        next() < 0.5 ? now - StepTail.WINDOW_MS : now - StepTail.WINDOW_MS - Math.floor(next() * 50 * 60_000)
+      const text = StepTail.renderSubagents({ now, children, windowStart, viewer })
+      const label = `seed ${9500 + n}`
+      if (count === 0) {
+        expect(text, label).toBeUndefined()
+        continue
+      }
+      const start = (row: StepTail.Child) => row.run?.started_at ?? row.created
+      const end = (row: StepTail.Child) => row.run?.ended_at ?? row.run?.started_at ?? 0
+      const byId = (a: StepTail.Child, b: StepTail.Child) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+      const running = children.filter((row) => row.running).toSorted((a, b) => start(a) - start(b) || byId(a, b))
+      const finished = children
+        .filter((row) => !row.running && row.run && (row.run.ended_at === undefined || row.run.ended_at >= windowStart))
+        .toSorted((a, b) => end(b) - end(a) || byId(a, b))
+
+      const lines = text!.split("\n")
+      expect(lines[0], label).toBe(
+        `Your subagents: ${count} direct, ${running.length} running, ${count - running.length} idle.`,
+      )
+      const runningAt = lines.indexOf("Running now:")
+      const finishedAt = lines.findIndex((line) => line.startsWith("Finished "))
+      const ids = (from: number, until: number) =>
+        lines
+          .slice(from, until)
+          .filter((line) => line.startsWith("  ses_"))
+          .map((line) => line.trim().split("  ")[0])
+      expect(runningAt === -1 ? [] : ids(runningAt + 1, finishedAt === -1 ? lines.length : finishedAt), label).toEqual(
+        running.slice(0, StepTail.LIST_ROWS).map((row) => row.id),
+      )
+      expect(finishedAt === -1 ? [] : ids(finishedAt + 1, lines.length), label).toEqual(
+        finished.slice(0, StepTail.LIST_ROWS).map((row) => row.id),
+      )
+      expect(
+        lines.find((line) => line.endsWith("more running")),
+        label,
+      ).toBe(
+        running.length > StepTail.LIST_ROWS ? `  … and ${running.length - StepTail.LIST_ROWS} more running` : undefined,
+      )
+      expect(
+        lines.find((line) => line.endsWith("more finished")),
+        label,
+      ).toBe(
+        finished.length > StepTail.LIST_ROWS
+          ? `  … and ${finished.length - StepTail.LIST_ROWS} more finished`
+          : undefined,
+      )
+      expect(lines.length, label).toBeLessThanOrEqual(25)
+      expect(StepTail.renderSubagents({ now, children, windowStart, viewer }), label).toBe(text)
     }
   })
 })

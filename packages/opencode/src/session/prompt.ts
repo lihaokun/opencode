@@ -46,7 +46,7 @@ import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { AGENT_TOOL_ID } from "@/tool/agent"
+import { AGENT_LIST_TOOL_ID, AGENT_TOOL_ID } from "@/tool/agent"
 import { AgentManagement } from "@/agent-management/schema"
 import { AgentDelegation } from "@/agent-management/delegation"
 import { AgentRun } from "@/agent-management/run"
@@ -62,7 +62,6 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { StepTail } from "./step-tail"
 import { AgentTree } from "@/agent-management/tree"
-import { AgentStatusProjection } from "@/agent-management/status"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
 
@@ -137,7 +136,6 @@ const layer = Layer.effect(
     const status = yield* SessionStatus.Service
     const sessions = yield* Session.Service
     const agentTree = yield* AgentTree.Service
-    const agentStatus = yield* AgentStatusProjection.Service
     const agents = yield* Agent.Service
     const provider = yield* Provider.Service
     const processor = yield* SessionProcessor.Service
@@ -1295,6 +1293,34 @@ const layer = Layer.effect(
       return "continue" as const
     })
 
+    // Step S14: the view and agent_list expose the same thing, so a session
+    // denied the tool is not handed it by another route — merged the way
+    // tools.ts merges it. Any failure drops the section and keeps the step.
+    const subagentView = Effect.fn("SessionPrompt.subagentView")(function* (input: {
+      session: Session.Info
+      agent: Agent.Info
+      now: number
+      windowStart: number
+    }) {
+      const ruleset = Permission.merge(input.agent.permission ?? [], input.session.permission ?? [])
+      if (Permission.evaluate(AGENT_LIST_TOOL_ID, "*", ruleset).action === "deny") return undefined
+      return yield* Effect.gen(function* () {
+        const children = yield* StepTail.collectSubagents({ sessions, status, parentID: input.session.id })
+        return StepTail.renderSubagents({
+          now: input.now,
+          children,
+          windowStart: input.windowStart,
+          viewer: input.session.id,
+        })
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("subagent view dropped", { "session.id": input.session.id, cause }).pipe(
+            Effect.as(undefined),
+          ),
+        ),
+      )
+    })
+
     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
@@ -1312,6 +1338,9 @@ const layer = Layer.effect(
         let continuations = 0
         let lastStepReached = false
         const stopHookCap = (yield* config.get()).stop_hook_block_cap ?? 8
+        // Step S15: the previous step's start bounds the view's window; on the
+        // first step that is the run's start.
+        let previousStepStart = Date.now()
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1398,6 +1427,8 @@ const layer = Layer.effect(
           }
 
           step++
+          const sinceStep = previousStepStart
+          previousStepStart = Date.now()
           if (step === 1)
             yield* title({
               session,
@@ -1452,11 +1483,6 @@ const layer = Layer.effect(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(FSUtil.Service, fsys),
             Effect.provideService(Session.Service, sessions),
-          )
-          msgs = yield* SessionReminders.applyAgentRoster({ messages: msgs, session, agent }).pipe(
-            Effect.provideService(Session.Service, sessions),
-            Effect.provideService(AgentTree.Service, agentTree),
-            Effect.provideService(AgentStatusProjection.Service, agentStatus),
           )
 
           const msg: SessionV1.Assistant = {
@@ -1552,7 +1578,15 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-            const tail = StepTail.render([StepTail.renderRepeat(repeat)])
+            const now = Date.now()
+            const view = yield* subagentView({ session, agent, now, windowStart: StepTail.windowStart(now, sinceStep) })
+            const body = [view, StepTail.renderRepeat(repeat)]
+            // The clock rides with any section and never alone (§4.5).
+            const tail = StepTail.render(
+              body.some((section) => section !== undefined)
+                ? [StepTail.renderClock({ now, run: AgentRun.read(session.metadata)?.number, step }), ...body]
+                : body,
+            )
             if (tail) yield* Effect.logInfo("step tail", { "session.id": sessionID, step, text: tail })
             const messages = [
               ...modelMsgs,
@@ -2166,7 +2200,6 @@ export const node = LayerNode.make({
     Session.node,
     Agent.node,
     AgentTree.node,
-    AgentStatusProjection.node,
     Provider.node,
     SessionProcessor.node,
     SessionCompaction.node,
