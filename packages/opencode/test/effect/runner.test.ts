@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Fiber, Latch, Ref, Scope } from "effect"
 import { Runner } from "@/effect/runner"
-import { it, pollWithTimeout } from "../lib/effect"
+import { it, awaitWithTimeout, pollWithTimeout } from "../lib/effect"
 
 const waitForState = <A, E>(runner: Runner.Runner<A, E>, tag: Runner.State<A, E>["_tag"]) =>
   Effect.gen(function* () {
@@ -693,6 +693,160 @@ describe("Runner", () => {
       expect(work2).toBeGreaterThanOrEqual(0)
       expect(idleEnd).toBeGreaterThanOrEqual(0)
       expect(idleEnd).toBeLessThan(work2)
+    }),
+  )
+
+  // The idle hook publishes externally observable state (SessionStatus
+  // events) and is executed inside finishRun's critical section. A defect
+  // there must not abort the transition: an unguarded failure leaves the ref
+  // on Running with the work fiber already finished — joiners await a Deferred
+  // that never completes, and every later caller joins that dead run forever.
+  it.live(
+    "survives a defecting idle hook: later runs still execute and settle",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      let idleCalls = 0
+      const executed: string[] = []
+      const runner = Runner.make<string>(s, {
+        onIdle: Effect.suspend(() => {
+          idleCalls += 1
+          return idleCalls === 1 ? Effect.die("idle hook blew up") : Effect.void
+        }),
+      })
+
+      const first = yield* runner.ensureRunning(Effect.succeed("one")).pipe(Effect.forkChild)
+      const firstExit = yield* awaitWithTimeout(Fiber.await(first), "first caller never settled")
+      expect(Exit.isSuccess(firstExit) && firstExit.value === "one").toBe(true)
+
+      // The first caller must settle even though its idle hook died, and the
+      // next run must start and settle instead of joining the dead one.
+      const second = yield* awaitWithTimeout(
+        runner.ensureRunning(
+          Effect.gen(function* () {
+            executed.push("two")
+            return "two"
+          }),
+        ),
+        "second call never settled: state wedged on Running by the failed idle",
+      )
+      expect(second).toBe("two")
+      expect(executed).toEqual(["two"])
+      expect(idleCalls).toBe(2)
+    }),
+  )
+
+  // The re-arm predicate also runs inside the critical section. A defect must
+  // fail closed — decide against re-arming — not wedge the state machine.
+  it.live(
+    "survives a defecting re-arm predicate: run settles without re-arming",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      let executions = 0
+      const runner = Runner.make<string>(s, {
+        shouldReArm: Effect.suspend(() => {
+          executions += 1
+          return executions === 1 ? Effect.die("predicate blew up") : Effect.succeed(false)
+        }),
+      })
+
+      const exit = yield* awaitWithTimeout(
+        runner.ensureRunning(Effect.succeed("done")).pipe(Effect.exit),
+        "call never settled: state wedged by the failed predicate",
+      )
+      expect(Exit.isSuccess(exit) && exit.value === "done").toBe(true)
+      expect(runner.state._tag).toBe("Idle")
+      // The work ran once; the defecting predicate decided against a restart.
+      expect(executions).toBe(1)
+    }),
+  )
+
+  // finishShell used to return its idle notification as the action executed
+  // after the semaphore released: a caller arriving in between started its run
+  // (busy) and the stale shell idle overwrote it. The notification must land
+  // inside the critical section, before the next work can start.
+  it.live(
+    "completes the shell idle transition before a queued caller's work starts",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const order: string[] = []
+      const runner = Runner.make<string>(s, {
+        onIdle: Effect.gen(function* () {
+          order.push("onIdle-start")
+          // Slow enough that a caller arriving between the state commit and a
+          // post-lock notification could slip past it.
+          yield* Effect.sleep("50 millis")
+          order.push("onIdle-end")
+        }),
+      })
+
+      const sh = yield* runner.startShell(Effect.succeed("shell")).pipe(Effect.forkChild)
+      while (!order.includes("onIdle-start")) yield* Effect.yieldNow
+
+      // Arrives while the shell's idle notification is mid-flight.
+      const next = yield* runner
+        .ensureRunning(
+          Effect.gen(function* () {
+            order.push("work")
+            return "work"
+          }),
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Fiber.await(sh)
+      yield* Fiber.await(next)
+
+      const work = order.indexOf("work")
+      const idleEnd = order.indexOf("onIdle-end")
+      expect(work).toBeGreaterThanOrEqual(0)
+      expect(idleEnd).toBeGreaterThanOrEqual(0)
+      expect(idleEnd).toBeLessThan(work)
+    }),
+  )
+
+  // cancel republishes idle via idleIfCurrent when the interrupted run's
+  // finishRun early-returns on the committed Idle state. Pre-fix that
+  // notification ran after the semaphore released: a caller queuing while
+  // cancel's action was still in flight started its work before the idle
+  // landed, and the stale idle overwrote the new run's busy (#85's observable
+  // "running session reported idle"). The notification must land inside the
+  // critical section, before the next work can start.
+  it.live(
+    "completes the cancel idle transition before a queued caller's work starts",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const order: string[] = []
+      const runner = Runner.make<string>(s, {
+        onIdle: Effect.gen(function* () {
+          order.push("onIdle-start")
+          yield* Effect.sleep("50 millis")
+          order.push("onIdle-end")
+        }),
+      })
+
+      const run = yield* runner.ensureRunning(Effect.never.pipe(Effect.as("x"))).pipe(Effect.forkChild)
+      while (runner.state._tag !== "Running") yield* Effect.yieldNow
+
+      // Forked, not awaited: the caller below must queue on the semaphore
+      // while cancel's action is still mid-flight, not after it committed.
+      const cancelFiber = yield* Effect.forkChild(runner.cancel)
+      yield* Effect.sleep("5 millis")
+      const next = yield* runner
+        .ensureRunning(
+          Effect.gen(function* () {
+            order.push("work")
+            return "work"
+          }),
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Fiber.await(cancelFiber)
+      yield* Fiber.await(next)
+
+      const work = order.indexOf("work")
+      const idleEnd = order.indexOf("onIdle-end")
+      expect(work).toBeGreaterThanOrEqual(0)
+      expect(idleEnd).toBeGreaterThanOrEqual(0)
+      expect(idleEnd).toBeLessThan(work)
     }),
   )
 })

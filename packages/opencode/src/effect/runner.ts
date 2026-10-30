@@ -51,9 +51,25 @@ export const make = <A, E = never>(
 ): Runner<A, E> => {
   const ref = SynchronizedRef.makeUnsafe<State<A, E>>({ _tag: "Idle" })
   const idle = opts?.onIdle ?? Effect.void
+  // Consumer hooks publish externally observable state (SessionStatus events).
+  // Every idle transition below runs INSIDE a modifyEffect critical section:
+  // an unguarded defect there would abort the callback before the new state is
+  // committed, leaving the ref on the old state with the work fiber already
+  // finished — joiners would await a Deferred that is never completed, and
+  // subsequent callers would join that same dead run forever. Log and keep
+  // going so the state transition and the waiter settlement always land.
+  const safeIdle = idle.pipe(
+    Effect.catchCause((cause) => Effect.logError("runner idle hook failed", { cause })),
+  )
   const onBusy = opts?.onBusy ?? Effect.void
   const onInterrupt = opts?.onInterrupt
   const shouldReArm = opts?.shouldReArm
+    ? // Same failure isolation, fail-closed: a defecting predicate must not
+      // wedge the critical section, it just decides against re-arming.
+      opts.shouldReArm.pipe(
+        Effect.catchCause((cause) => Effect.logWarning("runner re-arm check failed", { cause }).pipe(Effect.as(false))),
+      )
+    : undefined
   let ids = 0
 
   const state = () => SynchronizedRef.getUnsafe(ref)
@@ -70,8 +86,22 @@ export const make = <A, E = never>(
   const awaitDone = (done: Deferred.Deferred<A, E | Cancelled>) =>
     Deferred.await(done).pipe(Effect.catchTag("RunnerCancelled", (e) => onInterrupt ?? Effect.die(e)))
 
+  // Cancel has already committed Idle by the time this runs; the interrupted
+  // run's finishRun early-returns on the non-Running state, so this republishes
+  // the idle notification finishRun would have sent — unless a new run slipped
+  // in first (state no longer Idle), whose own transitions must not be
+  // overwritten by a stale idle.
   const idleIfCurrent = () =>
-    SynchronizedRef.modify(ref, (st) => [st._tag === "Idle" ? idle : Effect.void, st] as const).pipe(Effect.flatten)
+    SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (st) {
+        if (st._tag !== "Idle") return [Effect.void, st] as const
+        // In-lock, same invariant as finishRun: the notification must not land
+        // after a queued caller has already started the next run.
+        yield* safeIdle
+        return [Effect.void, st] as const
+      }),
+    ).pipe(Effect.flatten)
 
   const finishRun = (
     id: number,
@@ -99,7 +129,7 @@ export const make = <A, E = never>(
         // yielded from the returned action would execute after the semaphore
         // is released (#85: an out-of-band idle lets a queued caller start
         // its run before SessionRunState has published the session status).
-        yield* idle
+        yield* safeIdle
         return [
           Effect.gen(function* () {
             yield* complete(done, exit)
@@ -128,7 +158,10 @@ export const make = <A, E = never>(
       ref,
       Effect.fnUntraced(function* (st) {
         if (st._tag === "Shell" && st.shell.id === id) {
-          return [idle, { _tag: "Idle" }] as const
+          // Same critical-section invariant as finishRun: the shell's idle
+          // must land before the semaphore frees the way for the next run.
+          yield* safeIdle
+          return [Effect.void, { _tag: "Idle" }] as const
         }
         if (st._tag === "ShellThenRun" && st.shell.id === id) {
           const run = yield* startRun(st.run.work, st.run.done)
