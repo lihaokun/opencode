@@ -244,7 +244,11 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const abort = Effect.fn("SessionHttpApi.abort")(function* (ctx: { params: { sessionID: SessionID } }) {
-      yield* promptSvc.cancel(ctx.params.sessionID)
+      // Abort means "interrupt this session's own run". Descendant subagent jobs
+      // keep running in the background and report back through their own
+      // delegation notices; stopping the whole subtree is agent_stop's job, and
+      // deleting the session cascades on its own.
+      yield* promptSvc.cancel(ctx.params.sessionID, { cascade: false })
       return true
     })
 

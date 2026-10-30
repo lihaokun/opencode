@@ -107,7 +107,7 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 }
 
 export interface Interface {
-  readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  readonly cancel: (sessionID: SessionID, options?: SessionRunState.CancelOptions) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   /**
    * Send a message to a session and return without waiting for it — the whole
@@ -172,9 +172,12 @@ const layer = Layer.effect(
       } satisfies AgentManagement.AgentPromptOps
     })
 
-    const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
+    const cancel = Effect.fn("SessionPrompt.cancel")(function* (
+      sessionID: SessionID,
+      options?: SessionRunState.CancelOptions,
+    ) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
-      yield* state.cancel(sessionID)
+      yield* state.cancel(sessionID, options)
     })
 
     const deliverAsync = Effect.fn("SessionPrompt.deliverAsync")(function* (input: PromptInput) {

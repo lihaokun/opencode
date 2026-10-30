@@ -8,9 +8,19 @@ import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
 
+/** Options for cancel. `cascade: false` skips cancelling descendant background
+ * jobs — the session's own runner is still interrupted. Abort (HTTP
+ * session.abort) uses this: esc interrupts the main agent's run while subagent
+ * jobs keep running in the background. Teardown callers (agent_stop, session
+ * removal, workspace warp) keep the default cascade, which cancels every
+ * running job whose owner is the session or one of its descendants. */
+export interface CancelOptions {
+  cascade?: boolean
+}
+
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
-  readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  readonly cancel: (sessionID: SessionID, options?: CancelOptions) => Effect.Effect<void>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -78,8 +88,8 @@ const layer = Layer.effect(
       if (existing?.busy) yield* busyError(sessionID)
     })
 
-    const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
-      yield* cancelBackgroundJobs(background, sessionID)
+    const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID, options?: CancelOptions) {
+      if (options?.cascade !== false) yield* cancelBackgroundJobs(background, sessionID)
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
       if (!existing) {
