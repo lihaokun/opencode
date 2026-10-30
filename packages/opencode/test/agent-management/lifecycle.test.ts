@@ -8,7 +8,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { Deferred, Effect } from "effect"
+import { Deferred, Effect, Exit, Fiber } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
@@ -25,7 +25,8 @@ import { SessionID } from "@/session/schema"
 import { InstanceBootstrap } from "@/project/bootstrap"
 import { InstanceStore } from "@/project/instance-store"
 import { disposeAllInstances } from "../fixture/fixture"
-import { awaitWithTimeout, testEffect } from "../lib/effect"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
+import { AgentRun } from "@/agent-management/run"
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -601,6 +602,102 @@ describe("AgentLifecycle sibling snapshot", () => {
       expect(snapshot).not.toContain("\n  ses_fake")
       expect(snapshot).toContain("real\\n")
       expect(snapshot).toContain("honest\\n")
+    }),
+  )
+})
+
+// Subplan agentmgmt-2-run-state §4.6, §5.4.2: the notice names the run the
+// stop hit, from what the cancel found and the record read after it.
+describe("AgentLifecycle.stop names the run it hit", () => {
+  const record = (number: number, extra: Record<string, unknown> = {}) => ({
+    [AgentManagement.METADATA_AGENT_RUN]: { number, started_at: 1_000, woken_by: { kind: "system" }, ...extra },
+  })
+
+  // A target with a run in flight: work parked on a gate, so the cancel finds
+  // it Running. Nothing here writes the record; each case sets it as the
+  // real run loop would have left it.
+  const running = Effect.fn("LifecycleTest.running")(function* (id: SessionID) {
+    const runState = yield* SessionRunState.Service
+    const gate = yield* Deferred.make<void>()
+    const fallback = {} as SessionV1.WithParts
+    const fiber = yield* runState
+      .ensureRunning(id, Effect.succeed(fallback), Deferred.await(gate).pipe(Effect.as(fallback)))
+      .pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      runState.assertNotBusy(id).pipe(
+        Effect.exit,
+        Effect.map((exit) => (Exit.isFailure(exit) ? (true as const) : undefined)),
+      ),
+      "the target never became busy",
+    )
+    return fiber
+  })
+
+  const child = Effect.fn("LifecycleTest.child")(function* (metadata?: Record<string, unknown>) {
+    const sessions = yield* Session.Service
+    const root = yield* sessions.create({ title: "root" })
+    const a = yield* sessions.create({ parentID: root.id, title: "a", ...(metadata ? { metadata } : {}) })
+    return { root, a }
+  })
+
+  const stop = Effect.fn("LifecycleTest.stop")(function* (root: SessionID, target: SessionID) {
+    const lifecycle = yield* AgentLifecycle.Service
+    const { ops, seen } = stubOps()
+    yield* lifecycle.stop({ caller: root, target, ops })
+    yield* awaitWithTimeout(
+      Effect.gen(function* () {
+        while (seen.length === 0) yield* Effect.sleep("10 millis")
+      }),
+      "no notice delivered",
+    )
+    return (seen[0]!.parts[0] as { text: string }).text.split("\n")
+  })
+
+  it.instance("found running, and the record says stopped: stopped at that time", () =>
+    Effect.gen(function* () {
+      const { root, a } = yield* child(record(3, { ended_at: 5_000, outcome: "stopped" }))
+      const fiber = yield* running(a.id)
+      const lines = yield* stop(root.id, a.id)
+      yield* Fiber.await(fiber)
+      expect(lines).toContain(`run: 3, stopped at ${AgentRun.formatInstant(5_000)}`)
+    }),
+  )
+
+  it.instance("found running, but the record is open or ended otherwise: the stop was requested", () =>
+    Effect.gen(function* () {
+      const open = yield* child(record(3))
+      const fiber = yield* running(open.a.id)
+      const lines = yield* stop(open.root.id, open.a.id)
+      yield* Fiber.await(fiber)
+      expect(lines.find((line) => line.startsWith("run: 3, stop requested at "))).toBeDefined()
+
+      const ended = yield* child(record(4, { ended_at: 5_000, outcome: "completed" }))
+      const second = yield* running(ended.a.id)
+      const again = yield* stop(ended.root.id, ended.a.id)
+      yield* Fiber.await(second)
+      expect(again.find((line) => line.startsWith("run: 4, stop requested at "))).toBeDefined()
+    }),
+  )
+
+  it.instance("found idle: the run had already ended, or was cut off", () =>
+    Effect.gen(function* () {
+      const done = yield* child(record(2, { ended_at: 5_000, outcome: "completed" }))
+      expect(yield* stop(done.root.id, done.a.id)).toContain(
+        `run: 2 had already ended at ${AgentRun.formatInstant(5_000)} (completed); nothing was running`,
+      )
+      const cut = yield* child(record(2))
+      expect(yield* stop(cut.root.id, cut.a.id)).toContain(
+        `run: 2 was cut off (started ${AgentRun.formatInstant(1_000)}) and will be recorded as lost; nothing was running`,
+      )
+    }),
+  )
+
+  it.instance("no record, no run line", () =>
+    Effect.gen(function* () {
+      const { root, a } = yield* child()
+      const lines = yield* stop(root.id, a.id)
+      expect(lines.some((line) => line.startsWith("run:"))).toBe(false)
+      expect(lines).toContain("Agent cancelled: agent")
     }),
   )
 })

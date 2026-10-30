@@ -43,7 +43,7 @@
 | 省略行                                            | `… and N more running` / `… and N more finished`，不计入 10 行                                                                                                             | 主契约 §4.5   | 同上                                        | 同上                                   |
 | renderOutput 属性                                 | `run="<n>" ended="<ISO+tz>"`（记录已关闭时；否则两者皆无）                                                                                                                 | 主契约 §4.6   | `agent-management/delegation.ts`            | 测试断言标签文本                       |
 | 摘要后缀                                          | ` (run <n>, ended HH:MM:SS)`（与属性同条件）                                                                                                                               | 主契约 §4.6   | `session/prompt.ts` reportRunEnd            | server 独占措辞；TUI 原样显示          |
-| renderTermination 的 run 行                       | 三种写法见主契约 §4.6；无记录时无此行                                                                                                                                      | 主契约 §4.6   | `agent-management/lifecycle.ts`             | 测试三分支                             |
+| renderTermination 的 run 行                       | 三种写法见主契约 §4.6，另加空闲且记录打开的 cut off 写法（§5.4.2）；无记录时无此行                                                                                         | 主契约 §4.6   | `agent-management/lifecycle.ts`             | 测试三分支                             |
 | `Runner.cancel` / `SessionRunState.cancel` 返回值 | 取消前状态标签 `Idle \| Running \| Shell \| ShellThenRun`（无 runner 时 `Idle`）                                                                                           | 主契约 §5.4.2 | `effect/runner.ts`、`session/run-state.ts`  | renderTermination 三分支               |
 | agent_send 返回首句                               | 六种写法见主契约 §4.6；末尾恒加 `Current state of one agent: agent_status(target="…").`                                                                                    | 主契约 §4.6   | `tool/agent.ts`                             | 测试六例                               |
 | agent_status 参数                                 | `{ target: string }`                                                                                                                                                       | 主契约 §4.7   | `tool/agent.ts`                             | schema                                 |
@@ -148,8 +148,8 @@
 > **框架声明**：仓库未引入 property-based 框架。沿用 `step-tail` 分支的做法：种子化随机生成 + 按定义重算的参照实现，一次失败即报种子。
 
 - **INV-5（= I5）** 任意事件序列（发送到空闲的子、中途插入消息、re-arm、续跑窗口、完成 / 失败 / 被停、并发多子、崩溃遗留的打开记录、注入一次结束写失败）经真实 `loop` 执行后，每个子的 run 号序列严格递增且每次只加一；普通 re-arm 不改变它，续跑窗口加一；写失败与遗留的记录在下一次开始时被记为 lost 且号不重复；每条记录打开时会话已是 busy。—— T3（钩子阻止不加号由定值用例覆盖）
-- **INV-6（= I6）** 每份结束报告与停止通知的 run 号等于发出时该子已关闭的 run；同号报告至多一份；`ended ≥ started`；记录未关闭时报告无属性。—— T3（commit 4 给报告加 run 属性后扩入；commit 2 的 T3 只断言报告份数）
-- **INV-6b** `agent_send` 对空闲且记录已关闭的目标预告的 run 号等于该子的下一份报告的 run 号。—— T3（同上，commit 4）
+- **INV-6（= I6）** 每份结束报告的 run 号等于发出时该子已关闭的 run，按结束顺序一一对应；同号报告至多一份；结束写失败的那份报告不带 run 属性；`ended ≥ started`。—— T3（停止通知的 run 行由 `lifecycle.test.ts` 五种定值用例覆盖）
+- **INV-6b** `agent_send` 对空闲且记录已关闭的目标预告的 run 号等于该子的下一份报告的 run 号。—— 定值用例（经注册表里真实的 `agent_send` 投递；T3 不改走工具投递，理由见主契约 §5.4.3）
 - **INV-7（= I7）** 对任意步序列（工具步、询问钩子的最终回答、带中途插入新消息的最终回答）与任意 cap（1–8），钩子连续阻止长度不限：父收到的报告恰一份，其创建时间不早于最后一次询问；每次询问的 `continuations` 等于按定义推进的参照值；每个请求的最后一条用户消息文本等于当时最新的 reason 或插入消息；每次询问之前子会话的 `SessionStatus` 事件序列中没有 idle。—— T8
 - **INV-7b** 每段连续无工具、无新输入的退出尝试中询问与阻止次数 ≤ cap；一步含工具调用或钩子之外的新用户消息后计数从 0 重新累积。—— T8（steer、超 cap 的阻止）；定值用例（新 run 再次询问）
 - **INV-8（= I8）** 相邻两步请求的历史部分逐字相同（R1 扩展到带进度视图的会话）；视图文本不出现在会话历史与压缩输入中。

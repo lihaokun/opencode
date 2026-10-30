@@ -1761,27 +1761,33 @@ const layer = Layer.effect(
       )
     })
 
-    // Step S12: a run closes its record. Missing or already closed is logged:
-    // the open write failed, and begin accounts for it at the next start.
+    // Step S12: a run closes its record and hands it to the report, so the
+    // report names the run it closes (I6). Missing or already closed is logged
+    // and the report goes out without a run: the open write failed, and begin
+    // accounts for it at the next start.
     const recordRunEnd = Effect.fn("SessionPrompt.recordRunEnd")(function* (
       sessionID: SessionID,
       outcome: AgentManagement.RunOutcome,
     ) {
-      yield* Effect.gen(function* () {
+      return yield* Effect.gen(function* () {
         const current = yield* sessions.get(sessionID)
         const next = AgentRun.end(AgentRun.read(current.metadata), Date.now(), outcome)
         if (!next) {
-          return yield* Effect.logWarning("run record missing or already closed at run end", {
+          yield* Effect.logWarning("run record missing or already closed at run end", {
             "session.id": sessionID,
             outcome,
           })
+          return undefined
         }
         yield* sessions.setMetadata({
           sessionID,
           metadata: { ...current.metadata, [AgentManagement.METADATA_AGENT_RUN]: next },
         })
+        return next
       }).pipe(
-        Effect.catchCause((cause) => Effect.logWarning("run record not closed", { "session.id": sessionID, cause })),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("run record not closed", { "session.id": sessionID, cause }).pipe(Effect.as(undefined)),
+        ),
       )
     })
 
@@ -1818,8 +1824,10 @@ const layer = Layer.effect(
                 // that follows opens the next number (§6, point 16).
                 const unconsumed = Exit.isSuccess(exit) && (yield* hasUnconsumedTurn(input.sessionID))
                 const outcome = unconsumed ? undefined : classifyExit(input.sessionID, exit, yield* truncate.limits())
-                if (outcome) yield* recordRunEnd(input.sessionID, AgentRun.outcomeOf(outcome.kind))
-                if (notify) yield* reportRunEnd(session, parentID, outcome)
+                const closed = outcome
+                  ? yield* recordRunEnd(input.sessionID, AgentRun.outcomeOf(outcome.kind))
+                  : undefined
+                if (notify) yield* reportRunEnd(session, parentID, outcome, closed)
               }),
             ),
           )
@@ -1862,6 +1870,7 @@ const layer = Layer.effect(
       child: Session.Info,
       parentID: SessionID,
       outcome: AgentDelegation.Outcome | undefined,
+      closed: AgentManagement.AgentRun | undefined,
     ) {
       // No outcome: a message landed inside the run's last iteration and the
       // runner starts the next run straight away (#32). The child is not
@@ -1883,7 +1892,11 @@ const layer = Layer.effect(
       // never re-derives it from state or description.
       const description = child.metadata?.[AgentManagement.METADATA_AGENT_DESCRIPTION] ?? child.title
       const name = child.metadata?.[AgentManagement.METADATA_AGENT_NAME]
-      const summary = outcome.kind === "completed" ? `Agent completed: ${description}` : `Agent failed: ${description}`
+      // Step S18: the run this report closes, from the record closed a moment
+      // ago. Without a closed record there is no number to claim (I6).
+      const ended = closed ? AgentRun.ended(closed) : undefined
+      const suffix = ended ? ` (run ${ended.number}, ended ${AgentRun.formatClock(ended.ended_at)})` : ""
+      const summary = `${outcome.kind === "completed" ? "Agent completed" : "Agent failed"}: ${description}${suffix}`
       // Forked: the parent's run is awaited so that `settled` means the result
       // has been read, and awaiting it here would keep the child busy for as
       // long as the parent takes.
@@ -1913,6 +1926,7 @@ const layer = Layer.effect(
                 state: outcome.kind === "completed" ? "completed" : "error",
                 summary,
                 text: outcome.text,
+                ...(ended ? { run: ended.number, ended: AgentRun.formatInstant(ended.ended_at) } : {}),
               }),
               // The TUI renders one line from this metadata and never parses
               // the model-facing text above. The sender is for the record of

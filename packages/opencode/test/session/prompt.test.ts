@@ -65,6 +65,7 @@ import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/l
 import { Identifier } from "../../src/id/id"
 import { AgentManagement } from "@/agent-management/schema"
 import { AgentRun } from "@/agent-management/run"
+import { AGENT_SEND_TOOL_ID } from "@/tool/agent"
 import { AgentEvent } from "@opencode-ai/schema/agent-event"
 
 const summary = Layer.succeed(
@@ -4937,14 +4938,19 @@ it.instance("reports a completed run to the parent without switching its agent",
     const [notice] = yield* awaitNotices(parent.id, 1)
     // The sender fields are what the parent's next run records as its wake
     // source (subplan agentmgmt-2-run-state §4.3); the child has no name.
+    // The summary names the run it closes (I6); the TUI shows it verbatim.
     expect(notice.part.metadata).toEqual({
       kind: AgentManagement.NOTIFICATION_METADATA_KIND,
-      summary: "Agent completed: look around",
+      summary: expect.stringMatching(/^Agent completed: look around \(run 1, ended \d{2}:\d{2}:\d{2}\)$/),
       sender: child.id,
       sender_agent: "explore",
     })
     expect(notice.part.synthetic).toBe(true)
-    expect(notice.part.text).toContain(`<agent id="${child.id}" state="completed">`)
+    expect(notice.part.text).toMatch(
+      new RegExp(
+        `<agent id="${child.id}" state="completed" run="1" ended="\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[+-]\\d{2}:\\d{2}">`,
+      ),
+    )
     expect(notice.part.text).toContain("child done")
     // The parent is woken on it.
     yield* awaitWithTimeout(llm.wait(2), "the parent never ran on the notice", "5 seconds")
@@ -4976,11 +4982,11 @@ it.instance("a later run that dies of length still reports to the parent", () =>
     const list = yield* awaitNotices(parent.id, 2)
     expect(list[1].part.metadata).toEqual({
       kind: AgentManagement.NOTIFICATION_METADATA_KIND,
-      summary: "Agent failed: look around",
+      summary: expect.stringMatching(/^Agent failed: look around \(run 2, ended \d{2}:\d{2}:\d{2}\)$/),
       sender: child.id,
       sender_agent: "explore",
     })
-    expect(list[1].part.text).toContain(`<agent id="${child.id}" state="error">`)
+    expect(list[1].part.text).toMatch(new RegExp(`<agent id="${child.id}" state="error" run="2" ended="`))
     expect(list[1].part.text).toContain("MessageOutputLengthError")
     yield* awaitWithTimeout(llm.wait(4), "the parent never ran on the second notice", "5 seconds")
   }),
@@ -5005,8 +5011,8 @@ it.instance("every run end reports, not only the first", () =>
 
     const list = yield* awaitNotices(parent.id, 2)
     expect(list.map((item) => item.part.metadata?.summary)).toEqual([
-      "Agent completed: look around",
-      "Agent completed: look around",
+      expect.stringMatching(/^Agent completed: look around \(run 1, ended /),
+      expect.stringMatching(/^Agent completed: look around \(run 2, ended /),
     ])
     expect(list[1].part.text).toContain("second done")
     yield* awaitWithTimeout(llm.wait(4), "the parent never ran on the second notice", "5 seconds")
@@ -5133,7 +5139,9 @@ it.instance("says nothing when the child is about to run again", () =>
     )
 
     const list = yield* awaitNotices(parent.id, 1)
-    expect(list.map((item) => item.part.metadata?.summary)).toEqual(["Agent completed: look around"])
+    expect(list.map((item) => item.part.metadata?.summary)).toEqual([
+      expect.stringMatching(/^Agent completed: look around \(run 1, ended /),
+    ])
     expect(list[0].part.text).toContain("second done")
     yield* awaitWithTimeout(llm.wait(3), "the parent never ran on the notice", "5 seconds")
     // Still one: the first run's end was not reported on its own.
@@ -5483,9 +5491,12 @@ withFailingMetadata.instance(
           )
         })
 
+        // INV-6: the run numbers the reports carry, per child, as the runs end.
+        const reported = new Map<string, number[]>()
         const drive = Effect.fn("test.drive")(function* (child: Session.Info, index: number) {
           let number = 0
           let last: { number: number; outcome: string } | undefined
+          const expectReport = (run: number) => reported.set(child.id, [...(reported.get(child.id) ?? []), run])
           for (const run of plans[index]!) {
             const label = `seed ${9300 + n} ${run.token} ${run.wake} ${run.outcome} ${run.mode}${run.leftover ? " leftover" : ""}`
             if (run.leftover) {
@@ -5562,6 +5573,8 @@ withFailingMetadata.instance(
                 outcome: "completed",
                 previous: { number, outcome: "completed" },
               })
+              expectReport(number)
+              expectReport(number + 1)
               number += 1
               last = { number, outcome: "completed" }
               continue
@@ -5570,9 +5583,12 @@ withFailingMetadata.instance(
               expect(current, label).toMatchObject({ number, woken_by: wake, ...(last ? { previous: last } : {}) })
               expect(current?.ended_at, label).toBeUndefined()
               expect(metadataFailure.pending.has(child.id), label).toBe(false)
+              // The end write failed, so the report of this run names no run.
+              expectReport(0)
               last = { number, outcome: "lost" }
               continue
             }
+            if (run.outcome !== "stopped") expectReport(number)
             expect(current, label).toMatchObject({
               number,
               outcome: run.outcome,
@@ -5595,9 +5611,19 @@ withFailingMetadata.instance(
           .flat()
           .reduce((sum, run) => sum + (run.outcome === "stopped" ? 0 : run.mode === "window" ? 2 : 1), 0)
         const opens = plans.flat().reduce((sum, run) => sum + (run.mode === "window" ? 2 : 1), 0)
-        yield* awaitNotices(parent.id, reports)
+        const list = yield* awaitNotices(parent.id, reports)
         yield* waitForIdle(parent.id)
         expect(yield* notices(parent.id), `seed ${9300 + n}`).toHaveLength(reports)
+        // Each report names the run it closed, in order, once; a report of a
+        // run whose end write failed names none (0 here).
+        for (const child of children) {
+          const runs = list
+            .filter((item) => item.part.text.includes(`<agent id="${child.id}"`))
+            .map((item) => Number(/ run="(\d+)"/.exec(item.part.text)?.[1] ?? 0))
+          expect(runs, `seed ${9300 + n} ${child.id}`).toEqual(reported.get(child.id) ?? [])
+          const named = runs.filter((run) => run > 0)
+          expect(new Set(named).size, `seed ${9300 + n} ${child.id}`).toBe(named.length)
+        }
         expect(opened, `seed ${9300 + n}: a record opened on an idle session`).toEqual(opened.map(() => "busy"))
         expect(opened.length, `seed ${9300 + n}`).toBe(opens)
         expect(windows.size, `seed ${9300 + n}`).toBe(0)
@@ -5791,6 +5817,53 @@ it.instance(
       expect(elapsed).toBeLessThan(50)
     }),
   60_000,
+)
+
+// INV-6b: the run agent_send predicts for an idle target is the run its next
+// report names. Through the real tool, so the message is delivered as the
+// model's call would deliver it.
+it.instance("agent_send predicts the run number the next report carries", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const parent = yield* (yield* Session.Service).create({ title: "root", agent: "build", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    yield* user(child.id, "task-one")
+    yield* llm.pushMatch(lastUserIs("task-one"), reply().text("one done").stop())
+    yield* prompt.loop({ sessionID: child.id })
+    yield* awaitNotices(parent.id, 1)
+    yield* waitForIdle(parent.id)
+
+    const send = (yield* (yield* ToolRegistry.Service).all()).find((tool) => tool.id === AGENT_SEND_TOOL_ID)!
+    const ops: AgentManagement.AgentPromptOps = {
+      cancel: prompt.cancel,
+      resolvePromptParts: prompt.resolvePromptParts,
+      prompt: (input) => prompt.prompt(input).pipe(Effect.orDie),
+      deliverAsync: prompt.deliverAsync,
+    }
+    yield* llm.pushMatch(
+      (hit) => JSON.stringify(hit.body).includes("carry on") && !JSON.stringify(hit.body).includes("<agent id="),
+      reply().text("two done").stop(),
+    )
+    const result = yield* send.execute({ target: child.id, message: "carry on" }, {
+      sessionID: parent.id,
+      messageID: MessageID.ascending(),
+      agent: "build",
+      abort: new AbortController().signal,
+      extra: { promptOps: ops },
+      messages: [],
+      metadata: () => Effect.void,
+      ask: () => Effect.void,
+    } as never)
+    const output = String(result.output)
+    expect(output).toContain("was idle; this message starts run 2 (sent ")
+    expect(output).toContain(`Current state of one agent: agent_status(target="${child.id}").`)
+
+    const list = yield* awaitNotices(parent.id, 2)
+    expect(list[1].part.text).toContain(`<agent id="${child.id}" state="completed" run="2" ended="`)
+    expect(yield* record(child.id)).toMatchObject({ number: 2, woken_by: { kind: "agent", session: parent.id } })
+    yield* waitForIdle(parent.id)
+  }),
 )
 
 // ---------------------------------------------------------------------------

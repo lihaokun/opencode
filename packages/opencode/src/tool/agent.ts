@@ -8,6 +8,7 @@ import { AgentInbox } from "@/agent-management/inbox"
 import { AgentStatusProjection } from "@/agent-management/status"
 import { AgentTree } from "@/agent-management/tree"
 import { AgentManagement } from "@/agent-management/schema"
+import { AgentRun } from "@/agent-management/run"
 import { MessageV2 } from "../session/message-v2"
 import { Session } from "@/session/session"
 
@@ -272,6 +273,7 @@ export const AgentSendTool = Tool.define(
     const tree = yield* AgentTree.Service
     const inbox = yield* AgentInbox.Service
     const sessions = yield* Session.Service
+    const projection = yield* AgentStatusProjection.Service
 
     const run = Effect.fn("AgentSendTool.execute")(function* (
       params: Schema.Schema.Type<typeof SendParameters>,
@@ -284,6 +286,21 @@ export const AgentSendTool = Tool.define(
         .resolveTarget({ caller: ctx.sessionID, value: params.target, scope: "neighbor" })
         .pipe(Effect.catch((error) => Effect.succeed(error)))
       if (typeof target !== "string") return failed<SendMeta>(params.target, target.message)
+
+      // Step S21: the target's state as of this moment, taken before the
+      // delivery — it forks the target's run at once, and a read after it
+      // would see a mix of before and after. A target that does not exist is
+      // the delivery's failure to report, not this read's.
+      const snapshot = yield* sessions.get(target).pipe(
+        Effect.map((info) => ({
+          name: info.metadata?.[AgentManagement.METADATA_AGENT_NAME],
+          run: AgentRun.read(info.metadata),
+          child: info.parentID !== undefined,
+        })),
+        Effect.catch(() => Effect.succeed(undefined)),
+      )
+      const status = yield* projection.of(target)
+      const now = Date.now()
 
       const accepted = yield* inbox
         .deliver({
@@ -310,6 +327,8 @@ export const AgentSendTool = Tool.define(
         title: params.target,
         metadata: sendMeta,
         output: [
+          ...(snapshot ? [describeTarget(accepted.target, { ...snapshot, status, now })] : []),
+          `Current state of one agent: agent_status(target="${accepted.target}").`,
           `Accepted for ${accepted.target}.`,
           // Spelled out because a model that reads this as a call will spend its
           // next turn asking where the answer is.
@@ -379,6 +398,52 @@ export const AgentStopTool = Tool.define(
     }
   }),
 )
+
+/**
+ * What the message walks into, in six shapes (subplan agentmgmt-2-run-state
+ * §4.6). An idle target with a closed record starts its next run on this
+ * message, and the number is the record's plus one — nothing else opens a run
+ * in between without taking that number first. A running target reads the
+ * message inside the run it is in. A record missing under a running target is
+ * a start write still in flight, failed, or the continuation window: no
+ * number is claimed. A record open under an idle one is a run cut off by a
+ * crash, which the next start closes as lost. A session that is nobody's
+ * subagent has no record to speak of.
+ */
+function describeTarget(
+  target: string,
+  state: {
+    name: unknown
+    run: AgentManagement.AgentRun | undefined
+    child: boolean
+    status: AgentManagement.AgentStatus
+    now: number
+  },
+) {
+  const who = typeof state.name === "string" ? `${target} (${AgentInbox.escapeField(state.name)})` : target
+  if (!state.child) return state.status === "running" ? `${who} is running.` : `${who} is idle.`
+  const run = state.run
+  if (state.status === "running") {
+    if (run && run.ended_at === undefined) {
+      return `${who} is in run ${run.number} (started ${AgentRun.formatInstant(run.started_at)}); it reads this at its next step.`
+    }
+    return `${who} is running (its run record is not updated yet); it reads this at its next step.`
+  }
+  const sent = AgentRun.formatInstant(state.now)
+  if (!run) return `${who} was idle; this message starts run 1 (sent ${sent}).`
+  const ended = AgentRun.ended(run)
+  if (!ended) {
+    return `${who} was idle; its run ${run.number} was cut off (started ${AgentRun.formatInstant(run.started_at)}) and will be recorded as lost; this message starts run ${run.number + 1} (sent ${sent}).`
+  }
+  const last = `Its run ${ended.number} ended at ${AgentRun.formatInstant(ended.ended_at)} (${ended.outcome})`
+  const report =
+    ended.outcome === "stopped"
+      ? "no completion report exists for a stopped run."
+      : ended.outcome === "lost"
+        ? "it was cut off and has no report."
+        : "that report reaches you as a separate message."
+  return `${who} was idle; this message starts run ${run.number + 1} (sent ${sent}).\n${last}; ${report}`
+}
 
 /**
  * Which Agent tools a session may see, by depth.

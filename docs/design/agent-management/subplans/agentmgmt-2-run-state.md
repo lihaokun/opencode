@@ -551,26 +551,26 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 #### 5.4.1 `renderOutput` 与 `reportRunEnd`
 
 - `renderOutput` 入参增 `run?: number`、`ended?: number`，有值时输出 `run="…" ended="<ISO>"`。
-- `reportRunEnd`：读关闭后的 `agentRun`；`ended_at` 存在才传 `run` / `ended` 并加摘要后缀 ` (run 5, ended 03:41:18)`；记录缺失或未关闭时一并省略。
+- `reportRunEnd`：接收 `recordRunEnd` 刚写回的记录（同一个 `onExit` 里顺序传递，不再读一次）；记录已关闭才传 `run` / `ended` 并加摘要后缀 ` (run 5, ended 03:41:18)`；记录缺失、未关闭或关闭写失败时一并省略。
 - **正确性论证**：I6 由 5.2.2 的顺序给出；TUI 只读 `summary`，后缀是 server 的措辞 owner（子计划 1 §4.1）。
 - 测试：有记录 / 无记录 / 未关闭三例。
 
 #### 5.4.2 `Runner.cancel` 返回值与 `renderTermination`
 
-- `Runner.cancel`（`runner.ts:200-231`）改为返回取消前的状态标签（`Idle | Running | Shell | ShellThenRun`）；`SessionRunState.cancel` 透传（无 runner 时返回 `Idle`）。`AgentLifecycle.stop` 对 target 记下这个值。
-- `renderTermination` 入参增 `run?: AgentRun`、`before: StateTag`，三分支按 4.6：`before ∈ {Running, ShellThenRun}` 且 `run.outcome === "stopped"` → 已停止；`before ∈ {Running, ShellThenRun}` 否则 → stop requested；`before ∈ {Idle, Shell}` → 本就空闲（Shell 是人在该会话里跑命令，不是模型的 run）。无记录时不加 run 行。
+- `Runner.cancel`（`runner.ts:200-231`）改为返回取消前的状态标签 `Runner.StateTag`（`Idle | Running | Shell | ShellThenRun`）；`SessionRunState.cancel` 透传（无 runner 时返回 `Idle`）。`AgentLifecycle.stop` 对 target 记下这个值。
+- `renderTermination` 入参增 `{ before: StateTag, run?: AgentRun, now }`，按 4.6 分支：`before ∈ {Running, ShellThenRun}` 且记录已关闭为 `stopped` → `run: N, stopped at <ISO>`；`before ∈ {Running, ShellThenRun}` 否则 → `run: N, stop requested at <now>`；`before ∈ {Idle, Shell}` 且记录已关闭 → `run: N had already ended at <ISO> (<结局>); nothing was running`（Shell 是人在该会话里跑命令，不是模型的 run）；实施时补第四种，`before ∈ {Idle, Shell}` 且记录仍打开（崩溃遗留）→ `run: N was cut off (started <ISO>) and will be recorded as lost; nothing was running`。无记录时不加 run 行。行的位置在 `title:` 之后。
 - **正确性论证**：
   - 前置：`stop` 已对目标执行 cancel；`stop` 在发通知前重读目标元数据。
   - 论证：`before` 来自 cancel 本身的状态转换，不从记录推断，所以"本就空闲"不会被写成"已停止"；第一分支要求结局确为 stopped，自然结束的窗口（记录已关为 completed、runner 还在表里）落入第二分支，不会把完成时间说成停止时间；第二分支不等待被取消 fiber 的 `onExit`——通知的强度本就只到"已接受"。三分支由 `before × outcome` 穷尽。
   - 副作用：无（渲染）。
-- 测试：三分支各一例，用 Deferred 控制被取消 fiber 的退出时机；自然结束窗口里 stop 的一例。
+- 测试（`lifecycle.test.ts`）：目标的 work 挂在 Deferred 上使 cancel 看到 Running，记录按各情况预置：已关闭为 stopped → stopped at；打开或关闭为 completed（自然结束窗口）→ stop requested；空闲且已关闭 → had already ended；空闲且打开 → cut off；无记录 → 无 run 行。
 
 #### 5.4.3 `agent_send` 的返回（`tool/agent.ts:288-319`）
 
-- 在 `deliver` **之前**取快照：`status = projection.of(target)`、`run = target.metadata.agentRun`、`isChild = target.parentID !== undefined`。
-- 按 4.6 六种情况渲染；末尾加 `agent_status` 提示行；既有三句保留。
+- 在 `deliver` **之前**取快照：`status = projection.of(target)`、`run = target.metadata.agentRun`、`isChild = target.parentID !== undefined`、名字；目标不存在时快照为空，投递本身会以 `AgentNotFound` 失败并返回失败文本。
+- 按 4.6 六种情况渲染（名字有则写成 `ses_xxx (cw-b333)`，经 `escapeField`）；随后 `agent_status` 提示行；再是既有的 `Accepted for …` 与两句单向说明。
 - **正确性论证（决策 §6 第 4 点）**：目标在跑且记录未关闭时，消息进入当前 run 或紧接着的 re-arm run，run 号仍是 N（I5），"is in run N" 成立。目标空闲且记录已关闭时下一次开始的 run 必为 N+1（5.2.1 `begin` 对已关闭记录加一）；即使别的消息抢先唤醒，本消息也只是进入 run N+1。空闲且未关闭（遗留）时下一次开始会先关为 lost 再开 N+1，措辞如实写出。在跑且记录已关闭（续跑窗口或写入未完成）时不预告号。投递失败时工具本身返回失败文本，不输出这段话。快照在 deliver 之前取，避免 fork 已启动目标后读到 N+1 与 busy 的混合状态。
-- 测试：六种情况各一例；预告的 run 号与下一份报告一致（T3 覆盖）。
+- 测试：六种情况各一例（`tools.test.ts`）；预告的 run 号与下一份报告一致——经注册表里真实的 `agent_send` 投递、父收到的第二份报告带 `run="2"`（`prompt.test.ts` 定值用例）。T3 没有改走工具投递：工具的 `deliverAsync` 会自己 fork 目标的 run，与 T3 用 `prompt.loop` 控制每次 run 的起止冲突，所以 INV-6b 由定值用例承担，T3 承担 INV-6。
 
 ### 5.5 commit 5：`agent_status` 与 `agent_list`
 

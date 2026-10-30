@@ -21,6 +21,7 @@ import { AgentInbox } from "@/agent-management/inbox"
 import { AgentStatusProjection } from "@/agent-management/status"
 import { AgentTree } from "@/agent-management/tree"
 import { AgentManagement } from "@/agent-management/schema"
+import { AgentRun } from "@/agent-management/run"
 import { AgentTool, AgentListTool, AgentSendTool, AgentStopTool, visibleAgentTools } from "@/tool/agent"
 import type { SessionPrompt } from "@/session/prompt"
 import { MessageID } from "@/session/schema"
@@ -219,6 +220,118 @@ describe("agent_send tool", () => {
       expect(result.output).toContain(b.id)
       expect(result.output).toContain("session_id")
       expect(seen).toHaveLength(0)
+    }),
+  )
+})
+
+// Subplan agentmgmt-2-run-state §4.6: what the message walks into, from a
+// snapshot taken before the delivery, and a pointer to agent_status.
+describe("agent_send reports the target's run state", () => {
+  const run = (number: number, extra: Record<string, unknown> = {}) => ({
+    [AgentManagement.METADATA_AGENT_RUN]: { number, started_at: 1_000, woken_by: { kind: "system" }, ...extra },
+  })
+  const send = Effect.fn("ToolsTest.send")(function* (caller: string, messageID: string, target: string) {
+    const def = yield* (yield* AgentSendTool).init()
+    const { ops } = stubOps()
+    const result = yield* def.execute({ target, message: "carry on" }, context(caller, messageID, ops) as never)
+    return result.output.split("\n")
+  })
+
+  it.instance("an idle target with a closed record: the next number, and how the last run ended", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const done = yield* sessions.create({
+        parentID: chat.id,
+        title: "done",
+        metadata: {
+          [AgentManagement.METADATA_AGENT_NAME]: "cw-b333",
+          ...run(5, { ended_at: 2_000, outcome: "completed" }),
+        },
+      })
+      const stopped = yield* sessions.create({
+        parentID: chat.id,
+        title: "stopped",
+        metadata: run(7, { ended_at: 2_000, outcome: "stopped" }),
+      })
+      const lost = yield* sessions.create({
+        parentID: chat.id,
+        title: "lost",
+        metadata: run(2, { ended_at: 2_000, outcome: "lost" }),
+      })
+
+      const lines = yield* send(chat.id, assistant.id, done.id)
+      expect(lines[0]).toMatch(
+        new RegExp(`^${done.id} \\(cw-b333\\) was idle; this message starts run 6 \\(sent \\d{4}-.*\\)\\.$`),
+      )
+      expect(lines[1]).toBe(
+        `Its run 5 ended at ${AgentRun.formatInstant(2_000)} (completed); that report reaches you as a separate message.`,
+      )
+      expect(lines[2]).toBe(`Current state of one agent: agent_status(target="${done.id}").`)
+      expect(lines[3]).toBe(`Accepted for ${done.id}.`)
+      expect(lines[4]).toContain("one-way")
+
+      expect((yield* send(chat.id, assistant.id, stopped.id))[1]).toBe(
+        `Its run 7 ended at ${AgentRun.formatInstant(2_000)} (stopped); no completion report exists for a stopped run.`,
+      )
+      expect((yield* send(chat.id, assistant.id, lost.id))[1]).toBe(
+        `Its run 2 ended at ${AgentRun.formatInstant(2_000)} (lost); it was cut off and has no report.`,
+      )
+    }),
+  )
+
+  it.instance("an idle target with no record starts run 1; with an open record, it was cut off", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const fresh = yield* sessions.create({ parentID: chat.id, title: "fresh" })
+      const cut = yield* sessions.create({ parentID: chat.id, title: "cut", metadata: run(5) })
+
+      const first = yield* send(chat.id, assistant.id, fresh.id)
+      expect(first[0]).toMatch(new RegExp(`^${fresh.id} was idle; this message starts run 1 \\(sent `))
+      expect(first[1]).toContain("agent_status")
+
+      const second = yield* send(chat.id, assistant.id, cut.id)
+      expect(
+        second[0]!.startsWith(
+          `${cut.id} was idle; its run 5 was cut off (started ${AgentRun.formatInstant(1_000)}) and will be recorded as lost; this message starts run 6 (sent `,
+        ),
+      ).toBe(true)
+    }),
+  )
+
+  it.instance("a running target: inside its run, or without an up-to-date record", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const { chat, assistant } = yield* seed()
+      const inRun = yield* sessions.create({ parentID: chat.id, title: "in run", metadata: run(5) })
+      const stale = yield* sessions.create({
+        parentID: chat.id,
+        title: "stale",
+        metadata: run(5, { ended_at: 2_000, outcome: "completed" }),
+      })
+      yield* status.set(inRun.id, { type: "busy" })
+      yield* status.set(stale.id, { type: "busy" })
+
+      expect((yield* send(chat.id, assistant.id, inRun.id))[0]).toBe(
+        `${inRun.id} is in run 5 (started ${AgentRun.formatInstant(1_000)}); it reads this at its next step.`,
+      )
+      expect((yield* send(chat.id, assistant.id, stale.id))[0]).toBe(
+        `${stale.id} is running (its run record is not updated yet); it reads this at its next step.`,
+      )
+    }),
+  )
+
+  it.instance("a target that is nobody's subagent gets no run number", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const { chat, assistant } = yield* seed()
+      const root = yield* sessions.create({ title: "another root" })
+      expect((yield* send(chat.id, assistant.id, root.id))[0]).toBe(`${root.id} is idle.`)
+      yield* status.set(root.id, { type: "busy" })
+      expect((yield* send(chat.id, assistant.id, root.id))[0]).toBe(`${root.id} is running.`)
     }),
   )
 })
