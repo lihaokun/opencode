@@ -41,6 +41,14 @@ export type Context<M extends Metadata = Metadata> = {
   callID?: string
   extra?: { [key: string]: unknown }
   messages: SessionV1.WithParts[]
+  /**
+   * The args the model-visible layer (transcript input, permission patterns)
+   * should be derived from — always the args passed to `tool.execute.before`,
+   * never a plugin's `updatedInput`. Equals the execute args reference unless a
+   * hook returned `updatedInput`, so tools keyed on user-authored patterns
+   * (e.g. the shell permission scan) read this instead of their own params.
+   */
+  visibleInput: Record<string, unknown>
   metadata(input: { title?: string; metadata?: M }): Effect.Effect<void>
   ask(input: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">): Effect.Effect<void>
 }

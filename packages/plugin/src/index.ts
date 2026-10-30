@@ -265,7 +265,23 @@ export interface Hooks {
   ) => Promise<void>
   "tool.execute.before"?: (
     input: { tool: string; sessionID: string; callID: string },
-    output: { args: any },
+    output: {
+      args: any
+      /**
+       * When set, replaces the args the tool executes with — wholesale, not a
+       * merge. The model-visible input (session transcript, replays) and
+       * permission evaluation keep the original `args`, so an execution-layer
+       * rewrite (e.g. wrapping a command in a sandbox) stays invisible to the
+       * model. Must satisfy the tool's parameter schema: built-in and plugin
+       * tools reject invalid rewrites with a schema-invalid tool error before
+       * the tool body runs; MCP tools have no core-side schema, so a rewrite
+       * reaches the server as-is (server-side validation applies). Non-object
+       * values are wrapped as `{ value }`. Hooks that only mutate `args` in
+       * place are unaffected. Not honored by the MCP resource tools or
+       * synthetic agent delegations.
+       */
+      updatedInput?: any
+    },
   ) => Promise<void>
   "shell.env"?: (
     input: { cwd: string; sessionID?: string; callID?: string },

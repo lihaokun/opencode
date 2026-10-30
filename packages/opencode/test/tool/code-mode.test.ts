@@ -19,6 +19,7 @@ const ctx: Tool.Context = {
   abort: new AbortController().signal,
   callID: "call_code_mode",
   messages: [],
+  visibleInput: {},
   metadata: () => Effect.void,
   ask: () => Effect.void,
 }

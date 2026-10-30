@@ -8,7 +8,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
-import { fileURLToPath } from "url"
+import { fileURLToPath, pathToFileURL } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -54,6 +54,7 @@ import { Format } from "../../src/format"
 import { provideInstance, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer, type Usage } from "../lib/llm-server"
+import { markPluginDependenciesReady } from "../fixture/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -1389,6 +1390,102 @@ unix("loop retries a later missing finish without replaying an earlier completed
     expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("charged\n")
   }),
   15_000,
+)
+
+// Issue #91 end-to-end: a file-loaded plugin rewrites the bash tool's executed
+// command via `updatedInput` while the model-visible layer keeps the original.
+// Exercises the full chain — real plugin loading (Plugin.node) → hook trigger →
+// SessionTools.resolve substitution → real bash spawn → replay projection back
+// to the provider on the next request.
+unix(
+  "plugin updatedInput executes the rewritten command while replay keeps the original",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        if (!(yield* hasBash)) return
+        const pluginUrl = pathToFileURL(path.join(import.meta.dir, "..", "fixture", "updated-input-plugin.ts")).href
+        const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), plugin: [pluginUrl] }))
+        yield* Effect.promise(() => markPluginDependenciesReady(dir))
+
+        // fail fast with the real reason if the plugin never registered
+        const plugin = yield* Plugin.Service
+        const hooks = yield* plugin.init()
+        void hooks
+        const listed = yield* plugin.list()
+        expect(listed.some((hook) => typeof hook["tool.execute.before"] === "function")).toBe(true)
+
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({
+          title: "Pinned",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+        const executed = path.join(dir, "e2e-executed.txt")
+        const inner = `printf 'exec\\n' >> '${executed}'`
+
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "run the marker command" }],
+        })
+        yield* llm.push(
+          reply().tool("bash", {
+            // the model emits the sentinel-prefixed command
+            command: `ECHO_ORIGINAL ${inner}`,
+            description: "Append the marker",
+          }),
+          reply().text("done").stop(),
+        )
+
+        const result = yield* prompt.loop({ sessionID: chat.id })
+
+        expect(result.info.role).toBe("assistant")
+        if (result.info.role === "assistant") {
+          expect(result.info.finish).toBe("stop")
+          expect(result.info.error).toBeUndefined()
+        }
+        // spawn ran the rewritten command: the wrapper's eval executed the
+        // inner command once (the plugin adds no extra inner invocation).
+        const executedText = yield* Effect.promise(() => Bun.file(executed).text())
+        expect(executedText).toBe("exec\n")
+
+        // the persisted tool part keeps the model-emitted command
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        const toolPart = messages
+          .flatMap((message) => message.parts)
+          .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "bash")
+        expect(toolPart).toBeDefined()
+        if (toolPart?.state.status === "completed") {
+          expect(toolPart.state.input).toEqual({ command: `ECHO_ORIGINAL ${inner}`, description: "Append the marker" })
+          expect(toolPart.state.output).toContain("wrapped-done")
+          // user-visible title carries the executed (rewritten) command — the
+          // auditable counterpart of "execution ≠ visibility" (decisions W2)
+          expect(toolPart.state.title).not.toContain("ECHO_ORIGINAL")
+        }
+
+        // the replay sent back to the provider carries the original command in
+        // the assistant tool_use block; the tool *result* is the wrapper's
+        // output (that's the intended model-visible surface), but the rewritten
+        // command text itself must not leak into the transcript
+        const replayBody = (yield* llm.inputs).at(-1)
+        const replayMessages = (replayBody?.messages ?? []) as Array<Record<string, unknown>>
+        const assistantCall = replayMessages
+          .map((message) => JSON.stringify(message))
+          .find((text) => text.includes("ECHO_ORIGINAL"))
+        expect(assistantCall).toBeDefined()
+        const assistantRole = replayMessages.find(
+          (message) => message.role === "assistant" && JSON.stringify(message).includes("ECHO_ORIGINAL"),
+        )
+        expect(assistantRole).toBeDefined()
+        // negative: the rewritten command's own text never appears in the
+        // replayed transcript (the result content is the wrapper's *output*)
+        for (const message of replayMessages) {
+          expect(JSON.stringify(message)).not.toContain("eval 'wrapped_marker")
+        }
+      }),
+    ),
+  20_000,
 )
 
 it.instance("length wins over a successful StructuredOutput tool result", () =>

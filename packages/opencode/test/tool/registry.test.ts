@@ -457,6 +457,7 @@ describe("tool.registry", () => {
         agent: (yield* agents.defaultInfo()).name,
         abort: new AbortController().signal,
         messages: [],
+        visibleInput: {},
         metadata: () => Effect.void,
         ask: () => Effect.void,
       } satisfies Tool.Context)
