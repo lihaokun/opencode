@@ -52,13 +52,13 @@
 
 ## 1. 范围
 
-| commit | 触及文件                                                                                                                                                                                 | 契约变更                                                                                                                        |
-| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| 1      | `packages/plugin/src/index.ts`（Hooks 类型）；`packages/opencode/src/session/prompt.ts`；`packages/core/src/v1/config/config.ts`；`packages/core/src/plugin/skill/customize-opencode.md` | 新插件钩子 `experimental.session.stop`；新配置键 `stop_hook_block_cap`；合成继续消息的 metadata `stop_hook`                     |
-| 2      | `packages/opencode/src/session/{session,status}.ts`（patch 加锁；状态投影带时间）；`agent-management/{schema,run,inbox}.ts`；`session/prompt.ts`                                         | `Session.patch` 按会话串行；会话元数据键 `agentRun`；part metadata `agent_message` / `user_message`；结束报告 metadata 增发送方 |
-| 3      | `packages/opencode/src/session/{step-tail,prompt,reminders}.ts`                                                                                                                          | 末尾段新增进度视图（模型可见文本）；写入历史的花名册撤销                                                                        |
-| 4      | `packages/opencode/src/agent-management/{delegation,lifecycle}.ts`；`effect/runner.ts`、`session/run-state.ts`（`cancel` 返回取消前状态）；`session/prompt.ts`；`tool/agent.ts`          | 报告属性 `run` / `ended`；摘要后缀；停止通知加 run 行；`agent_send` 返回文本                                                    |
-| 5      | `packages/opencode/src/tool/{agent,registry}.ts`；`permission/index.ts`（`disabled` 别名表）                                                                                             | 新工具 `agent_status`；`agent_list` 参数、排序、上限与计数行                                                                    |
+| commit | 触及文件                                                                                                                                                                                                 | 契约变更                                                                                                                        |
+| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| 1      | `packages/plugin/src/index.ts`（Hooks 类型）；`packages/opencode/src/session/prompt.ts`；`packages/core/src/v1/config/config.ts`；`packages/core/src/plugin/skill/customize-opencode.md`                 | 新插件钩子 `experimental.session.stop`；新配置键 `stop_hook_block_cap`；合成继续消息的 metadata `stop_hook`                     |
+| 2      | `packages/opencode/src/session/{session,status}.ts`（patch 加锁；状态投影带时间）；`agent-management/{schema,run,inbox}.ts`；`session/prompt.ts`                                                         | `Session.patch` 按会话串行；会话元数据键 `agentRun`；part metadata `agent_message` / `user_message`；结束报告 metadata 增发送方 |
+| 3      | `packages/opencode/src/session/{step-tail,prompt,reminders}.ts`；`agent-management/schema.ts`（`ROSTER_MAX_ROWS` 注释）；web `agents.mdx`                                                                | 末尾段新增进度视图（模型可见文本）；写入历史的花名册撤销                                                                        |
+| 4      | `packages/opencode/src/agent-management/{delegation,lifecycle}.ts`；`effect/runner.ts`、`session/run-state.ts`（`cancel` 返回取消前状态）；`session/prompt.ts`；`tool/agent.ts`                          | 报告属性 `run` / `ended`；摘要后缀；停止通知加 run 行；`agent_send` 返回文本                                                    |
+| 5      | `packages/opencode/src/tool/{agent,registry}.ts`；`permission/index.ts`（`disabled` 别名表）；`agent-management/{schema,tree}.ts`（`AgentSkeleton.run`）；文档 `customize-opencode.md`、web `agents.mdx` | 新工具 `agent_status`；`agent_list` 参数、排序、上限与计数行                                                                    |
 
 明确不做（记录再引入条件）：
 
@@ -104,7 +104,7 @@
 - **`Session.patch` 的锁获取超时**（30 秒）：`die`，消息带会话 id。这是对未来重入或卡死的守卫（H6c），正常情况下锁持有毫秒级，不会触发。
 - **run 记录写失败**：记警告，run 照常进行。后果是：开始写失败则本 run 没有记录，结束时 `end` 发现无记录只记警告；结束写失败则记录停在打开状态，下一次新 run 开始时把它关为 `lost` 再开新号（I5）。报告在记录缺失或未关闭时省略 run 属性（I6）。
 - **进度视图数据读取失败**：整节省略（在 §5.3.2 的采集步骤 `catchAll` 到 `undefined`），重复计数节照常。
-- **`agent_status` 的解析失败**：与 `agent_send` 同一套渲染——零匹配列邻居，多匹配列全部候选并要求用 session_id。
+- **`agent_status` 的解析失败**：与 `agent_send` 同一套渲染——零匹配列邻居，多匹配列全部候选并要求用 session_id。目标不在邻居集合内（用 session_id 指向孙辈等）：`<id> is not one of your neighbours; only yourself, your parent, your direct children and your siblings can be looked up.`；`agent_list` 被 deny：`agent_list is denied for you, and agent_status shows the same information.`
 - **`agent_list` 的非法参数**：由参数 schema 拒绝，不进入执行。
 - 测试失败处理遵循 workflow §5.4，禁止改测试凑绿。
 
@@ -216,7 +216,7 @@ agent 发送方的消息（agent_send、停止通知）—— deliver 的 kind =
 input：
   - sessionID: SessionID
   - parentID?: SessionID — 子 agent 时存在；主会话为空。宿主不据此区分，插件自行决定管谁
-  - agent: string — 本会话当前绑定的 agent 定义名
+  - agent: string — 本轮用户消息的 agent 定义名（`lastUser.agent`，通常即会话当前绑定的）
   - message: { info: AssistantMessage, parts: Part[] } — 模型的最终回答（SDK v2 已导出 AssistantMessage，
     `sdk/js/src/v2/gen/types.gen.ts:336`）；对应 Claude Code 的 last_assistant_message
   - continuations: NonNegativeInt — 连续被阻止的次数；> 0 即 Claude Code 的 stop_hook_active。
@@ -487,6 +487,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
   **必须是一个 `onExit` 内顺序调用**，不能挂两个 `onExit`（后挂的先跑，报告会读到未关闭的记录）。
 
+- 原子性只到 patch 级：`recordRunStart` / `recordRunEnd` 的"重读元数据再整体写回"在锁外，锁保证的是 `setMetadata` 内部的读合并不与其他 patch 交错。元数据级的并发写方只有 run 记录自己（一次 run 一个 fiber，顺序执行）和 HTTP `session.update`（已知破坏路径），`agentName` 等键在创建后不再写，所以没有第二个写方可抹掉。
 - `recordRunStart(id, parentID, fresh)`：重读会话元数据；唤醒消息经 `sessions.messages({ limit: 1 })` 取最新一行（不加载历史）；`wokenBy = wakeSource({ number: (previous?.number ?? 0) + 1, parent, message })`；`next = begin(previous, now, wokenBy, fresh)`；`next` 存在才 `setMetadata({ ...metadata, agentRun: next })`。任何失败记警告，run 照常。
 - `recordRunEnd(id, outcome)`：只在 `unconsumed` 为假时调用（为真则 runner 将 re-arm，同一 run 继续，不关闭）；重读元数据；`next = end(current, now, outcome)`；存在才写回，缺失记警告。
 - `reportRunEnd` 改为接收 `onExit` 已分类的 `outcome`（`undefined` 表示有未消费的消息、不是真的结束），不再自己读 `hasUnconsumedTurn`，也不再自己分类。
@@ -551,7 +552,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 #### 5.4.1 `renderOutput` 与 `reportRunEnd`
 
-- `renderOutput` 入参增 `run?: number`、`ended?: number`，有值时输出 `run="…" ended="<ISO>"`。
+- `renderOutput` 入参增 `run?: number`、`ended?: string`（调用方按 `run.ts` 的格式先格式化，delegation 不依赖 run 模块），两者齐全时输出 `run="…" ended="<ISO>"`。
 - `reportRunEnd`：接收 `recordRunEnd` 刚写回的记录（同一个 `onExit` 里顺序传递，不再读一次）；记录已关闭才传 `run` / `ended` 并加摘要后缀 ` (run 5, ended 03:41:18)`；记录缺失、未关闭或关闭写失败时一并省略。
 - **正确性论证**：I6 由 5.2.2 的顺序给出；TUI 只读 `summary`，后缀是 server 的措辞 owner（子计划 1 §4.1）。
 - 测试：有记录 / 无记录 / 未关闭三例。

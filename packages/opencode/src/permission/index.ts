@@ -240,8 +240,8 @@ export function merge(...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule[] 
 export function disabled(tools: string[], ruleset: PermissionV1.Ruleset): Set<string> {
   const edits = ["edit", "write", "apply_patch"]
   const reads = ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]
-  // agent_status shows one row of what agent_list shows, so the deny that
-  // hides one hides the other (subplan agentmgmt-2-run-state I9).
+  // Step S24: agent_status shows one row of what agent_list shows, so the deny
+  // that hides one hides the other (subplan agentmgmt-2-run-state I9).
   const aliases: Record<string, string> = { agent_status: "agent_list" }
   return new Set(
     tools.filter((tool) => {

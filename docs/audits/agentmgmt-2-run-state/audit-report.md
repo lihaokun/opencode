@@ -50,4 +50,21 @@
 
 ## 3. 结论
 
-两轮审查后，§4.4 六条的剩余 ⚠️ 全部对应第二轮的 N/D 项，已按 §6 第 16 点写入子计划与 expectations；上位文档残留已清理。设计阶段退出，进入 §5 实现（commit 1 起）。实施阶段的 Step 5 双验证记录追加于此。
+两轮审查后，§4.4 六条的剩余 ⚠️ 全部对应第二轮的 N/D 项，已按 §6 第 16 点写入子计划与 expectations；上位文档残留已清理。设计阶段退出，进入 §5 实现（commit 1 起）。
+
+### 3.1 Step 5 双验证（2026-10-31，基线 `fe2470fdfd`，五个实施提交 `79f2e32ff9`、`aae71d50ec`、`4be70d5251`、`e2cb3d5aeb`、`fe2470fdfd`）
+
+**路径 A（仓库单测承担机械化检查）**
+
+- §2 / §3：schema 与枚举由 `run.test.ts`（记录纯函数、`read` 容错）、`inbox.test.ts`（三条 metadata 路径、文本逐字不变）、`prompt.test.ts`（报告 metadata 与属性、stop_hook part）、`next.test.ts`（别名表）钉住。
+- §4：`grep -rhoE "Step S[0-9]+" packages/opencode/src packages/plugin/src` 覆盖 S1–S24（S7 在 plugin 包），审核前缺 S7 / S17 / S24，已补。
+- §5 / §6：定值用例在 `prompt.test.ts`（钩子六支、不触发的退出仍报告、re-arm、续跑窗口、遗留 lost、唤醒来源四规则、视图三步历史一致、deny 不附带）、`lifecycle.test.ts`（停止通知五种 run 行）、`tools.test.ts`（agent_send 七种写法、agent_status 五种 run 行与范围 / 权限、agent_list 过滤 / 排序 / 上限 / 计数）、`session.test.ts`（重入守卫）。
+- §7：T3（INV-5 / 6 / 13，8 种子）、T4（INV-12，8 种子）、T7（INV-8b，12 种子）、T8（INV-7 / 7b，12 种子）、T9（INV-11，6 种子，参照按审核意见加强）；INV-6b、INV-9、INV-10 为定值 / 枚举。
+- §8：600 个直接子一次 `children` 且 < 50 ms；单次 patch < 50 ms；视图 ≤ 25 行；钩子每段 ≤ cap 次；agent_list 默认 50。
+- 运行结果：五个 commit 的定向用例全过；`prompt.test.ts` 全文件（139）与 agent-management / session / permission / tool 套件（681）的失败全部是 5 秒超时（机器负载 10–22，用户的 Coq / OCaml 构建并行），单独重跑全过；两条墙钟上界用例在 HEAD 上同样超时，不计为回归。
+
+**路径 B（独立审核 agent，只给契约文档与 diff）**
+
+- 逐项判定表见审核输出；结论：❌ 2（步骤标记缺三处；T9 参照弱于 INV-11 且"等价"不成立）、⚠️ 11（清零规则变更需追认、锁外重读的原子性表述、钩子 `agent` 措辞、schema 不校验三条不变量、§5.1.4 测试缺口、§2 缺两条文本、代码有契约未写的失败文本与文档文件、INV-13 观测点、性能观测点与集成测试收窄、INV-6 / 6b 改定值、`ended` 类型）、未判定 5。
+- 契约文档的实施期改动分类：13 处为实施细节如实记录；7 处为配合实现 / 测试而改（第 17 点、INV-6 收窄、INV-6b 改定值、INV-11 重述、性能观测点、§5.3.2 收窄、INV-5 列表），其中 INV-11 的重述被判为不等价，其余判为可接受。
+- 处置：`decisions.md` D1–D17；❌ 两项已修并重跑，⚠️ 六项已修、三项文档化、两项接受并记录，未判定五项核对或接受。critical 0、unresolved 0。

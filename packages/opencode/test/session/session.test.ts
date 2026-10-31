@@ -303,10 +303,11 @@ describe("Session.patch serializes writes to one session", () => {
 
   // T9: random concurrent patches. Every `session.updated` is published inside
   // the lock, in lock order, so the sequence of published rows is the serial
-  // order the lock chose. A lost update shows up as a field reverting to an
-  // older value between two consecutive rows: the row that lost it was merged
-  // from a stale read. So between neighbours at most one of the fields the ops
-  // write may change, and the final row is the last published one.
+  // order the lock chose. A lost update is a field going back to a value it
+  // already had: the row that lost it was merged from a stale read. Every op
+  // writes a value of its own, so the check is that no observed field ever
+  // takes a value seen before, that every written value shows up in some row,
+  // and that the final row is the last published one.
   it.instance("concurrent patches of one session never lose a field (T9)", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service
@@ -321,11 +322,20 @@ describe("Session.patch serializes writes to one session", () => {
           if (data.sessionID === info.id) rows.push(data.info)
           return Effect.void
         })
+        const written: Record<string, string[]> = { title: [], note: [], agent: [], model: [] }
         const ops = Array.from({ length: 3 + Math.floor(next() * 10) }, (_, i) => {
           const roll = next()
-          if (roll < 0.3) return session.setTitle({ sessionID: info.id, title: `title ${i}` })
-          if (roll < 0.6) return session.setMetadata({ sessionID: info.id, metadata: { note: `meta ${i}` } })
+          if (roll < 0.3) {
+            written.title.push(`title ${i}`)
+            return session.setTitle({ sessionID: info.id, title: `title ${i}` })
+          }
+          if (roll < 0.6) {
+            written.note.push(`meta ${i}`)
+            return session.setMetadata({ sessionID: info.id, metadata: { note: `meta ${i}` } })
+          }
           if (roll < 0.8) return session.touch(info.id)
+          written.agent.push(`agent ${i}`)
+          written.model.push(`m${i}`)
           return session.setAgentModel({
             sessionID: info.id,
             agent: `agent ${i}`,
@@ -337,17 +347,27 @@ describe("Session.patch serializes writes to one session", () => {
         yield* unsubscribe
 
         expect(rows, `seed ${9100 + n}`).toHaveLength(ops.length)
-        let previous = info
-        for (const row of rows) {
-          const changed = [
-            row.title !== previous.title,
-            row.metadata?.note !== previous.metadata?.note,
-            row.agent !== previous.agent,
-          ].filter(Boolean).length
-          expect(changed, `seed ${9100 + n}: a row reverted a field`).toBeLessThanOrEqual(1)
-          previous = row
+        const fields = {
+          title: (row: SessionNs.Info) => row.title,
+          note: (row: SessionNs.Info) => String(row.metadata?.note ?? ""),
+          agent: (row: SessionNs.Info) => row.agent ?? "",
+          model: (row: SessionNs.Info) => row.model?.id ?? "",
         }
-        expect(yield* session.get(info.id)).toEqual(previous)
+        for (const [field, read] of Object.entries(fields)) {
+          const seen = new Set<string>()
+          let current = read(info)
+          seen.add(current)
+          for (const row of rows) {
+            const value = read(row)
+            if (value === current) continue
+            expect(seen.has(value), `seed ${9100 + n}: ${field} went back to "${value}"`).toBe(false)
+            seen.add(value)
+            current = value
+          }
+          for (const value of written[field]!)
+            expect(seen.has(value), `seed ${9100 + n}: ${field} "${value}" never landed`).toBe(true)
+        }
+        expect(yield* session.get(info.id)).toEqual(rows.at(-1)!)
         yield* session.remove(info.id)
       }
     }),

@@ -1,6 +1,6 @@
 # 每步末尾附加段：一步内重复拒绝、跨步重复计数、子 agent 运行状态
 
-- 状态：修正方案待确认（第一至五部分已填；第六至八部分为计划，修复后回填）
+- 状态：修复完成，待 PR（第六至八部分的实际状态见文末"回填"）
 - Issue：#76（死循环）、#75（子 agent 时序与数量）；附带 #73 的服务端部分（agent 消息打标记）
 - 分支：`step-tail`（基于 `dev@d9d7de31fb`）
 - 影响模块：`packages/opencode` 的 SessionPrompt 循环、SessionTools、SessionProcessor、agent-management（inbox、delegation、tool/agent）、`provider/transform.ts` 的缓存断点
@@ -318,3 +318,40 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 1. **StructuredOutput 不受一步内拒绝保护。** `prompt.ts` 在 `SessionTools.resolve` 完成包装之后才加入 StructuredOutput，而旧 processor 检查能看到每一个调用。复现：一次返回内三个相同的 StructuredOutput 调用全部完成。修正：包装移到本步最终工具表组装之后（4.2）。本修正不涉及 #18 的终止机制。
 2. **服务端报上下文越界会清零跨步计数。** 越界的请求没有完成模型步骤，却被当作"没有工具调用的一步"参与比较。复现：相同 Edit 两步，服务端返回越界，压缩，再一次相同 Edit，压缩后两次请求都没有末尾段。修正：结果为压缩且消息没有 finish 的一步跳过计数更新（4.3）。
 3. **Anthropic 自动缓存模式下末尾段承载了断点。** 配置顶层 `cacheControl` 时跳过 `applyCaching`，自动断点落在每步都变的末尾段上，每步只写不读。官方说明见 <https://platform.claude.com/docs/en/build-with-claude/prompt-caching#automatic-caching>，其中把"可变后缀上的断点"列为常见错误，建议在静态前缀末尾放显式断点。修正见 4.1。
+
+## 回填（2026-10-31，`step-tail` 分支）
+
+提交（按顺序）：
+
+| 提交         | 内容                                                                          | 对应                             |
+| ------------ | ----------------------------------------------------------------------------- | -------------------------------- |
+| `bfc07a0e80` | 末尾段机制、一步内拒绝、跨步计数                                              | 4.1、4.2、4.3；R1、R2、P1、P2    |
+| `97b272f37f` | 审核补正三项：StructuredOutput 入保护、服务端越界不清零、自动缓存前的显式断点 | 审核补正 1–3；R4、P5、P6         |
+| `79f2e32ff9` | 停止钩子 `experimental.session.stop`（#81）                                   | 4.4 的 run 结束定义；子计划 §5.1 |
+| `aae71d50ec` | run 记录、`Session.patch` 按会话串行、agent 消息标记（#73 服务端）            | 4.4；子计划 §5.2；P3 → T3、T9    |
+| `4be70d5251` | 末尾段进度视图，花名册撤销                                                    | 4.9；子计划 §5.3；T7             |
+| `e2cb3d5aeb` | 报告、停止通知与 agent_send 带 run                                            | 4.5、4.6；子计划 §5.4；R3        |
+| `fe2470fdfd` | `agent_status`、`agent_list` 参数 / 排序 / 上限 / 计数行                      | 4.7、4.8；子计划 §5.5；P4 → T4   |
+
+第六部分（测试）的实际落点：
+
+- R1、R2、R4、P1、P2、P5、P6：`test/session/prompt.test.ts`、`test/session/step-tail.test.ts`、`test/session/tools.test.ts`、`test/provider/transform.test.ts`（第一组，已在 `bfc07a0e80` / `97b272f37f`）。
+- R3：`prompt.test.ts` 的 run-end notice 用例（报告带 `run="N" ended="…"`）、INV-6b 定值用例（agent_send 预告的号 = 下一份报告）、`test/agent-management/tools.test.ts` 的 agent_send 六种措辞。
+- P3 → T3（`prompt.test.ts`，随机并发多子）：run 号严格 +1、re-arm 不加、续跑窗口加一、结束写失败与遗留关为 lost、报告的号与关闭的 run 一一对应、记录打开时已 busy。agent_send 预告（INV-6b）由定值用例承担，理由见子计划 §5.4.3。
+- P4 → T4（`tools.test.ts`）：随机邻居与参数，子集、计数行、上限、排序。
+- 另有子计划新增的 T7（进度视图纯函数随机）、T8（停止钩子随机 run）、T9（并发 patch 随机）。
+- 边缘项："变化超过 8 行时截断"随设计改为两个列表各 10 行加省略行；"末尾子 agent 节无子时不附带"在 `prompt.test.ts`。
+- 既有用例改写：processor-effect、cli/run、cli/serve 的 doom-loop 用例已在第一组改写。
+
+第七部分（代码）的实际落点与计划的差异：
+
+- 新增 `agent-management/run.ts`（记录的纯函数）；`session/step-tail.ts` 增进度视图与采集函数（采集放在 StepTail 而非 prompt.ts，服务经参数传入以便计数测试）。
+- `session/session.ts`：`patch` 按会话加锁（计划未列，子计划 §5.2.0 补入）。
+- `session/status.ts`：投影条目带 `at`（线上 `Info` 不变）。
+- `effect/runner.ts`、`session/run-state.ts`：`cancel` 返回取消前状态。
+- `permission/index.ts`：`disabled` 的别名表加 `agent_status → agent_list`。
+- `session/reminders.ts`：`applyAgentRoster` 删除，sentinel 保留。
+- `tool/agent.ts`：agent_send 返回、agent_list 参数、agent_status；`tool/registry.ts` 注册并给 SessionStatus 依赖。
+- `plugin/src/index.ts`、`core/src/v1/config/config.ts`：停止钩子类型与 `stop_hook_block_cap`。
+
+第八部分（文档）：架构、细化设计、子计划、调研 §18、expectations 已随各 commit 更新；`customize-opencode.md`、web `agents.mdx` / `permissions.mdx` 已更新；`session-processor-fix-periodic-doom-loop.md` 的取代说明已在第一组加上。

@@ -326,6 +326,8 @@ export interface Hooks {
     output: { enabled: boolean },
   ) => Promise<void>
   /**
+   * Step S7 (subplan agentmgmt-2-run-state): the stop hook's shape.
+   *
    * Called when a session's run is about to end because the model gave a final
    * answer with no tool calls, before anything reports the run as over.
    * `decision: "block"` with a `reason` keeps the run going: the reason is

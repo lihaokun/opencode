@@ -6112,12 +6112,80 @@ withStopHook.instance("runs that end on an error, a truncation or the step limit
   }),
 )
 
-withStopHook.instance("the step limit ends the run without asking the stop hook", () =>
+// §5.1.4: the exits the hook never sees still end the run for the parent —
+// each reports, and the hook is not asked once. A rejected permission is the
+// in-step `result === "stop"` break; the three are subagents so the report
+// is observable.
+withStopHook.instance(
+  "an error, a truncation or a rejected permission ends a subagent's run unasked, and the parent still hears",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(stopHookCfg())
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const parent = yield* sessions.create({ title: "root", permission: allowAll })
+      const failing = yield* subagent(parent.id)
+      const truncated = yield* subagent(parent.id)
+      const denied = yield* sessions.create({
+        parentID: parent.id,
+        title: "denied (@explore subagent)",
+        agent: "explore",
+        permission: [...allowAll, { permission: "glob", pattern: "*", action: "ask" }],
+        metadata: {
+          [AgentManagement.METADATA_AGENT_DESCRIPTION]: "denied",
+          [AgentManagement.METADATA_AGENT_NOTIFY]: true,
+        },
+      })
+      // Blocks only the children: the parent's runs on the notices end as
+      // they like, and only the children's asks count.
+      const children = new Set<string>([failing.id, truncated.id, denied.id])
+      stopHook.reset([
+        (input, output) => {
+          if (!children.has(input.sessionID)) return
+          output.decision = "block"
+          output.reason = "never read"
+        },
+      ])
+
+      yield* user(failing.id, "fail-task")
+      yield* llm.pushMatch(lastUserIs("fail-task"), reply().contentFilter())
+      yield* prompt.loop({ sessionID: failing.id })
+      yield* user(truncated.id, "cut-task")
+      yield* llm.pushMatch(lastUserIs("cut-task"), reply().text("cut").usage({ input: 10, output: 10 }).length())
+      yield* prompt.loop({ sessionID: truncated.id })
+      // A deny rule would only hide the tool; the stop is the rejection of an
+      // ask, answered here as the user would answer it.
+      yield* user(denied.id, "deny-task")
+      yield* llm.pushMatch(lastUserIs("deny-task"), reply().tool("glob", { pattern: "*.nothing-denied" }))
+      const run = yield* prompt.loop({ sessionID: denied.id }).pipe(Effect.forkChild)
+      const permission = yield* Permission.Service
+      const asked = yield* pollWithTimeout(
+        permission.list().pipe(Effect.map((list) => list.find((request) => request.sessionID === denied.id))),
+        "the glob call never asked for permission",
+        "10 seconds",
+      )
+      yield* permission.reply({ requestID: asked.id, reply: "reject" })
+      yield* awaitWithTimeout(Fiber.await(run), "the denied run never finished", "10 seconds")
+
+      const list = yield* awaitNotices(parent.id, 3)
+      expect(stopHook.calls.filter((call) => children.has(call.sessionID))).toHaveLength(0)
+      expect(list.map((item) => String(item.part.metadata?.summary).split(" (run")[0]).toSorted()).toEqual([
+        "Agent failed: denied",
+        "Agent failed: look around",
+        "Agent failed: look around",
+      ])
+      yield* waitForIdle(parent.id)
+    }),
+  30_000,
+)
+
+withStopHook.instance("the step limit ends the run without asking the stop hook, and a subagent still reports", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(stepLimitCfg)
     stopHook.reset([blocks(["never read"])])
     const prompt = yield* SessionPrompt.Service
-    const chat = yield* (yield* Session.Service).create({ title: "limited", permission: allowAll })
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "limited", permission: allowAll })
     yield* user(chat.id, "go")
     yield* llm.text("a")
 
@@ -6125,6 +6193,18 @@ withStopHook.instance("the step limit ends the run without asking the stop hook"
 
     expect(stopHook.calls).toHaveLength(0)
     expect(yield* llm.calls).toBe(1)
+
+    const parent = yield* sessions.create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    // Scoped to the child: the parent's run on the notice is not under test.
+    stopHook.reset([blocks(["never read"])], child.id)
+    yield* user(child.id, "limited-task")
+    yield* llm.pushMatch(lastUserIs("limited-task"), reply().text("limited done").stop())
+    yield* prompt.loop({ sessionID: child.id })
+    const [notice] = yield* awaitNotices(parent.id, 1)
+    expect(stopHook.calls).toHaveLength(0)
+    expect(String(notice.part.metadata?.summary)).toMatch(/^Agent completed: look around \(run 1, ended /)
+    yield* waitForIdle(parent.id)
   }),
 )
 

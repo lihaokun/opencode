@@ -22,6 +22,9 @@ export const AGENT_SEND_TOOL_ID = "agent_send"
 export const AGENT_STOP_TOOL_ID = "agent_stop"
 export const AGENT_STATUS_TOOL_ID = "agent_status"
 
+// Step S24: agent_status is visible exactly when agent_list is — here by
+// depth (visibleAgentTools below), and by permission through the alias in
+// Permission.disabled (I9).
 export const AGENT_TOOL_IDS = [
   AGENT_TOOL_ID,
   AGENT_LIST_TOOL_ID,

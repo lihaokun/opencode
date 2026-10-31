@@ -13,6 +13,8 @@ import BUILD_SWITCH from "./prompt/build-switch.txt"
 import PLAN_MODE from "./prompt/plan-mode.txt"
 
 /**
+ * Step S17: the roster is gone, only its prefix stays.
+ *
  * Prefix of the roster parts an earlier version wrote into transcripts. The
  * roster is retired — the step tail carries a view of the subagents on every
  * step without touching history (subplan agentmgmt-2-run-state §4.5) — but
