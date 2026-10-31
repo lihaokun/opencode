@@ -380,7 +380,8 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 返回：
   表头 session_id / name / agent_type / relation / status / run / last / title / workdir
     run：agentRun.number，无记录留空；last：max(started_at, ended_at) 的 ISO，无记录留空
-  排序：在跑的在前；其余按 last 倒序，无记录的按 time_created 倒序；并列按 session_id
+  排序：自己（relation = self）恒在第一行（§6 第 18 点）；然后在跑的在前；其余按活动时间倒序，
+    活动时间 = 记录的 max(started_at, ended_at)，无记录取 time_created（一个键，两种来源混排）；并列按 session_id
   末尾计数行：`showing <shown> of <total> (<running> running, <idle> idle)`——total 与两个计数按
     过滤后、截断前的集合统计
   不带参数时默认上限 50，这是对现有输出的有意改变
@@ -578,7 +579,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 1. `resolveTarget(caller, params.target, "neighbor")`，失败渲染同 `agent_send`。
 2. `Permission.evaluate(AGENT_LIST_TOOL_ID, "*", merged ruleset)` 为 deny → 返回失败文本（I9 执行期的一半）。`agent_list` 自身没有执行期检查，只靠工具表隐藏；这里多一道是有意的不对称，安全方向正确，文档写明。
-3. `sessions.get(target)`、`status.get(target)`、`neighborhood(caller)` 取 relation。
+3. `neighborhood(caller)` 取成员（含 relation 与 `run`）；目标不在邻居集合内（例如用 session_id 指向孙辈）→ 失败文本，范围与 `agent_list` 严格相同；`status.get(target)` 取最后一步时间。
 4. 按 4.7 渲染（run 行五种写法）。
 
 - **正确性论证**：解析范围与 `agent_list` 同为邻居；步骤 2 使"禁用 agent_list 的配置不会经 agent_status 泄露同样的信息"成立；run 行五种写法由 `status × 记录状态` 穷尽。副作用：无。
@@ -592,10 +593,10 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 #### 5.5.3 `agent_list(params, ctx)`
 
-1. 组装 `AgentInfo` 如今（`neighborhood` + `of`），每行再读 `agentRun`。
+1. 组装 `AgentInfo` 如今（`neighborhood` + `of`）；`agentRun` 随 `AgentSkeleton.run` 从 `toSkeleton` 读出的同一行带出，不再逐行读会话。
 2. 过滤：`relation`、`status`、`query`（实例名或标题子串，大小写不敏感，匹配转义前的原文）。
 3. 统计 `total / running / idle`（过滤后）。
-4. 排序：在跑在前；其余按 `last` 倒序；无记录按 `time_created` 倒序；并列按 session_id。
+4. 排序：自己在前；在跑在前；其余按活动时间（`last ?? time_created`）倒序；并列按 session_id。
 5. 截断到 `limit ?? 50`；渲染表与计数行。
 
 - **正确性论证**：结果 ⊆ 过滤后的集合 ⊆ 邻居；计数行按截断前的集合算，所以 `shown ≤ total`；默认上限是有意的行为改变，描述里写明。
@@ -635,6 +636,10 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 2026-10-30（commit 1 实施中发现，按常规判断处置）：
 
 17. **清零规则改为"钩子之外的新用户消息"**，取代第 16 点 D-e 的"按 runLoop 调用计、re-arm 从 0 起"。原因：run 中途插入的消息（steer）在同一次 runLoop 内被读到——下一轮顶部 `lastAssistantBelongsToLatestTurn` 为假，直接进入下一步——不是新一次调用；按调用计时，模型回答完 steer 再停，计数沿用上一段，违背"新输入就是新的停止尝试"。新规则：循环顶部最新用户消息的 parts 没有 `stop_hook` 标记即清零；re-arm 消费的输入没有标记，自然落入其中。与 Claude Code 的 stop_hook_active 仍一致。T8 随之扩成随机 cap、可超上限的阻止、中途插入消息、询问前无 idle 与报告时序的断言。
+
+2026-10-31（commit 5 实施前，用户确认）：
+
+18. **`agent_list` 自己那一行置顶**，其后才是"在跑在前、其余按活动倒序"。模型容易漏看自己；`relation` 列仍写 `self`，`relation: "self"` 过滤只返回这一行。
 
 与 #75 原文的差异：末尾段内容记 INFO 日志而不是写进助手消息的元数据（修正方案文档 §4.1）；`agent_send` 的措辞按第 4 点改；"最近 5 步的变化"按第 8 点改为快照。
 

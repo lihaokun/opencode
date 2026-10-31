@@ -9,15 +9,28 @@ import { AgentStatusProjection } from "@/agent-management/status"
 import { AgentTree } from "@/agent-management/tree"
 import { AgentManagement } from "@/agent-management/schema"
 import { AgentRun } from "@/agent-management/run"
+import { Agent } from "@/agent/agent"
+import { Permission } from "@/permission"
 import { MessageV2 } from "../session/message-v2"
 import { Session } from "@/session/session"
+import { SessionStatus } from "@/session/status"
+import { PositiveInt } from "@opencode-ai/core/schema"
 
 export const AGENT_TOOL_ID = "agent"
 export const AGENT_LIST_TOOL_ID = "agent_list"
 export const AGENT_SEND_TOOL_ID = "agent_send"
 export const AGENT_STOP_TOOL_ID = "agent_stop"
+export const AGENT_STATUS_TOOL_ID = "agent_status"
 
-export const AGENT_TOOL_IDS = [AGENT_TOOL_ID, AGENT_LIST_TOOL_ID, AGENT_SEND_TOOL_ID, AGENT_STOP_TOOL_ID]
+export const AGENT_TOOL_IDS = [
+  AGENT_TOOL_ID,
+  AGENT_LIST_TOOL_ID,
+  AGENT_STATUS_TOOL_ID,
+  AGENT_SEND_TOOL_ID,
+  AGENT_STOP_TOOL_ID,
+]
+/** Rows agent_list shows when `limit` is not given. */
+export const DEFAULT_LIST_LIMIT = 50
 
 export const Parameters = Schema.Struct({
   description: Schema.String.annotate({ description: "A short (3-5 word) description of the task" }),
@@ -50,7 +63,25 @@ const StopParameters = Schema.Struct({
   }),
 })
 
-const ListParameters = Schema.Struct({})
+const ListParameters = Schema.Struct({
+  status: Schema.optional(Schema.Literals(["running", "idle"])).annotate({
+    description: "Only agents in this state",
+  }),
+  relation: Schema.optional(Schema.Literals(["self", "parent", "child", "sibling"])).annotate({
+    description: "Only agents in this relation to you",
+  }),
+  query: Schema.optional(Schema.String).annotate({
+    description:
+      "Only agents whose name or title contains this text, case-insensitively; the agent type is not searched",
+  }),
+  limit: Schema.optional(PositiveInt).annotate({ description: "At most this many rows; 50 when omitted" }),
+})
+
+const StatusParameters = Schema.Struct({
+  target: Schema.String.annotate({
+    description: "The session_id of the Agent, or the name of one of your neighbours",
+  }),
+})
 
 type AgentMeta = {
   parentSessionId?: string
@@ -58,6 +89,7 @@ type AgentMeta = {
   model?: { providerID: string; modelID: string }
 }
 type ListMeta = { count?: number }
+type StatusMeta = { target?: string }
 type SendMeta = { target?: string }
 type StopMeta = { stopped?: number; failed?: number }
 
@@ -76,11 +108,19 @@ const AGENT_DESCRIPTION = [
 ].join("\n")
 
 const LIST_DESCRIPTION = [
-  "- Lists the agents you can address: yourself, your parent, your direct children and your siblings",
+  "- Lists the agents you can address: yourself, your parent, your direct children and your siblings. Your own row comes first, then the running ones, then the rest by their latest run activity, newest first",
   "- Does not list grandchildren, or agents belonging to an unrelated conversation",
   "- Every row carries a session_id, which always works as a target; a row may also carry a name, which is shorter but only unique by convention — when two rows share one, use the session_id",
+  "- `run` is the number of the agent's current or last run and `last` is when that run started or ended, whichever is later; both are empty for an agent that has never run. agent_status gives one agent's run in full",
   "- Status is `running` or `idle`, read at this instant. `idle` is a subagent between runs: it keeps its session, context and directory, and a message to it starts its next run; a message to a `running` one is read at its next step. It is a snapshot, not a promise: one shown as running may finish immediately after",
   "- Status never says how an agent finished; that arrives as a message",
+  "- `status`, `relation` and `query` narrow the list; `limit` caps it, at 50 rows unless set. The last line counts the whole match, so a capped list says how much it left out",
+].join("\n")
+
+const STATUS_DESCRIPTION = [
+  "- Shows one agent you can address — yourself, your parent, a direct child or a sibling — by session_id or name: its state, its current or last run with when it started or ended and how it ended, the run before that, and its working directory",
+  "- Read at this instant, like agent_list: an agent shown running may finish immediately after",
+  "- A run that ended `completed` or `failed` also reaches you as a message when the agent is your own subagent; one that ended `stopped` or `lost` sends no report",
 ].join("\n")
 
 const SEND_DESCRIPTION = [
@@ -92,6 +132,7 @@ const SEND_DESCRIPTION = [
   "- Reaches your parent, children and siblings by name or session_id, and any agent at all by session_id",
   "- The recipient acts under its own permissions: this is not a way to have work done that you are not allowed to do yourself",
   "- Your identity is attached automatically and cannot be set from here",
+  "- What comes back also says what the message walked into: the target's state and run at the moment of delivery",
 ].join("\n")
 
 const STOP_DESCRIPTION = [
@@ -210,41 +251,80 @@ export const AgentTool = Tool.define(
   }),
 )
 
+/** `last` for a row, and the activity it is sorted by: the run's start or end, whichever is later. */
+function activityOf(member: AgentManagement.AgentSkeleton) {
+  return member.run ? Math.max(member.run.started_at, member.run.ended_at ?? 0) : undefined
+}
+
+function compare(a: string, b: string) {
+  return a < b ? -1 : a > b ? 1 : 0
+}
+
 export const AgentListTool = Tool.define(
   AGENT_LIST_TOOL_ID,
   Effect.gen(function* () {
     const tree = yield* AgentTree.Service
     const projection = yield* AgentStatusProjection.Service
 
-    const run = Effect.fn("AgentListTool.execute")(function* (_params: unknown, ctx: Tool.Context) {
+    const run = Effect.fn("AgentListTool.execute")(function* (
+      params: Schema.Schema.Type<typeof ListParameters>,
+      ctx: Tool.Context,
+    ) {
       const result = yield* tree.neighborhood(ctx.sessionID).pipe(Effect.catch((error) => Effect.succeed(error)))
       if ("_tag" in result) return failed<ListMeta>("agents", result.message)
 
       // Status is assembled here, not in the tree: it is a different observed
       // domain, and the tree cannot answer it.
-      const rows = yield* Effect.forEach(
+      const members = yield* Effect.forEach(
         result.members,
-        (member) =>
-          projection.of(member.session_id).pipe(
-            Effect.map((status) => ({
-              session_id: member.session_id,
-              // name, agent_type and title all originate with the model and
-              // land in a tab-separated table read by another model. A tab
-              // shifts the columns and a newline forges an entire row --
-              // session_id included, which is the field a reader routes on. The
-              // same encoding the message header uses, for the same reason.
-              name: AgentInbox.escapeField(member.name ?? ""),
-              agent_type: AgentInbox.escapeField(member.agent_type ?? ""),
-              relation: member.relation,
-              status,
-              title: AgentInbox.escapeField(member.title),
-              workdir: member.workdir?.path ?? "",
-            })),
-          ),
+        (member) => projection.of(member.session_id).pipe(Effect.map((status) => ({ ...member, status }))),
         { concurrency: "unbounded" },
       )
 
-      const header = ["session_id", "name", "agent_type", "relation", "status", "title", "workdir"]
+      // Step S23: filter, count, sort, cut — the count is of the whole match,
+      // so a cut list says how much it left out. The query matches the name
+      // and the title, never the type: a type names a definition, and a
+      // fanned-out session has many of one.
+      const query = params.query?.toLowerCase()
+      const matched = members.filter(
+        (member) =>
+          (params.status === undefined || member.status === params.status) &&
+          (params.relation === undefined || member.relation === params.relation) &&
+          (query === undefined ||
+            (member.name ?? "").toLowerCase().includes(query) ||
+            member.title.toLowerCase().includes(query)),
+      )
+      const running = matched.filter((member) => member.status === "running").length
+      // Yourself first (decision §6, point 18), then the running, then the
+      // rest by latest activity, newest first; ties by session_id so two reads
+      // order alike.
+      const shown = matched
+        .toSorted((a, b) => {
+          if ((a.relation === "self") !== (b.relation === "self")) return a.relation === "self" ? -1 : 1
+          if ((a.status === "running") !== (b.status === "running")) return a.status === "running" ? -1 : 1
+          return (
+            (activityOf(b) ?? b.time_created) - (activityOf(a) ?? a.time_created) || compare(a.session_id, b.session_id)
+          )
+        })
+        .slice(0, params.limit ?? DEFAULT_LIST_LIMIT)
+      const rows = shown.map((member) => ({
+        session_id: member.session_id,
+        // name, agent_type and title all originate with the model and land in
+        // a tab-separated table read by another model. A tab shifts the
+        // columns and a newline forges an entire row -- session_id included,
+        // which is the field a reader routes on. The same encoding the message
+        // header uses, for the same reason.
+        name: AgentInbox.escapeField(member.name ?? ""),
+        agent_type: AgentInbox.escapeField(member.agent_type ?? ""),
+        relation: member.relation,
+        status: member.status,
+        run: member.run ? String(member.run.number) : "",
+        last: member.run ? AgentRun.formatInstant(activityOf(member) ?? member.time_created) : "",
+        title: AgentInbox.escapeField(member.title),
+        workdir: member.workdir?.path ?? "",
+      }))
+
+      const header = ["session_id", "name", "agent_type", "relation", "status", "run", "last", "title", "workdir"]
       const lines = [header.join("\t"), ...rows.map((row) => header.map((key) => (row as never)[key]).join("\t"))]
       return {
         title: "agents",
@@ -252,6 +332,7 @@ export const AgentListTool = Tool.define(
         output: [
           ...lines,
           "",
+          `showing ${rows.length} of ${matched.length} (${running} running, ${matched.length - running} idle)`,
           "session_id always works as a target. A name is shorter but is not guaranteed unique; when two rows share one, use the session_id.",
         ].join("\n"),
       }
@@ -266,6 +347,111 @@ export const AgentListTool = Tool.define(
     }
   }),
 )
+
+export const AgentStatusTool = Tool.define(
+  AGENT_STATUS_TOOL_ID,
+  Effect.gen(function* () {
+    const tree = yield* AgentTree.Service
+    const projection = yield* AgentStatusProjection.Service
+    const status = yield* SessionStatus.Service
+    const sessions = yield* Session.Service
+    const agents = yield* Agent.Service
+
+    const run = Effect.fn("AgentStatusTool.execute")(function* (
+      params: Schema.Schema.Type<typeof StatusParameters>,
+      ctx: Tool.Context,
+    ) {
+      // Step S22: the same reach as agent_list, the same gate, then one member.
+      const target = yield* tree
+        .resolveTarget({ caller: ctx.sessionID, value: params.target, scope: "neighbor" })
+        .pipe(Effect.catch((error) => Effect.succeed(error)))
+      if (typeof target !== "string") return failed<StatusMeta>(params.target, target.message)
+
+      // agent_list's deny, applied here at execution as well as at the tool
+      // table: this is agent_list for one row, and must not hand out what the
+      // other was denied (I9). Merged the way tools.ts merges it.
+      const self = yield* sessions.get(ctx.sessionID).pipe(Effect.orDie)
+      const definition = yield* agents.get(ctx.agent)
+      const ruleset = Permission.merge(definition?.permission ?? [], self.permission ?? [])
+      if (Permission.evaluate(AGENT_LIST_TOOL_ID, "*", ruleset).action === "deny") {
+        return failed<StatusMeta>(
+          params.target,
+          "agent_list is denied for you, and agent_status shows the same information.",
+        )
+      }
+
+      const neighborhood = yield* tree.neighborhood(ctx.sessionID).pipe(Effect.catch((error) => Effect.succeed(error)))
+      if ("_tag" in neighborhood) return failed<StatusMeta>(params.target, neighborhood.message)
+      const member = neighborhood.members.find((item) => item.session_id === target)
+      if (!member) {
+        return failed<StatusMeta>(
+          params.target,
+          `${target} is not one of your neighbours; only yourself, your parent, your direct children and your siblings can be looked up.`,
+        )
+      }
+
+      const state = yield* projection.of(target)
+      const current = yield* status.get(target)
+      return {
+        title: params.target,
+        metadata: { target } satisfies StatusMeta,
+        output: [
+          `session_id: ${member.session_id}`,
+          `name: ${AgentInbox.escapeField(member.name ?? "")}`,
+          `agent_type: ${AgentInbox.escapeField(member.agent_type ?? "")}`,
+          `relation: ${member.relation}`,
+          `status: ${state}`,
+          ...runLines(member, state, current.at, ctx.sessionID),
+          `workdir: ${member.workdir?.path ?? ""}`,
+        ].join("\n"),
+      }
+    })
+
+    return {
+      description: STATUS_DESCRIPTION,
+      parameters: StatusParameters,
+      jsonSchema: ToolJsonSchema.fromSchema(StatusParameters),
+      execute: (params: Schema.Schema.Type<typeof StatusParameters>, ctx: Tool.Context) =>
+        run(params, ctx).pipe(Effect.orDie),
+    }
+  }),
+)
+
+/**
+ * The run lines of agent_status (subplan agentmgmt-2-run-state §4.7): the run
+ * in one of five shapes by state and record, the run before when the record
+ * keeps one, and the last step while running. A session that is nobody's
+ * subagent has no record to speak of and gets none of them.
+ */
+function runLines(
+  member: AgentManagement.AgentSkeleton,
+  state: AgentManagement.AgentStatus,
+  lastStep: number | undefined,
+  viewer: Parameters<typeof AgentRun.describeSource>[1],
+) {
+  if (member.parent_id === undefined) return []
+  const run = member.run
+  const ended = run ? AgentRun.ended(run) : undefined
+  const line =
+    state === "running"
+      ? run && !ended
+        ? `${run.number}, started ${AgentRun.formatInstant(run.started_at)}, woken by ${AgentRun.describeSource(run.woken_by, viewer)}`
+        : "record not updated yet"
+      : !run
+        ? "none yet"
+        : ended
+          ? `${run.number}, ended ${AgentRun.formatInstant(ended.ended_at)} (${ended.outcome})`
+          : `${run.number}, started ${AgentRun.formatInstant(run.started_at)}, cut off (will be recorded as lost)`
+  return [
+    `run: ${line}`,
+    ...(run?.previous
+      ? [
+          `previous run: ${run.previous.number}, ended ${AgentRun.formatInstant(run.previous.ended_at)} (${run.previous.outcome})`,
+        ]
+      : []),
+    ...(state === "running" && lastStep !== undefined ? [`last step: ${AgentRun.formatInstant(lastStep)}`] : []),
+  ]
+}
 
 export const AgentSendTool = Tool.define(
   AGENT_SEND_TOOL_ID,
@@ -465,6 +651,6 @@ export const visibleAgentTools = Effect.fn("AgentTools.visible")(function* (
   // depth, so list and send remain. The test is depth, not whether it currently
   // has children — otherwise agent_stop would blink in and out.
   return depth >= limit
-    ? [AGENT_LIST_TOOL_ID, AGENT_SEND_TOOL_ID]
-    : [AGENT_TOOL_ID, AGENT_LIST_TOOL_ID, AGENT_SEND_TOOL_ID, AGENT_STOP_TOOL_ID]
+    ? [AGENT_LIST_TOOL_ID, AGENT_STATUS_TOOL_ID, AGENT_SEND_TOOL_ID]
+    : [AGENT_TOOL_ID, AGENT_LIST_TOOL_ID, AGENT_STATUS_TOOL_ID, AGENT_SEND_TOOL_ID, AGENT_STOP_TOOL_ID]
 })

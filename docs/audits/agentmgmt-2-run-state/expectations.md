@@ -113,7 +113,7 @@
 **agent_status / agent_list（commit 5）**
 
 - S22 `agent_status`：resolveTarget(neighbor) → `agent_list` 权限求值 → 读取 → 渲染（run 行五种）
-- S23 `agent_list`：组装 → 过滤 → 统计 → 排序 → 截断 → 计数行
+- S23 `agent_list`：组装 → 过滤 → 统计 → 排序（self 置顶 → 在跑 → 活动倒序 → id）→ 截断 → 计数行
 - S24 可见性：`AGENT_TOOL_IDS` 与 `visibleAgentTools` 并列；`Permission.disabled` 别名 `agent_status→agent_list`
 
 ## 5. 行为契约（语义，人审）
@@ -127,7 +127,7 @@
 - 结束报告与停止通知标明它关闭的那个 run；run 号允许不连续，不回溯补发报告；同一 run 号的报告至多一份；lost 的 run 没有报告；崩溃后不补发通知。
 - `agent_send` 的六种措辞按投递前快照选择；非子会话只写 running / idle；末尾恒附 `agent_status` 提示行；既有三句单向消息说明保留；stopped / lost 的第二句不假定停止者是调用者。
 - `agent_status` 的可查范围、解析与权限与 `agent_list` 完全相同；`agent_list` 被禁用时 `agent_status` 不出现在工具表、执行也被拒（有意的不对称：`agent_list` 自身无执行期检查）。
-- `agent_list` 不带参数时默认上限 50；计数行按过滤后、截断前的集合统计；`query` 不匹配 `agent_type`。
+- `agent_list` 不带参数时默认上限 50；计数行按过滤后、截断前的集合统计；`query` 不匹配 `agent_type`；自己的行恒在第一行（§6 第 18 点）。
 - 进度视图只在有直接子且 `agent_list` 非 deny 的会话出现；两个列表各最多 10 行；窗口至少覆盖上一步开始以来，首步为 run 开始以来；cut off 行不受窗口限制；"last step" 是状态投影最近一次置 busy 的时间；花名册不再写入历史。
 - 新 run 启动时先置 busy 再开记录：任何时刻不会出现"记录已打开、状态 idle"的刚启动 run。
 - 模型可见的消息文本不因任何 metadata 而变。
@@ -157,7 +157,7 @@
 - **INV-9（= I9）** 对权限规则形态 {无规则、`agent_list: deny` 通配、`agent_list` 具体 pattern 的 deny（`Permission.disabled` 只认 `pattern === "*"`，故不隐藏）、`agent_status: deny`} × 深度 {< limit, ≥ limit} 的全部组合，工具表中 `agent_status ∈ tools ⇔ agent_list ∈ tools`；`agent_list` 通配 deny 时 `agent_status` 执行被拒。—— 枚举
 - **INV-10（= I10）** 对任意发送方字段，`render()` 的输出与基线逐字相同；四条路径的 metadata 形状固定。—— 枚举
 - **INV-11（= I11）** 对同一会话的任意并发 patch 序列（随机的 setTitle / setMetadata / touch / setAgentModel），锁内按序发布的 `session.updated` 行序列中相邻两行至多一个被写字段变化（丢失的更新表现为字段回退），最终行等于最后一个事件的行；即每个字段等于最后一次写该字段的值。—— T9
-- **INV-12** `agent_list` 结果 ⊆ 过滤后的邻居集合 ⊆ 邻居；计数行与过滤后集合的统计一致；行数 ≤ limit；排序满足"在跑在前，其余按 last 倒序，并列按 id"。—— T4
+- **INV-12** `agent_list` 结果 ⊆ 过滤后的邻居集合 ⊆ 邻居；计数行与过滤后集合的统计一致；行数 ≤ limit；排序满足"self 在前，在跑在前，其余按活动（`last ?? time_created`）倒序，并列按 id"。—— T4
 - **INV-13** 新 run 启动后任一时刻，`状态 idle ∧ 记录打开` 只在崩溃遗留下出现：随机启动与查询交错，断言 agent_send / agent_status 从不对刚启动的 run 输出 cut off。—— T3
 
 ## 8. 性能契约（机械化）

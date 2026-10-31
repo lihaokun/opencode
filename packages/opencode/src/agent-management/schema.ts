@@ -70,6 +70,8 @@ export interface AgentSkeleton {
   relation: AgentRelation
   time_created: number
   workdir: AgentWorkdir | undefined
+  /** The run record, read off the same row; absent for a session that never ran or is nobody's subagent. */
+  run?: AgentRun
 }
 
 export interface AgentInfo extends AgentSkeleton {

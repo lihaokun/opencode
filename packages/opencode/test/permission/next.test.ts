@@ -1172,3 +1172,21 @@ it.instance(
     }),
   { git: true },
 )
+
+// Subplan agentmgmt-2-run-state I9: agent_status shows one row of what
+// agent_list shows, so the deny that hides one hides the other, and nothing
+// else does.
+test("disabled - agent_status follows agent_list", () => {
+  const both = ["agent_list", "agent_status"]
+  expect(Permission.disabled(both, [{ permission: "agent_list", pattern: "*", action: "deny" }])).toEqual(new Set(both))
+  expect(Permission.disabled(both, [{ permission: "agent_list", pattern: "specific", action: "deny" }])).toEqual(
+    new Set(),
+  )
+  expect(Permission.disabled(both, [{ permission: "agent_status", pattern: "*", action: "deny" }])).toEqual(new Set())
+  expect(
+    Permission.disabled(both, [
+      { permission: "*", pattern: "*", action: "deny" },
+      { permission: "agent_list", pattern: "*", action: "allow" },
+    ]),
+  ).toEqual(new Set())
+})
