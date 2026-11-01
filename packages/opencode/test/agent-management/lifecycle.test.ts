@@ -606,10 +606,9 @@ describe("AgentLifecycle sibling snapshot", () => {
   )
 })
 
-// Subplan agentmgmt-2-run-state §4.6, §5.4.2: the notice names the run the
-// stop hit, from what the cancel found, the record as the cancel went in, and
-// the record read after it.
-describe("AgentLifecycle.stop names the run it hit", () => {
+// The cancel's state and the record read afterwards are independent facts.
+// A record snapshot does not identify the execution that cancel captured.
+describe("AgentLifecycle.stop reports the operation and latest record", () => {
   const record = (number: number, extra: Record<string, unknown> = {}) => ({
     [AgentManagement.METADATA_AGENT_RUN]: { number, started_at: 1_000, woken_by: { kind: "system" }, ...extra },
   })
@@ -654,13 +653,16 @@ describe("AgentLifecycle.stop names the run it hit", () => {
     return (seen[0]!.parts[0] as { text: string }).text.split("\n")
   })
 
-  it.instance("found running, and the record says stopped: stopped at that time", () =>
+  it.instance("found running, and the latest record says stopped", () =>
     Effect.gen(function* () {
       const { root, a } = yield* child(record(3, { ended_at: 5_000, outcome: "stopped" }))
       const fiber = yield* running(a.id)
       const lines = yield* stop(root.id, a.id)
       yield* Fiber.await(fiber)
-      expect(lines).toContain(`run: 3, stopped at ${AgentRun.formatInstant(5_000)}`)
+      expect(lines.some((line) => line.startsWith("Stop requested at "))).toBe(true)
+      expect(lines).toContain(
+        `Latest run record after cancellation: 3, ended at ${AgentRun.formatInstant(5_000)} (stopped).`,
+      )
     }),
   )
 
@@ -670,104 +672,100 @@ describe("AgentLifecycle.stop names the run it hit", () => {
       const fiber = yield* running(open.a.id)
       const lines = yield* stop(open.root.id, open.a.id)
       yield* Fiber.await(fiber)
-      expect(lines.find((line) => line.startsWith("run: 3, stop requested at "))).toBeDefined()
+      expect(lines.some((line) => line.startsWith("Stop requested at "))).toBe(true)
+      expect(lines).toContain(
+        `Latest run record after cancellation: 3, not closed (started ${AgentRun.formatInstant(1_000)}).`,
+      )
 
       const ended = yield* child(record(4, { ended_at: 5_000, outcome: "completed" }))
       const second = yield* running(ended.a.id)
       const again = yield* stop(ended.root.id, ended.a.id)
       yield* Fiber.await(second)
-      expect(again.find((line) => line.startsWith("run: 4, stop requested at "))).toBeDefined()
+      expect(again.some((line) => line.startsWith("Stop requested at "))).toBe(true)
+      expect(again).toContain(
+        `Latest run record after cancellation: 4, ended at ${AgentRun.formatInstant(5_000)} (completed).`,
+      )
     }),
   )
 
-  // The run the stop hit is the one open as the cancel went in. A cancel sets
-  // the runner idle before the old work has wound down, so a message can start
-  // the next run meanwhile — which closes this one as lost and opens its own
-  // (the second external review, R3). The notice names the run that was
-  // stopped and says the next has started; it never calls the new run, which
-  // is still busy, the stopped one.
-  it.instance(
-    "found running, and the next run opened during the stop: names the stopped run, says the next started",
-    () =>
-      Effect.gen(function* () {
-        const sessions = yield* Session.Service
-        const runState = yield* SessionRunState.Service
-        const status = yield* SessionStatus.Service
-        const lifecycle = yield* AgentLifecycle.Service
-        const { root, a } = yield* child(record(1))
-        const fallback = {} as SessionV1.WithParts
-        const started = yield* Deferred.make<void>()
-        const closing = yield* Deferred.make<void>()
-        const release = yield* Deferred.make<void>()
-        // Work that parks, and whose wind-down waits on a gate: the window in
-        // which the next run can open.
-        const old = yield* runState
-          .ensureRunning(
-            a.id,
-            Effect.succeed(fallback),
-            Effect.gen(function* () {
-              yield* Deferred.succeed(started, undefined)
-              return yield* Effect.never
-            }).pipe(
-              Effect.ensuring(Deferred.succeed(closing, undefined).pipe(Effect.andThen(Deferred.await(release)))),
-            ),
-          )
-          .pipe(Effect.forkChild)
-        yield* awaitWithTimeout(Deferred.await(started), "the old run never started")
-        const { ops, seen } = stubOps()
-        const stop = yield* lifecycle.stop({ caller: root.id, target: a.id, ops }).pipe(Effect.forkChild)
-        yield* awaitWithTimeout(Deferred.await(closing), "the cancel never reached the old run")
-        // The next run opens its record over the old one, as the real loop
-        // would, and stays busy.
-        const gate = yield* Deferred.make<void>()
-        const next = yield* runState
-          .ensureRunning(
-            a.id,
-            Effect.succeed(fallback),
-            Effect.gen(function* () {
-              yield* sessions.setMetadata({
-                sessionID: a.id,
-                metadata: record(2, { started_at: 2_000, previous: { number: 1, ended_at: 2_000, outcome: "lost" } }),
-              })
-              yield* status.set(a.id, { type: "busy" })
-              yield* Deferred.await(gate)
-              return fallback
-            }),
-          )
-          .pipe(Effect.forkChild)
-        yield* pollWithTimeout(
-          sessions
-            .get(a.id)
-            .pipe(Effect.map((info) => (AgentRun.read(info.metadata)?.number === 2 ? true : undefined))),
-          "the next run never opened",
+  // A cancel releases the runner before the old work has wound down. The
+  // latest record can therefore belong to a replacement that was not stopped.
+  it.instance("a replacement during cancellation is reported only as the latest record", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const runState = yield* SessionRunState.Service
+      const status = yield* SessionStatus.Service
+      const lifecycle = yield* AgentLifecycle.Service
+      const { root, a } = yield* child(record(1))
+      const fallback = {} as SessionV1.WithParts
+      const started = yield* Deferred.make<void>()
+      const closing = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      // Work that parks, and whose wind-down waits on a gate: the window in
+      // which the next run can open.
+      const old = yield* runState
+        .ensureRunning(
+          a.id,
+          Effect.succeed(fallback),
+          Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            return yield* Effect.never
+          }).pipe(Effect.ensuring(Deferred.succeed(closing, undefined).pipe(Effect.andThen(Deferred.await(release))))),
         )
-        yield* Deferred.succeed(release, undefined)
-        yield* awaitWithTimeout(Fiber.await(stop), "the stop never finished")
-        yield* pollWithTimeout(
-          Effect.sync(() => (seen.length > 0 ? true : undefined)),
-          "no notice delivered",
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(started), "the old run never started")
+      const { ops, seen } = stubOps()
+      const stop = yield* lifecycle.stop({ caller: root.id, target: a.id, ops }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(closing), "the cancel never reached the old run")
+      // The next run opens its record over the old one, as the real loop
+      // would, and stays busy.
+      const gate = yield* Deferred.make<void>()
+      const next = yield* runState
+        .ensureRunning(
+          a.id,
+          Effect.succeed(fallback),
+          Effect.gen(function* () {
+            yield* sessions.setMetadata({
+              sessionID: a.id,
+              metadata: record(2, { started_at: 2_000, previous: { number: 1, ended_at: 2_000, outcome: "lost" } }),
+            })
+            yield* status.set(a.id, { type: "busy" })
+            yield* Deferred.await(gate)
+            return fallback
+          }),
         )
-        const lines = (seen[0]!.parts[0] as { text: string }).text.split("\n")
-        expect(lines.find((line) => line.startsWith("run: 1, stop requested at "))).toMatch(
-          /; run 2 has started since$/,
-        )
-        expect(lines.some((line) => line.startsWith("run: 2"))).toBe(false)
-        expect((yield* status.get(a.id)).type).toBe("busy")
-        yield* Deferred.succeed(gate, undefined)
-        yield* Fiber.await(old)
-        yield* Fiber.await(next)
-      }),
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions.get(a.id).pipe(Effect.map((info) => (AgentRun.read(info.metadata)?.number === 2 ? true : undefined))),
+        "the next run never opened",
+      )
+      yield* Deferred.succeed(release, undefined)
+      yield* awaitWithTimeout(Fiber.await(stop), "the stop never finished")
+      yield* pollWithTimeout(
+        Effect.sync(() => (seen.length > 0 ? true : undefined)),
+        "no notice delivered",
+      )
+      const lines = (seen[0]!.parts[0] as { text: string }).text.split("\n")
+      expect(lines).toContain(
+        `Latest run record after cancellation: 2, not closed (started ${AgentRun.formatInstant(2_000)}).`,
+      )
+      expect(lines.some((line) => line.startsWith("run:"))).toBe(false)
+      expect((yield* status.get(a.id)).type).toBe("busy")
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.await(old)
+      yield* Fiber.await(next)
+    }),
   )
 
-  it.instance("found idle: the run had already ended, or was cut off", () =>
+  it.instance("found idle: does not infer liveness from a closed or open record", () =>
     Effect.gen(function* () {
       const done = yield* child(record(2, { ended_at: 5_000, outcome: "completed" }))
       expect(yield* stop(done.root.id, done.a.id)).toContain(
-        `run: 2 had already ended at ${AgentRun.formatInstant(5_000)} (completed); nothing was running`,
+        `Latest run record after cancellation: 2, ended at ${AgentRun.formatInstant(5_000)} (completed).`,
       )
       const cut = yield* child(record(2))
       expect(yield* stop(cut.root.id, cut.a.id)).toContain(
-        `run: 2 was cut off (started ${AgentRun.formatInstant(1_000)}) and will be recorded as lost; nothing was running`,
+        `Latest run record after cancellation: 2, not closed (started ${AgentRun.formatInstant(1_000)}).`,
       )
     }),
   )
@@ -776,8 +774,215 @@ describe("AgentLifecycle.stop names the run it hit", () => {
     Effect.gen(function* () {
       const { root, a } = yield* child()
       const lines = yield* stop(root.id, a.id)
-      expect(lines.some((line) => line.startsWith("run:"))).toBe(false)
+      expect(lines.some((line) => line.startsWith("Latest run record"))).toBe(false)
+      expect(lines).toContain("No model run was running when cancellation was applied.")
       expect(lines).toContain("Agent cancelled: agent")
     }),
   )
+
+  it.instance("stop observations cover runner state and record snapshots (T10 matrix)", () =>
+    Effect.gen(function* () {
+      for (const before of ["idle", "running"] as const) {
+        for (const shape of ["missing", "open", ...AgentManagement.RUN_OUTCOMES] as const) {
+          const label = `${before}/${shape}`
+          const metadata =
+            shape === "missing" ? undefined : record(7, shape === "open" ? {} : { ended_at: 5_000, outcome: shape })
+          const target = yield* child(metadata)
+          const fiber = before === "running" ? yield* running(target.a.id) : undefined
+          const lines = yield* stop(target.root.id, target.a.id)
+          if (fiber) yield* Fiber.await(fiber)
+          expect(lines.some((line) => line.startsWith("Stop requested at ")), label).toBe(before === "running")
+          expect(lines.includes("No model run was running when cancellation was applied."), label).toBe(before === "idle")
+          const snapshots = lines.filter((line) => line.startsWith("Latest run record"))
+          expect(snapshots, label).toEqual(
+            shape === "missing" ? [] : [shape === "open"
+              ? `Latest run record after cancellation: 7, not closed (started ${AgentRun.formatInstant(1_000)}).`
+              : `Latest run record after cancellation: 7, ended at ${AgentRun.formatInstant(5_000)} (${shape}).`],
+          )
+          expect(lines.some((line) => line.startsWith("run:")), label).toBe(false)
+        }
+      }
+    }),
+    30_000,
+  )
 })
+
+// T10: cross the cancellation schedule with the record's independent state.
+// The gates control real runners; the oracle tracks which work was interrupted
+// and what each work wrote, rather than inferring execution identity from a row.
+for (const seed of [1201, 2402, 3603]) {
+  it.instance(
+    `stop observations match cancellation schedules (T10 seed ${seed})`,
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const states = yield* SessionRunState.Service
+        const status = yield* SessionStatus.Service
+        const lifecycle = yield* AgentLifecycle.Service
+        let random = seed
+        const next = () => (random = (Math.imul(random, 1664525) + 1013904223) >>> 0) / 4294967296
+        for (const timing of ["descendants", "target"] as const) {
+          for (const shape of ["open", "closed", "missing"] as const) {
+            const number = 1 + Math.floor(next() * 1000)
+            const started = 1_000 + Math.floor(next() * 100_000)
+            const outcome = AgentManagement.RUN_OUTCOMES[Math.floor(next() * AgentManagement.RUN_OUTCOMES.length)]!
+            const label = `${seed}: ${timing}/${shape}, run ${number}`
+            const root = yield* sessions.create({ title: label })
+            const target = yield* sessions.create({
+              parentID: root.id,
+              metadata:
+                shape === "missing"
+                  ? {}
+                  : {
+                      agentRun: {
+                        number,
+                        started_at: started,
+                        woken_by: { kind: "system" },
+                        ...(shape === "closed" ? { ended_at: started + 1, outcome } : {}),
+                      },
+                    },
+            })
+            const fallback = {} as SessionV1.WithParts
+            const ready = yield* Deferred.make<void>()
+            const endOld = yield* Deferred.make<void>()
+            const closing = yield* Deferred.make<void>()
+            const release = yield* Deferred.make<void>()
+            const releaseNew = yield* Deferred.make<void>()
+            const newReady = yield* Deferred.make<void>()
+            const interrupted = new Set<number>()
+            const old = yield* states
+              .ensureRunning(
+                target.id,
+                Effect.succeed(fallback),
+                Effect.gen(function* () {
+                  yield* Deferred.succeed(ready, undefined)
+                  if (timing === "target") return yield* Effect.never
+                  yield* Deferred.await(endOld)
+                  yield* sessions.setMetadata({
+                    sessionID: target.id,
+                    metadata: {
+                      agentRun: {
+                        number,
+                        started_at: started,
+                        ended_at: started + 2,
+                        outcome: "completed",
+                        woken_by: { kind: "system" },
+                      },
+                    },
+                  })
+                  return fallback
+                }).pipe(
+                  Effect.onInterrupt(() => Effect.sync(() => void interrupted.add(number))),
+                  Effect.ensuring(
+                    timing === "target"
+                      ? Deferred.succeed(closing, undefined).pipe(Effect.andThen(Deferred.await(release)))
+                      : Effect.void,
+                  ),
+                ),
+              )
+              .pipe(Effect.forkChild)
+            yield* Deferred.await(ready)
+            // Random tree depth changes how many descendant layers precede the target.
+            const grand =
+              timing === "descendants"
+                ? yield* Effect.gen(function* () {
+                    let parentID = target.id
+                    const depth = 1 + Math.floor(next() * 3)
+                    for (let i = 0; i < depth; i++) parentID = (yield* sessions.create({ parentID })).id
+                    const ready = yield* Deferred.make<void>()
+                    const fiber = yield* states
+                      .ensureRunning(
+                        parentID,
+                        Effect.succeed(fallback),
+                        Deferred.succeed(ready, undefined).pipe(
+                          Effect.andThen(Effect.never),
+                          Effect.ensuring(
+                            Deferred.succeed(closing, undefined).pipe(Effect.andThen(Deferred.await(release))),
+                          ),
+                        ),
+                      )
+                      .pipe(Effect.forkChild)
+                    yield* Deferred.await(ready)
+                    return fiber
+                  })
+                : undefined
+            const { ops, seen } = stubOps()
+            const stopping = yield* lifecycle.stop({ caller: root.id, target: target.id, ops }).pipe(Effect.forkChild)
+            yield* awaitWithTimeout(Deferred.await(closing), `${label}: cancel did not reach the gate`)
+            if (timing === "descendants") {
+              yield* Deferred.succeed(endOld, undefined)
+              yield* Fiber.await(old)
+            }
+            const replacement = yield* states
+              .ensureRunning(
+                target.id,
+                Effect.succeed(fallback),
+                Effect.gen(function* () {
+                  yield* sessions.setMetadata({
+                    sessionID: target.id,
+                    metadata: {
+                      agentRun: { number: number + 1, started_at: started + 3, woken_by: { kind: "system" } },
+                    },
+                  })
+                  yield* status.set(target.id, { type: "busy" })
+                  yield* Deferred.succeed(newReady, undefined)
+                  yield* Deferred.await(releaseNew)
+                  return fallback
+                }).pipe(
+                  Effect.onInterrupt(() =>
+                    Effect.gen(function* () {
+                      interrupted.add(number + 1)
+                      yield* sessions.setMetadata({
+                        sessionID: target.id,
+                        metadata: {
+                          agentRun: {
+                            number: number + 1,
+                            started_at: started + 3,
+                            ended_at: started + 4,
+                            outcome: "stopped",
+                            woken_by: { kind: "system" },
+                          },
+                        },
+                      })
+                    }),
+                  ),
+                ),
+              )
+              .pipe(Effect.forkChild)
+            yield* awaitWithTimeout(Deferred.await(newReady), `${label}: replacement did not start`)
+            yield* Deferred.succeed(release, undefined)
+            yield* awaitWithTimeout(Fiber.await(stopping), `${label}: stop did not finish`)
+            yield* pollWithTimeout(
+              Effect.sync(() => (seen.length > 0 ? true : undefined)),
+              `${label}: no notice`,
+            )
+            const busy = (yield* status.get(target.id)).type
+            const lines = (seen[0]!.parts[0] as { text: string }).text.split("\n")
+            yield* Deferred.succeed(releaseNew, undefined)
+            yield* Fiber.await(old)
+            yield* Fiber.await(replacement)
+            if (grand) yield* Fiber.await(grand)
+
+            expect([...interrupted], label).toEqual([timing === "descendants" ? number + 1 : number])
+            const notCancelled = timing === "descendants" ? number : number + 1
+            expect(lines.some((line) => line.startsWith(`run: ${notCancelled},`)), label).toBe(false)
+            expect(
+              lines.some((line) => line.startsWith("Stop requested at ")),
+              label,
+            ).toBe(true)
+            expect(
+              lines.some((line) => line.startsWith("run:")),
+              label,
+            ).toBe(false)
+            expect(lines, label).toContain(
+              timing === "descendants"
+                ? `Latest run record after cancellation: ${number + 1}, ended at ${AgentRun.formatInstant(started + 4)} (stopped).`
+                : `Latest run record after cancellation: ${number + 1}, not closed (started ${AgentRun.formatInstant(started + 3)}).`,
+            )
+            if (timing === "target") expect(busy, label).toBe("busy")
+          }
+        }
+      }),
+    60_000,
+  )
+}

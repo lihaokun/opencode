@@ -189,7 +189,7 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 
 - `renderOutput` 增加属性：`<agent id="…" state="completed" run="5" ended="2026-10-20T03:41:18+08:00">`。时间为带时区的完整时间。
 - 摘要（TUI 一行显示）追加 `(run 5, ended 03:41:18)`。
-- 停止通知加一行 `run: 5, stopped at <时间>`。run 号允许不连续：被取消的 run 由停止通知承载，因后代仍在跑而推迟的报告报告的是实际关闭的那个 run，不回溯补发（2026-10-23 决定）。
+- 停止通知分开陈述 Session 取消操作与 `Latest run record after cancellation: N, ...` 记录快照，不把读到的编号推断成被取消的执行。run 号仍允许不连续；不回溯补发报告。第三轮复审的根因、窗口生命周期修正及 PBT 见 [Run 观察修正](session-fix-run-observations.md)。
 
 ### 4.6 #75 agent_send 返回
 

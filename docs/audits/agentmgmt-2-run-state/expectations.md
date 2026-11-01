@@ -45,8 +45,8 @@
 | 省略行                                            | `… and N more running` / `… and N more finished`，不计入 10 行                                                                                                                                                                                         | 主契约 §4.5   | 同上                                        | 同上                                                                                 |
 | renderOutput 属性                                 | `run="<n>" ended="<ISO+tz>"`（记录已关闭时；否则两者皆无；`ended` 由调用方按 run.ts 格式好传入）                                                                                                                                                       | 主契约 §4.6   | `agent-management/delegation.ts`            | 测试断言标签文本                                                                     |
 | 摘要后缀                                          | ` (run <n>, ended HH:MM:SS)`（与属性同条件）                                                                                                                                                                                                           | 主契约 §4.6   | `session/prompt.ts` reportRunEnd            | server 独占措辞；TUI 原样显示                                                        |
-| renderTermination 的 run 行                       | 三种写法见主契约 §4.6，另加空闲且记录打开的 cut off 写法（§5.4.2）；无记录时无此行                                                                                                                                                                     | 主契约 §4.6   | `agent-management/lifecycle.ts`             | 测试三分支                                                                           |
-| `Runner.cancel` / `SessionRunState.cancel` 返回值 | 取消前状态标签 `Idle \| Running \| Shell \| ShellThenRun`（无 runner 时 `Idle`）                                                                                                                                                                       | 主契约 §5.4.2 | `effect/runner.ts`、`session/run-state.ts`  | renderTermination 三分支                                                             |
+| renderTermination 操作与记录行 | 操作行由 cancel 返回状态决定；独立的 `Latest run record after cancellation: N, ...` 为读取快照；无记录省略后者 | 主契约 §4.6 / §5.4.2 | `agent-management/lifecycle.ts` | 不声称取消的执行号 |
+| `Runner.cancel` / `SessionRunState.cancel` 返回值 | 取消前状态标签 `Idle \| Running \| Shell \| ShellThenRun`（无 runner 时 `Idle`）                                                                                                                                                                       | 主契约 §5.4.2 | `effect/runner.ts`、`session/run-state.ts`  | renderTermination 操作行                                                             |
 | agent_send 返回首句                               | 六种写法见主契约 §4.6；末尾恒加 `Current state of one agent: agent_status(target="…").`                                                                                                                                                                | 主契约 §4.6   | `tool/agent.ts`                             | 测试六例                                                                             |
 | agent_status 参数                                 | `{ target: string }`                                                                                                                                                                                                                                   | 主契约 §4.7   | `tool/agent.ts`                             | schema                                                                               |
 | agent_status 返回行                               | `session_id / name / agent_type / relation / status / run / previous run / last step / workdir`，run 行五种写法；非子会话无 run 与 previous run 行，在跑时有 last step 行                                                                              | 主契约 §4.7   | 同上                                        | 测试逐行                                                                             |
@@ -102,7 +102,7 @@
 **进度视图（commit 3）**
 
 - S14 门：无直接子或 `agent_list` deny → 不附带
-- S15 采集：`Session.children` 一次 SQL；状态投影 `list()` 一次给 running 与 last step；`windowStart = min(now − 10min, previousStepStart)`，首步用 run 开始，`previousStepStart` 只在该步响应到手后才记为该步时间（预检撤回、provider 拒绝、不出视图的迭代都不推进）；失败整节省略
+- S15 采集：一次 children SQL 和一次 status.list；窗口下界取 `min(now − 10min, previousStepStart)`。状态由 work 持有，首步初始化，同号 re-arm 保留（含根），新号或新 loop 重置；收到带 finish 的响应即推进，先于各提前退出分支；预检撤回/provider 拒绝不推进。
 - S16 渲染：在跑升序（`started_at ?? created`）、已结束降序（`ended_at ?? started_at`）、cut off 行不受窗口限制、各 10 行、省略行、上一个 run 的分号句；节序在重复计数之前
 - S17 删除花名册注入（`applyAgentRoster` 调用与实现），保留 sentinel 常量
 
@@ -110,7 +110,7 @@
 
 - S18 `reportRunEnd` 读关闭后的 agentRun → 已关闭才加 run / ended 属性与摘要后缀
 - S19 `Runner.cancel` / `SessionRunState.cancel` 返回取消前状态标签
-- S20 `renderTermination`：取消前读记录（`was`）→ cancel → 取消后重读（`run`）→ 击中的 run 取取消前打开的那条 → 四支，取消期间开了新 run 时附 `; run M has started since`
+- S20 `renderTermination`：cancel → 读取最新记录；操作行与记录快照行独立，不从前后记录推导被取消的 run。
 - S21 `agent_send` 在 deliver **之前**取状态与 agentRun 快照 → 六种措辞 + agent_status 提示行；投递失败不输出
 
 **agent_status / agent_list（commit 5）**
@@ -127,7 +127,7 @@
 - 主会话与子 agent 用同一个钩子、同一分支；宿主不按 `parentID` 做任何区分。
 - run 号只在新 run 开始时加一：work 首次执行，或续跑时记录已被 `onExit` 关闭；普通 re-arm 不加；遗留打开记录在新 run 开始时关为 lost。
 - 首次 run 的唤醒来源是创建者（父）；结束报告唤醒的 run 来源记为发报告的子；人经 TUI 的 agent-message 路由记 `user`，经普通 prompt 端点记 `system`；其余记 `system`。
-- 结束报告与停止通知标明它关闭的那个 run；run 号允许不连续，不回溯补发报告；同一 run 号的报告至多一份；lost 的 run 没有报告；崩溃后不补发通知。
+- 结束报告标明实际关闭的 run，停止通知只附最新记录快照、不声称取消身份；run 号允许不连续，不回溯补发报告；同一 run 号的报告至多一份；lost 的 run 没有报告；崩溃后不补发通知。
 - `agent_send` 的六种措辞按投递前快照选择；非子会话只写 running / idle；末尾恒附 `agent_status` 提示行；既有三句单向消息说明保留；stopped / lost 的第二句不假定停止者是调用者。
 - `agent_status` 的可查范围、解析与权限与 `agent_list` 完全相同；`agent_list` 被禁用时 `agent_status` 不出现在工具表、执行也被拒（有意的不对称：`agent_list` 自身无执行期检查）。
 - `agent_list` 不带参数时默认上限 50；计数行按过滤后、截断前的集合统计；`query` 不匹配 `agent_type`；自己的行恒在第一行（§6 第 18 点）。
@@ -141,9 +141,9 @@
 - `runLoop` 退出 → 钩子 →（放行）→ `onExit`：一次 `hasUnconsumedTurn` 读 → run 记录关闭 → `reportRunEnd` → runner 自己的读 → re-arm 或 `onIdle`。被阻止时链在第二步折回循环。
 - `onExit` 的读与 runner 的读不一致（消息恰落在两次读之间）时：记录关为 completed 且 run N 报告发出；runner 续跑同一 work，`fresh = false` 但记录已关闭 → 开 run N+1，续跑结果以 N+1 报告。不出现同号两份报告，也不静默。
 - `agent_send` 的状态快照取自 deliver 之前；返回文本描述的是投递那一刻，不承诺此后。
-- `renderTermination` 的 run 号取取消进入时打开的记录：取消后记录仍是它且已关为 stopped → `stopped at`；否则（结束写失败、自然结束窗口）→ `stop requested at`，不等待；取消期间下一 run 已开启（记录号变大）→ 仍写旧号并附 `; run M has started since`，绝不把新 run 写成被停止的；取消前状态为 Idle / Shell 时写"had already ended" / "cut off"。
+- `renderTermination` 不关联取消执行与元数据编号。`before` 来自 cancel，记录来自取消后的独立读取；打开只称 not closed，不推断 running/cut off。
 - 记账失败不阻塞 run，也不阻止报告发出；报告在记录缺失或未关闭时省略 run / ended。
-- 进度视图每步重建，不写入历史，不进压缩输入；窗口按墙钟与上一次带视图的步开始计算。
+- 进度视图每步重建，不写入历史，不进压缩输入；窗口按墙钟与上一次带视图的步开始计算，同号 re-arm 保留工作闭包里的下界；新号/新 loop 重置。
 - `Session.patch` 对同一会话串行；锁只在 patch 时持有；`publish` 返回时投影已完成、同步监听者已跑完；`Updated` 监听者不得回头 patch 同一会话（现状五个监听者均不会；守卫是 30 s 超时 die）。
 
 ## 7. 不变量契约（property-based）
@@ -151,7 +151,7 @@
 > **框架声明**：仓库未引入 property-based 框架。沿用 `step-tail` 分支的做法：种子化随机生成 + 按定义重算的参照实现，一次失败即报种子。
 
 - **INV-5（= I5）** 任意事件序列（发送到空闲的子、中途插入消息、re-arm、续跑窗口、完成 / 失败 / 被停、并发多子、崩溃遗留的打开记录、注入一次结束写失败、注入一次开始写失败、取消收尾时下一 run 已开启）经真实 `loop` 执行后，每个子的 run 号序列严格递增且每次只加一；普通 re-arm 不改变它，续跑窗口加一；写失败与遗留的记录在下一次开始时被记为 lost 且号不重复；一次 run 只关闭自己持有号的记录：取消收尾不动下一 run 的记录，开始写失败的 run 不冒用遗留记录、其报告无 run 属性，它被 re-arm 后同样不认领（晚到消息与写失败是两个独立抽取的维度）；每条记录打开时会话已是 busy。—— T3 加两条定值用例（钩子阻止不加号由定值用例覆盖）
-- **INV-6（= I6）** 每份结束报告的 run 号等于发出时该子已关闭的 run，按结束顺序一一对应；同号报告至多一份；结束写失败的那份报告不带 run 属性；`ended ≥ started`。—— T3（停止通知的 run 行由 `lifecycle.test.ts` 五种定值用例覆盖）
+- **INV-6（= I6）** 每份结束报告的 run 号等于发出时该子已关闭的 run，按结束顺序一一对应；同号报告至多一份；结束写失败的那份报告不带 run 属性；`ended ≥ started`。—— T3（停止通知的独立快照性质见 INV-14）
 - **INV-6b** `agent_send` 对空闲且记录已关闭的目标预告的 run 号等于该子的下一份报告的 run 号。—— 定值用例（经注册表里真实的 `agent_send` 投递；T3 不改走工具投递，理由见主契约 §5.4.3）
 - **INV-7（= I7）** 对任意步序列（工具步、询问钩子的最终回答、带中途插入新消息的最终回答）与任意 cap（1–8），钩子连续阻止长度不限：父收到的报告恰一份，其创建时间不早于最后一次询问；每次询问的 `continuations` 等于按定义推进的参照值；每个请求的最后一条用户消息文本等于当时最新的 reason 或插入消息；每次询问之前子会话的 `SessionStatus` 事件序列中没有 idle。—— T8
 - **INV-7b** 每段连续无工具、无新输入的退出尝试中询问与阻止次数 ≤ cap；一步含工具调用或钩子之外的新用户消息后计数从 0 重新累积。—— T8（steer、超 cap 的阻止）；定值用例（新 run 再次询问）
@@ -162,6 +162,9 @@
 - **INV-11（= I11）** 对同一会话的任意并发 patch 序列（随机的 setTitle / setMetadata / touch / setAgentModel；另 `updateMetadata` 并发自增 N 次恰得 N，每次写入的值各不相同），锁内按序发布的 `session.updated` 行序列中，title / metadata.note / agent / model.id 四个字段都不会回到出现过的值（丢失的更新就是回退），每次写入的值都在某一行出现过，最终行等于最后一个事件的行。这蕴含"每个字段等于最后一次写该字段的值"。—— T9
 - **INV-12** `agent_list` 结果 ⊆ 过滤后的邻居集合 ⊆ 邻居；计数行与过滤后集合的统计一致；行数 ≤ limit；排序满足"self 在前，在跑在前，其余按活动（`last ?? time_created`）倒序，并列按 id"。—— T4
 - **INV-13** 新 run 启动后任一时刻，`状态 idle ∧ 记录打开` 只在崩溃遗留下出现：T3 在每条记录打开的 `session.updated` 事件里读状态投影，断言已是 busy；agent_send / agent_status 的 cut off 措辞都以 idle 为前提，故等价于"从不对刚启动的 run 输出 cut off"。—— T3
+
+- **INV-14** 取消交接期间任意初始记录状态、任意目标/后代清理顺序下，通知分别描述 cancel 状态和读取的最新记录，不猜测取消编号；replacement 是否被取消由真实 Runner 中断集合断言。—— T10（3 种子，每种子 2 时序 × 3 记录状态，随机深度/编号/时间/结局；另枚举 Idle/Running × 最终记录缺失/打开/四种结局，共 12 格）。
+- **INV-15** 同号 re-arm 的下一份视图覆盖上一真实步骤期间的孩子完成；新号续跑或独立新 run 不继承旧宽窗口。根 Session 同样保留普通 re-arm 窗口；10 分钟边界含等号。—— T11（2 种子 × 4 生命周期，每例 4 个完成时间位置；第二组种子增加前置工具步及已展示的更早完成项，共三次请求，验证提前退出前也推进下界）。
 
 ## 8. 性能契约（机械化）
 
@@ -204,3 +207,5 @@
 - [x] 2026-11-01 补充：一份外部审核（基线 `9daaf4b85e`，3 P2 + 2 边界 + PBT 缺口）与 §5.2 审核一起处置 → `decisions.md` D18–D40。契约随之改动：INV-5 增归属与开始写失败、取消交接；S11 / S12 改为 `Session.updateMetadata` 锁内读-判-写；S22 门先于解析；§2 agent_status 行、钩子继续消息行；§9 增来源名 / session id / workdir 转义；INV-8b 行数恰等于定义；INV-11 增 `updateMetadata` 并发自增；窗口下界改为"上一次带视图的步"
 - [x] 2026-11-01 第二轮外部审核（基线 `05aba09705`）：R1–R3 处置 → `decisions.md` D41–D46、`audit-report.md` §3.3。契约随之改动：S11 的 re-arm 只续接自己持有的记录；S15 下界只在响应到手后推进；S20 增取消前读与"has started since"；INV-5 增"开始写失败后的 re-arm 不认领"；§6 停止通知四种情况
 - [x] 修正方案文档 `session-fix-step-tail-repeat-and-agents.md` 第六、七、八部分已回填 commit
+
+- [x] 2026-11-02 第三轮修正：S15 的窗口随 work 生命周期保留，带 finish 响应在提前退出前推进；S20 操作与快照分离。新增 INV-14/T10、INV-15/T11，14 定向用例通过；独立复核 0 unresolved；完整模块 900 pass / 7 skip / 1 todo / 2 fail，两项时间预算失败单跑均过，原失败仍保留，见 audit-report §3.4 / decisions D47–D50。

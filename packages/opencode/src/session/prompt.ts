@@ -1326,8 +1326,11 @@ const layer = Layer.effect(
       )
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    const runLoop: (
+      sessionID: SessionID,
+      viewState: { previousStepStart?: number },
+    ) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
+      function* (sessionID: SessionID, viewState: { previousStepStart?: number }) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
@@ -1349,7 +1352,9 @@ const layer = Layer.effect(
         // (compaction, a subtask), a step the overflow check withdrew before
         // sending and one the provider rejected all leave it alone, or a long
         // one would hide what ended during the step before it.
-        let previousStepStart = Date.now()
+        // The work owns this state: an ordinary re-arm calls runLoop again
+        // without starting a new logical run or discarding its previous view.
+        viewState.previousStepStart ??= Date.now()
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1590,7 +1595,7 @@ const layer = Layer.effect(
               session,
               agent,
               now,
-              windowStart: StepTail.windowStart(now, previousStepStart),
+              windowStart: StepTail.windowStart(now, viewState.previousStepStart ?? now),
             })
             const body = [view, StepTail.renderRepeat(repeat)]
             // The clock rides with any section and never alone (§4.5).
@@ -1640,6 +1645,11 @@ const layer = Layer.effect(
               { ...streamInput, preparedPayload },
               { recoverContextOverflow: compactionToken === "none" && canCompact },
             )
+            // A finished response has read this view, even if it ends this
+            // runLoop (content filtering, length, structured output). A re-arm
+            // must continue from this step, not replay an older view's window.
+            // Preflight withdrawals and rejected requests have no finish.
+            if (handle.message.finish) viewState.previousStepStart = now
 
             if (handle.message.error?.name === "MessageOutputLengthError" || handle.message.finish === "length") {
               return "break" as const
@@ -1695,10 +1705,6 @@ const layer = Layer.effect(
             // compaction before sending, or rejected by the provider as too long, is
             // not a step (fix doc session-fix-step-tail-repeat-and-agents §3.2).
             if (rejected) return "continue" as const
-            // The model has read this step's view, so its time is the floor of
-            // the next one's window. A step withdrawn above or rejected by the
-            // provider left the floor where it was.
-            previousStepStart = now
             const current = StepTail.signature(
               yield* MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database)),
             )
@@ -1853,6 +1859,7 @@ const layer = Layer.effect(
       // The run number this execution owns, for the close: set on every
       // (re)start, undefined when the open write failed.
       let own: number | undefined
+      const viewState: { previousStepStart?: number } = {}
       const work = parentID
         ? Effect.gen(function* () {
             const fresh = !started
@@ -1860,8 +1867,12 @@ const layer = Layer.effect(
             // Busy before the record opens, or a reader in between sees an
             // open record on an idle session and calls the run cut off (H9b).
             yield* status.set(input.sessionID, { type: "busy" })
-            own = yield* recordRunStart(input.sessionID, parentID, fresh, own)
-            return yield* runLoop(input.sessionID)
+            const next = yield* recordRunStart(input.sessionID, parentID, fresh, own)
+            // The continuation window can open the next run on this same
+            // work object. Only a new record resets its view window.
+            if (next !== undefined && next !== own) viewState.previousStepStart = undefined
+            own = next
+            return yield* runLoop(input.sessionID, viewState)
           }).pipe(
             Effect.onExit((exit) =>
               Effect.gen(function* () {
@@ -1879,7 +1890,7 @@ const layer = Layer.effect(
               }),
             ),
           )
-        : runLoop(input.sessionID)
+        : runLoop(input.sessionID, viewState)
       return yield* state.ensureRunning(
         input.sessionID,
         lastAssistant(input.sessionID),

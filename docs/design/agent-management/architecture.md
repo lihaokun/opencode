@@ -11,7 +11,7 @@
 - 2026-10-23 第五次实质修订（子计划 `agentmgmt-2-run-state`，依据 issue #75 / #81 / #73 与
   `docs/fixes/session-fix-step-tail-repeat-and-agents.md`）：工具表面由四个改为**五个**，新增 `agent_status`
   （撤销调研 §12 的收敛，理由见调研 §18）；子 agent 的每次 run 有编号、起止时间、唤醒来源与结局
-  （会话元数据 `agentRun`）；结束报告、停止通知与 `agent_send` 的返回标明 run；`agent_list` 有参数与上限；
+  （会话元数据 `agentRun`）；结束报告与 `agent_send` 的返回标明 run，停止通知仅附取消后的最新 run 记录快照；`agent_list` 有参数与上限；
   每步末尾附不入历史的子 agent 节；新增插件停止钩子，**run 结束 = 循环退出且钩子放行**。
 - 工具表面：五个（调研 §12 曾收敛为四个，§18 恢复单项查询为 `agent_status`；§13 把恢复统一交给 `agent_send`）
 - 日期：2026-09-04，末次修订 2026-09-14

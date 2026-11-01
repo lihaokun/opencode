@@ -23,7 +23,7 @@
 | G8a 会话字段的并发 patch 不再互相覆盖（G8 的前提）           | `Session.patch` 按会话串行化                                                             | 2      |
 | G13 agent 发来的消息可被 TUI 按标记识别（#73 服务端）        | M3 `AgentInbox.deliver`（加 metadata，模型可见文本不变）                                 | 2      |
 | G12 父在每步末尾看到一张进度视图：谁在跑、谁刚停、现在几点   | `StepTail` 子 agent 节（M5 表面的一部分，数据来自 G8）；写入历史的花名册随之撤销         | 3      |
-| G9 父能把报告、停止通知与 agent_send 的返回对到具体的 run    | `reportRunEnd` 的报告属性、M4 `renderTermination`、M5 `agent_send` 的返回文本            | 4      |
+| G9 报告和 agent_send 对号，停止通知附最新记录快照    | `reportRunEnd` 的报告属性、M4 `renderTermination`、M5 `agent_send` 的返回文本            | 4      |
 | G10 查询单个 agent 的当前状态（架构 G2 改由此承载）          | M5 新工具 `agent_status`（可见性与权限跟随 `agent_list`）                                | 5      |
 | G11 `agent_list` 输出有界、可过滤，且带 run 信息             | M5 `agent_list` 参数                                                                     | 5      |
 
@@ -43,7 +43,7 @@
 ### 0.3 模块级不变量
 
 - **I5（承重）run 号单调**：对任一有父会话，run 号只在"新 run 开始"时加一，新 run 的判定是：work 首次执行（闭包标志，H9），或续跑时记录已被 `onExit` 关闭（§5.2.1）。普通 re-arm（记录仍打开）不加；被钩子阻止的停止不加。记录写失败或进程崩溃留下的打开记录，在下一次新 run 开始时关为 `lost` 再开新号，两个 run 不共号。
-- **I6 报告对号**：每份结束报告（completed / failed）与停止通知所标的 run，等于发出时该会话记录里已关闭的当前 run；记录缺失或未关闭时报告不带 run 属性。
+- **I6 报告对号**：每份结束报告（completed / failed）所标的 run 来自本执行实际关闭的记录；记录缺失或未关闭时报告不带 run 属性。停止通知独立陈述取消操作与最新记录快照，不声称取消的编号。
 - **I7 钩子先于一切正常结束效果**：模型自行给出最终回答的退出，先经钩子；放行后才有 run 记录关闭、`reportRunEnd`、runner 的 `onIdle`。被阻止的停止不产生任何 run 结束的可观察效果。不经钩子的退出（出错、权限或提问被拒、输出截断、人中断、`agent_stop`、步数上限）仍走记录关闭与报告，它们不是模型自己决定的停止。
 - **I8 末尾段不入历史**（继承已落地的机制）；进度视图只从 run 记录、会话行与状态投影读，不读历史。
 - **I9 agent_status ≡ agent_list 的可见性与权限**：工具表中二者同生同灭（深度与权限两维）；执行期按 `agent_list` 的权限键求值。
@@ -292,7 +292,7 @@ output（默认 { decision: "allow" }）：
 
 窗口：取"最近 10 分钟"与"上一步开始以来"两者中更长者。保底项保证一步里跑了 30 分钟的编译时，期间
   结束的子 agent 至少被下一步看到一次。上一步开始时间由 runLoop 记录：上一次模型真正读到的视图组装时的 Date.now()——压缩等不出视图的迭代、
-  被预检撤回或被 provider 拒绝的步都不算；本 run 第一步没有上一步，用 run 开始时间。
+  被预检撤回或被 provider 拒绝的步都不算；本 run 第一步没有上一步，用 run 开始时间。窗口状态由 work 闭包持有，同号 re-arm（包括根会话）保留；独立新 run 或同一 work 成功开出新编号时重置。
 
 排序与上限：
   - 在跑：按 `started_at ?? time_created` 升序（跑得久的最容易被忘、最可能卡住），最多 10 行，超出丢最新派出的，
@@ -326,19 +326,20 @@ output（默认 { decision: "allow" }）：
   TUI 摘要：`Agent completed: <描述> (run 5, ended 03:41:18)`，失败同理
   run / ended 取自关闭后的 agentRun；记录缺失或未关闭（结束写失败）时两个属性与摘要后缀一并省略（I6）
 
-停止通知（renderTermination）新增一行，依据 `cancel` 返回的取消前状态、取消前读到的记录与取消后重读的记录。
-  "停止击中的 run"是取消进入时打开的那条记录（取消前读）；取消后的记录说明它怎么结束的，或下一 run 已开启：
-  - 取消前状态为 Running / ShellThenRun，且该 run 的记录已关闭为 stopped：`run: 5, stopped at 2026-10-20T03:41:18+08:00`
-  - 取消前状态为 Running / ShellThenRun，但记录未关闭或结局不是 stopped（结束写失败，或恰在自然结束的
-    窗口里）：`run: 5, stop requested at <now>`，不等待
-  - 同上，但取消期间下一 run 已开启（取消先把 runner 置 Idle 再等旧 fiber 收尾，新消息可在此间开启新 run，
-    它把旧记录关为 lost）：`run: 5, stop requested at <now>; run 6 has started since`——绝不把没被取消的
-    新 run 写成被停止的那个（第二轮外部审核 R3）
-  - 取消前状态为 Idle（run-state.ts:81-90 对无 runner 的目标 cancel 是空操作，或 runner 仍在表里但已 Idle）：
-    `run: 5 had already ended at <时间> (<结局>); nothing was running`
-  被 agent_stop 停下的 run 仍不单独报告（架构 §4.4），但它的编号经这一行与 agent_status 可见。无记录时不加 run 行
+停止通知（renderTermination）分开陈述操作事实与取消后读到的记录快照：
+  - cancel 返回 Running / ShellThenRun：`Stop requested at <ISO>.`，不将请求归给某个 run 号。
+  - cancel 返回 Idle / Shell：`No model run was running when cancellation was applied.`。
+  - 若取消后读取的记录已关闭：`Latest run record after cancellation: N, ended at <ISO> (<outcome>).`
+  - 若记录仍打开：`Latest run record after cancellation: N, not closed (started <ISO>).`
+  - 无记录时省略记录行，操作行保留。
 
-run 号允许不连续（决策 §6 第 3 点）：被取消的 run 由停止通知承载；自己仍有后代在跑时推迟的报告，
+取消范围、实际取消语义和通知通道不变。目标可能在等待后代取消或旧 fiber 清理期间换 run，
+所以前后元数据快照都不能证明哪个编号被本次 cancel 捕获。记录行只报告存储事实，不声称
+“此 run 被本次停止”，也不从打开记录推导 running / cut off。此处不增加公开 ID 或同步锁
+（第三轮外部复审，修正方案 session-fix-run-observations）。
+被 agent_stop 停下的 run 仍不单独报告（架构 §4.4）。
+
+run 号允许不连续（决策 §6 第 3 点）：停止通知携带最新记录快照，并不保证指向被取消的 run；自己仍有后代在跑时推迟的报告，
   报告的是实际关闭的那个 run，不回溯补发；lost 的 run 没有任何报告。工具描述里不解释这些。
 
 agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun 作为快照；deliverAsync 立即 fork，之后读会
@@ -541,7 +542,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 #### 5.3.2 `runLoop` 中的数据采集（`prompt.ts:1434` 组装 tail 处）
 
-- runLoop 级状态 `previousStepStart`：初值为 runLoop 进入时间（本 run 第一步没有上一步，用 run 开始）；组装视图处用它算窗口；只在该步的响应到手之后（`handle.process` 返回且不是 provider 拒绝）才记为该步的 `now`。压缩、子任务、溢出恢复这些不出视图就 `continue` 的迭代，被预检（`willOverflow`）撤回去压缩的步，以及被 provider 以超长拒绝的步，都不推进它——否则一次长压缩会把窗口下界推到模型真正读到的上一步之后，期间结束的子就漏掉（代码审核 2026-11-01 第 3 条；预检撤回这一支是第二轮外部审核 R2 补的，它用受控时钟和真实 loop 复现了漏掉）。
+- work 闭包持有 `viewState.previousStepStart`，第一次 runLoop 实际执行时初始化为当前时间。同号 re-arm 保留（根会话同样如此）；独立 loop 有新对象，同一 work 成功开出新号时清空后重建。`handle.process` 返回且响应带 finish 后，先记为该步的 `now`，再判断 content-filter、length、structured output 等提前退出；不出视图的迭代、预检撤回、provider 超长拒绝都不推进下界。开始写失败且同号续跑不重置窗口。
 - 采集（`catchAll` 到 `undefined` → 整节省略）：
   1. 权限门：`Permission.evaluate(AGENT_LIST_TOOL_ID, "*", merged)` 为 deny → 不附带（与 `reminders.ts:94-97` 同一规则）。
   2. **一次 SQL**：`sessions.children(id)`（`session.ts:688-696`，`where parent_id = ?`，一次查询、一次 hydrate）。为空 → 不附带。
@@ -556,6 +557,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
   - 权限门与被删除的花名册同一条规则，信息暴露面不变。
   - 副作用：无（只读）。
 - 测试（`prompt.test.ts`）：无子不附带；`agent_list` deny 不附带；进度视图与重复计数共存且节序正确（视图在前，重复计数收尾）；相邻三步请求的历史部分逐字相同（扩展 R1），视图与时钟都不进历史；花名册不再写入历史；600 个直接子的采集只调一次 `children`、不超过 50 ms。"首步用 run 开始"由 `StepTail.windowStart` 的单元测试与 `previousStepStart` 的初值承担；"预检撤回的步不推进下界"用 bun 的测试时钟（`setSystemTime`）与真实 loop 验证：第二步期间子结束，第三步被预检撤回去压缩，压缩后发出的那一步的视图仍含该子的结束行（第二轮外部审核 R2 的复现用例改写）。
+- T11（随机生命周期）：真实 prompt loop，交叉同号 re-arm / 新号续跑窗口 / 独立新 run / 根会话 re-arm；随机长步骤时长与早期完成时刻，并固定覆盖最近 10 分钟边界 −1/0/+1 ms。按契约时间区间计算应显示的孩子集合，验证同号保留、新号重置及请求中的完成行；一组种子先运行工具步，验证已在前一份视图展示的更早完成项不会因 content-filter 提前退出重复进入窗口。
 - T7（随机）：随机生成子集合（状态、run 记录、创建时间、最后一步时间）与窗口，断言两个列表恰等于按 4.5 定义计算的集合、顺序满足定义、行数 ≤ 10、省略计数正确；相邻步之间同一输入产出同一文本。
 
 ### 5.4 commit 4：报告、停止通知与 `agent_send`
@@ -569,13 +571,11 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 #### 5.4.2 `Runner.cancel` 返回值与 `renderTermination`
 
-- `Runner.cancel`（`runner.ts:200-231`）改为返回取消前的状态标签 `Runner.StateTag`（`Idle | Running | Shell | ShellThenRun`）；`SessionRunState.cancel` 透传（无 runner 时返回 `Idle`）。`AgentLifecycle.stop` 对 target 记下这个值。
-- `renderTermination` 入参增 `{ before: StateTag, was?: AgentRun, run?: AgentRun, now }`——`was` 是取消前读到的记录，`run` 是取消后重读的；击中的 run = `was` 打开时取 `was`，否则取 `run`；`run.number > 击中号` 时在 stop requested 后加 `; run <M> has started since`（第二轮外部审核 R3）。按 4.6 分支：`before ∈ {Running, ShellThenRun}` 且记录已关闭为 `stopped` → `run: N, stopped at <ISO>`；`before ∈ {Running, ShellThenRun}` 否则 → `run: N, stop requested at <now>`；`before ∈ {Idle, Shell}` 且记录已关闭 → `run: N had already ended at <ISO> (<结局>); nothing was running`（Shell 是人在该会话里跑命令，不是模型的 run）；实施时补第四种，`before ∈ {Idle, Shell}` 且记录仍打开（崩溃遗留）→ `run: N was cut off (started <ISO>) and will be recorded as lost; nothing was running`。无记录时不加 run 行。行的位置在 `title:` 之后。
-- **正确性论证**：
-  - 前置：`stop` 在 cancel 前读一次目标元数据（`was`），cancel 后再读一次（`run`）。
-  - 论证：`before` 来自 cancel 本身的状态转换，不从记录推断，所以"本就空闲"不会被写成"已停止"；第一分支要求结局确为 stopped，自然结束的窗口（记录已关为 completed、runner 还在表里）落入第二分支，不会把完成时间说成停止时间；第二分支不等待被取消 fiber 的 `onExit`——通知的强度本就只到"已接受"。取消进入时打开的记录就是被取消的那次执行的记录（runner Running ⇒ 正在执行的 run 要么已开记录要么开记录失败）；取消后记录号更大，只能是取消期间开启的下一 run（它把旧记录关为 lost），所以行里仍写旧号、附"has started since"。分支由 `before × was × run` 穷尽。
-  - 副作用：无（渲染）。
-- 测试（`lifecycle.test.ts`）：目标的 work 挂在 Deferred 上使 cancel 看到 Running，记录按各情况预置：已关闭为 stopped → stopped at；打开或关闭为 completed（自然结束窗口）→ stop requested；空闲且已关闭 → had already ended；空闲且打开 → cut off；无记录 → 无 run 行；真实 `SessionRunState` 交接——旧 work 的收尾挂在 Deferred 上，`stop` 进行中时第二个 `ensureRunning` 开出 run 2 的记录并保持 busy，放行后通知写 `run: 1, stop requested at …; run 2 has started since`，没有任何 `run: 2` 开头的行，run 2 仍 busy。
+- `Runner.cancel` 返回操作时状态标签 `Idle | Running | Shell | ShellThenRun`；`SessionRunState.cancel` 透传。它描述 Session 的取消操作，不带持久化 run 身份。
+- `renderTermination` 入参为 `{ before: StateTag, run?: AgentRun, now }`，不再读取 `was`。`before` 决定操作行；取消后读取的 `run` 独立决定记录快照行，见 §4.6。
+- **正确性论证**：取消操作时的 runner 状态来自 cancel 自身；最新记录的号、开始、结束及结局直接来自取消后的同一次读取。两种事实不推导彼此的身份，因而目标在后代取消或旧执行清理期间换 run、记账失败留下旧行、记录缺失，都不会把任意旧号或新号说成被本次停止的执行。
+- 副作用：少一次取消前元数据读取；取消调度、范围与返回值不变。
+- 测试：运行/空闲 × 打开/关闭/缺失记录的文本契约；取消旧执行期间 replacement 仍 busy 的回归。T10 交叉后代清理期间目标换 run / 目标清理期间 replacement 启动与初始打开/关闭/缺失记录，随机编号、时间、关闭结局和后代深度；真实 Runner 的中断集合为执行参照，模型可见文本只能陈述操作与最新记录，不能冒称停止编号；另枚举 Idle/Running × 最终记录缺失/打开/四种结局，逐一断言操作行和记录行。
 
 #### 5.4.3 `agent_send` 的返回（`tool/agent.ts:288-319`）
 
@@ -623,7 +623,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 1. **推翻调研 §12，新增 `agent_status`**。理由：#75 的竞态要求在发消息的当下知道目标的 run 号与时间；花名册只在回合边界更新且没有这两项；`agent_list` 能答但要翻整表。工具表面由四个改为五个，架构 G2 改由 `agent_status` 承载（调研 §18）。
 2. **结束报告唤醒的 run，`woken_by` 记为发报告的子 agent**，不记 `system`。报告 part 的 metadata 为此加发送方三字段，与 agent_send 的消息同一套字段。
-3. **run 号允许不连续**。被取消的 run 由停止通知承载；自己仍有后代在跑时推迟的报告，报告的是实际关闭的那个 run，不回溯补发。停止通知带 run 号与时间。
+3. **run 号允许不连续**。停止通知只附最新记录快照，不保证对应被取消的编号；自己仍有后代在跑时推迟的报告，报告的是实际关闭的那个 run，不回溯补发。停止通知带 run 号与时间。
 4. **`agent_send` 对空闲目标写 "starts run N+1 (sent …)"，不写 "started at"**。投递只到"已接受"，不能宣称已开始。
 5. **`agentRun` 存在会话元数据里，不加表或列**。所有有父会话的会话都记录；主会话不记录。
 6. **#81 的停止钩子**：钩子名 `experimental.session.stop`，输出 `{ decision, reason? }` 默认放行；上限 8 次、调用工具即清零、配置可改；结构化输出的 run 第一版不触发；主会话与子 agent 用同一个钩子、同一分支，宿主不区分；并入本子计划——**run 结束 = 循环退出且钩子放行**。

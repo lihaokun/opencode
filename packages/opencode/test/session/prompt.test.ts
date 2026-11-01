@@ -6022,6 +6022,137 @@ it.instance(
   45_000,
 )
 
+// T11: exercise window lifetime through the real runner, not only windowStart.
+// The event listener creates a new-number continuation; a content-filter exit
+// with an already-admitted input creates a same-number re-arm. Time and child
+// completion positions vary independently, including the inclusive 10m edge.
+for (const seed of [1501, 1502]) {
+  for (const mode of ["rearm", "next", "fresh", "root"] as const) {
+    it.instance(
+      `view windows follow logical runs (T11 ${mode} seed ${seed})`,
+      () =>
+        Effect.gen(function* () {
+          const { llm } = yield* useServerConfig(providerCfg)
+          const prompt = yield* SessionPrompt.Service
+          const sessions = yield* Session.Service
+          const status = yield* SessionStatus.Service
+          const events = yield* EventV2Bridge.Service
+          const next = rng(seed)
+          const t0 = Date.now()
+          const prefix = seed === 1502
+          const stepStart = t0 + (prefix ? 15 * 60_000 : 0)
+          const resumed = stepStart + (25 + Math.floor(next() * 30)) * 60_000
+          const ends = [
+            ...(prefix ? [t0 + 5 * 60_000] : []),
+            stepStart + (1 + Math.floor(next() * 7)) * 60_000,
+            ...[-1, 0, 1].map((delta) => resumed - 600_000 + delta),
+          ]
+          setSystemTime(t0)
+          yield* Effect.addFinalizer(() => Effect.sync(() => setSystemTime()))
+          const parent = yield* sessions.create({ title: "root", permission: allowAll })
+          const worker = mode === "root" ? parent : yield* subagent(parent.id, { notify: false })
+          const children = yield* Effect.forEach(ends, () =>
+            sessions.create({
+              parentID: worker.id,
+              metadata: { agentRun: { number: 1, started_at: t0, woken_by: { kind: "system" } } },
+            }),
+          )
+          yield* Effect.forEach(children, (child) => status.set(child.id, { type: "busy" }))
+          let landed = false
+          const off = yield* events.listen((event) => {
+            if (mode !== "next" || landed || event.type !== Session.Event.Updated.type) return Effect.void
+            const data = event.data as { sessionID: string; info: Session.Info }
+            if (data.sessionID !== worker.id || AgentRun.read(data.info.metadata)?.ended_at === undefined)
+              return Effect.void
+            landed = true
+            return user(worker.id, "late").pipe(Effect.provideService(Session.Service, sessions), Effect.asVoid)
+          })
+          yield* Effect.addFinalizer(() => off)
+          yield* user(worker.id, "first")
+          const release = defer<void>()
+          const prefixRelease = defer<void>()
+          if (prefix) yield* llm.push(reply().wait(prefixRelease.promise).tool("glob", { pattern: "**/absent" }).stop())
+          const response = reply().wait(release.promise).text("first response")
+          yield* llm.push(mode === "rearm" || mode === "root" ? response.contentFilter() : response.stop())
+          yield* llm.text("second response")
+          const first = yield* prompt.loop({ sessionID: worker.id }).pipe(Effect.forkChild)
+          yield* awaitWithTimeout(llm.wait(1), "first view missing", "10 seconds")
+          if (prefix) {
+            // This completion is already shown at stepStart. The later
+            // content-filter exit must advance past it before the re-arm.
+            setSystemTime(stepStart)
+            yield* sessions.setMetadata({
+              sessionID: children[0]!.id,
+              metadata: {
+                agentRun: {
+                  number: 1,
+                  started_at: t0,
+                  ended_at: ends[0]!,
+                  outcome: "completed",
+                  woken_by: { kind: "system" },
+                },
+              },
+            })
+            yield* status.set(children[0]!.id, { type: "idle" })
+            prefixRelease.resolve()
+            yield* awaitWithTimeout(llm.wait(2), "view after tool missing", "10 seconds")
+            const request = (yield* llm.inputs)[1]!
+            expect(JSON.stringify(Array.isArray(request.messages) ? request.messages.at(-1) : undefined)).toContain(
+              children[0]!.id,
+            )
+          }
+          const before = yield* record(worker.id)
+          setSystemTime(resumed)
+          yield* Effect.forEach(children, (child, index) =>
+            Effect.gen(function* () {
+              yield* sessions.setMetadata({
+                sessionID: child.id,
+                metadata: {
+                  agentRun: {
+                    number: 1,
+                    started_at: t0,
+                    ended_at: ends[index]!,
+                    outcome: "completed",
+                    woken_by: { kind: "system" },
+                  },
+                },
+              })
+              yield* status.set(child.id, { type: "idle" })
+            }),
+          )
+          if (mode === "rearm" || mode === "root") yield* user(worker.id, "late")
+          release.resolve()
+          yield* awaitWithTimeout(Fiber.await(first), "first execution stuck", "10 seconds")
+          if (mode === "fresh") {
+            yield* waitForIdle(worker.id)
+            yield* user(worker.id, "late")
+            yield* prompt.loop({ sessionID: worker.id })
+          }
+          yield* awaitWithTimeout(llm.wait(prefix ? 3 : 2), "second view missing", "10 seconds")
+          yield* waitForIdle(worker.id)
+          const after = yield* record(worker.id)
+          const inputs = yield* llm.inputs
+          expect(inputs).toHaveLength(prefix ? 3 : 2)
+          const request = inputs.at(-1)!
+          const tail = JSON.stringify(Array.isArray(request.messages) ? request.messages.at(-1) : undefined)
+          expect(tail).toContain(`Your subagents: ${children.length} direct, 0 running, ${children.length} idle.`)
+          for (const [index, child] of children.entries()) {
+            // The oracle is the contract's two intervals, independent of the
+            // production window helper or its lifecycle state.
+            const expected =
+              ends[index]! >= resumed - 600_000 ||
+              ((mode === "rearm" || mode === "root") && ends[index]! >= stepStart)
+            expect(tail.includes(child.id), `${mode}/${seed}: child ${index}, ended ${ends[index]}`).toBe(expected)
+          }
+          expect(before?.number).toBe(mode === "root" ? undefined : 1)
+          expect(after?.number).toBe(mode === "root" ? undefined : mode === "rearm" ? 1 : 2)
+          expect(landed).toBe(mode === "next")
+        }),
+      45_000,
+    )
+  }
+}
+
 it.instance("no view without children, and none for a parent denied agent_list", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
