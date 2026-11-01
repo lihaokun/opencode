@@ -91,6 +91,25 @@
 - 正确性 / 可维护性——独立审核 agent，只给 diff 与子计划 §5 的论证，不给作者结论：❌ 0、⚠️ 12（D25–D36）。最重的是第 1 条：归属检查与写入不在同一把锁内——`Runner.cancel` 在 `SynchronizedRef.modify` 里同步置 Idle、随后才等旧 fiber 退出，期间新 run 可开始，旧收尾与新开启并发时锁外的"读—判—写"让后写者抹掉先写者（旧 run 把已被关为 lost 并开出 N+1 的记录改回 `N stopped`，N+1 消失）。改法：`Session.updateMetadata` 在 patch 锁内读-判-写，`recordRunStart` / `recordRunEnd` 改用，§5.2.0 / §5.2.2 的"元数据写方只有 run 记录自己、顺序执行"前提改写。其余：继续消息丢 `system` / `tools`（D26）、窗口下界被不渲染的迭代推进（D27）、`sender` 未经解码直接 `SessionID.make`（D28）、续跑窗口的 part 时序（D29，接受）、H6c 清单补四处（D30）、`runLine` 注释失实（D31）、agent_send 提示行（D32，接受）、`workdir` 未转义（D33）、冗余与类型四项（D34）、`escapeField` 归属（D35）、sentinel 注释（D36）。
 - 审核核对通过的论证：`stopGate` 六支与 S6 两处清零；`subagentView` 权限门与失败降级；work 包装的 fresh / re-arm 区分、busy 先于记录、`onExit` 单次读与关闭先于报告；`reportRunEnd` 的 `undefined` / cancelled / 无 `closed` 三路；`Session.patch` 锁的计数清理、超时可中断性（Effect 4 `raceAll` 子 fiber 可中断，`Semaphore.take` 中断时清理 waiter）；`begin` / `end` / `ended` / `outcomeOf` / `wakeSource` / `describeSource` / `formatInstant` 分支穷尽；视图排序、窗口、转义、行数上界；`Runner.cancel` 返回值与 `before` 只记 target；agent_status 门先于解析、范围与 agent_list 同、五种 run 行穷尽；agent_send 快照在投递前、六种措辞穷尽、预告号与 `begin` 一致；agent_list 过滤→计数→排序→截断；`disabled` 别名 + `visibleAgentTools` ⇒ I9 工具表一半；`deliver` 标记文本不变（I10）。
 
-**处置结果**：已修 D18–D22、D25–D28、D31、D33、D34（前三项）、D35、D37–D39；文档化 D24、D29、D30、D36；接受并记录 D32、D34 第四项、D40。critical 0、unresolved 0。
+**处置结果**：已修 D18–D22、D25–D28、D31、D33、D34（前三项）、D35、D37–D39；文档化 D24、D29、D30、D36；接受并记录 D32、D34 第四项、D40。本节提交后的第二轮外部审核（§3.3）又复现三条 P2，所以本节不能单独算关闭；0 unresolved 见 §3.3。
 
 **运行**：typecheck 过；定向用例——`session.test` / `run.test` / `tools.test` / `step-tail.test` / `lifecycle.test` / `inbox.test` 122 过 0 败，`prompt.test` 钩子 + run 记录 + T3 + 视图 33 过 0 败；外部审核修正前的 `prompt.test` 全文件 141 过 0 败；全量回归（agent-management / session / tool / permission / effect，`--timeout 60000`，负载下 1099 s）：1321 条中 1312 过、7 跳过、1 败——`tool.registry` 的插件包用例以 20 s 的自带预算超时，与本改动无关（外部审核在 `9daaf4b85e` 上看到同一条），单独重跑 7.8 s 过。
+
+### 3.3 第二轮外部审核（2026-11-01，基线 `05aba09705`，即 §3.2 的处置提交）
+
+复审在隔离副本上按 workflow 复核了 §3.2 的修正闭环、完整相关模块测试、独立契约对照与组合边界，确认 §3.2 的基础问题已修，但复现三条新的 P2，均为"修了一支、漏了相邻一支"：
+
+| #   | 项                                                                                                                     | 处置                                                                                       |
+| --- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| R1  | 遗留打开记录 + 开始写失败 + 同一 work re-arm：续跑把遗留的 7 当成自己的，报告 `run="7"`。T3 的一维 Mode 生成不出该组合 | `begin(…, own)`，re-arm 只续接自己持有的记录；T3 拆成晚到消息 × 写失败两维；定值用例 → D41 |
+| R2  | 预检撤回的步在视图组装处就推进了窗口下界；长压缩后的下一步漏掉上一真实步期间结束的子（受控时钟 + 真实 loop 复现）      | 下界只在响应到手后推进；受控时钟用例 → D42                                                 |
+| R3  | 取消 run 1 期间 run 2 已开启，通知写成 `run: 2, stop requested`                                                        | 取消前读记录定击中的 run，附 `run 2 has started since`；真实 runState 交接用例 → D43       |
+| —   | PBT 结构：故障位置与时序应独立抽取；handoff 未启动 replacement、未验证通知                                             | → D44                                                                                      |
+| —   | 套件观察：600 子 50 ms 新旧版都超（54–67 ms）；agent 工具 metadata 等待超时新旧版都超                                  | 接受 + 记录 → D45                                                                          |
+| —   | §3.2 的"0 unresolved"在 R1–R3 关闭前不成立                                                                             | 措辞更正 → D46                                                                             |
+
+三个修复各有一条修前失败、修后通过的用例（stash 源码改动后重跑确认失败，恢复后通过）。
+
+**运行**：typecheck 过；`run.test` + `lifecycle.test` 45 过 0 败；`prompt.test` 定向（两条开始写失败用例、T3、预检撤回窗口、续跑窗口、取消交接、视图三条）10 过 0 败；全量回归（agent-management / session / tool / permission / effect，`--timeout 60000`，负载下 1151 s）：1325 条中 1316 过、7 跳过、1 todo、1 败——仍是 `tool.registry` 的插件包用例以自带 20 s 预算超时（§3.2 同一条，两轮外部审核都见过），单独重跑结果：`1 pass  0 fail Ran 1 test across 1 file. [7.45s]`。
+
+**结论**：R1–R3 关闭；critical 0、unresolved 0（D45 的两项是既有问题，单独记录，不计为通过）。

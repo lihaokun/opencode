@@ -428,6 +428,10 @@ const layer = Layer.effect(
       // cancel itself is the only place that can tell; a status read before
       // or after it would be a race.
       let before: Runner.StateTag = "Idle"
+      // Step S20: the record as the cancel goes in names the run it hits; the
+      // one read after says how that run ended — or that the next has opened.
+      const target = yield* sessions.get(input.target).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      const was = AgentRun.read(target?.metadata)
       for (const level of layers) {
         yield* Effect.forEach(
           level,
@@ -466,6 +470,7 @@ const layer = Layer.effect(
               sender_agent: info.agent,
               body: renderTermination(info, stopped.length - 1, {
                 before,
+                was,
                 run: AgentRun.read(info.metadata),
                 now: Date.now(),
               }),
@@ -491,7 +496,12 @@ const layer = Layer.effect(
 function renderTermination(
   info: Session.Info,
   descendants: number,
-  state: { before: Runner.StateTag; run: AgentManagement.AgentRun | undefined; now: number },
+  state: {
+    before: Runner.StateTag
+    was: AgentManagement.AgentRun | undefined
+    run: AgentManagement.AgentRun | undefined
+    now: number
+  },
 ) {
   const raw = info.metadata?.[AgentManagement.METADATA_AGENT_NAME]
   const name = raw === undefined ? undefined : AgentInbox.escapeField(raw)
@@ -510,23 +520,35 @@ function renderTermination(
 
 /**
  * Step S20: which run the stop hit, four ways (subplan agentmgmt-2-run-state
- * §4.6). `before` is what the cancel found; the record is read afterwards,
- * once the cancelled fiber has wound down (the cancel awaits it). A run found
- * running whose record now says stopped was stopped by this call. One found
- * running whose record is open or ended otherwise — the end write failed, the
- * run ended on its own in the window before the cancel, or a new run opened
- * during the cancel and closed it as lost — gets "requested", not a time
- * nobody waited for. One found idle had already ended, or was cut off: a
- * stop on it was a no-op. No record, no line.
+ * §4.6). `before` is what the cancel found; `was` is the record as the cancel
+ * went in and `run` the one read after it, once the old fiber has wound down
+ * (the cancel awaits it). The run a stop hits is the one open as it went in.
+ * Its record afterwards says stopped when this call stopped it; open or ended
+ * otherwise — the end write failed, or the run ended on its own just before
+ * the cancel — it gets "requested", not a time nobody waited for. A cancel
+ * sets the runner idle before the old work has wound down, so the next run
+ * can open meanwhile and close this one as lost: the line still names the
+ * run that was stopped and says the next has started, since that one was
+ * never cancelled. A run found idle had already ended, or was cut off: a stop
+ * on it was a no-op. No record, no line.
  */
-function runLine(state: { before: Runner.StateTag; run: AgentManagement.AgentRun | undefined; now: number }) {
+function runLine(state: {
+  before: Runner.StateTag
+  was: AgentManagement.AgentRun | undefined
+  run: AgentManagement.AgentRun | undefined
+  now: number
+}) {
+  if (state.before === "Running" || state.before === "ShellThenRun") {
+    const hit = state.was && state.was.ended_at === undefined ? state.was : state.run
+    if (!hit) return undefined
+    const ended = state.run && state.run.number === hit.number ? AgentRun.ended(state.run) : undefined
+    if (ended?.outcome === "stopped") return `run: ${hit.number}, stopped at ${AgentRun.formatInstant(ended.ended_at)}`
+    const since = state.run && state.run.number > hit.number ? `; run ${state.run.number} has started since` : ""
+    return `run: ${hit.number}, stop requested at ${AgentRun.formatInstant(state.now)}${since}`
+  }
   const run = state.run
   if (!run) return undefined
   const ended = AgentRun.ended(run)
-  if (state.before === "Running" || state.before === "ShellThenRun") {
-    if (ended?.outcome === "stopped") return `run: ${run.number}, stopped at ${AgentRun.formatInstant(ended.ended_at)}`
-    return `run: ${run.number}, stop requested at ${AgentRun.formatInstant(state.now)}`
-  }
   if (ended) {
     return `run: ${run.number} had already ended at ${AgentRun.formatInstant(ended.ended_at)} (${ended.outcome}); nothing was running`
   }

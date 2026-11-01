@@ -5,7 +5,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { expect } from "bun:test"
+import { expect, setSystemTime } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
@@ -5477,6 +5477,61 @@ withFailingMetadata.instance("a run whose open write failed claims no leftover a
   }),
 )
 
+// The same run re-armed (the second external review, R1): its first execution
+// opened nothing, so the re-arm owns nothing either, and the leftover it was
+// started over is not its to continue. The record stays as it was, the report
+// names no run, and the next run closes the leftover as lost.
+withFailingMetadata.instance("a re-arm after a failed open write claims no leftover either", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    yield* sessions.setMetadata({
+      sessionID: child.id,
+      metadata: {
+        ...child.metadata,
+        [AgentManagement.METADATA_AGENT_RUN]: { number: 7, started_at: 1_000, woken_by: { kind: "system" } },
+      },
+    })
+    metadataFailure.pendingStart.add(child.id)
+    yield* user(child.id, "task-a")
+    const gate = defer<void>()
+    yield* llm.pushMatch(lastUserIs("task-a"), reply().wait(gate.promise).text("partial").contentFilter())
+    yield* llm.pushMatch(lastUserIs("task-a late"), reply().text("late done").stop())
+    const fiber = yield* prompt.loop({ sessionID: child.id }).pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      llm.hits.pipe(Effect.map((hits) => (hits.some(lastUserIs("task-a")) ? true : undefined))),
+      "the request never arrived",
+      "10 seconds",
+    )
+    yield* user(child.id, "task-a late")
+    gate.resolve()
+    yield* Fiber.await(fiber)
+    yield* waitForIdle(child.id)
+
+    const untouched = yield* record(child.id)
+    expect(untouched).toMatchObject({ number: 7, started_at: 1_000 })
+    expect(untouched?.ended_at).toBeUndefined()
+    const [first] = yield* awaitNotices(parent.id, 1)
+    expect(first.part.text).not.toContain(' run="')
+    expect(first.part.text).toContain("late done")
+    yield* waitForIdle(parent.id)
+
+    yield* user(child.id, "task-b")
+    yield* llm.pushMatch(lastUserIs("task-b"), reply().text("b done").stop())
+    yield* prompt.loop({ sessionID: child.id })
+    expect(yield* record(child.id)).toMatchObject({
+      number: 8,
+      outcome: "completed",
+      previous: { number: 7, outcome: "lost" },
+    })
+    yield* awaitNotices(parent.id, 2)
+    yield* waitForIdle(parent.id)
+  }),
+)
+
 // Decision §6, point 16: a message landing between onExit's read of the re-arm
 // predicate and the runner's own. The record closes run 1 and run 1 reports;
 // the runner re-arms the same work over a closed record, which is run 2, and
@@ -5540,28 +5595,30 @@ withFailingMetadata.instance(
       const events = yield* EventV2Bridge.Service
       type Wake = "parent" | "agent" | "user" | "system"
       type Outcome = "completed" | "failed" | "stopped"
-      type Mode = "plain" | "steer" | "rearm" | "window" | "fail" | "startfail" | "handoff"
+      type Late = "none" | "steer" | "rearm" | "window"
+      type Write = "ok" | "endfail" | "startfail"
       for (let n = 0; n < 8; n++) {
         const next = rng(9300 + n)
         const pick = <T>(items: readonly T[]) => items[Math.floor(next() * items.length)]!
         const plans = [0, 1].map((index) =>
           Array.from({ length: 2 + Math.floor(next() * 3) }, (_, r) => {
             const outcome: Outcome = pick(["completed", "completed", "completed", "failed", "stopped"])
-            // The late-message modes need a run that answers; a failing end
-            // write needs a run that ends on its own; a handoff — the next run
-            // opening while this one is being cancelled — needs a stop.
-            const mode: Mode =
-              outcome === "stopped"
-                ? pick(["plain", "plain", "handoff"])
-                : outcome === "failed"
-                  ? pick(["plain", "fail", "startfail"])
-                  : pick(["plain", "steer", "rearm", "window", "fail", "startfail"])
+            // Two dimensions drawn apart, so any late message meets any write
+            // failure — a re-arm after a failed open among them. What cannot
+            // happen is left out: a late message needs a run that answers; a
+            // continuation window needs the close to land, since the window
+            // is its publish; a handoff — the next run opening while this one
+            // is being cancelled — needs a stop and a run that opened.
+            const late: Late = outcome === "completed" ? pick(["none", "none", "steer", "rearm", "window"]) : "none"
+            const write: Write = late === "window" ? "ok" : pick(["ok", "ok", "ok", "endfail", "startfail"])
             return {
               token: `t${n}-${index}-${r}`,
               wake: (r === 0 ? "parent" : pick(["agent", "user", "system"])) as Wake,
               leftover: r > 0 && next() < 0.2,
               outcome,
-              mode,
+              late,
+              write,
+              handoff: outcome === "stopped" && write === "ok" && next() < 0.4,
             }
           }),
         )
@@ -5604,7 +5661,7 @@ withFailingMetadata.instance(
           let last: { number: number; outcome: string } | undefined
           const expectReport = (run: number) => reported.set(child.id, [...(reported.get(child.id) ?? []), run])
           for (const run of plans[index]!) {
-            const label = `seed ${9300 + n} ${run.token} ${run.wake} ${run.outcome} ${run.mode}${run.leftover ? " leftover" : ""}`
+            const label = `seed ${9300 + n} ${run.token} ${run.wake} ${run.outcome} ${run.late}/${run.write}${run.handoff ? " handoff" : ""}${run.leftover ? " leftover" : ""}`
             if (run.leftover) {
               // As a crash leaves it: open, one past the last number.
               const current = yield* sessions.get(child.id)
@@ -5631,36 +5688,36 @@ withFailingMetadata.instance(
                   : undefined
             yield* user(child.id, run.token, metadata)
             const gate = defer<void>()
-            const held = run.mode === "steer" || run.mode === "rearm" ? reply().wait(gate.promise) : reply()
-            if (run.mode === "rearm") yield* llm.pushMatch(lastUserIs(run.token), held.text("partial").contentFilter())
+            const held = run.late === "steer" || run.late === "rearm" ? reply().wait(gate.promise) : reply()
+            if (run.late === "rearm") yield* llm.pushMatch(lastUserIs(run.token), held.text("partial").contentFilter())
             else if (run.outcome === "completed")
               yield* llm.pushMatch(lastUserIs(run.token), held.text(`done ${run.token}`).stop())
             else if (run.outcome === "failed")
               yield* llm.pushMatch(lastUserIs(run.token), held.text("cut").usage({ input: 10, output: 10 }).length())
             else yield* llm.pushMatch(lastUserIs(run.token), reply().hang())
-            if (run.mode === "steer" || run.mode === "rearm")
+            if (run.late === "steer" || run.late === "rearm")
               yield* llm.pushMatch(lastUserIs(`${run.token} late`), reply().text(`late ${run.token}`).stop())
-            if (run.mode === "window") {
+            if (run.late === "window") {
               windows.set(child.id, { number: number + 1, token: run.token })
               yield* llm.pushMatch(lastUserIs(`${run.token} window`), reply().text(`window ${run.token}`).stop())
             }
-            if (run.mode === "fail") metadataFailure.pending.add(child.id)
-            if (run.mode === "startfail") metadataFailure.pendingStart.add(child.id)
+            if (run.write === "endfail") metadataFailure.pending.add(child.id)
+            if (run.write === "startfail") metadataFailure.pendingStart.add(child.id)
             const before = yield* record(child.id)
 
             const fiber = yield* prompt.loop({ sessionID: child.id }).pipe(Effect.forkChild)
-            if (run.mode === "steer" || run.mode === "rearm" || run.outcome === "stopped") {
+            if (run.late === "steer" || run.late === "rearm" || run.outcome === "stopped") {
               yield* pollWithTimeout(
                 llm.hits.pipe(Effect.map((hits) => (hits.some(lastUserIs(run.token)) ? true : undefined))),
                 `${label}: the request never arrived`,
                 "20 seconds",
               )
             }
-            if (run.mode === "steer" || run.mode === "rearm") {
+            if (run.late === "steer" || run.late === "rearm") {
               yield* user(child.id, `${run.token} late`)
               gate.resolve()
             }
-            if (run.mode === "handoff") {
+            if (run.handoff) {
               // As the next run leaves it when it opens while this one is
               // still being cancelled: this run closed as lost, its own open.
               const current = yield* sessions.get(child.id)
@@ -5682,15 +5739,16 @@ withFailingMetadata.instance(
             yield* awaitWithTimeout(Fiber.await(fiber), `${label}: the run never finished`, "30 seconds")
             // Either late message re-arms the runner, which keeps the child
             // busy across it; the loop call returned at the first exit.
-            if (run.mode === "rearm" || run.mode === "window") yield* waitForIdle(child.id)
+            if (run.late === "rearm" || run.late === "window") yield* waitForIdle(child.id)
 
             const current = yield* record(child.id)
-            if (run.mode === "startfail") {
-              // Nothing opened, so nothing owned: the record is as it was, and
-              // the report names no run.
+            if (run.write === "startfail") {
+              // Nothing opened, so nothing owned — on a re-arm too, which
+              // claims neither a leftover nor a closed record: the record is
+              // as it was, and the report, if any, names no run.
               expect(current, label).toEqual(before)
               expect(metadataFailure.pendingStart.has(child.id), label).toBe(false)
-              expectReport(0)
+              if (run.outcome !== "stopped") expectReport(0)
               continue
             }
             number += 1
@@ -5703,7 +5761,7 @@ withFailingMetadata.instance(
                 : run.wake === "agent"
                   ? { kind: "agent", session: peer, name: `peer ${index}` }
                   : { kind: run.wake }
-            if (run.mode === "handoff") {
+            if (run.handoff) {
               // The cancelled run's wind-down left the next run's record alone.
               expect(current, label).toMatchObject({ number: number + 1, previous: { number, outcome: "lost" } })
               expect(current?.ended_at, label).toBeUndefined()
@@ -5711,7 +5769,7 @@ withFailingMetadata.instance(
               last = { number, outcome: "lost" }
               continue
             }
-            if (run.mode === "window") {
+            if (run.late === "window") {
               expect(current, label).toMatchObject({
                 number: number + 1,
                 woken_by: { kind: "system" },
@@ -5724,12 +5782,13 @@ withFailingMetadata.instance(
               last = { number, outcome: "completed" }
               continue
             }
-            if (run.mode === "fail") {
+            if (run.write === "endfail") {
               expect(current, label).toMatchObject({ number, woken_by: wake, ...(last ? { previous: last } : {}) })
               expect(current?.ended_at, label).toBeUndefined()
               expect(metadataFailure.pending.has(child.id), label).toBe(false)
-              // The end write failed, so the report of this run names no run.
-              expectReport(0)
+              // The end write failed, so the report of this run, if any, names
+              // no run.
+              if (run.outcome !== "stopped") expectReport(0)
               last = { number, outcome: "lost" }
               continue
             }
@@ -5754,10 +5813,10 @@ withFailingMetadata.instance(
         // continuation window is two runs and two reports.
         const reports = plans
           .flat()
-          .reduce((sum, run) => sum + (run.outcome === "stopped" ? 0 : run.mode === "window" ? 2 : 1), 0)
+          .reduce((sum, run) => sum + (run.outcome === "stopped" ? 0 : run.late === "window" ? 2 : 1), 0)
         const opens = plans
           .flat()
-          .reduce((sum, run) => sum + (run.mode === "window" ? 2 : run.mode === "startfail" ? 0 : 1), 0)
+          .reduce((sum, run) => sum + (run.late === "window" ? 2 : run.write === "startfail" ? 0 : 1), 0)
         const list = yield* awaitNotices(parent.id, reports)
         yield* waitForIdle(parent.id)
         expect(yield* notices(parent.id), `seed ${9300 + n}`).toHaveLength(reports)
@@ -5873,6 +5932,94 @@ it.instance("each step ends with the clock and the subagent view, and the histor
     expect(stored).not.toContain("Your subagents")
     expect(stored).not.toContain("Now: ")
   }),
+)
+
+// A view the model never read must not move the window's floor (the second
+// external review, R2): the overflow check withdraws a step after its view was
+// built, and the compaction that follows can run long. Were the floor moved by
+// the withdrawn step, a child that finished during the step before it would be
+// in no view the model reads. Bun's test clock stands in for the hour this
+// takes; the loop and the overflow check are real.
+it.instance(
+  "a step the overflow check withdrew leaves the window's floor where the last sent step put it",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(preflightCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const t0 = Date.now()
+      setSystemTime(t0)
+      yield* Effect.addFinalizer(() => Effect.sync(() => setSystemTime()))
+      const parent = yield* sessions.create({ title: "window", permission: allowAll })
+      yield* seed(parent.id, { finish: "stop", userText: "earlier turn" })
+      const child = yield* sessions.create({
+        parentID: parent.id,
+        title: "child",
+        metadata: {
+          [AgentManagement.METADATA_AGENT_RUN]: { number: 1, started_at: t0 - 1_000, woken_by: { kind: "system" } },
+        },
+      })
+      yield* status.set(child.id, { type: "busy" })
+      const file = path.join(dir, "window.txt")
+      yield* writeText(file, "unchanged")
+      yield* prompt.prompt({
+        sessionID: parent.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "work" }],
+      })
+      // Two edit calls with arguments large enough that the third request fails
+      // the overflow check. The second response and the summary wait on gates,
+      // so the clock can move between them.
+      const large = "x".repeat(80_000)
+      const args = { filePath: file, oldString: large, newString: large }
+      const second = defer<void>()
+      const summary = defer<void>()
+      yield* llm.tool("edit", args)
+      yield* llm.push(reply().wait(second.promise).tool("edit", args).stop())
+      yield* llm.push(reply().wait(summary.promise).text("summary").stop())
+      yield* llm.text("done")
+
+      const run = yield* prompt.loop({ sessionID: parent.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(2), "the second step never arrived", "10 seconds")
+      // The child finishes five minutes into the second step.
+      setSystemTime(t0 + 5 * 60_000)
+      yield* sessions.setMetadata({
+        sessionID: child.id,
+        metadata: {
+          [AgentManagement.METADATA_AGENT_RUN]: {
+            number: 1,
+            started_at: t0 - 1_000,
+            ended_at: t0 + 5 * 60_000,
+            outcome: "completed",
+            woken_by: { kind: "system" },
+          },
+        },
+      })
+      yield* status.set(child.id, { type: "idle" })
+      // The second step's response comes half an hour in; the third step is
+      // built, withdrawn by the overflow check, and compaction asks for its
+      // summary instead.
+      setSystemTime(t0 + 30 * 60_000)
+      second.resolve()
+      yield* awaitWithTimeout(llm.wait(3), "the compaction never asked for its summary", "10 seconds")
+      // The summary lands a quarter of an hour later, and the next step goes out.
+      setSystemTime(t0 + 45 * 60_000)
+      summary.resolve()
+      yield* awaitWithTimeout(Fiber.await(run), "the run never finished", "15 seconds")
+
+      const requests = yield* llm.inputs
+      expect(requests).toHaveLength(4)
+      const stored = yield* sessions.messages({ sessionID: parent.id })
+      expect(stored.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
+      // The last request's view still reaches back to the second step, the
+      // last one sent, so the child's end is in it.
+      const tail = JSON.stringify((requests.at(-1)!.messages as unknown[]).at(-1))
+      expect(tail).toContain(child.id)
+      expect(tail).toContain("run 1 ended")
+    }),
+  45_000,
 )
 
 it.instance("no view without children, and none for a parent denied agent_list", () =>

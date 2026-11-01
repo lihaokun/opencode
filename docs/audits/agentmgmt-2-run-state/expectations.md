@@ -92,7 +92,7 @@
 **run 记录（commit 2，`loop` 的 work 包装）**
 
 - S10 闭包标志：首次执行 `fresh = true`，re-arm 为 false；work 先 `status.set busy`
-- S11 开始（`Session.updateMetadata`，patch 锁内读-判-写）：重读元数据 → 遗留打开记录关为 lost 入 previous；续跑遇已关闭记录按新 run → `wakeSource` → `begin` → 有新值才写回 → 返回本次 run 持有的号（新开的，或 re-arm 时仍打开的；写失败为 undefined）
+- S11 开始（`Session.updateMetadata`，patch 锁内读-判-写）：重读元数据 → 遗留打开记录关为 lost 入 previous；续跑遇已关闭记录按新 run → `wakeSource` → `begin` → 有新值才写回 → 返回本次 run 持有的号（新开的，或 re-arm 时自己仍打开的；写失败为 undefined，且其后的 re-arm 也不认领任何记录）
 - S12 结束（同一把锁内判归属并写）：`onExit` 内读一次 `hasUnconsumedTurn` → 为真不关闭；否则 `outcomeOf` → 记录号 = 本次 run 持有的号才 `end` → 写回 → 再 `reportRunEnd(outcome, closed)`；号不符（取消收尾与下一 run 开启重叠、打开写失败后的遗留记录）→ 不关、报告无 run 属性
 
 **消息标记（commit 2，`deliver`）**
@@ -102,7 +102,7 @@
 **进度视图（commit 3）**
 
 - S14 门：无直接子或 `agent_list` deny → 不附带
-- S15 采集：`Session.children` 一次 SQL；状态投影 `list()` 一次给 running 与 last step；`windowStart = min(now − 10min, previousStepStart)`，首步用 run 开始；失败整节省略
+- S15 采集：`Session.children` 一次 SQL；状态投影 `list()` 一次给 running 与 last step；`windowStart = min(now − 10min, previousStepStart)`，首步用 run 开始，`previousStepStart` 只在该步响应到手后才记为该步时间（预检撤回、provider 拒绝、不出视图的迭代都不推进）；失败整节省略
 - S16 渲染：在跑升序（`started_at ?? created`）、已结束降序（`ended_at ?? started_at`）、cut off 行不受窗口限制、各 10 行、省略行、上一个 run 的分号句；节序在重复计数之前
 - S17 删除花名册注入（`applyAgentRoster` 调用与实现），保留 sentinel 常量
 
@@ -110,7 +110,7 @@
 
 - S18 `reportRunEnd` 读关闭后的 agentRun → 已关闭才加 run / ended 属性与摘要后缀
 - S19 `Runner.cancel` / `SessionRunState.cancel` 返回取消前状态标签
-- S20 `renderTermination` 三分支，依据取消前状态与记录结局
+- S20 `renderTermination`：取消前读记录（`was`）→ cancel → 取消后重读（`run`）→ 击中的 run 取取消前打开的那条 → 四支，取消期间开了新 run 时附 `; run M has started since`
 - S21 `agent_send` 在 deliver **之前**取状态与 agentRun 快照 → 六种措辞 + agent_status 提示行；投递失败不输出
 
 **agent_status / agent_list（commit 5）**
@@ -141,7 +141,7 @@
 - `runLoop` 退出 → 钩子 →（放行）→ `onExit`：一次 `hasUnconsumedTurn` 读 → run 记录关闭 → `reportRunEnd` → runner 自己的读 → re-arm 或 `onIdle`。被阻止时链在第二步折回循环。
 - `onExit` 的读与 runner 的读不一致（消息恰落在两次读之间）时：记录关为 completed 且 run N 报告发出；runner 续跑同一 work，`fresh = false` 但记录已关闭 → 开 run N+1，续跑结果以 N+1 报告。不出现同号两份报告，也不静默。
 - `agent_send` 的状态快照取自 deliver 之前；返回文本描述的是投递那一刻，不承诺此后。
-- `renderTermination` 读 agentRun 时被取消 fiber 的 `onExit` 可能尚未完成；此时写 `stop requested at`，不等待；取消前状态为 Idle / Shell 时写"had already ended"；自然结束窗口（记录已关为 completed 而 runner 仍 Running）落入 stop requested。
+- `renderTermination` 的 run 号取取消进入时打开的记录：取消后记录仍是它且已关为 stopped → `stopped at`；否则（结束写失败、自然结束窗口）→ `stop requested at`，不等待；取消期间下一 run 已开启（记录号变大）→ 仍写旧号并附 `; run M has started since`，绝不把新 run 写成被停止的；取消前状态为 Idle / Shell 时写"had already ended" / "cut off"。
 - 记账失败不阻塞 run，也不阻止报告发出；报告在记录缺失或未关闭时省略 run / ended。
 - 进度视图每步重建，不写入历史，不进压缩输入；窗口按墙钟与上一次带视图的步开始计算。
 - `Session.patch` 对同一会话串行；锁只在 patch 时持有；`publish` 返回时投影已完成、同步监听者已跑完；`Updated` 监听者不得回头 patch 同一会话（现状五个监听者均不会；守卫是 30 s 超时 die）。
@@ -150,7 +150,7 @@
 
 > **框架声明**：仓库未引入 property-based 框架。沿用 `step-tail` 分支的做法：种子化随机生成 + 按定义重算的参照实现，一次失败即报种子。
 
-- **INV-5（= I5）** 任意事件序列（发送到空闲的子、中途插入消息、re-arm、续跑窗口、完成 / 失败 / 被停、并发多子、崩溃遗留的打开记录、注入一次结束写失败、注入一次开始写失败、取消收尾时下一 run 已开启）经真实 `loop` 执行后，每个子的 run 号序列严格递增且每次只加一；普通 re-arm 不改变它，续跑窗口加一；写失败与遗留的记录在下一次开始时被记为 lost 且号不重复；一次 run 只关闭自己持有号的记录：取消收尾不动下一 run 的记录，开始写失败的 run 不冒用遗留记录、其报告无 run 属性；每条记录打开时会话已是 busy。—— T3 加两条定值用例（钩子阻止不加号由定值用例覆盖）
+- **INV-5（= I5）** 任意事件序列（发送到空闲的子、中途插入消息、re-arm、续跑窗口、完成 / 失败 / 被停、并发多子、崩溃遗留的打开记录、注入一次结束写失败、注入一次开始写失败、取消收尾时下一 run 已开启）经真实 `loop` 执行后，每个子的 run 号序列严格递增且每次只加一；普通 re-arm 不改变它，续跑窗口加一；写失败与遗留的记录在下一次开始时被记为 lost 且号不重复；一次 run 只关闭自己持有号的记录：取消收尾不动下一 run 的记录，开始写失败的 run 不冒用遗留记录、其报告无 run 属性，它被 re-arm 后同样不认领（晚到消息与写失败是两个独立抽取的维度）；每条记录打开时会话已是 busy。—— T3 加两条定值用例（钩子阻止不加号由定值用例覆盖）
 - **INV-6（= I6）** 每份结束报告的 run 号等于发出时该子已关闭的 run，按结束顺序一一对应；同号报告至多一份；结束写失败的那份报告不带 run 属性；`ended ≥ started`。—— T3（停止通知的 run 行由 `lifecycle.test.ts` 五种定值用例覆盖）
 - **INV-6b** `agent_send` 对空闲且记录已关闭的目标预告的 run 号等于该子的下一份报告的 run 号。—— 定值用例（经注册表里真实的 `agent_send` 投递；T3 不改走工具投递，理由见主契约 §5.4.3）
 - **INV-7（= I7）** 对任意步序列（工具步、询问钩子的最终回答、带中途插入新消息的最终回答）与任意 cap（1–8），钩子连续阻止长度不限：父收到的报告恰一份，其创建时间不早于最后一次询问；每次询问的 `continuations` 等于按定义推进的参照值；每个请求的最后一条用户消息文本等于当时最新的 reason 或插入消息；每次询问之前子会话的 `SessionStatus` 事件序列中没有 idle。—— T8
@@ -202,4 +202,5 @@
 - [x] `decisions.md`：D1–D17
 - [x] §5.2 五维度审核：实施期间未按 commit 留下书面自审（原表述不实，2026-11-01 更正）；补做一次覆盖全部实施提交的审核 → `audit-report.md` §3.2、`decisions.md` D25–D40；最终人工验证待用户
 - [x] 2026-11-01 补充：一份外部审核（基线 `9daaf4b85e`，3 P2 + 2 边界 + PBT 缺口）与 §5.2 审核一起处置 → `decisions.md` D18–D40。契约随之改动：INV-5 增归属与开始写失败、取消交接；S11 / S12 改为 `Session.updateMetadata` 锁内读-判-写；S22 门先于解析；§2 agent_status 行、钩子继续消息行；§9 增来源名 / session id / workdir 转义；INV-8b 行数恰等于定义；INV-11 增 `updateMetadata` 并发自增；窗口下界改为"上一次带视图的步"
+- [x] 2026-11-01 第二轮外部审核（基线 `05aba09705`）：R1–R3 处置 → `decisions.md` D41–D46、`audit-report.md` §3.3。契约随之改动：S11 的 re-arm 只续接自己持有的记录；S15 下界只在响应到手后推进；S20 增取消前读与"has started since"；INV-5 增"开始写失败后的 re-arm 不认领"；§6 停止通知四种情况
 - [x] 修正方案文档 `session-fix-step-tail-repeat-and-agents.md` 第六、七、八部分已回填 commit

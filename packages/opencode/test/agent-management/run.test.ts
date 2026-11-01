@@ -22,12 +22,16 @@ function message(metadata?: Record<string, unknown>): SessionV1.WithParts {
 
 describe("AgentRun.begin", () => {
   test("the first run is number 1 with no previous", () => {
-    expect(AgentRun.begin(undefined, now, source, true)).toEqual({ number: 1, started_at: now, woken_by: source })
+    expect(AgentRun.begin(undefined, now, source, true, undefined)).toEqual({
+      number: 1,
+      started_at: now,
+      woken_by: source,
+    })
   })
 
   test("a fresh start over a closed record takes the next number and keeps the end", () => {
     const closed = { number: 3, started_at: 1, woken_by: source, ended_at: 2, outcome: "failed" as const }
-    expect(AgentRun.begin(closed, now, source, true)).toEqual({
+    expect(AgentRun.begin(closed, now, source, true, undefined)).toEqual({
       number: 4,
       started_at: now,
       woken_by: source,
@@ -35,21 +39,34 @@ describe("AgentRun.begin", () => {
     })
   })
 
-  test("a re-arm over an open record writes nothing: the run continues", () => {
-    expect(AgentRun.begin({ number: 3, started_at: 1, woken_by: source }, now, source, false)).toBeUndefined()
+  test("a re-arm over the open record it owns writes nothing: the run continues", () => {
+    expect(AgentRun.begin({ number: 3, started_at: 1, woken_by: source }, now, source, false, 3)).toBeUndefined()
+  })
+
+  // A re-arm claims only what it owns. One whose open write failed owns
+  // nothing, so a leftover it was started over stays a leftover (the second
+  // external review, R1); a record gone or carrying another number is not its
+  // either.
+  test("a re-arm that owns nothing, or not this record, writes nothing and claims nothing", () => {
+    const open = { number: 3, started_at: 1, woken_by: source }
+    expect(AgentRun.begin(open, now, source, false, undefined)).toBeUndefined()
+    expect(AgentRun.begin(open, now, source, false, 2)).toBeUndefined()
+    expect(AgentRun.begin(undefined, now, source, false, 3)).toBeUndefined()
+    const closed = { ...open, ended_at: 2, outcome: "completed" as const }
+    expect(AgentRun.begin(closed, now, source, false, undefined)).toBeUndefined()
   })
 
   // The continuation window (§6, point 16): onExit closed run N and reported
   // it before the runner saw the late message, so the re-arm is run N+1.
-  test("a re-arm over a closed record is the next run", () => {
+  test("a re-arm over its own closed record is the next run", () => {
     const closed = { number: 3, started_at: 1, woken_by: source, ended_at: 2, outcome: "completed" as const }
-    expect(AgentRun.begin(closed, now, source, false)?.number).toBe(4)
+    expect(AgentRun.begin(closed, now, source, false, 3)?.number).toBe(4)
   })
 
   // I5: a leftover open record — the process died or the end write failed —
   // is closed as lost by the run that finds it, so no two runs share a number.
   test("a fresh start over an open record closes it as lost first", () => {
-    expect(AgentRun.begin({ number: 3, started_at: 1, woken_by: source }, now, source, true)).toEqual({
+    expect(AgentRun.begin({ number: 3, started_at: 1, woken_by: source }, now, source, true, undefined)).toEqual({
       number: 4,
       started_at: now,
       woken_by: source,

@@ -24,19 +24,27 @@ export function read(metadata: Record<string, unknown> | undefined) {
  * The record a run opens with, or undefined when nothing is to be written.
  *
  * `fresh` is the work's first execution; a re-arm re-executes the same work
- * (H9). A re-arm over an open record continues that run. A re-arm over a
- * closed one is the continuation window: onExit already ended run N and
- * reported it, so what follows is run N+1 (§6, point 16). A fresh start over
- * an open record is a leftover — the process died or the end write failed —
- * and it is closed as lost here, so the two runs never share a number (I5).
+ * (H9), and `own` is the number its previous execution owned — undefined when
+ * it owned nothing. A re-arm continues the run whose open record it owns, and
+ * nothing else: one that owns nothing (its open write failed) claims no
+ * leftover, however open that looks, and one whose record is gone or carries
+ * another number writes nothing either. A re-arm over its own closed record is
+ * the continuation window: onExit already ended run N and reported it, so what
+ * follows is run N+1 (§6, point 16). A fresh start over an open record is a
+ * leftover — the process died or the end write failed — and it is closed as
+ * lost here, so the two runs never share a number (I5).
  */
 export function begin(
   previous: AgentManagement.AgentRun | undefined,
   now: number,
   wokenBy: AgentManagement.WakeSource,
   fresh: boolean,
+  own: number | undefined,
 ): AgentManagement.AgentRun | undefined {
-  if (!fresh && previous && previous.ended_at === undefined) return undefined
+  if (!fresh) {
+    if (own === undefined || previous === undefined || previous.number !== own) return undefined
+    if (previous.ended_at === undefined) return undefined
+  }
   const last =
     previous === undefined
       ? undefined

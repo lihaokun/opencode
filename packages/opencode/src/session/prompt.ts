@@ -1343,11 +1343,12 @@ const layer = Layer.effect(
         let continuations = 0
         let lastStepReached = false
         const stopHookCap = (yield* config.get()).stop_hook_block_cap ?? 8
-        // Step S15: the time of the previous view bounds this view's window —
-        // the start of the previous step sent to the model; on the first step
-        // that is the run's start. An iteration that continues without a view
-        // (compaction, a subtask) does not move it, or a long one would hide
-        // what ended during the step before it.
+        // Step S15: the time of the previous view the model read bounds this
+        // view's window; on the first step that is the run's start. Moved only
+        // once a step's response is in: an iteration without a view
+        // (compaction, a subtask), a step the overflow check withdrew before
+        // sending and one the provider rejected all leave it alone, or a long
+        // one would hide what ended during the step before it.
         let previousStepStart = Date.now()
 
         while (true) {
@@ -1591,7 +1592,6 @@ const layer = Layer.effect(
               now,
               windowStart: StepTail.windowStart(now, previousStepStart),
             })
-            previousStepStart = now
             const body = [view, StepTail.renderRepeat(repeat)]
             // The clock rides with any section and never alone (§4.5).
             const tail = StepTail.render(
@@ -1695,6 +1695,10 @@ const layer = Layer.effect(
             // compaction before sending, or rejected by the provider as too long, is
             // not a step (fix doc session-fix-step-tail-repeat-and-agents §3.2).
             if (rejected) return "continue" as const
+            // The model has read this step's view, so its time is the floor of
+            // the next one's window. A step withdrawn above or rejected by the
+            // provider left the floor where it was.
+            previousStepStart = now
             const current = StepTail.signature(
               yield* MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database)),
             )
@@ -1734,15 +1738,18 @@ const layer = Layer.effect(
 
     // Step S11: a run opens its record (subplan agentmgmt-2-run-state §5.2.2)
     // and learns which number it owns: the one it opened, or on a re-arm the
-    // one still open. Failures are logged and the run goes on without a
-    // number: the record is bookkeeping, and a run that cannot write it is
-    // still a run — but it owns nothing, so it closes nothing later (I5).
-    // begin closes a leftover open record as lost and writes nothing for a
-    // re-arm over an open one.
+    // one it already owned while that is still the open record. Failures are
+    // logged and the run goes on without a number: the record is bookkeeping,
+    // and a run that cannot write it is still a run — but it owns nothing, so
+    // it closes nothing later, and a re-arm of it claims nothing either, not
+    // even the leftover it was started over (I5). begin closes a leftover open
+    // record as lost on a fresh start and writes nothing for a re-arm over the
+    // record it owns.
     const recordRunStart = Effect.fn("SessionPrompt.recordRunStart")(function* (
       sessionID: SessionID,
       parentID: SessionID,
       fresh: boolean,
+      own: number | undefined,
     ) {
       return yield* Effect.gen(function* () {
         const parent = yield* sessions.get(parentID)
@@ -1771,11 +1778,16 @@ const layer = Layer.effect(
                 message: latest,
               }),
               fresh,
+              own,
             )
             return next ? { ...current, [AgentManagement.METADATA_AGENT_RUN]: next } : undefined
           },
         })
-        return AgentRun.read(result.after)?.number
+        const record = AgentRun.read(result.after)
+        if (result.after !== result.before) return record?.number
+        // Nothing written: a re-arm keeps what it owned while that is the open
+        // record; anything else open is not this run's.
+        return record !== undefined && record.number === own && record.ended_at === undefined ? own : undefined
       }).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("run record not opened", { "session.id": sessionID, cause }).pipe(Effect.as(undefined)),
@@ -1848,7 +1860,7 @@ const layer = Layer.effect(
             // Busy before the record opens, or a reader in between sees an
             // open record on an idle session and calls the run cut off (H9b).
             yield* status.set(input.sessionID, { type: "busy" })
-            own = yield* recordRunStart(input.sessionID, parentID, fresh)
+            own = yield* recordRunStart(input.sessionID, parentID, fresh, own)
             return yield* runLoop(input.sessionID)
           }).pipe(
             Effect.onExit((exit) =>
