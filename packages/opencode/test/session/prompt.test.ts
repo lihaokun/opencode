@@ -301,10 +301,13 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   return LayerNode.compile(promptRoot, replacements)
 }
 
-// T3 injects one failed end write per marked session: this Session wraps the
-// real one and dies on the first setMetadata that closes a run record of a
-// session in `pending`. Everything else goes straight through.
-const metadataFailure = { pending: new Set<string>() }
+// T3 injects one failed run-record write per marked session: this Session
+// wraps the real one and dies on the first updateMetadata that closes a run
+// record of a session in `pending`, or opens one of a session in
+// `pendingStart` — thrown inside the update, which runs under the lock, so
+// the failure is a defect of the write itself. Everything else goes straight
+// through.
+const metadataFailure = { pending: new Set<string>(), pendingStart: new Set<string>() }
 const failingMetadataSession = LayerNode.make({
   service: Session.Service,
   layer: Layer.effect(
@@ -313,10 +316,21 @@ const failingMetadataSession = LayerNode.make({
       const real = yield* Session.Service
       return Session.Service.of({
         ...real,
-        setMetadata: (input) =>
-          AgentRun.read(input.metadata)?.ended_at !== undefined && metadataFailure.pending.delete(input.sessionID)
-            ? Effect.die(new Error("injected end write failure"))
-            : real.setMetadata(input),
+        updateMetadata: (input) =>
+          real.updateMetadata({
+            sessionID: input.sessionID,
+            update: (current) => {
+              const next = input.update(current)
+              const run = next === undefined ? undefined : AgentRun.read(next)
+              if (run?.ended_at !== undefined && metadataFailure.pending.delete(input.sessionID)) {
+                throw new Error("injected end write failure")
+              }
+              if (run && run.ended_at === undefined && metadataFailure.pendingStart.delete(input.sessionID)) {
+                throw new Error("injected start write failure")
+              }
+              return next
+            },
+          }),
       })
     }),
   ).pipe(
@@ -5372,6 +5386,97 @@ it.instance("a leftover open record is closed as lost and the next run takes the
   }),
 )
 
+// A run closes only the record it owns (I5). A cancel sets the runner idle
+// before the old fiber has wound down, so the next run can open — closing
+// this one as lost — while this one's onExit is still to come; that onExit
+// must leave the new record alone. Reproduced here by writing the next run's
+// record as it would stand, then cancelling.
+it.instance("a cancelled run's wind-down leaves the next run's record alone", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    yield* user(child.id, "hang-task")
+    yield* llm.pushMatch(lastUserIs("hang-task"), reply().hang())
+    const fiber = yield* prompt.loop({ sessionID: child.id }).pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      llm.hits.pipe(Effect.map((hits) => (hits.some(lastUserIs("hang-task")) ? true : undefined))),
+      "the request never arrived",
+      "10 seconds",
+    )
+    expect(yield* record(child.id)).toMatchObject({ number: 1 })
+
+    const now = Date.now()
+    const current = yield* sessions.get(child.id)
+    yield* sessions.setMetadata({
+      sessionID: child.id,
+      metadata: {
+        ...current.metadata,
+        [AgentManagement.METADATA_AGENT_RUN]: {
+          number: 2,
+          started_at: now,
+          woken_by: { kind: "system" },
+          previous: { number: 1, ended_at: now, outcome: "lost" },
+        },
+      },
+    })
+    yield* prompt.cancel(child.id)
+    yield* Fiber.await(fiber)
+
+    const after = yield* record(child.id)
+    expect(after).toMatchObject({ number: 2, previous: { number: 1, outcome: "lost" } })
+    expect(after?.ended_at).toBeUndefined()
+    yield* Effect.sleep("200 millis")
+    expect(yield* notices(parent.id)).toEqual([])
+  }),
+)
+
+// The other side of ownership: a run whose open write failed owns no record,
+// so a leftover it did not open stays as it is and its report names no run;
+// the next run then closes the leftover as lost.
+withFailingMetadata.instance("a run whose open write failed claims no leftover and reports no run number", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    yield* sessions.setMetadata({
+      sessionID: child.id,
+      metadata: {
+        ...child.metadata,
+        [AgentManagement.METADATA_AGENT_RUN]: { number: 7, started_at: 1_000, woken_by: { kind: "system" } },
+      },
+    })
+    metadataFailure.pendingStart.add(child.id)
+    yield* user(child.id, "task-a")
+    yield* llm.pushMatch(lastUserIs("task-a"), reply().text("a done").stop())
+    yield* prompt.loop({ sessionID: child.id })
+
+    const untouched = yield* record(child.id)
+    expect(untouched).toMatchObject({ number: 7, started_at: 1_000 })
+    expect(untouched?.ended_at).toBeUndefined()
+    const [first] = yield* awaitNotices(parent.id, 1)
+    expect(first.part.text).not.toContain(' run="')
+    expect(String(first.part.metadata?.summary)).toBe("Agent completed: look around")
+    yield* waitForIdle(parent.id)
+
+    yield* user(child.id, "task-b")
+    yield* llm.pushMatch(lastUserIs("task-b"), reply().text("b done").stop())
+    yield* prompt.loop({ sessionID: child.id })
+    expect(yield* record(child.id)).toMatchObject({
+      number: 8,
+      outcome: "completed",
+      previous: { number: 7, outcome: "lost" },
+    })
+    const list = yield* awaitNotices(parent.id, 2)
+    expect(list[1].part.text).toContain(`<agent id="${child.id}" state="completed" run="8" ended="`)
+    yield* waitForIdle(parent.id)
+  }),
+)
+
 // Decision §6, point 16: a message landing between onExit's read of the re-arm
 // predicate and the runner's own. The record closes run 1 and run 1 reports;
 // the runner re-arms the same work over a closed record, which is run 2, and
@@ -5435,7 +5540,7 @@ withFailingMetadata.instance(
       const events = yield* EventV2Bridge.Service
       type Wake = "parent" | "agent" | "user" | "system"
       type Outcome = "completed" | "failed" | "stopped"
-      type Mode = "plain" | "steer" | "rearm" | "window" | "fail"
+      type Mode = "plain" | "steer" | "rearm" | "window" | "fail" | "startfail" | "handoff"
       for (let n = 0; n < 8; n++) {
         const next = rng(9300 + n)
         const pick = <T>(items: readonly T[]) => items[Math.floor(next() * items.length)]!
@@ -5443,13 +5548,14 @@ withFailingMetadata.instance(
           Array.from({ length: 2 + Math.floor(next() * 3) }, (_, r) => {
             const outcome: Outcome = pick(["completed", "completed", "completed", "failed", "stopped"])
             // The late-message modes need a run that answers; a failing end
-            // write needs a run that ends on its own.
+            // write needs a run that ends on its own; a handoff — the next run
+            // opening while this one is being cancelled — needs a stop.
             const mode: Mode =
               outcome === "stopped"
-                ? "plain"
+                ? pick(["plain", "plain", "handoff"])
                 : outcome === "failed"
-                  ? pick(["plain", "fail"])
-                  : pick(["plain", "steer", "rearm", "window", "fail"])
+                  ? pick(["plain", "fail", "startfail"])
+                  : pick(["plain", "steer", "rearm", "window", "fail", "startfail"])
             return {
               token: `t${n}-${index}-${r}`,
               wake: (r === 0 ? "parent" : pick(["agent", "user", "system"])) as Wake,
@@ -5539,6 +5645,8 @@ withFailingMetadata.instance(
               yield* llm.pushMatch(lastUserIs(`${run.token} window`), reply().text(`window ${run.token}`).stop())
             }
             if (run.mode === "fail") metadataFailure.pending.add(child.id)
+            if (run.mode === "startfail") metadataFailure.pendingStart.add(child.id)
+            const before = yield* record(child.id)
 
             const fiber = yield* prompt.loop({ sessionID: child.id }).pipe(Effect.forkChild)
             if (run.mode === "steer" || run.mode === "rearm" || run.outcome === "stopped") {
@@ -5552,20 +5660,57 @@ withFailingMetadata.instance(
               yield* user(child.id, `${run.token} late`)
               gate.resolve()
             }
+            if (run.mode === "handoff") {
+              // As the next run leaves it when it opens while this one is
+              // still being cancelled: this run closed as lost, its own open.
+              const current = yield* sessions.get(child.id)
+              seen.set(child.id, number + 2)
+              yield* sessions.setMetadata({
+                sessionID: child.id,
+                metadata: {
+                  ...current.metadata,
+                  [AgentManagement.METADATA_AGENT_RUN]: {
+                    number: number + 2,
+                    started_at: Date.now(),
+                    woken_by: { kind: "system" },
+                    previous: { number: number + 1, ended_at: Date.now(), outcome: "lost" },
+                  },
+                },
+              })
+            }
             if (run.outcome === "stopped") yield* prompt.cancel(child.id)
             yield* awaitWithTimeout(Fiber.await(fiber), `${label}: the run never finished`, "30 seconds")
             // Either late message re-arms the runner, which keeps the child
             // busy across it; the loop call returned at the first exit.
             if (run.mode === "rearm" || run.mode === "window") yield* waitForIdle(child.id)
 
+            const current = yield* record(child.id)
+            if (run.mode === "startfail") {
+              // Nothing opened, so nothing owned: the record is as it was, and
+              // the report names no run.
+              expect(current, label).toEqual(before)
+              expect(metadataFailure.pendingStart.has(child.id), label).toBe(false)
+              expectReport(0)
+              continue
+            }
             number += 1
+            // Record 1 is the parent's by definition (§4.2): the creating
+            // prompt carries no marker. When the true first run's open write
+            // failed, the next run is record 1 and reads as the parent's too.
             const wake =
-              run.wake === "parent"
+              number === 1 || run.wake === "parent"
                 ? { kind: "agent", session: parent.id, agent: "build" }
                 : run.wake === "agent"
                   ? { kind: "agent", session: peer, name: `peer ${index}` }
                   : { kind: run.wake }
-            const current = yield* record(child.id)
+            if (run.mode === "handoff") {
+              // The cancelled run's wind-down left the next run's record alone.
+              expect(current, label).toMatchObject({ number: number + 1, previous: { number, outcome: "lost" } })
+              expect(current?.ended_at, label).toBeUndefined()
+              number += 1
+              last = { number, outcome: "lost" }
+              continue
+            }
             if (run.mode === "window") {
               expect(current, label).toMatchObject({
                 number: number + 1,
@@ -5610,7 +5755,9 @@ withFailingMetadata.instance(
         const reports = plans
           .flat()
           .reduce((sum, run) => sum + (run.outcome === "stopped" ? 0 : run.mode === "window" ? 2 : 1), 0)
-        const opens = plans.flat().reduce((sum, run) => sum + (run.mode === "window" ? 2 : 1), 0)
+        const opens = plans
+          .flat()
+          .reduce((sum, run) => sum + (run.mode === "window" ? 2 : run.mode === "startfail" ? 0 : 1), 0)
         const list = yield* awaitNotices(parent.id, reports)
         yield* waitForIdle(parent.id)
         expect(yield* notices(parent.id), `seed ${9300 + n}`).toHaveLength(reports)
@@ -5906,6 +6053,48 @@ const stopHookParts = Effect.fn("test.stopHookParts")(function* (sessionID: Sess
         part.type === "text" && part.metadata?.kind === AgentManagement.STOP_HOOK_METADATA_KIND,
     )
 })
+
+// The continuation is the same turn going on: it keeps what the request reads
+// off the latest user message — its system text and tool switches — or the
+// steps after a block would run with another system and another tool set.
+withStopHook.instance("the continuation message keeps the turn's system text and tool switches", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(stopHookCfg())
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    stopHook.reset([blocks(["keep going"])], child.id)
+    const msg = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID: child.id,
+      agent: "build",
+      model: ref,
+      system: "answer in one line",
+      tools: { glob: false },
+      time: { created: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: msg.id,
+      sessionID: child.id,
+      type: "text",
+      text: "go",
+    })
+    yield* llm.text("first")
+    yield* llm.text("second")
+    yield* llm.text("the parent read the notice")
+    yield* prompt.loop({ sessionID: child.id })
+
+    const msgs = yield* MessageV2.filterCompactedEffect(child.id)
+    const continuation = msgs.findLast((item) => item.info.role === "user")?.info
+    expect(continuation).toMatchObject({ role: "user", system: "answer in one line", tools: { glob: false } })
+    expect(continuation?.id).not.toBe(msg.id)
+    yield* awaitNotices(parent.id, 1)
+    yield* waitForIdle(parent.id)
+  }),
+)
 
 withStopHook.instance(
   "the stop hook keeps a subagent's run going with its reasons, and the parent hears once after it allows",

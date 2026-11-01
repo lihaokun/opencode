@@ -1,6 +1,6 @@
 import { Option, Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { AgentDelegation } from "./delegation"
+import type { AgentDelegation } from "./delegation"
 import { AgentManagement } from "./schema"
 import { SessionID } from "../session/schema"
 
@@ -10,6 +10,7 @@ import { SessionID } from "../session/schema"
 // touches a store or a clock.
 
 const decode = Schema.decodeUnknownOption(AgentManagement.AgentRun)
+const decodeSessionID = Schema.decodeUnknownOption(SessionID)
 
 /**
  * The record in a session's metadata, or undefined when it is absent or
@@ -92,9 +93,11 @@ export function wakeSource(input: {
   const kind = meta?.kind
   const fromAgent =
     kind === AgentManagement.AGENT_MESSAGE_METADATA_KIND || kind === AgentManagement.NOTIFICATION_METADATA_KIND
-  if (fromAgent && typeof meta?.sender === "string") {
-    return agentSource(SessionID.make(meta.sender), text(meta.sender_name), text(meta.sender_agent))
-  }
+  // The sender is part metadata, which the prompt endpoint takes from any
+  // client: decoded, not trusted. One that is not a session id is nobody in
+  // particular, and a system wake, rather than no record at all.
+  const sender = fromAgent ? Option.getOrUndefined(decodeSessionID(meta?.sender)) : undefined
+  if (sender !== undefined) return agentSource(sender, text(meta?.sender_name), text(meta?.sender_agent))
   if (kind === AgentManagement.USER_MESSAGE_METADATA_KIND) return { kind: "user" }
   return { kind: "system" }
 }
@@ -136,12 +139,19 @@ function pad(value: number) {
   return String(value).padStart(2, "0")
 }
 
-/** The wake source as the session `viewer` reads it (§4.2). */
+/**
+ * The wake source as the session `viewer` reads it (§4.2). The name came
+ * from a model and lands inside a system-written line, so it is escaped like
+ * a message header's fields: a newline in it would otherwise end the line and
+ * start a forged one. The session id is escaped too: it was decoded from part
+ * metadata, and the decoder checks its prefix, not its characters.
+ */
 export function describeSource(source: AgentManagement.WakeSource, viewer: SessionID) {
   if (source.kind === "user") return "user"
   if (source.kind === "system") return "system"
   if (source.session === viewer) return "your message"
-  return source.name ?? source.session ?? "agent"
+  if (source.name !== undefined) return AgentManagement.escapeField(source.name)
+  return source.session === undefined ? "agent" : AgentManagement.escapeField(source.session)
 }
 
 export * as AgentRun from "./run"

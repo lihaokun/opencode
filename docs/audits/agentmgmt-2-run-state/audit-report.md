@@ -68,3 +68,29 @@
 - 逐项判定表见审核输出；结论：❌ 2（步骤标记缺三处；T9 参照弱于 INV-11 且"等价"不成立）、⚠️ 11（清零规则变更需追认、锁外重读的原子性表述、钩子 `agent` 措辞、schema 不校验三条不变量、§5.1.4 测试缺口、§2 缺两条文本、代码有契约未写的失败文本与文档文件、INV-13 观测点、性能观测点与集成测试收窄、INV-6 / 6b 改定值、`ended` 类型）、未判定 5。
 - 契约文档的实施期改动分类：13 处为实施细节如实记录；7 处为配合实现 / 测试而改（第 17 点、INV-6 收窄、INV-6b 改定值、INV-11 重述、性能观测点、§5.3.2 收窄、INV-5 列表），其中 INV-11 的重述被判为不等价，其余判为可接受。
 - 处置：`decisions.md` D1–D17；❌ 两项已修并重跑，⚠️ 六项已修、三项文档化、两项接受并记录，未判定五项核对或接受。critical 0、unresolved 0。
+
+### 3.2 §5.2 代码审核（2026-11-01，基线 `9daaf4b85e`；审核对象 `git diff 97b272f37f -- packages/opencode/src packages/plugin/src packages/core/src` 含本轮工作区改动）
+
+**起因**：实施期间没有按 commit 留下书面的 §5.2 五维度自审——`decisions.md` 原勾选的"随各 commit 报告记录"不实，已更正。本轮补做一次，连同一份外部审核（基线 `9daaf4b85e`）一起处置。
+
+**外部审核（3 P2 + 2 边界 + PBT 缺口，先处置）**
+
+| #    | 项                                                              | 处置（详见 decisions）                       |
+| ---- | --------------------------------------------------------------- | -------------------------------------------- |
+| P2-1 | 旧 run 的取消收尾关闭新 run 的记录（`recordRunEnd` 不看归属）   | run 归属：开记录返回持有号，只关持有号 → D18 |
+| P2-2 | 开始写入失败的 run 结束时冒用遗留号，报告带号                   | 持有号 undefined 不关、报告无 run 属性 → D19 |
+| P2-3 | 唤醒来源名不转义                                                | `describeSource` 经 `escapeField` → D20      |
+| B-1  | 运行中的根会话缺 `last step`                                    | 非子会话也给 last step → D21                 |
+| B-2  | deny 门晚于重名解析，候选 session_id 外泄                       | 门先于 `resolveTarget` → D22                 |
+| PBT  | T3 缺取消交接 / 开始写失败形态；T7 缺控制字符来源名             | 两形态 + 两定值用例；T7 随机来源名 → D23     |
+| 顺带 | T3 扩展暴露参照缺口：开始写失败之后的记录 1 按 §4.2 规则 1 记父 | 参照按记录号判；§4.2 注 → D24                |
+
+**五维度**
+
+- 一致性 / 风格 / 性能——作者读全量 diff 自审：D37（三层三目、`Parameters<…>[1]`）、D38（状态映射两处）、D39（记录开 / 关判据三处不一）、D40（性能无新增热点）。
+- 正确性 / 可维护性——独立审核 agent，只给 diff 与子计划 §5 的论证，不给作者结论：❌ 0、⚠️ 12（D25–D36）。最重的是第 1 条：归属检查与写入不在同一把锁内——`Runner.cancel` 在 `SynchronizedRef.modify` 里同步置 Idle、随后才等旧 fiber 退出，期间新 run 可开始，旧收尾与新开启并发时锁外的"读—判—写"让后写者抹掉先写者（旧 run 把已被关为 lost 并开出 N+1 的记录改回 `N stopped`，N+1 消失）。改法：`Session.updateMetadata` 在 patch 锁内读-判-写，`recordRunStart` / `recordRunEnd` 改用，§5.2.0 / §5.2.2 的"元数据写方只有 run 记录自己、顺序执行"前提改写。其余：继续消息丢 `system` / `tools`（D26）、窗口下界被不渲染的迭代推进（D27）、`sender` 未经解码直接 `SessionID.make`（D28）、续跑窗口的 part 时序（D29，接受）、H6c 清单补四处（D30）、`runLine` 注释失实（D31）、agent_send 提示行（D32，接受）、`workdir` 未转义（D33）、冗余与类型四项（D34）、`escapeField` 归属（D35）、sentinel 注释（D36）。
+- 审核核对通过的论证：`stopGate` 六支与 S6 两处清零；`subagentView` 权限门与失败降级；work 包装的 fresh / re-arm 区分、busy 先于记录、`onExit` 单次读与关闭先于报告；`reportRunEnd` 的 `undefined` / cancelled / 无 `closed` 三路；`Session.patch` 锁的计数清理、超时可中断性（Effect 4 `raceAll` 子 fiber 可中断，`Semaphore.take` 中断时清理 waiter）；`begin` / `end` / `ended` / `outcomeOf` / `wakeSource` / `describeSource` / `formatInstant` 分支穷尽；视图排序、窗口、转义、行数上界；`Runner.cancel` 返回值与 `before` 只记 target；agent_status 门先于解析、范围与 agent_list 同、五种 run 行穷尽；agent_send 快照在投递前、六种措辞穷尽、预告号与 `begin` 一致；agent_list 过滤→计数→排序→截断；`disabled` 别名 + `visibleAgentTools` ⇒ I9 工具表一半；`deliver` 标记文本不变（I10）。
+
+**处置结果**：已修 D18–D22、D25–D28、D31、D33、D34（前三项）、D35、D37–D39；文档化 D24、D29、D30、D36；接受并记录 D32、D34 第四项、D40。critical 0、unresolved 0。
+
+**运行**：typecheck 过；定向用例——`session.test` / `run.test` / `tools.test` / `step-tail.test` / `lifecycle.test` / `inbox.test` 122 过 0 败，`prompt.test` 钩子 + run 记录 + T3 + 视图 33 过 0 败；外部审核修正前的 `prompt.test` 全文件 141 过 0 败；全量回归（agent-management / session / tool / permission / effect，`--timeout 60000`，负载下 1099 s）：1321 条中 1312 过、7 跳过、1 败——`tool.registry` 的插件包用例以 20 s 的自带预算超时，与本改动无关（外部审核在 `9daaf4b85e` 上看到同一条），单独重跑 7.8 s 过。

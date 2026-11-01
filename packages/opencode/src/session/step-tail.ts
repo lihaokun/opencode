@@ -6,7 +6,7 @@ import type { SessionStatus } from "./status"
 import type { SessionID } from "./schema"
 import { AgentManagement } from "../agent-management/schema"
 import { AgentRun } from "../agent-management/run"
-import { AgentInbox } from "../agent-management/inbox"
+import { AgentStatusProjection } from "../agent-management/status"
 
 /**
  * The step tail: a short block of facts appended at the very end of one
@@ -152,7 +152,7 @@ export const collectSubagents = Effect.fn("StepTail.collectSubagents")(function*
       id: row.id,
       ...(typeof name === "string" ? { name } : {}),
       created: row.time.created,
-      running: current?.type === "busy" || current?.type === "retry",
+      running: AgentStatusProjection.project(current) === "running",
       ...(current?.at === undefined ? {} : { lastStep: current.at }),
       ...(run ? { run } : {}),
     }
@@ -217,7 +217,7 @@ function compare(a: string, b: string) {
 // Escaped for the same reason a message header is: the name comes from the
 // model, and a newline in it would forge a row of its own.
 function label(child: Child) {
-  return child.name === undefined ? `  ${child.id}  ` : `  ${child.id}  ${AgentInbox.escapeField(child.name)}  `
+  return child.name === undefined ? `  ${child.id}  ` : `  ${child.id}  ${AgentManagement.escapeField(child.name)}  `
 }
 
 function runningRow(child: Child, input: { windowStart: number; viewer: SessionID }) {

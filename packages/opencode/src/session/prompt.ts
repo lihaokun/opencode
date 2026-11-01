@@ -1266,7 +1266,10 @@ const layer = Layer.effect(
         return "exit" as const
       }
       // Step S5: the reason becomes the next user message, synthetic like the
-      // compaction continue message, and the same run goes on.
+      // compaction continue message, and the same run goes on. It keeps the
+      // turn's own system text and tool switches: the request reads both off
+      // the latest user message, so dropping them here would change the
+      // system and the tool set for the rest of the run.
       const now = Date.now()
       const message = yield* sessions.updateMessage({
         id: MessageID.ascending(),
@@ -1275,6 +1278,8 @@ const layer = Layer.effect(
         time: { created: now },
         agent: input.user.agent,
         model: input.user.model,
+        ...(input.user.system === undefined ? {} : { system: input.user.system }),
+        ...(input.user.tools === undefined ? {} : { tools: input.user.tools }),
       })
       yield* sessions.updatePart({
         id: PartID.ascending(),
@@ -1338,8 +1343,11 @@ const layer = Layer.effect(
         let continuations = 0
         let lastStepReached = false
         const stopHookCap = (yield* config.get()).stop_hook_block_cap ?? 8
-        // Step S15: the previous step's start bounds the view's window; on the
-        // first step that is the run's start.
+        // Step S15: the time of the previous view bounds this view's window —
+        // the start of the previous step sent to the model; on the first step
+        // that is the run's start. An iteration that continues without a view
+        // (compaction, a subtask) does not move it, or a long one would hide
+        // what ended during the step before it.
         let previousStepStart = Date.now()
 
         while (true) {
@@ -1427,8 +1435,6 @@ const layer = Layer.effect(
           }
 
           step++
-          const sinceStep = previousStepStart
-          previousStepStart = Date.now()
           if (step === 1)
             yield* title({
               session,
@@ -1579,7 +1585,13 @@ const layer = Layer.effect(
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
             const now = Date.now()
-            const view = yield* subagentView({ session, agent, now, windowStart: StepTail.windowStart(now, sinceStep) })
+            const view = yield* subagentView({
+              session,
+              agent,
+              now,
+              windowStart: StepTail.windowStart(now, previousStepStart),
+            })
+            previousStepStart = now
             const body = [view, StepTail.renderRepeat(repeat)]
             // The clock rides with any section and never alone (§4.5).
             const tail = StepTail.render(
@@ -1720,70 +1732,91 @@ const layer = Layer.effect(
         Effect.provideService(Database.Service, database),
       )
 
-    // Step S11: a run opens its record (subplan agentmgmt-2-run-state §5.2.2).
-    // Failures are logged and the run goes on: the record is bookkeeping, and
-    // a run that cannot write it is still a run. begin closes a leftover open
-    // record as lost and writes nothing for a re-arm over an open one.
+    // Step S11: a run opens its record (subplan agentmgmt-2-run-state §5.2.2)
+    // and learns which number it owns: the one it opened, or on a re-arm the
+    // one still open. Failures are logged and the run goes on without a
+    // number: the record is bookkeeping, and a run that cannot write it is
+    // still a run — but it owns nothing, so it closes nothing later (I5).
+    // begin closes a leftover open record as lost and writes nothing for a
+    // re-arm over an open one.
     const recordRunStart = Effect.fn("SessionPrompt.recordRunStart")(function* (
       sessionID: SessionID,
       parentID: SessionID,
       fresh: boolean,
     ) {
-      yield* Effect.gen(function* () {
-        const current = yield* sessions.get(sessionID)
-        const previous = AgentRun.read(current.metadata)
+      return yield* Effect.gen(function* () {
         const parent = yield* sessions.get(parentID)
         const name = parent.metadata?.[AgentManagement.METADATA_AGENT_NAME]
         // The message that woke this run is the latest one, and only its first
         // text part's metadata is read: one row and its parts.
         const latest = (yield* sessions.messages({ sessionID, limit: 1 }))[0]
-        const next = AgentRun.begin(
-          previous,
-          Date.now(),
-          AgentRun.wakeSource({
-            number: (previous?.number ?? 0) + 1,
-            parent: {
-              id: parentID,
-              ...(typeof name === "string" ? { name } : {}),
-              ...(parent.agent === undefined ? {} : { agent: parent.agent }),
-            },
-            message: latest,
-          }),
-          fresh,
-        )
-        if (!next) return
-        yield* sessions.setMetadata({
+        const now = Date.now()
+        // Read, decided and written under the session's patch lock: the run
+        // this one follows may be winding down at this very moment, and
+        // neither write may overtake the other's read.
+        const result = yield* sessions.updateMetadata({
           sessionID,
-          metadata: { ...current.metadata, [AgentManagement.METADATA_AGENT_RUN]: next },
+          update: (current) => {
+            const previous = AgentRun.read(current)
+            const next = AgentRun.begin(
+              previous,
+              now,
+              AgentRun.wakeSource({
+                number: (previous?.number ?? 0) + 1,
+                parent: {
+                  id: parentID,
+                  ...(typeof name === "string" ? { name } : {}),
+                  ...(parent.agent === undefined ? {} : { agent: parent.agent }),
+                },
+                message: latest,
+              }),
+              fresh,
+            )
+            return next ? { ...current, [AgentManagement.METADATA_AGENT_RUN]: next } : undefined
+          },
         })
+        return AgentRun.read(result.after)?.number
       }).pipe(
-        Effect.catchCause((cause) => Effect.logWarning("run record not opened", { "session.id": sessionID, cause })),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("run record not opened", { "session.id": sessionID, cause }).pipe(Effect.as(undefined)),
+        ),
       )
     })
 
-    // Step S12: a run closes its record and hands it to the report, so the
-    // report names the run it closes (I6). Missing or already closed is logged
-    // and the report goes out without a run: the open write failed, and begin
-    // accounts for it at the next start.
+    // Step S12: a run closes the record it owns and hands it to the report, so
+    // the report names the run it closes (I6). It never touches another run's
+    // record: a cancelled run's wind-down can overlap the next run's start,
+    // which has already closed this one as lost and opened its own; and a run
+    // whose open write failed owns nothing, however a leftover may look.
+    // Either way the report goes out without a run. Ownership is judged and
+    // the record written under the same permit, or the overlap above could
+    // still land this run's stale row over the next run's open.
     const recordRunEnd = Effect.fn("SessionPrompt.recordRunEnd")(function* (
       sessionID: SessionID,
       outcome: AgentManagement.RunOutcome,
+      own: number | undefined,
     ) {
       return yield* Effect.gen(function* () {
-        const current = yield* sessions.get(sessionID)
-        const next = AgentRun.end(AgentRun.read(current.metadata), Date.now(), outcome)
-        if (!next) {
-          yield* Effect.logWarning("run record missing or already closed at run end", {
+        const now = Date.now()
+        const result = yield* sessions.updateMetadata({
+          sessionID,
+          update: (current) => {
+            const record = AgentRun.read(current)
+            if (own === undefined || !record || record.number !== own) return undefined
+            const next = AgentRun.end(record, now, outcome)
+            return next ? { ...current, [AgentManagement.METADATA_AGENT_RUN]: next } : undefined
+          },
+        })
+        if (result.after === result.before) {
+          yield* Effect.logWarning("run record left alone at run end", {
             "session.id": sessionID,
             outcome,
+            own,
+            current: AgentRun.read(result.before),
           })
           return undefined
         }
-        yield* sessions.setMetadata({
-          sessionID,
-          metadata: { ...current.metadata, [AgentManagement.METADATA_AGENT_RUN]: next },
-        })
-        return next
+        return AgentRun.read(result.after)
       }).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("run record not closed", { "session.id": sessionID, cause }).pipe(Effect.as(undefined)),
@@ -1805,6 +1838,9 @@ const layer = Layer.effect(
       // never ran. `started` lives in this closure for the same reason: the
       // first execution opens a run, every later one continues it (Step S10).
       let started = false
+      // The run number this execution owns, for the close: set on every
+      // (re)start, undefined when the open write failed.
+      let own: number | undefined
       const work = parentID
         ? Effect.gen(function* () {
             const fresh = !started
@@ -1812,7 +1848,7 @@ const layer = Layer.effect(
             // Busy before the record opens, or a reader in between sees an
             // open record on an idle session and calls the run cut off (H9b).
             yield* status.set(input.sessionID, { type: "busy" })
-            yield* recordRunStart(input.sessionID, parentID, fresh)
+            own = yield* recordRunStart(input.sessionID, parentID, fresh)
             return yield* runLoop(input.sessionID)
           }).pipe(
             Effect.onExit((exit) =>
@@ -1825,7 +1861,7 @@ const layer = Layer.effect(
                 const unconsumed = Exit.isSuccess(exit) && (yield* hasUnconsumedTurn(input.sessionID))
                 const outcome = unconsumed ? undefined : classifyExit(input.sessionID, exit, yield* truncate.limits())
                 const closed = outcome
-                  ? yield* recordRunEnd(input.sessionID, AgentRun.outcomeOf(outcome.kind))
+                  ? yield* recordRunEnd(input.sessionID, AgentRun.outcomeOf(outcome.kind), own)
                   : undefined
                 if (notify) yield* reportRunEnd(session, parentID, outcome, closed)
               }),

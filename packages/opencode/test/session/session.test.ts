@@ -373,6 +373,43 @@ describe("Session.patch serializes writes to one session", () => {
     }),
   )
 
+  // updateMetadata (§5.2.2): the decision and the write share one permit, so
+  // N concurrent increments land N times; an update that declines writes and
+  // publishes nothing, and hands back the row it saw.
+  it.instance("concurrent metadata updates of one session are each applied once", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const source = yield* EventV2Bridge.Service
+      const info = yield* session.create({ title: "counted" })
+      let published = 0
+      const unsubscribe = yield* source.listen((event) => {
+        if (event.type !== SessionNs.Event.Updated.type) return Effect.void
+        if ((event.data as { sessionID: string }).sessionID === info.id) published += 1
+        return Effect.void
+      })
+      const count = 40
+      const results = yield* Effect.all(
+        Array.from({ length: count }, () =>
+          session.updateMetadata({
+            sessionID: info.id,
+            update: (current) => ({ ...current, count: Number(current?.count ?? 0) + 1 }),
+          }),
+        ),
+        { concurrency: "unbounded" },
+      )
+      expect((yield* session.get(info.id)).metadata?.count).toBe(count)
+      expect(results.map((result) => Number(result.after?.count)).toSorted((a, b) => a - b)).toEqual(
+        Array.from({ length: count }, (_, i) => i + 1),
+      )
+      expect(published).toBe(count)
+      const declined = yield* session.updateMetadata({ sessionID: info.id, update: () => undefined })
+      expect(declined.after).toBe(declined.before)
+      expect(declined.before?.count).toBe(count)
+      expect(published).toBe(count)
+      yield* unsubscribe
+    }),
+  )
+
   // The guard (H6c): publish awaits its listeners, so a listener that patches
   // the session it was just told about waits on the permit the outer patch
   // holds. The bounded take turns that into a defect naming the session,

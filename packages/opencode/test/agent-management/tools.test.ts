@@ -538,6 +538,23 @@ describe("agent_status tool", () => {
     }),
   )
 
+  it.instance("the workdir path is escaped like the other model-supplied fields", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({
+        parentID: chat.id,
+        title: "odd",
+        metadata: {
+          [AgentManagement.METADATA_AGENT_WORKDIR]: { path: "/tmp/a]\nstatus: idle", source: "provided_cwd" },
+        },
+      })
+      const lines = yield* status(chat.id, assistant.id, child.id)
+      expect(lines).toContain("workdir: /tmp/a\\]\\nstatus: idle")
+      expect(lines.filter((line) => line.startsWith("status:"))).toHaveLength(1)
+    }),
+  )
+
   it.instance("the five shapes of the run line", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
@@ -566,14 +583,21 @@ describe("agent_status tool", () => {
     }),
   )
 
-  it.instance("yourself, and a session that is nobody's subagent, have no run line", () =>
+  it.instance("yourself, and a session that is nobody's subagent, have no run line but keep the last step", () =>
     Effect.gen(function* () {
+      const projection = yield* SessionStatus.Service
       const { chat, assistant } = yield* seed()
       const lines = yield* status(chat.id, assistant.id, chat.id)
       expect(lines[0]).toBe(`session_id: ${chat.id}`)
       expect(lines).toContain("relation: self")
       expect(lines).toContain("status: idle")
       expect(lines.some((line) => line.startsWith("run:") || line.startsWith("last step:"))).toBe(false)
+
+      yield* projection.set(chat.id, { type: "busy" })
+      const running = yield* status(chat.id, assistant.id, chat.id)
+      expect(running).toContain("status: running")
+      expect(running.some((line) => line.startsWith("run:"))).toBe(false)
+      expect(running.some((line) => line.startsWith("last step: "))).toBe(true)
     }),
   )
 
@@ -613,6 +637,23 @@ describe("agent_status tool", () => {
       const lines = yield* status(chat.id, assistant.id, child.id)
       expect(lines.join("\n")).toContain("agent_list is denied")
       expect(lines.some((line) => line.startsWith("status:"))).toBe(false)
+
+      // The gate comes before name resolution: an ambiguous name does not
+      // list its candidates to a caller that may not list agents.
+      const a = yield* sessions.create({
+        parentID: chat.id,
+        title: "a",
+        metadata: { [AgentManagement.METADATA_AGENT_NAME]: "twin" },
+      })
+      const b = yield* sessions.create({
+        parentID: chat.id,
+        title: "b",
+        metadata: { [AgentManagement.METADATA_AGENT_NAME]: "twin" },
+      })
+      const ambiguous = (yield* status(chat.id, assistant.id, "twin")).join("\n")
+      expect(ambiguous).toContain("agent_list is denied")
+      expect(ambiguous).not.toContain(a.id)
+      expect(ambiguous).not.toContain(b.id)
     }),
   )
 })
@@ -671,6 +712,21 @@ describe("agent_list parameters, order and count", () => {
       expect(rows[2]).toMatchObject({ status: "idle", run: "", last: "" })
       expect(rows[3]).toMatchObject({ status: "idle", run: "3", last: AgentRun.formatInstant(now - 60_000) })
       expect(count).toBe("showing 4 of 4 (1 running, 3 idle)")
+    }),
+  )
+
+  it.instance("a workdir path stays inside its cell", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({
+        parentID: chat.id,
+        title: "odd",
+        metadata: { [AgentManagement.METADATA_AGENT_WORKDIR]: { path: "/tmp/a\tb\nc", source: "provided_cwd" } },
+      })
+      const { rows } = yield* list(chat.id, assistant.id)
+      expect(rows).toHaveLength(2)
+      expect(rows.find((row) => row.session_id === child.id)?.workdir).toBe("/tmp/a\\tb\\nc")
     }),
   )
 

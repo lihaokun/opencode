@@ -31,7 +31,7 @@
 
 - **H6** `Session.patch` 是"读整条会话、内存合并、发布 `Updated` 事件、投影整行写回"（`session.ts:826-839`，`core/src/session/projector.ts:234-240`），**没有锁**：并发的两个 patch 整行后写者胜。运行中并发 patch 同一会话的既有写入方：每条消息投递时的 `touch`（`prompt.ts:1189`）、每条消息的 `setAgentModel`（`prompt.ts:810`）、第一步异步 `setTitle`（`prompt.ts:325`），以及 HTTP `session.update` 对元数据的整体替换（`handlers/session.ts:205-207`，SDK 公开）。本子计划在 `Session.patch` 内按会话加信号量（§5.2.0）之后，前三者与 run 记录不再交错；HTTP 整体替换保持替换语义，记为已知破坏路径（§1）。
 - **H6b** `Updated` 是持久化事件，投影在 `publish` 返回之前于事务内同步完成（`core/src/event.ts` 的 `commitDurableEvent` 在 `Effect.uninterruptible` 的事务里逐个执行 projector，237-353）。因此锁住"读、合并、发布"这一段即可保证后一个 patch 读到前一个的结果。
-- **H6c** `publish` 还会在返回前同步等待全部 `listen` 监听者（`event.ts:406-412`），所以锁内发布期间若有监听者回头 patch 同一会话，就会在不可重入的信号量上挂死。2026-10-29 核对的全部 `listen` 注册点（`grep "\.listen(" opencode/src core/src`，排除网络监听）：`share/share-next.ts:170` 只读会话并入队、flush 已 fork；`event-v2-bridge.ts:35` 只向同步的 `GlobalBus`（EventEmitter）转发，回调不能 yield；`server/.../handlers/event.ts:32` 只入队；`plugin/index.ts:255` 对插件的 `event` 钩子是 `void` 掉的，不等待，插件在钩子里再 patch 会在锁外排队而不是死锁；`session/llm.ts:176` 只过滤权限回复事件。结论：现状没有重入路径。守卫（§5.2.0）：锁的获取带 30 秒超时，超时即 `die` 并带会话 id，让未来的重入或卡死成为可见的缺陷而不是永久挂起。
+- **H6c** `publish` 还会在返回前同步等待全部 `listen` 监听者（`event.ts:406-412`），所以锁内发布期间若有监听者回头 patch 同一会话，就会在不可重入的信号量上挂死。2026-10-29 核对的全部 `listen` 注册点（`grep "\.listen(" opencode/src core/src`，排除网络监听）：`share/share-next.ts:170` 只读会话并入队、flush 已 fork；`event-v2-bridge.ts:35` 只向同步的 `GlobalBus`（EventEmitter）转发，回调不能 yield；`server/.../handlers/event.ts:32` 只入队；`plugin/index.ts:255` 对插件的 `event` 钩子是 `void` 掉的，不等待，插件在钩子里再 patch 会在锁外排队而不是死锁；`session/llm.ts:176` 只过滤权限回复事件；2026-11-01 代码审核另核出 `project/vcs.ts:319`、`project/project.ts:388`、`core/src/event.ts:155`（只入队）、`cli/cmd/github.handler.ts:853`，均不 patch 会话。结论：现状没有重入路径。守卫（§5.2.0）：锁的获取带 30 秒超时，超时即 `die` 并带会话 id，让未来的重入或卡死成为可见的缺陷而不是永久挂起。
 - **H7** 插件钩子按顺序等待（`Plugin.trigger` 对每个钩子 `Effect.promise(() => fn(input, output))`，`packages/opencode/src/plugin/index.ts:284-296`），因此 `(input, output)` 形态的钩子可以同步把关。它没有超时；钩子 reject 成为 defect，不是类型化错误。
 - **H8** 合成用户消息落库后，`runLoop` 下一轮顶部重读历史时它就是 `lastUser`，`lastAssistantBelongsToLatestTurn`（`prompt.ts:1232-1235`）为假，退出条件不成立，循环继续——与压缩后自动继续用的是同一机制（`compaction.ts:548-581`）。
 - **H9** runner 对一次 run 恰执行一次 work；re-arm 时重新执行的是**同一个 work 对象**（`effect/runner.ts:90-95` `startRun(work, fresh)`）；`ensureRunning` 在 Running 态只 `awaitDone`（`runner.ts:149-151`）。`work` 由 `loop()` 每次调用新建，所以 work 闭包里的局部变量在 re-arm 之间保留、在新 run 之间不共享。这是 §5.2.2 用闭包标志判断 re-arm 的依据。
@@ -160,7 +160,7 @@ RunOutcome = "completed" | "failed" | "stopped" | "lost"
 
 推导规则（新 run 开始时，按序，先命中者胜）：
   1. number = 1（首次 run）⇒ { kind: "agent", session: parentID, name/agent 取父会话 }——
-     创建者就是唤醒者（H11）
+     创建者就是唤醒者（H11）。按记录号判：首次 run 的打开写入失败时，下一次 run 的记录号是 1，也落在本条
   2. 唤醒本次 run 的用户消息（run 开始时 MessageV2.latest(msgs).user）的首个 text part 的
      metadata.kind ∈ { "agent_message", "agent_notification" } ⇒ { kind: "agent", 取其 sender 三字段 }
      —— agent_send 的消息、停止通知、子 agent 的结束报告都落在这里（决策 §6 第 2 点）
@@ -168,10 +168,13 @@ RunOutcome = "completed" | "failed" | "stopped" | "lost"
      （`handlers/session.ts:337-347`，TUI `routes/session/index.tsx:425` 用它）；人经普通 prompt 端点
      发进子会话的消息没有标记，落入规则 4
   4. 其余 ⇒ { kind: "system" }（压缩后的自动继续、普通 prompt 端点等）
+  注：规则 2 的 sender 来自 part metadata，普通 prompt 端点可写任意 metadata，所以经 SessionID 解码，
+     解不出 ⇒ 落规则 4（代码审核 2026-11-01 第 4 条）。续跑窗口里 re-arm 的 run 读最新消息时，它的
+     text part 可能还没落库（消息行先写、part 后写），此时规则 2/3 不命中、记为 system；只影响标注，接受（第 5 条）。
 
 渲染规则（进度视图、agent_status、agent_list 共用）：
   - 从某会话 S 的视角：kind = agent 且 session = S ⇒ `your message`；
-    kind = agent 且 session ≠ S ⇒ 发送方的 name，缺省时用 session id；
+    kind = agent 且 session ≠ S ⇒ 发送方的 name，缺省时用 session id（两者都经 escapeField）；
     kind = user ⇒ `user`；kind = system ⇒ `system`
 
 跨模块共享性：跨模块共享 — producer: run.ts（纯函数）；consumer: 同 AgentRun
@@ -288,7 +291,7 @@ output（默认 { decision: "allow" }）：
   4. 重复计数：第一组已实现的那句
 
 窗口：取"最近 10 分钟"与"上一步开始以来"两者中更长者。保底项保证一步里跑了 30 分钟的编译时，期间
-  结束的子 agent 至少被下一步看到一次。上一步开始时间由 runLoop 记录（每步进入时的 Date.now()）；
+  结束的子 agent 至少被下一步看到一次。上一步开始时间由 runLoop 记录（上一次组装视图时的 Date.now()；压缩等不出视图的迭代不算）；
   本 run 第一步没有上一步，用 run 开始时间。
 
 排序与上限：
@@ -366,10 +369,10 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
     空闲且记录已关闭 → `5, ended <ISO> (<结局>)`
     空闲且记录未关闭 → `5, started <ISO>, cut off (will be recorded as lost)`
     从未跑过 → `none yet`
-    非子会话 → 省略本行
+    非子会话 → 省略本行（previous run 行同）
   previous run：有 previous 时 → `4, ended <ISO> (<结局>)`
-  last step：在跑时 → 状态投影最近一次置 busy 的 ISO；空闲时省略
-  workdir
+  last step：在跑时 → 状态投影最近一次置 busy 的 ISO；空闲时省略。非子会话（根会话、自己）在跑时同样有本行
+  workdir（路径经 escapeField：它可来自模型给的 cwd）
 可查范围、解析与权限：与 agent_list 相同（I9）
 
 工具：agent_list（参数全部可选）
@@ -405,7 +408,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
   2. `cap = cfg.stop_hook_block_cap ?? 8`；`continuations >= cap` → 记日志 `stop hook cap reached` → 退出。`cap = 0` 时钩子因此根本不被调用。
   3. `decision = plugin.trigger("experimental.session.stop", input, { decision: "allow" })`，`input` 按 4.4 组装，`message` 取 `lastAssistantMsg`。用 `Effect.catchAllCause` 收住 defect → 记日志 → 放行。
   4. `decision !== "block"` → 退出。`reason` 缺省或空白 → 记警告 → 退出。
-  5. 阻止：照 `compaction.ts:548-581` 落库一条用户消息（`agent` / `model` 取 `lastUser` 的），一个 text part：`text = reason`、`synthetic: true`、`metadata: { kind: "stop_hook", reason }`；`continuations += 1`；`continue`。
+  5. 阻止：照 `compaction.ts:548-581` 落库一条用户消息（`agent` / `model` 取 `lastUser` 的，`system` / `tools` 也取：`llm/request.ts` 每步从当前用户消息读逐消息 system 与工具开关，继续消息不带它们会在同一 run 里改变后续步的 system 与工具集——代码审核 2026-11-01 第 2 条），一个 text part：`text = reason`、`synthetic: true`、`metadata: { kind: "stop_hook", reason }`；`continuations += 1`；`continue`。
 - **分支覆盖**：步数上限 / 到顶 / 钩子抛错 / 放行 / 阻止无理由 / 阻止有理由，六支各一测。
 - **正确性论证**：
   - 前置：进入该分支即模型给出了最终回答且没有待执行的工具调用；出错退出分支（1241-1248）与步内 `break` 的各路径（1478-1511）都不经此处（4.4 的"不触发"清单）。
@@ -435,13 +438,13 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 - 在 Session 层维护 `Map<SessionID, { gate: Semaphore(1), waiting }>`，`patch` 整体包在 `gate.withPermits(1)` 里：读行、合并、`publish(Updated)`。照 `summary.ts:185-205` 的写法；条目在无等待者时清理。
 - **守卫**：`gate.take(1)` 经 `Effect.timeoutOrElse({ duration, orElse: die("Session.patch lock held too long or re-entered: <sessionID>") })`，再以 `acquireUseRelease` 包住读、合并、发布与 `release(1)`；只对获取计时，持有不计时。时长默认 30 秒，环境变量 `OPENCODE_SESSION_PATCH_LOCK_MS` 可改（测试缩短用，运行时不需要设）。正常锁持有毫秒级（一次行读 + 一次事务写 + 同步监听者，见 H6c），不会触发；未来的重入或卡死变成带会话 id 的 defect。
-- **调用关系**：callers: `touch` / `setTitle` / `setMetadata` / `setAgentModel` / `setPermission` / `setRevert` 等既有方法（全部经 `patch`）；callees: `get`、`events.publish`。
+- **调用关系**：callers: `touch` / `setTitle` / `setMetadata` / `setAgentModel` / `setPermission` / `setRevert` 等既有方法（全部经 `patch`），以及 `updateMetadata`（同一把锁内读-判-写，§5.2.2）；callees: `get`、`events.publish`。
 - **正确性论证**：
   - 前置：H6b——`publish` 返回时投影已写完；H6c——现状没有同步监听者回头 patch 同一会话。
   - 论证：同一会话的 patch 串行 ⇒ 每次 `get` 读到上一次 patch 的投影结果 ⇒ 合并基于最新行 ⇒ 没有旧快照覆盖（I11）。不同会话的 patch 互不阻塞。锁只覆盖 patch，正常执行路径不拿锁。
   - 后置：对任意并发 patch 序列，最终行等于某个串行执行的结果。
   - 副作用论证：无新副作用；超时守卫只在异常时 die。
-- 测试：T9（随机）——对同一会话并发执行随机的 `setTitle` / `setMetadata` / `touch` / `setAgentModel` 序列；`session.updated` 在锁内按序发布，所以事件序列就是锁选定的串行顺序，断言相邻两行之间至多一个被写字段变化（丢失的更新表现为某字段回退到旧值）且最终行等于最后一个事件的行——这等价于"每个字段等于最后一次写它的值"；重入守卫——注册一个在 `Updated` 事件里 patch 同一会话的 `listen` 监听者，断言 patch 在超时（测试里缩短）后以带会话 id 的 defect 结束而不是永久挂起；锁时长——单次 patch 的锁持有 < 50 ms。
+- 测试：T9（随机）——对同一会话并发执行随机的 `setTitle` / `setMetadata` / `touch` / `setAgentModel` 序列；`session.updated` 在锁内按序发布，所以事件序列就是锁选定的串行顺序，断言相邻两行之间至多一个被写字段变化（丢失的更新表现为某字段回退到旧值）且最终行等于最后一个事件的行——这等价于"每个字段等于最后一次写它的值"；重入守卫——注册一个在 `Updated` 事件里 patch 同一会话的 `listen` 监听者，断言 patch 在超时（测试里缩短）后以带会话 id 的 defect 结束而不是永久挂起；锁时长——单次 patch 的锁持有 < 50 ms；`updateMetadata`——并发 N 次自增一个元数据计数器，结果恰为 N（丢失更新会少），`update` 返回 undefined 时不发 `Updated` 事件且写前写后是同一对象。
 
 #### 5.2.1 `agent-management/run.ts`（新，纯函数）
 
@@ -467,19 +470,20 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
   ```ts
   let started = false // work 闭包：首次执行是新 run，之后都是 re-arm（H9）
+  let own: number | undefined // 本次执行持有的记录号；打开写失败时为 undefined
   const work = Effect.gen(function* () {
     const fresh = !started
     started = true
     yield* status.set(id, { type: "busy" }) // 先置 busy，再开记录（H9b）
-    yield* recordRunStart(session, fresh)
+    own = yield* recordRunStart(id, parentID, fresh)
     return yield* runLoop(id)
   }).pipe(
     Effect.onExit((exit) =>
       Effect.gen(function* () {
         const unconsumed = Exit.isSuccess(exit) && (yield* hasUnconsumedTurn(id)) // 只读一次（H10）
         const outcome = unconsumed ? undefined : classifyExit(id, exit, limits) // 分类也只做一次
-        if (outcome) yield* recordRunEnd(id, outcomeOf(outcome.kind))
-        if (notify) yield* reportRunEnd(session, parentID, outcome)
+        const closed = outcome ? yield* recordRunEnd(id, outcomeOf(outcome.kind), own) : undefined
+        if (notify) yield* reportRunEnd(session, parentID, outcome, closed)
       }),
     ),
   )
@@ -487,16 +491,17 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
   **必须是一个 `onExit` 内顺序调用**，不能挂两个 `onExit`（后挂的先跑，报告会读到未关闭的记录）。
 
-- 原子性只到 patch 级：`recordRunStart` / `recordRunEnd` 的"重读元数据再整体写回"在锁外，锁保证的是 `setMetadata` 内部的读合并不与其他 patch 交错。元数据级的并发写方只有 run 记录自己（一次 run 一个 fiber，顺序执行）和 HTTP `session.update`（已知破坏路径），`agentName` 等键在创建后不再写，所以没有第二个写方可抹掉。
-- `recordRunStart(id, parentID, fresh)`：重读会话元数据；唤醒消息经 `sessions.messages({ limit: 1 })` 取最新一行（不加载历史）；`wokenBy = wakeSource({ number: (previous?.number ?? 0) + 1, parent, message })`；`next = begin(previous, now, wokenBy, fresh)`；`next` 存在才 `setMetadata({ ...metadata, agentRun: next })`。任何失败记警告，run 照常。
-- `recordRunEnd(id, outcome)`：只在 `unconsumed` 为假时调用（为真则 runner 将 re-arm，同一 run 继续，不关闭）；重读元数据；`next = end(current, now, outcome)`；存在才写回，缺失记警告。
-- `reportRunEnd` 改为接收 `onExit` 已分类的 `outcome`（`undefined` 表示有未消费的消息、不是真的结束），不再自己读 `hasUnconsumedTurn`，也不再自己分类。
+- 原子性：`recordRunStart` / `recordRunEnd` 的读、判、写经 `Session.updateMetadata({ sessionID, update })` 在 patch 锁内完成——`update` 是同步纯函数，拿到现有元数据，返回要写的元数据或 undefined 表示不写；调用返回写前与写后的元数据，没写时两者是同一个对象。这是代码审核（2026-11-01，audit-report §3.2 第 1 条）改的：`Runner.cancel` 先把 runner 置 Idle 再等旧 fiber 退出，期间新 run 可以开始，于是旧 run 的收尾与新 run 的开启并发；锁外的"读—判—写"让后写者抹掉先写者：旧 run 通过归属检查后，把已被新 run 关为 lost 并开出 N+1 的记录改回 `N stopped`，N+1 的记录消失，再下一次 run 又开 N+1。其他元数据写方：HTTP `session.update`（已知破坏路径）；`agentName` 等键创建后不再写。
+- `recordRunStart(id, parentID, fresh)`：重读会话元数据；唤醒消息经 `sessions.messages({ limit: 1 })` 取最新一行（不加载历史）；`wokenBy = wakeSource({ number: (previous?.number ?? 0) + 1, parent, message })`；`next = begin(previous, now, wokenBy, fresh)`——`previous`、`wokenBy`、`next` 都在 `updateMetadata` 的 `update` 里算，`next` 存在才返回 `{ ...metadata, agentRun: next }`；父会话的名字与最新消息在锁外先读好，它们不是争用的数据。返回本次 run 持有的记录号，即写后元数据里的记录号：新开的号，re-arm 时仍打开的那个号。任何失败记警告，run 照常，返回 undefined——它什么都不持有。
+- `recordRunEnd(id, outcome, own)`：只在 `unconsumed` 为假时调用（为真则 runner 将 re-arm，同一 run 继续，不关闭）；在 `updateMetadata` 的 `update` 里：记录号 ≠ `own`（含 `own` 为 undefined）或记录已关闭 → 不写：取消中的 run 收尾时，下一 run 可能已把它的记录关为 lost 并开了新号；打开写失败的 run 则可能面对一条它没开的遗留记录——两者都不是它的；否则写 `end(current, now, outcome)`。没写（写前写后相同）→ 记一条警告（带 `own` 与现有记录号）、返回 undefined；写了 → 返回写后的记录。
+- `reportRunEnd` 改为接收 `onExit` 已分类的 `outcome`（`undefined` 表示有未消费的消息、不是真的结束）与刚关闭的记录 `closed`（没关成为 undefined，报告就不带 run 属性），不再自己读 `hasUnconsumedTurn`，也不再自己分类。
 - **正确性论证**：
   - 前置：runner 对一次 run 恰执行一次 work，re-arm 重跑同一 work（H9）；runner 自己在临界区内再读一次 `hasUnconsumedTurn` 决定是否 re-arm（H10）。
+  - **归属**（外部审核 2026-11-01 的两条 P2）：`cancel` 先把 runner 置 Idle 再中断 fiber，被中断 fiber 的 `onExit` 可能晚于下一 run 的 `recordRunStart`（它把旧记录关为 lost、开出 N+1）；不看归属，旧 run 的收尾会把 N+1 关成 stopped。打开写失败的 run 什么都没开，遗留的打开记录不是它的；不看归属，一次完成会冒用遗留号，报告也带上这个号。所以关闭以"记录号 = 持有号"为前提，持有号在 work 闭包里随每次（重）启动刷新。
   - 论证：新 run 与 re-arm 由闭包标志区分，与记录状态无关，崩溃或写失败不能让新 run 被误判为 re-arm（I5）。`onExit` 内只读一次，记录关闭与报告看到同一个答案：要么都认为 run 继续（都不动），要么都认为 run 结束（先关闭，后报告读到已关闭的记录，I6）。
   - **与 runner 读数不同的窗口**：消息恰落在 `onExit` 的读与 runner 的读之间时，这里判"结束"——记录关为 completed、报告 run N 发出——而 runner 判"续跑"，重跑同一 work：`fresh = false`，`begin` 看到记录已关闭，按 §5.2.1 开 run N+1，`woken_by` 取那条消息。续跑的结果以 run N+1 报告。父看到的序列是"run N 完成报告 → run N+1 完成报告"，与它随后发 `agent_send` 时读到的"starts run N+1"一致，不会出现两份同号报告，也不会有静默的续跑。这个窗口与 #32 修复后的现状相同，不扩大。
   - busy 先于记录：H9b 消除"记录已打开、状态还是 idle"的启动窗口，agent_send 与 agent_status 不会把刚启动的 run 说成 cut off。
-  - 后置：每次 run 至多一次开始写入、至多一次结束写入。
+  - 后置：每次 run 至多一次开始写入、至多一次结束写入；结束写入只落在本 run 持有号的记录上。
   - 副作用论证：至多两次 `setMetadata`（经 5.2.0 的锁）加一次内存状态置位；记账失败不影响 run。
 
 #### 5.2.3 `AgentInbox.deliver` 的标记（`inbox.ts:114-122`，#73 服务端）
@@ -513,8 +518,8 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 #### 5.2.5 测试
 
-- run 记录：首次 run 为 1 且 `woken_by` 为父；agent_send 唤醒的 run 加一且来源为发送方，`previous` 为上一个 run 的结束；结束报告唤醒祖辈时来源为发报告的子；人经 agent-message 路由唤醒为 user，经普通 prompt 端点为 system；re-arm（记录打开）不加号；`agent_stop` 记 `stopped`；钩子阻止不加号、不写 `ended_at`；遗留打开记录在新 run 开始时关为 `lost` 且新 run 号加一；结束写失败后的下一次 run 仍加一；续跑窗口（消息落在 `onExit` 读与 runner 读之间，用 Deferred 控制）产生 run N 报告与 run N+1 报告各一份；新 run 启动的头几毫秒内状态已是 busy。
-- T3（随机，run 层）：两个子并发、各自顺序跑 2–4 次 run，8 个种子。每次 run 随机取唤醒来源（父 / agent 消息 / TUI 路由 / 普通 prompt）、结局（完成 / length 失败 / 挂住时被取消）与形态之一：普通；中途插入消息（同一 run 读到）；最后一轮结束时插入消息（content-filter 收尾，runner re-arm，同一 run 继续）；续跑窗口（在关闭记录的 `session.updated` 监听里插消息，恰落在 `onExit` 与 runner 两次读之间，run N 关闭、run N+1 开启）；结束写失败（测试用一层包装的 Session.Service 让关闭记录的 `setMetadata` 死一次，走真实的 catch 分支）；另随机在 run 前写入崩溃遗留的打开记录。经真实 `loop` 执行，断言：每个子的 run 号严格 +1，re-arm 不加号，续跑窗口加一号且两份报告；`woken_by` 符合四条规则；`ended_at ≥ started_at`；写失败与遗留的记录在下一次开始时被关为 lost；报告份数 = 完成与失败的 run 数（被取消的不报）；每条记录打开时会话已是 busy（INV-13）。报告对号（INV-6）与 agent_send 预告（INV-6b）要等 commit 4 给报告加 run 属性，届时扩 T3。
+- run 记录：首次 run 为 1 且 `woken_by` 为父；agent_send 唤醒的 run 加一且来源为发送方，`previous` 为上一个 run 的结束；结束报告唤醒祖辈时来源为发报告的子；人经 agent-message 路由唤醒为 user，经普通 prompt 端点为 system；re-arm（记录打开）不加号；`agent_stop` 记 `stopped`；钩子阻止不加号、不写 `ended_at`；遗留打开记录在新 run 开始时关为 `lost` 且新 run 号加一；结束写失败后的下一次 run 仍加一；续跑窗口（消息落在 `onExit` 读与 runner 读之间，用 Deferred 控制）产生 run N 报告与 run N+1 报告各一份；新 run 启动的头几毫秒内状态已是 busy；取消中的 run 收尾时下一 run 的记录已在（测试在取消前写入），收尾不动它、不发报告；打开写失败的 run 遇到遗留打开记录：记录原样、报告不带 run 属性，下一 run 把遗留关为 lost 并取下一个号。
+- T3（随机，run 层）：两个子并发、各自顺序跑 2–4 次 run，8 个种子。每次 run 随机取唤醒来源（父 / agent 消息 / TUI 路由 / 普通 prompt）、结局（完成 / length 失败 / 挂住时被取消）与形态之一：普通；中途插入消息（同一 run 读到）；最后一轮结束时插入消息（content-filter 收尾，runner re-arm，同一 run 继续）；续跑窗口（在关闭记录的 `session.updated` 监听里插消息，恰落在 `onExit` 与 runner 两次读之间，run N 关闭、run N+1 开启）；结束写失败（测试用一层包装的 Session.Service 让关闭记录的 `setMetadata` 死一次，走真实的 catch 分支）；开始写失败（同一包装让打开记录的写入死一次：记录原样、无报告号、不进号）；取消时下一 run 已开启（取消前写入下一 run 的记录，收尾不得改它）；另随机在 run 前写入崩溃遗留的打开记录。经真实 `loop` 执行，断言：每个子的 run 号严格 +1，re-arm 不加号，续跑窗口加一号且两份报告；`woken_by` 符合四条规则（记录号为 1 即记父，包括首次 run 开始写失败之后的那次）；`ended_at ≥ started_at`；写失败与遗留的记录在下一次开始时被关为 lost；报告份数 = 完成与失败的 run 数（被取消的不报）；每条记录打开时会话已是 busy（INV-13）。报告对号（INV-6）与 agent_send 预告（INV-6b）要等 commit 4 给报告加 run 属性，届时扩 T3。
 
 ### 5.3 commit 3：末尾段进度视图
 
@@ -531,18 +536,18 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 #### 5.3.2 `runLoop` 中的数据采集（`prompt.ts:1434` 组装 tail 处）
 
-- runLoop 级状态 `previousStepStart`：初值为 runLoop 进入时间（本 run 第一步没有上一步，用 run 开始）；每步进入时先把当前值交给本步使用，再记 `Date.now()`。
+- runLoop 级状态 `previousStepStart`：初值为 runLoop 进入时间（本 run 第一步没有上一步，用 run 开始）；在组装视图处用它算窗口，然后记为本次视图的 `now`。只有真正发给模型的步推进它：压缩、子任务、溢出恢复这些不出视图就 `continue` 的迭代不算"上一步"，否则一次长压缩会把窗口下界推到真实上一步之后，期间结束的子就漏掉（代码审核 2026-11-01 第 3 条）。
 - 采集（`catchAll` 到 `undefined` → 整节省略）：
   1. 权限门：`Permission.evaluate(AGENT_LIST_TOOL_ID, "*", merged)` 为 deny → 不附带（与 `reminders.ts:94-97` 同一规则）。
   2. **一次 SQL**：`sessions.children(id)`（`session.ts:688-696`，`where parent_id = ?`，一次查询、一次 hydrate）。为空 → 不附带。
-  3. 状态投影取一次 `status.list()`（内存，一次拷贝；实施时从逐子 `get` 改为一次 `list`：600 个子时逐次 Effect 调用的开销就占去大半预算），对每行：`running = type ∈ {busy, retry}`、`lastStep = at`；`run = metadata.agentRun`；名字 = `metadata.agentName`；`created = time.created`。采集放在 `StepTail.collectSubagents({ sessions, status, parentID })`，服务经参数显式传入（`Pick<Interface, "children">` / `Pick<Interface, "list">`），它能到达存储的路只有 `children` 这一条。
+  3. 状态投影取一次 `status.list()`（内存，一次拷贝；实施时从逐子 `get` 改为一次 `list`：600 个子时逐次 Effect 调用的开销就占去大半预算），对每行：`running = AgentStatusProjection.project(status) === "running"`（与 `agent_list` 同一映射函数）、`lastStep = at`；`run = metadata.agentRun`；名字 = `metadata.agentName`；`created = time.created`。采集放在 `StepTail.collectSubagents({ sessions, status, parentID })`，服务经参数显式传入（`Pick<Interface, "children">` / `Pick<Interface, "list">`），它能到达存储的路只有 `children` 这一条。
   4. `windowStart = min(now − 10 min, previousStepStart)`。
   5. 自身位置：子会话取自己的 `agentRun.number`（本步开始时已写），主会话无；步号 = `step`。
 - `tail = StepTail.render([renderSubagents(...), renderRepeat(repeat)])`。
 - 同一 commit 删除 `applyAgentRoster` 的注入与调用（`reminders.ts:56-153`、`prompt.ts:1335-1339`），保留 `AGENT_ROSTER_SENTINEL`；相关测试改为断言不再注入。
 - **正确性论证**：
   - 读取量：一次 SQL 加一次内存投影拷贝，N 为直接子数；不读消息、不读部件、不算 depth。600 个直接子实测采集加渲染在负载 12 的机器上仍在 50 ms 内（expectations §8 的断言）。
-  - 窗口的保底项保证"任何结束至少被下一步看到一次"：结束时间 ≥ 上一步开始 ⇒ 在本步窗口内；第一步用 run 开始时间，run 开始前结束的由 10 分钟项覆盖。
+  - 窗口的保底项保证"任何结束至少被下一步看到一次"：结束时间 ≥ 上一次视图的时刻（上一个真实步的开始）⇒ 在本步窗口内；第一步用 run 开始时间，run 开始前结束的由 10 分钟项覆盖。
   - 权限门与被删除的花名册同一条规则，信息暴露面不变。
   - 副作用：无（只读）。
 - 测试（`prompt.test.ts`）：无子不附带；`agent_list` deny 不附带；进度视图与重复计数共存且节序正确（视图在前，重复计数收尾）；相邻三步请求的历史部分逐字相同（扩展 R1），视图与时钟都不进历史；花名册不再写入历史；600 个直接子的采集只调一次 `children`、不超过 50 ms。"30 分钟长步"与"首步用 run 开始"无法在真实时钟下集成验证，由 `StepTail.windowStart` 的单元测试与 `runLoop` 里 `previousStepStart` 的初值、每步更新两行代码承担。
@@ -578,12 +583,12 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 #### 5.5.1 `agent_status(params, ctx)`（`tool/agent.ts` 新工具，ID `agent_status`）
 
-1. `resolveTarget(caller, params.target, "neighbor")`，失败渲染同 `agent_send`。
-2. `Permission.evaluate(AGENT_LIST_TOOL_ID, "*", merged ruleset)` 为 deny → 返回失败文本（I9 执行期的一半）。`agent_list` 自身没有执行期检查，只靠工具表隐藏；这里多一道是有意的不对称，安全方向正确，文档写明。
-3. `neighborhood(caller)` 取成员（含 relation 与 `run`）；目标不在邻居集合内（例如用 session_id 指向孙辈）→ 失败文本，范围与 `agent_list` 严格相同；`status.get(target)` 取最后一步时间。
-4. 按 4.7 渲染（run 行五种写法）。
+1. `Permission.evaluate(AGENT_LIST_TOOL_ID, "*", merged ruleset)` 为 deny → 返回失败文本（I9 执行期的一半）。先于解析：重名的失败文本列出候选 session_id，被拒的调用者不该拿到（外部审核 2026-11-01）。`agent_list` 自身没有执行期检查，只靠工具表隐藏；这里多一道是有意的不对称，安全方向正确，文档写明。
+2. `resolveTarget(caller, params.target, "neighbor")`，失败渲染同 `agent_send`。
+3. `neighborhood(caller)` 取成员（含 relation 与 `run`）；目标不在邻居集合内（例如用 session_id 指向孙辈）→ 失败文本，范围与 `agent_list` 严格相同；`status.get(target)` 一次取状态与最后一步时间（状态经 `AgentStatusProjection.project`，与 `agent_list` 同一映射；读两次会各看一个瞬间）。
+4. 按 4.7 渲染（run 行五种写法；非子会话没有 run 与 previous run 行，在跑时仍有 last step 行）。
 
-- **正确性论证**：解析范围与 `agent_list` 同为邻居；步骤 2 使"禁用 agent_list 的配置不会经 agent_status 泄露同样的信息"成立；run 行五种写法由 `status × 记录状态` 穷尽。副作用：无。
+- **正确性论证**：解析范围与 `agent_list` 同为邻居；步骤 1 使"禁用 agent_list 的配置不会经 agent_status 泄露同样的信息"成立，且先于步骤 2，连候选 session_id 也不泄露；run 行五种写法由 `status × 记录状态` 穷尽。副作用：无。
 
 #### 5.5.2 可见性
 
@@ -598,7 +603,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 2. 过滤：`relation`、`status`、`query`（实例名或标题子串，大小写不敏感，匹配转义前的原文）。
 3. 统计 `total / running / idle`（过滤后）。
 4. 排序：自己在前；在跑在前；其余按活动时间（`last ?? time_created`）倒序；并列按 session_id。
-5. 截断到 `limit ?? 50`；渲染表与计数行。
+5. 截断到 `limit ?? 50`；渲染表与计数行（`workdir` 路径与 name / title 一样经 `escapeField`：它可来自模型给的 cwd）。
 
 - **正确性论证**：结果 ⊆ 过滤后的集合 ⊆ 邻居；计数行按截断前的集合算，所以 `shown ≤ total`；默认上限是有意的行为改变，描述里写明。
 - T4（随机）：随机生成邻居集合（含重名、无名、无记录）与参数，断言子集关系、计数行与全集统计一致、行数 ≤ limit、排序满足定义。

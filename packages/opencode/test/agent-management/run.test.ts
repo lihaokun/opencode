@@ -111,6 +111,15 @@ describe("AgentRun.wakeSource", () => {
     })
     expect(bare).toEqual({ kind: "agent", session: other })
     expect(Object.keys(bare)).toEqual(["kind", "session"])
+    // The sender is part metadata any client may write: one that is not a
+    // session id is nobody in particular.
+    expect(
+      AgentRun.wakeSource({
+        number: 2,
+        parent: { id: parent },
+        message: message({ kind: "agent_message", sender: "nobody" }),
+      }),
+    ).toEqual({ kind: "system" })
   })
 
   test("rule 3: the TUI's agent-message route is the user", () => {
@@ -141,9 +150,11 @@ describe("AgentRun.read", () => {
 })
 
 describe("AgentRun.describeSource", () => {
-  test("four readings, from the viewer's side", () => {
+  test("four readings, from the viewer's side; a name is escaped", () => {
     expect(AgentRun.describeSource({ kind: "agent", session: child }, child)).toBe("your message")
     expect(AgentRun.describeSource({ kind: "agent", session: other, name: "cw-1" }, child)).toBe("cw-1")
+    expect(AgentRun.describeSource({ kind: "agent", session: other, name: "a]\nb" }, child)).toBe("a\\]\\nb")
+    expect(AgentRun.describeSource({ kind: "agent", session: SessionID.make("ses]\nx") }, child)).toBe("ses\\]\\nx")
     expect(AgentRun.describeSource({ kind: "agent", session: other }, child)).toBe(other)
     expect(AgentRun.describeSource({ kind: "user" }, child)).toBe("user")
     expect(AgentRun.describeSource({ kind: "system" }, child)).toBe("system")

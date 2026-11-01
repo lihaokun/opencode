@@ -509,14 +509,15 @@ function renderTermination(
 }
 
 /**
- * Step S20: which run the stop hit, three ways (subplan agentmgmt-2-run-state
- * §4.6). `before` is what the cancel found; the record is read afterwards. A
- * run found running whose record now says stopped was stopped by this call.
- * One found running whose record is open or ended otherwise — the cancelled
- * fiber's onExit still pending, the end write failed, or the run ended on its
- * own in the window before the cancel — gets "requested", not a time nobody
- * waited for. One found idle had already ended, or was cut off: a stop on it
- * was a no-op. No record, no line.
+ * Step S20: which run the stop hit, four ways (subplan agentmgmt-2-run-state
+ * §4.6). `before` is what the cancel found; the record is read afterwards,
+ * once the cancelled fiber has wound down (the cancel awaits it). A run found
+ * running whose record now says stopped was stopped by this call. One found
+ * running whose record is open or ended otherwise — the end write failed, the
+ * run ended on its own in the window before the cancel, or a new run opened
+ * during the cancel and closed it as lost — gets "requested", not a time
+ * nobody waited for. One found idle had already ended, or was cut off: a
+ * stop on it was a no-op. No record, no line.
  */
 function runLine(state: { before: Runner.StateTag; run: AgentManagement.AgentRun | undefined; now: number }) {
   const run = state.run

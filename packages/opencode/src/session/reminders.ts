@@ -19,6 +19,8 @@ import PLAN_MODE from "./prompt/plan-mode.txt"
  * roster is retired — the step tail carries a view of the subagents on every
  * step without touching history (subplan agentmgmt-2-run-state §4.5) — but
  * the parts it wrote remain in old sessions, and this is how they are known.
+ * Nothing in src reads it any more: it is here for the tests that assert the
+ * roster is gone, and for anyone reading an old transcript.
  */
 export const AGENT_ROSTER_SENTINEL = "<!-- opencode:subagents -->"
 

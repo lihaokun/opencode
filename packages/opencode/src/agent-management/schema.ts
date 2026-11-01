@@ -15,6 +15,36 @@ import { SessionID } from "../session/schema"
 export type AgentStatus = "running" | "idle"
 
 /**
+ * Makes a model-supplied string safe to interpolate into a system-written line:
+ * a message header's fields, a row of agent_list, a line of the step tail.
+ *
+ * A name and an agent type both come from the model, and both land inside the
+ * first line of a message. Left alone, a name containing `]` and a newline ends
+ * that line early and starts whatever it likes on the next one — a second
+ * message header, for instance.
+ *
+ * Encoding, not stripping: stripping renders `a\nb` and `ab` the same, so two
+ * different agents become indistinguishable. And the backslash has to go first,
+ * or a real newline encodes to `\n` and collides with a name that literally
+ * contained those two characters, which loses the same property by a longer
+ * route.
+ *
+ * What this guarantees is about the header's fields, not about the whole
+ * message: a body is free to contain anything, `[Agent message from …`
+ * included, because the boundary is the first line and the first line is built
+ * entirely from encoded fields.
+ */
+export function escapeField(value: string) {
+  return value
+    .replaceAll("\\", "\\\\")
+    .replaceAll("\r", "\\r")
+    .replaceAll("\n", "\\n")
+    .replaceAll("\t", "\\t")
+    .replaceAll("[", "\\[")
+    .replaceAll("]", "\\]")
+}
+
+/**
  * How many Agents the neighbour snapshot will name. (The roster that shared
  * this cap is retired; the step tail's view has its own, StepTail.LIST_ROWS.)
  *

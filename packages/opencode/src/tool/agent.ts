@@ -13,6 +13,7 @@ import { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
 import { MessageV2 } from "../session/message-v2"
 import { Session } from "@/session/session"
+import { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
 import { PositiveInt } from "@opencode-ai/core/schema"
 
@@ -255,8 +256,8 @@ export const AgentTool = Tool.define(
 )
 
 /** `last` for a row, and the activity it is sorted by: the run's start or end, whichever is later. */
-function activityOf(member: AgentManagement.AgentSkeleton) {
-  return member.run ? Math.max(member.run.started_at, member.run.ended_at ?? 0) : undefined
+function activityOf(run: AgentManagement.AgentRun) {
+  return Math.max(run.started_at, run.ended_at ?? 0)
 }
 
 function compare(a: string, b: string) {
@@ -306,25 +307,27 @@ export const AgentListTool = Tool.define(
           if ((a.relation === "self") !== (b.relation === "self")) return a.relation === "self" ? -1 : 1
           if ((a.status === "running") !== (b.status === "running")) return a.status === "running" ? -1 : 1
           return (
-            (activityOf(b) ?? b.time_created) - (activityOf(a) ?? a.time_created) || compare(a.session_id, b.session_id)
+            (b.run ? activityOf(b.run) : b.time_created) - (a.run ? activityOf(a.run) : a.time_created) ||
+            compare(a.session_id, b.session_id)
           )
         })
         .slice(0, params.limit ?? DEFAULT_LIST_LIMIT)
       const rows = shown.map((member) => ({
         session_id: member.session_id,
-        // name, agent_type and title all originate with the model and land in
-        // a tab-separated table read by another model. A tab shifts the
-        // columns and a newline forges an entire row -- session_id included,
-        // which is the field a reader routes on. The same encoding the message
-        // header uses, for the same reason.
+        // name, agent_type, title and the workdir path (a cwd the model gave)
+        // all originate with the model and land in a tab-separated table read
+        // by another model. A tab shifts the columns and a newline forges an
+        // entire row -- session_id included, which is the field a reader
+        // routes on. The same encoding the message header uses, for the same
+        // reason.
         name: AgentInbox.escapeField(member.name ?? ""),
         agent_type: AgentInbox.escapeField(member.agent_type ?? ""),
         relation: member.relation,
         status: member.status,
         run: member.run ? String(member.run.number) : "",
-        last: member.run ? AgentRun.formatInstant(activityOf(member) ?? member.time_created) : "",
+        last: member.run ? AgentRun.formatInstant(activityOf(member.run)) : "",
         title: AgentInbox.escapeField(member.title),
-        workdir: member.workdir?.path ?? "",
+        workdir: AgentInbox.escapeField(member.workdir?.path ?? ""),
       }))
 
       const header = ["session_id", "name", "agent_type", "relation", "status", "run", "last", "title", "workdir"]
@@ -355,7 +358,6 @@ export const AgentStatusTool = Tool.define(
   AGENT_STATUS_TOOL_ID,
   Effect.gen(function* () {
     const tree = yield* AgentTree.Service
-    const projection = yield* AgentStatusProjection.Service
     const status = yield* SessionStatus.Service
     const sessions = yield* Session.Service
     const agents = yield* Agent.Service
@@ -364,15 +366,11 @@ export const AgentStatusTool = Tool.define(
       params: Schema.Schema.Type<typeof StatusParameters>,
       ctx: Tool.Context,
     ) {
-      // Step S22: the same reach as agent_list, the same gate, then one member.
-      const target = yield* tree
-        .resolveTarget({ caller: ctx.sessionID, value: params.target, scope: "neighbor" })
-        .pipe(Effect.catch((error) => Effect.succeed(error)))
-      if (typeof target !== "string") return failed<StatusMeta>(params.target, target.message)
-
-      // agent_list's deny, applied here at execution as well as at the tool
-      // table: this is agent_list for one row, and must not hand out what the
-      // other was denied (I9). Merged the way tools.ts merges it.
+      // Step S22: the gate first, then the same reach as agent_list, then one
+      // member. agent_list's deny applies here at execution as well as at the
+      // tool table: this is agent_list for one row, and must not hand out what
+      // the other was denied (I9) — not even the candidates an ambiguous name
+      // would list. Merged the way tools.ts merges it.
       const self = yield* sessions.get(ctx.sessionID).pipe(Effect.orDie)
       const definition = yield* agents.get(ctx.agent)
       const ruleset = Permission.merge(definition?.permission ?? [], self.permission ?? [])
@@ -382,6 +380,11 @@ export const AgentStatusTool = Tool.define(
           "agent_list is denied for you, and agent_status shows the same information.",
         )
       }
+
+      const target = yield* tree
+        .resolveTarget({ caller: ctx.sessionID, value: params.target, scope: "neighbor" })
+        .pipe(Effect.catch((error) => Effect.succeed(error)))
+      if (typeof target !== "string") return failed<StatusMeta>(params.target, target.message)
 
       const neighborhood = yield* tree.neighborhood(ctx.sessionID).pipe(Effect.catch((error) => Effect.succeed(error)))
       if ("_tag" in neighborhood) return failed<StatusMeta>(params.target, neighborhood.message)
@@ -393,8 +396,10 @@ export const AgentStatusTool = Tool.define(
         )
       }
 
-      const state = yield* projection.of(target)
+      // One read of the projection for the state and the last step both, so
+      // the two describe the same instant.
       const current = yield* status.get(target)
+      const state = AgentStatusProjection.project(current)
       return {
         title: params.target,
         metadata: { target } satisfies StatusMeta,
@@ -405,7 +410,7 @@ export const AgentStatusTool = Tool.define(
           `relation: ${member.relation}`,
           `status: ${state}`,
           ...runLines(member, state, current.at, ctx.sessionID),
-          `workdir: ${member.workdir?.path ?? ""}`,
+          `workdir: ${AgentInbox.escapeField(member.workdir?.path ?? "")}`,
         ].join("\n"),
       }
     })
@@ -424,36 +429,45 @@ export const AgentStatusTool = Tool.define(
  * The run lines of agent_status (subplan agentmgmt-2-run-state §4.7): the run
  * in one of five shapes by state and record, the run before when the record
  * keeps one, and the last step while running. A session that is nobody's
- * subagent has no record to speak of and gets none of them.
+ * subagent has no record to speak of, so it gets only the last step.
  */
 function runLines(
   member: AgentManagement.AgentSkeleton,
   state: AgentManagement.AgentStatus,
   lastStep: number | undefined,
-  viewer: Parameters<typeof AgentRun.describeSource>[1],
+  viewer: SessionID,
 ) {
-  if (member.parent_id === undefined) return []
+  const last = state === "running" && lastStep !== undefined ? [`last step: ${AgentRun.formatInstant(lastStep)}`] : []
+  if (member.parent_id === undefined) return last
   const run = member.run
-  const ended = run ? AgentRun.ended(run) : undefined
-  const line =
-    state === "running"
-      ? run && !ended
-        ? `${run.number}, started ${AgentRun.formatInstant(run.started_at)}, woken by ${AgentRun.describeSource(run.woken_by, viewer)}`
-        : "record not updated yet"
-      : !run
-        ? "none yet"
-        : ended
-          ? `${run.number}, ended ${AgentRun.formatInstant(ended.ended_at)} (${ended.outcome})`
-          : `${run.number}, started ${AgentRun.formatInstant(run.started_at)}, cut off (will be recorded as lost)`
   return [
-    `run: ${line}`,
+    `run: ${runLine(state, run, viewer)}`,
     ...(run?.previous
       ? [
           `previous run: ${run.previous.number}, ended ${AgentRun.formatInstant(run.previous.ended_at)} (${run.previous.outcome})`,
         ]
       : []),
-    ...(state === "running" && lastStep !== undefined ? [`last step: ${AgentRun.formatInstant(lastStep)}`] : []),
+    ...last,
   ]
+}
+
+/**
+ * The five shapes of the run line, by state and record. Open means no
+ * `ended_at`, as begin and end define it, so this reads a record the way the
+ * next start will: one with an end time but no outcome is closed here and
+ * continued as the next number there.
+ */
+function runLine(state: AgentManagement.AgentStatus, run: AgentManagement.AgentRun | undefined, viewer: SessionID) {
+  if (state === "running") {
+    if (run && run.ended_at === undefined) {
+      return `${run.number}, started ${AgentRun.formatInstant(run.started_at)}, woken by ${AgentRun.describeSource(run.woken_by, viewer)}`
+    }
+    return "record not updated yet"
+  }
+  if (!run) return "none yet"
+  const ended = AgentRun.ended(run)
+  if (ended) return `${run.number}, ended ${AgentRun.formatInstant(ended.ended_at)} (${ended.outcome})`
+  return `${run.number}, started ${AgentRun.formatInstant(run.started_at)}, cut off (will be recorded as lost)`
 }
 
 export const AgentSendTool = Tool.define(

@@ -15,34 +15,10 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/AgentInbox") {}
 
-/**
- * Makes a model-supplied string safe to interpolate into a system-written line.
- *
- * A name and an agent type both come from the model, and both land inside the
- * first line of a message. Left alone, a name containing `]` and a newline ends
- * that line early and starts whatever it likes on the next one — a second
- * message header, for instance.
- *
- * Encoding, not stripping: stripping renders `a\nb` and `ab` the same, so two
- * different agents become indistinguishable. And the backslash has to go first,
- * or a real newline encodes to `\n` and collides with a name that literally
- * contained those two characters, which loses the same property by a longer
- * route.
- *
- * What this guarantees is about the header's fields, not about the whole
- * message: a body is free to contain anything, `[Agent message from …`
- * included, because the boundary is the first line and the first line is built
- * entirely from encoded fields.
- */
-export function escapeField(value: string) {
-  return value
-    .replaceAll("\\", "\\\\")
-    .replaceAll("\r", "\\r")
-    .replaceAll("\n", "\\n")
-    .replaceAll("\t", "\\t")
-    .replaceAll("[", "\\[")
-    .replaceAll("]", "\\]")
-}
+// The field encoding lives with the other shared definitions (it is used by
+// the pure run and step-tail modules too) and stays reachable here, where
+// every message header has always taken it from.
+export { escapeField } from "./schema"
 
 /**
  * The header line for a message from the human, sent through the TUI's
@@ -59,8 +35,8 @@ export const USER_MESSAGE_HEADER = "[Message from user]"
  * ambiguous, while a session_id works from anywhere.
  */
 export function render(message: AgentManagement.AgentMessage) {
-  const name = message.sender_name === undefined ? undefined : escapeField(message.sender_name)
-  const agent = escapeField(message.sender_agent ?? "agent")
+  const name = message.sender_name === undefined ? undefined : AgentManagement.escapeField(message.sender_name)
+  const agent = AgentManagement.escapeField(message.sender_agent ?? "agent")
   const who = name ? `${name} (${agent}, ${message.sender})` : `${agent} (${message.sender})`
   return [
     `[Agent message from ${who}]`,

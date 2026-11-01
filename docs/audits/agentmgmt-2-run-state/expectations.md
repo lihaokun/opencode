@@ -31,7 +31,7 @@
 | TextPart.metadata（agent 消息）                   | `{ kind: "agent_message", sender, sender_name?, sender_agent? }`                                                                                                                                                                                       | 主契约 §4.3   | `agent-management/inbox.ts`                 | 模型文本不变（INV-10）                                                               |
 | TextPart.metadata（agent-message 路由的头行）     | `{ kind: "user_message" }`                                                                                                                                                                                                                             | 主契约 §4.3   | 同上                                        | 同上                                                                                 |
 | TextPart.metadata（结束报告）                     | 既有 `{ kind: "agent_notification", summary }` + `sender, sender_name?, sender_agent?`                                                                                                                                                                 | 主契约 §4.3   | `session/prompt.ts` reportRunEnd            | 同上；TUI 只读 summary                                                               |
-| TextPart.metadata（钩子继续消息）                 | `{ kind: "stop_hook", reason }`，part `synthetic: true`，text = reason                                                                                                                                                                                 | 主契约 §4.4   | `session/prompt.ts` runLoop                 | 合成消息；TUI 渲染见 #90                                                             |
+| TextPart.metadata（钩子继续消息）                 | `{ kind: "stop_hook", reason }`，part `synthetic: true`，text = reason，消息的 agent / model / system / tools 取 lastUser 的                                                                                                                           | 主契约 §4.4   | `session/prompt.ts` runLoop                 | 合成消息；TUI 渲染见 #90                                                             |
 | Hook input                                        | `{ sessionID, parentID?, agent, message: { info: AssistantMessage, parts: Part[] }, continuations: NonNegativeInt }`（`agent` 是本轮用户消息的 agent；continuations 由钩子之外的新用户消息与工具调用清零）                                             | 主契约 §4.4   | `plugin/src/index.ts` + `session/prompt.ts` | 类型声明 + 测试断言输入形状                                                          |
 | Hook output                                       | `{ decision: "allow" \| "block"; reason?: string }`，默认 allow                                                                                                                                                                                        | 主契约 §4.4   | 同上                                        | block 无 reason ⇒ 视为 allow；后写者胜                                               |
 | Config.stop_hook_block_cap                        | `NonNegativeInt`，缺省 8；0 = 不调用钩子                                                                                                                                                                                                               | 主契约 §4.4   | `core/src/v1/config/config.ts`              | schema 校验                                                                          |
@@ -49,7 +49,7 @@
 | `Runner.cancel` / `SessionRunState.cancel` 返回值 | 取消前状态标签 `Idle \| Running \| Shell \| ShellThenRun`（无 runner 时 `Idle`）                                                                                                                                                                       | 主契约 §5.4.2 | `effect/runner.ts`、`session/run-state.ts`  | renderTermination 三分支                                                             |
 | agent_send 返回首句                               | 六种写法见主契约 §4.6；末尾恒加 `Current state of one agent: agent_status(target="…").`                                                                                                                                                                | 主契约 §4.6   | `tool/agent.ts`                             | 测试六例                                                                             |
 | agent_status 参数                                 | `{ target: string }`                                                                                                                                                                                                                                   | 主契约 §4.7   | `tool/agent.ts`                             | schema                                                                               |
-| agent_status 返回行                               | `session_id / name / agent_type / relation / status / run / previous run / last step / workdir`，run 行五种写法                                                                                                                                        | 主契约 §4.7   | 同上                                        | 测试逐行                                                                             |
+| agent_status 返回行                               | `session_id / name / agent_type / relation / status / run / previous run / last step / workdir`，run 行五种写法；非子会话无 run 与 previous run 行，在跑时有 last step 行                                                                              | 主契约 §4.7   | 同上                                        | 测试逐行                                                                             |
 | agent_status 失败文本                             | 被拒 `agent_list is denied for you, and agent_status shows the same information.`；非邻居 `<id> is not one of your neighbours; only yourself, your parent, your direct children and your siblings can be looked up.`；名字零匹配 / 多匹配同 agent_send | 主契约 §3     | `tool/agent.ts`                             | 测试两例                                                                             |
 | agent_list 参数                                   | `{ status?, relation?, query?, limit? }`，limit 缺省 50                                                                                                                                                                                                | 主契约 §4.7   | 同上                                        | schema；§3 枚举                                                                      |
 | agent_list 列                                     | `session_id / name / agent_type / relation / status / run / last / title / workdir`；`last` 为 ISO 或空                                                                                                                                                | 主契约 §4.7   | 同上                                        | 测试表头与行                                                                         |
@@ -80,7 +80,7 @@
 - S2 连续上限：`continuations >= cap` → 记日志 → 退出（cap = 0 即永不询问）
 - S3 触发钩子，`catchAllCause`（抛错 → 记日志 → 放行）
 - S4 `decision !== "block"` 或 reason 空白 → 退出（空白记警告）
-- S5 阻止：落库合成用户消息（text = reason，metadata stop_hook），`continuations + 1`，继续
+- S5 阻止：落库合成用户消息（text = reason，metadata stop_hook；消息的 agent / model / system / tools 取 lastUser 的），`continuations + 1`，继续
 - S6 清零：循环顶部最新用户消息无 `stop_hook` 标记 → `continuations = 0`；`hasToolCalls` 为真 → `continuations = 0`；每步 `isLastStep` 为真 → `lastStepReached = true`
 - S7 Hooks 类型与 `customize-opencode.md` 条目
 
@@ -92,8 +92,8 @@
 **run 记录（commit 2，`loop` 的 work 包装）**
 
 - S10 闭包标志：首次执行 `fresh = true`，re-arm 为 false；work 先 `status.set busy`
-- S11 开始：重读元数据 → 遗留打开记录关为 lost 入 previous；续跑遇已关闭记录按新 run → `wakeSource` → `begin` → 有新值才写回
-- S12 结束：`onExit` 内读一次 `hasUnconsumedTurn` → 为真不关闭；否则 `outcomeOf` → `end` → 写回 → 再 `reportRunEnd(unconsumed)`
+- S11 开始（`Session.updateMetadata`，patch 锁内读-判-写）：重读元数据 → 遗留打开记录关为 lost 入 previous；续跑遇已关闭记录按新 run → `wakeSource` → `begin` → 有新值才写回 → 返回本次 run 持有的号（新开的，或 re-arm 时仍打开的；写失败为 undefined）
+- S12 结束（同一把锁内判归属并写）：`onExit` 内读一次 `hasUnconsumedTurn` → 为真不关闭；否则 `outcomeOf` → 记录号 = 本次 run 持有的号才 `end` → 写回 → 再 `reportRunEnd(outcome, closed)`；号不符（取消收尾与下一 run 开启重叠、打开写失败后的遗留记录）→ 不关、报告无 run 属性
 
 **消息标记（commit 2，`deliver`）**
 
@@ -115,7 +115,7 @@
 
 **agent_status / agent_list（commit 5）**
 
-- S22 `agent_status`：resolveTarget(neighbor) → `agent_list` 权限求值 → 读取 → 渲染（run 行五种）
+- S22 `agent_status`：`agent_list` 权限求值 → resolveTarget(neighbor) → 读取 → 渲染（run 行五种；非子会话只有 last step 行）
 - S23 `agent_list`：组装 → 过滤 → 统计 → 排序（self 置顶 → 在跑 → 活动倒序 → id）→ 截断 → 计数行
 - S24 可见性：`AGENT_TOOL_IDS` 与 `visibleAgentTools` 并列；`Permission.disabled` 别名 `agent_status→agent_list`
 
@@ -131,7 +131,7 @@
 - `agent_send` 的六种措辞按投递前快照选择；非子会话只写 running / idle；末尾恒附 `agent_status` 提示行；既有三句单向消息说明保留；stopped / lost 的第二句不假定停止者是调用者。
 - `agent_status` 的可查范围、解析与权限与 `agent_list` 完全相同；`agent_list` 被禁用时 `agent_status` 不出现在工具表、执行也被拒（有意的不对称：`agent_list` 自身无执行期检查）。
 - `agent_list` 不带参数时默认上限 50；计数行按过滤后、截断前的集合统计；`query` 不匹配 `agent_type`；自己的行恒在第一行（§6 第 18 点）。
-- 进度视图只在有直接子且 `agent_list` 非 deny 的会话出现；两个列表各最多 10 行；窗口至少覆盖上一步开始以来，首步为 run 开始以来；cut off 行不受窗口限制；"last step" 是状态投影最近一次置 busy 的时间；花名册不再写入历史。
+- 进度视图只在有直接子且 `agent_list` 非 deny 的会话出现；两个列表各最多 10 行；窗口至少覆盖上一次带视图的步开始以来（压缩等不出视图的迭代不推进它），首步为 run 开始以来；cut off 行不受窗口限制；"last step" 是状态投影最近一次置 busy 的时间；花名册不再写入历史。
 - 新 run 启动时先置 busy 再开记录：任何时刻不会出现"记录已打开、状态 idle"的刚启动 run。
 - 模型可见的消息文本不因任何 metadata 而变。
 - 没有默认步数上限；`steps` 仍为按 agent 的选择项。
@@ -143,23 +143,23 @@
 - `agent_send` 的状态快照取自 deliver 之前；返回文本描述的是投递那一刻，不承诺此后。
 - `renderTermination` 读 agentRun 时被取消 fiber 的 `onExit` 可能尚未完成；此时写 `stop requested at`，不等待；取消前状态为 Idle / Shell 时写"had already ended"；自然结束窗口（记录已关为 completed 而 runner 仍 Running）落入 stop requested。
 - 记账失败不阻塞 run，也不阻止报告发出；报告在记录缺失或未关闭时省略 run / ended。
-- 进度视图每步重建，不写入历史，不进压缩输入；窗口按墙钟与上一步开始计算。
+- 进度视图每步重建，不写入历史，不进压缩输入；窗口按墙钟与上一次带视图的步开始计算。
 - `Session.patch` 对同一会话串行；锁只在 patch 时持有；`publish` 返回时投影已完成、同步监听者已跑完；`Updated` 监听者不得回头 patch 同一会话（现状五个监听者均不会；守卫是 30 s 超时 die）。
 
 ## 7. 不变量契约（property-based）
 
 > **框架声明**：仓库未引入 property-based 框架。沿用 `step-tail` 分支的做法：种子化随机生成 + 按定义重算的参照实现，一次失败即报种子。
 
-- **INV-5（= I5）** 任意事件序列（发送到空闲的子、中途插入消息、re-arm、续跑窗口、完成 / 失败 / 被停、并发多子、崩溃遗留的打开记录、注入一次结束写失败）经真实 `loop` 执行后，每个子的 run 号序列严格递增且每次只加一；普通 re-arm 不改变它，续跑窗口加一；写失败与遗留的记录在下一次开始时被记为 lost 且号不重复；每条记录打开时会话已是 busy。—— T3（钩子阻止不加号由定值用例覆盖）
+- **INV-5（= I5）** 任意事件序列（发送到空闲的子、中途插入消息、re-arm、续跑窗口、完成 / 失败 / 被停、并发多子、崩溃遗留的打开记录、注入一次结束写失败、注入一次开始写失败、取消收尾时下一 run 已开启）经真实 `loop` 执行后，每个子的 run 号序列严格递增且每次只加一；普通 re-arm 不改变它，续跑窗口加一；写失败与遗留的记录在下一次开始时被记为 lost 且号不重复；一次 run 只关闭自己持有号的记录：取消收尾不动下一 run 的记录，开始写失败的 run 不冒用遗留记录、其报告无 run 属性；每条记录打开时会话已是 busy。—— T3 加两条定值用例（钩子阻止不加号由定值用例覆盖）
 - **INV-6（= I6）** 每份结束报告的 run 号等于发出时该子已关闭的 run，按结束顺序一一对应；同号报告至多一份；结束写失败的那份报告不带 run 属性；`ended ≥ started`。—— T3（停止通知的 run 行由 `lifecycle.test.ts` 五种定值用例覆盖）
 - **INV-6b** `agent_send` 对空闲且记录已关闭的目标预告的 run 号等于该子的下一份报告的 run 号。—— 定值用例（经注册表里真实的 `agent_send` 投递；T3 不改走工具投递，理由见主契约 §5.4.3）
 - **INV-7（= I7）** 对任意步序列（工具步、询问钩子的最终回答、带中途插入新消息的最终回答）与任意 cap（1–8），钩子连续阻止长度不限：父收到的报告恰一份，其创建时间不早于最后一次询问；每次询问的 `continuations` 等于按定义推进的参照值；每个请求的最后一条用户消息文本等于当时最新的 reason 或插入消息；每次询问之前子会话的 `SessionStatus` 事件序列中没有 idle。—— T8
 - **INV-7b** 每段连续无工具、无新输入的退出尝试中询问与阻止次数 ≤ cap；一步含工具调用或钩子之外的新用户消息后计数从 0 重新累积。—— T8（steer、超 cap 的阻止）；定值用例（新 run 再次询问）
 - **INV-8（= I8）** 相邻两步请求的历史部分逐字相同（R1 扩展到带进度视图的会话）；视图文本不出现在会话历史与压缩输入中。
-- **INV-8b** 随机生成子集合（状态、记录、创建时间、最后一步时间）与窗口：在跑列表恰等于投影 running 的子按 `started_at ?? created` 升序取前 10；已结束列表恰等于空闲且（已关闭且 `ended_at ≥ windowStart`，或未关闭）的子按 `ended_at ?? started_at` 降序取前 10；省略计数等于被截去的数量；同一输入两次渲染文本相同。—— T7
+- **INV-8b** 随机生成子集合（状态、记录、创建时间、最后一步时间）与窗口：在跑列表恰等于投影 running 的子按 `started_at ?? created` 升序取前 10；已结束列表恰等于空闲且（已关闭且 `ended_at ≥ windowStart`，或未关闭）的子按 `ended_at ?? started_at` 降序取前 10；省略计数等于被截去的数量；行数恰为标题、各行与省略行之和（名字与唤醒来源名含换行、制表符、`]` 时也不多出一行）；同一输入两次渲染文本相同。—— T7
 - **INV-9（= I9）** 对权限规则形态 {无规则、`agent_list: deny` 通配、`agent_list` 具体 pattern 的 deny（`Permission.disabled` 只认 `pattern === "*"`，故不隐藏）、`agent_status: deny`} × 深度 {< limit, ≥ limit} 的全部组合，工具表中 `agent_status ∈ tools ⇔ agent_list ∈ tools`；`agent_list` 通配 deny 时 `agent_status` 执行被拒。—— 枚举
 - **INV-10（= I10）** 对任意发送方字段，`render()` 的输出与基线逐字相同；四条路径的 metadata 形状固定。—— 枚举
-- **INV-11（= I11）** 对同一会话的任意并发 patch 序列（随机的 setTitle / setMetadata / touch / setAgentModel，每次写入的值各不相同），锁内按序发布的 `session.updated` 行序列中，title / metadata.note / agent / model.id 四个字段都不会回到出现过的值（丢失的更新就是回退），每次写入的值都在某一行出现过，最终行等于最后一个事件的行。这蕴含"每个字段等于最后一次写该字段的值"。—— T9
+- **INV-11（= I11）** 对同一会话的任意并发 patch 序列（随机的 setTitle / setMetadata / touch / setAgentModel；另 `updateMetadata` 并发自增 N 次恰得 N，每次写入的值各不相同），锁内按序发布的 `session.updated` 行序列中，title / metadata.note / agent / model.id 四个字段都不会回到出现过的值（丢失的更新就是回退），每次写入的值都在某一行出现过，最终行等于最后一个事件的行。这蕴含"每个字段等于最后一次写该字段的值"。—— T9
 - **INV-12** `agent_list` 结果 ⊆ 过滤后的邻居集合 ⊆ 邻居；计数行与过滤后集合的统计一致；行数 ≤ limit；排序满足"self 在前，在跑在前，其余按活动（`last ?? time_created`）倒序，并列按 id"。—— T4
 - **INV-13** 新 run 启动后任一时刻，`状态 idle ∧ 记录打开` 只在崩溃遗留下出现：T3 在每条记录打开的 `session.updated` 事件里读状态投影，断言已是 busy；agent_send / agent_status 的 cut off 措辞都以 idle 为前提，故等价于"从不对刚启动的 run 输出 cut off"。—— T3
 
@@ -174,7 +174,7 @@
 
 ## 9. 安全/副作用契约
 
-- 进度视图、`agent_status`、`agent_list` 中来自模型的名字与标题一律经 `AgentInbox.escapeField`，换行无法伪造一行。
+- 进度视图、`agent_status`、`agent_list` 中来自模型的名字与标题一律经 `AgentInbox.escapeField`，run 记录里的唤醒来源名（`woken_by.name`，经 `describeSource`；无名字时输出的 session id 同样转义）与 `workdir` 路径（可来自模型给的 cwd；`agent_status` 与 `agent_list` 两处）也在其中，换行无法伪造一行。
 - 钩子的 `reason` 原样成为模型的下一条输入；它来自用户安装的插件，与压缩后的合成继续消息同信任级，不转义。
 - 钩子不能执行工具、不能改历史，只能决定继续与否；连续阻止有上界。
 - `agent_status` 不暴露 `agent_list` 之外的任何信息（相同范围、相同权限键）。
@@ -200,5 +200,6 @@
 - [x] 路径 A：以仓库单测承担——§2 / §3 由 `run.test.ts`、`inbox.test.ts`、`prompt.test.ts`（报告 metadata）、`next.test.ts` 钉住；§4 `Step S1–S24` grep 全覆盖（命令见 §4，S7 在 plugin 包）；§5 / §6 定值用例在 `prompt.test.ts`、`lifecycle.test.ts`、`tools.test.ts`、`session.test.ts`；§7 T3 / T4 / T7 / T8 / T9 加 INV-6b、INV-9、INV-10 的定值与枚举；§8 五条性能断言。专用脚本仍 N/A，理由同子计划 1
 - [x] 路径 B：独立审核 agent（给契约文档 + git diff，不给实现位置列）→ `audit-report.md` §3.1；❌ 2 已修，⚠️ 11 处置见 `decisions.md`
 - [x] `decisions.md`：D1–D17
-- [x] §5.2 五维度审核：逐 commit 自审随各 commit 报告记录；最终人工验证待用户
+- [x] §5.2 五维度审核：实施期间未按 commit 留下书面自审（原表述不实，2026-11-01 更正）；补做一次覆盖全部实施提交的审核 → `audit-report.md` §3.2、`decisions.md` D25–D40；最终人工验证待用户
+- [x] 2026-11-01 补充：一份外部审核（基线 `9daaf4b85e`，3 P2 + 2 边界 + PBT 缺口）与 §5.2 审核一起处置 → `decisions.md` D18–D40。契约随之改动：INV-5 增归属与开始写失败、取消交接；S11 / S12 改为 `Session.updateMetadata` 锁内读-判-写；S22 门先于解析；§2 agent_status 行、钩子继续消息行；§9 增来源名 / session id / workdir 转义；INV-8b 行数恰等于定义；INV-11 增 `updateMetadata` 并发自增；窗口下界改为"上一次带视图的步"
 - [x] 修正方案文档 `session-fix-step-tail-repeat-and-agents.md` 第六、七、八部分已回填 commit

@@ -516,6 +516,18 @@ export interface Interface {
   readonly setTitle: (input: { sessionID: SessionID; title: string }) => Effect.Effect<void>
   readonly setArchived: (input: { sessionID: SessionID; time?: number }) => Effect.Effect<void>
   readonly setMetadata: (input: typeof SetMetadataInput.Type) => Effect.Effect<void>
+  /**
+   * Read, decide and write a session's metadata under its patch lock, so the
+   * decision cannot be overtaken by another patch (subplan
+   * agentmgmt-2-run-state §5.2.2). `update` sees the metadata as it stands and
+   * returns what to write, or undefined to write nothing; it runs inside the
+   * lock, so it stays synchronous. Resolves with the metadata before and
+   * after: `after` is `before` itself when nothing was written.
+   */
+  readonly updateMetadata: (input: {
+    sessionID: SessionID
+    update: (current: typeof Metadata.Type | undefined) => typeof Metadata.Type | undefined
+  }) => Effect.Effect<{ before: typeof Metadata.Type | undefined; after: typeof Metadata.Type | undefined }>
   readonly setAgentModel: (input: {
     sessionID: SessionID
     agent: string
@@ -828,7 +840,7 @@ const layer: Layer.Layer<
     // fields back (subplan agentmgmt-2-run-state §5.2.0, I11). Sessions do not
     // wait on each other, and an entry goes once nobody is waiting on it.
     const locks = new Map<SessionID, { gate: Semaphore.Semaphore; waiting: number }>()
-    const patch = (sessionID: SessionID, info: Patch) =>
+    const locked = <A, E>(sessionID: SessionID, body: Effect.Effect<A, E>) =>
       Effect.gen(function* () {
         const entry = locks.get(sessionID) ?? { gate: Semaphore.makeUnsafe(1), waiting: 0 }
         locks.set(sessionID, entry)
@@ -838,14 +850,14 @@ const layer: Layer.Layer<
         // this long is a listener patching the session it was just told about
         // (publish awaits its listeners, so that never returns on its own) or
         // a wedge, and either is a defect worth naming the session in.
-        yield* Effect.acquireUseRelease(
+        return yield* Effect.acquireUseRelease(
           entry.gate.take(1).pipe(
             Effect.timeoutOrElse({
               duration: patchLockTimeout(),
               orElse: () => Effect.die(new Error(`Session.patch lock held too long or re-entered: ${sessionID}`)),
             }),
           ),
-          () => applyPatch(sessionID, info),
+          () => body,
           () => entry.gate.release(1),
         ).pipe(
           Effect.ensuring(
@@ -857,20 +869,48 @@ const layer: Layer.Layer<
         )
       })
 
-    const applyPatch = (sessionID: SessionID, info: Patch) =>
-      Effect.gen(function* () {
-        const current = yield* get(sessionID)
-        const next = {
-          ...current,
-          ...info,
-          time: info.time ? { ...current.time, ...info.time } : current.time,
-          share: info.share === null ? undefined : info.share ? { ...current.share, ...info.share } : current.share,
-          summary: info.summary === null ? undefined : (info.summary ?? current.summary),
-          revert: info.revert === null ? undefined : (info.revert ?? current.revert),
-          permission: info.permission === null ? undefined : (info.permission ?? current.permission),
-        } as Info
-        yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next })
-      })
+    const patch = (sessionID: SessionID, info: Patch) =>
+      locked(
+        sessionID,
+        Effect.gen(function* () {
+          const current = yield* get(sessionID)
+          yield* publishPatch(sessionID, current, info)
+        }),
+      )
+
+    // The decision is made on the row as it stands under the permit and the
+    // row is written before the permit goes, so no other patch can slip in
+    // between (subplan agentmgmt-2-run-state §5.2.2).
+    const updateMetadata = Effect.fn("Session.updateMetadata")(function* (input: {
+      sessionID: SessionID
+      update: (current: typeof Metadata.Type | undefined) => typeof Metadata.Type | undefined
+    }) {
+      return yield* locked(
+        input.sessionID,
+        Effect.gen(function* () {
+          const current = yield* get(input.sessionID)
+          const next = input.update(current.metadata)
+          if (next === undefined) return { before: current.metadata, after: current.metadata }
+          yield* publishPatch(input.sessionID, current, { metadata: next, time: { updated: Date.now() } })
+          return { before: current.metadata, after: next }
+        }),
+      ).pipe(Effect.orDie)
+    })
+
+    // Merge the patch over the row as read and publish it; the projection
+    // writes the row before publish returns (H6b).
+    const publishPatch = (sessionID: SessionID, current: Info, info: Patch) => {
+      const next = {
+        ...current,
+        ...info,
+        time: info.time ? { ...current.time, ...info.time } : current.time,
+        share: info.share === null ? undefined : info.share ? { ...current.share, ...info.share } : current.share,
+        summary: info.summary === null ? undefined : (info.summary ?? current.summary),
+        revert: info.revert === null ? undefined : (info.revert ?? current.revert),
+        permission: info.permission === null ? undefined : (info.permission ?? current.permission),
+      } as Info
+      return events.publish(SessionV1.Event.Updated, { sessionID, info: next })
+    }
 
     const touch = Effect.fn("Session.touch")(function* (sessionID: SessionID) {
       yield* patch(sessionID, { time: { updated: Date.now() } }).pipe(Effect.orDie)
@@ -1050,6 +1090,7 @@ const layer: Layer.Layer<
       setTitle,
       setArchived,
       setMetadata,
+      updateMetadata,
       setAgentModel,
       setPermission,
       setRevert,
