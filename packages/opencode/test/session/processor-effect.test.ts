@@ -1275,237 +1275,63 @@ const runSettlement = Effect.fn("test.runSettlement")(function* (
 // Tests
 // ---------------------------------------------------------------------------
 
-itPeriodicDoomLoop.live("session.processor asks doom_loop permission after three period-2 repetitions", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const { processors, session, provider } = yield* boot()
-        const events = yield* EventV2Bridge.Service
-        const asked = defer<PermissionV1.Request>()
-        const off = yield* events.listen((event) => {
-          if (event.type === "permission.asked") asked.resolve(event.data as PermissionV1.Request)
-          return Effect.void
-        })
-        yield* Effect.addFinalizer(() => off)
+// Repeat refusal moved to tool resolution (session/tools.ts): the processor only
+// records what the model called and never asks or stops on a repeat. These fake
+// LLMs emit the tool results themselves, so every call here completes.
+const recordsWithoutAsking = (dir: string, input: { text: string; calls: number }) =>
+  Effect.gen(function* () {
+    const { processors, session, provider } = yield* boot()
+    const events = yield* EventV2Bridge.Service
+    let asked = 0
+    const off = yield* events.listen((event) => {
+      if (event.type === "permission.asked") asked++
+      return Effect.void
+    })
+    yield* Effect.addFinalizer(() => off)
 
-        const chat = yield* session.create({})
-        const parent = yield* user(chat.id, "period-2 doom loop")
-        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
-        const fiber = yield* handle
-          .process({
-            user: {
-              id: parent.id,
-              sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "period-2 doom loop" }],
-            tools: {},
-          })
-          .pipe(Effect.forkChild)
+    const chat = yield* session.create({})
+    const parent = yield* user(chat.id, input.text)
+    const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+    const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+    const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+    const result = yield* handle.process({
+      user: {
+        id: parent.id,
+        sessionID: chat.id,
+        role: "user",
+        time: parent.time,
+        agent: parent.agent,
+        model: { providerID: ref.providerID, modelID: ref.modelID },
+      } satisfies SessionV1.User,
+      sessionID: chat.id,
+      model: mdl,
+      agent: agent(),
+      system: [],
+      messages: [{ role: "user", content: input.text }],
+      tools: {},
+    })
 
-        const request = yield* Effect.promise(() => asked.promise).pipe(
-          Effect.timeoutOrElse({
-            duration: "1 second",
-            orElse: () => Effect.fail(new Error("timed out waiting for periodic doom-loop permission")),
-          }),
-        )
-        expect(request).toMatchObject({
-          sessionID: chat.id,
-          permission: "doom_loop",
-          patterns: ["search"],
-          metadata: { tool: "search", input: { query: "b" } },
-          always: ["search"],
-        })
+    expect(result).toBe("continue")
+    expect(asked).toBe(0)
+    expect(handle.message.error).toBeUndefined()
+    const parts = yield* MessageV2.parts(msg.id)
+    const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+    expect(tools.map((part) => part.state.status)).toEqual(Array.from({ length: input.calls }, () => "completed"))
+  })
 
-        const parts = yield* MessageV2.parts(msg.id)
-        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
-        expect(tools).toHaveLength(6)
-        expect(tools.slice(0, 5).every((part) => part.state.status === "completed")).toBe(true)
-        expect(tools[5]).toMatchObject({
-          callID: "call-b3",
-          tool: "search",
-          state: { status: "running", input: { query: "b" } },
-        })
-
-        yield* Fiber.interrupt(fiber)
-      }),
-    { config: cfg },
-  ),
+itPeriodicDoomLoop.live("session.processor records a period-2 cycle without asking", () =>
+  provideTmpdirInstance((dir) => recordsWithoutAsking(dir, { text: "period-2 cycle", calls: 6 }), { config: cfg }),
 )
 
-itPeriodOneDoomLoop.live("session.processor preserves period-1 doom_loop ask behavior", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const { processors, session, provider } = yield* boot()
-        const events = yield* EventV2Bridge.Service
-        const asked = defer<PermissionV1.Request>()
-        const off = yield* events.listen((event) => {
-          if (event.type === "permission.asked") asked.resolve(event.data as PermissionV1.Request)
-          return Effect.void
-        })
-        yield* Effect.addFinalizer(() => off)
-
-        const chat = yield* session.create({})
-        const parent = yield* user(chat.id, "period-1 doom loop")
-        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
-        const fiber = yield* handle
-          .process({
-            user: {
-              id: parent.id,
-              sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "period-1 doom loop" }],
-            tools: {},
-          })
-          .pipe(Effect.forkChild)
-
-        const request = yield* Effect.promise(() => asked.promise).pipe(
-          Effect.timeoutOrElse({
-            duration: "1 second",
-            orElse: () => Effect.fail(new Error("timed out waiting for period-1 doom-loop permission")),
-          }),
-        )
-        expect(request).toMatchObject({
-          sessionID: chat.id,
-          permission: "doom_loop",
-          patterns: ["lookup"],
-          metadata: { tool: "lookup", input: { query: "a" } },
-          always: ["lookup"],
-        })
-
-        const parts = yield* MessageV2.parts(msg.id)
-        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
-        expect(tools).toHaveLength(3)
-        expect(tools.slice(0, 2).every((part) => part.state.status === "completed")).toBe(true)
-        expect(tools[2]).toMatchObject({
-          callID: "call-a3",
-          tool: "lookup",
-          state: { status: "running", input: { query: "a" } },
-        })
-
-        yield* Fiber.interrupt(fiber)
+for (const action of [undefined, "allow", "deny"] as const) {
+  itPeriodOneDoomLoop.live(
+    `session.processor records a period-1 cycle without asking (doom_loop ${action ?? "default"})`,
+    () =>
+      provideTmpdirInstance((dir) => recordsWithoutAsking(dir, { text: "period-1 cycle", calls: 3 }), {
+        config: action ? { ...cfg, permission: { doom_loop: action } } : cfg,
       }),
-    { config: cfg },
-  ),
-)
-
-itPeriodOneDoomLoop.live("session.processor continues a period-1 cycle when doom_loop is allowed", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const { processors, session, provider } = yield* boot()
-        const events = yield* EventV2Bridge.Service
-        let asked = 0
-        const off = yield* events.listen((event) => {
-          if (event.type === "permission.asked") asked++
-          return Effect.void
-        })
-        yield* Effect.addFinalizer(() => off)
-
-        const chat = yield* session.create({})
-        const parent = yield* user(chat.id, "allowed period-1 doom loop")
-        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
-        const result = yield* handle.process({
-          user: {
-            id: parent.id,
-            sessionID: chat.id,
-            role: "user",
-            time: parent.time,
-            agent: parent.agent,
-            model: { providerID: ref.providerID, modelID: ref.modelID },
-          } satisfies SessionV1.User,
-          sessionID: chat.id,
-          model: mdl,
-          agent: agent(),
-          system: [],
-          messages: [{ role: "user", content: "allowed period-1 doom loop" }],
-          tools: {},
-        })
-
-        expect(result).toBe("continue")
-        expect(asked).toBe(0)
-        const parts = yield* MessageV2.parts(msg.id)
-        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
-        expect(tools).toHaveLength(3)
-        expect(tools.every((part) => part.state.status === "completed")).toBe(true)
-      }),
-    { config: { ...cfg, permission: { doom_loop: "allow" } } },
-  ),
-)
-
-itPeriodOneDoomLoop.live("session.processor stops a period-1 cycle when doom_loop is denied", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const { processors, session, provider } = yield* boot()
-        const events = yield* EventV2Bridge.Service
-        let asked = 0
-        const off = yield* events.listen((event) => {
-          if (event.type === "permission.asked") asked++
-          return Effect.void
-        })
-        yield* Effect.addFinalizer(() => off)
-
-        const chat = yield* session.create({})
-        const parent = yield* user(chat.id, "denied period-1 doom loop")
-        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
-        const result = yield* handle.process({
-          user: {
-            id: parent.id,
-            sessionID: chat.id,
-            role: "user",
-            time: parent.time,
-            agent: parent.agent,
-            model: { providerID: ref.providerID, modelID: ref.modelID },
-          } satisfies SessionV1.User,
-          sessionID: chat.id,
-          model: mdl,
-          agent: agent(),
-          system: [],
-          messages: [{ role: "user", content: "denied period-1 doom loop" }],
-          tools: {},
-        })
-
-        expect(result).toBe("stop")
-        expect(asked).toBe(0)
-        expect(handle.message.error).toBeDefined()
-        const parts = yield* MessageV2.parts(msg.id)
-        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
-        expect(tools).toHaveLength(3)
-        expect(tools.slice(0, 2).every((part) => part.state.status === "completed")).toBe(true)
-        expect(tools[2]).toMatchObject({
-          callID: "call-a3",
-          tool: "lookup",
-          state: { status: "error", input: { query: "a" }, error: "Tool execution aborted" },
-        })
-      }),
-    { config: { ...cfg, permission: { doom_loop: "deny" } } },
-  ),
-)
+  )
+}
 
 itReplayedToolCall.live("session.processor isolates persisted history and counts an active replayed call ID once", () =>
   provideTmpdirInstance(

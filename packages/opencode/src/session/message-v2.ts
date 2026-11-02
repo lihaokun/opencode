@@ -508,6 +508,29 @@ export function parts(messageID: MessageID) {
   })
 }
 
+// The role of the chronologically latest message, or undefined for an empty
+// session. Generated IDs use the same order in SQLite and compareChronology,
+// so this needs one indexed row and no parts. A custom ID can contain non-BMP
+// characters: SQLite orders UTF-8, while JS orders UTF-16 code units. Only a
+// SQL winner containing a surrogate can lose under JS's order. For that rare
+// case reuse the old filtered-history predicate, including compaction bounds.
+export const latestRole = Effect.fn("MessageV2.latestRole")(function* (sessionID: SessionID) {
+  const { db } = yield* Database.Service
+  const row = yield* db
+    .select({ id: MessageTable.id, data: MessageTable.data })
+    .from(MessageTable)
+    .where(eq(MessageTable.session_id, sessionID))
+    .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+    .limit(1)
+    .get()
+    .pipe(Effect.orDie)
+  if (!row) return undefined
+  if (!/[\uD800-\uDFFF]/.test(row.id)) return (row.data as Info).role
+  const result = latest(yield* filterCompactedEffect(sessionID))
+  if (!result.user) return result.assistant?.role
+  return !result.assistant || compareChronology(result.user, result.assistant) > 0 ? "user" : "assistant"
+})
+
 export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: SessionID; messageID: MessageID }) {
   const { db } = yield* Database.Service
   const row = yield* db

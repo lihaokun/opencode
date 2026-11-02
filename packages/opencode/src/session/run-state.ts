@@ -10,7 +10,8 @@ import { SessionStatus } from "./status"
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
-  readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  /** Resolves with what the cancel found, as Runner.cancel does; `Idle` when there was no runner. */
+  readonly cancel: (sessionID: SessionID) => Effect.Effect<Runner.StateTag>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -59,11 +60,16 @@ const layer = Layer.effect(
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
       if (existing) return existing
+      // One Runner per session for the lifetime of the instance: it is never
+      // removed from the map. Deleting it on idle opened a race (#85) — a
+      // writer that grabbed the reference before the delete then started a
+      // run on a runner the map no longer knew about, and the next writer
+      // built a second runner, leaving one session with two loops. Reusing a
+      // stale runner is safe because every hook below is parameterized by
+      // sessionID and re-reads persisted state when it executes; a hook that
+      // captures per-run state at creation time would break that invariant.
       const next = Runner.make<SessionV1.WithParts>(data.scope, {
-        onIdle: Effect.gen(function* () {
-          data.runners.delete(sessionID)
-          yield* status.set(sessionID, { type: "idle" })
-        }),
+        onIdle: status.set(sessionID, { type: "idle" }),
         onBusy: status.set(sessionID, { type: "busy" }),
         onInterrupt,
         shouldReArm,
@@ -84,9 +90,9 @@ const layer = Layer.effect(
       const existing = data.runners.get(sessionID)
       if (!existing) {
         yield* status.set(sessionID, { type: "idle" })
-        return
+        return "Idle" as const
       }
-      yield* existing.cancel
+      return yield* existing.cancel
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (

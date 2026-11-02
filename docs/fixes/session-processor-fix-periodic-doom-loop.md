@@ -9,6 +9,8 @@
 - workflow 路径：`docs/workflow.md` §7 bug-fix flow + §7.1 八部分修正方案
 - 修复分类：算法内部逻辑错误，并同步扩展既有 `doom_loop` 行为契约；不修改公共 API、permission schema 或数据库 schema
 
+> **后续取代（2026-10-21，#76）**：本文的检测算法保留，检测位置与触发后的处理已由 [`session-fix-step-tail-repeat-and-agents.md`](session-fix-step-tail-repeat-and-agents.md) 取代。本文的状态只保存在 processor 内，而 processor 每个 provider step 新建一次，所以检测范围始终是一次模型返回，跨步的重复从未被看到。现在检测器随每步重建的工具表放在 `SessionTools.resolve` 中，命中时不执行该调用、以错误返回给模型且不发起询问，`doom_loop: allow` 关闭拒绝；跨步重复只在每步请求末尾计数。下文的 ask / once / reject 流程与相应端测已不再适用。
+
 本修复只处理有界周期性工具调用绕过。总工具调用预算、非周期扰动检测、稳定 key 排序 JSON canonicalization 和无条件中止策略均为独立增强，不混入本次修改。
 
 ---

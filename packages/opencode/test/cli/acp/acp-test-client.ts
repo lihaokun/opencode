@@ -44,7 +44,14 @@ export function createAcpClient(acp: AcpHandle): AcpClient {
       yield* acp.send(message)
 
       while (true) {
-        const received = yield* acp.receive.pipe(Effect.timeout(Duration.seconds(15)))
+        // Cold CLI startup on a shared Windows runner is part of this wait.
+        // Keep the receive budget below the enclosing 60s subprocess test.
+        const received = yield* acp.receive.pipe(
+          Effect.timeoutOrElse({
+            duration: Duration.seconds(30),
+            orElse: () => Effect.fail(new Error(`Timed out waiting for ACP ${method} response (id ${id}) after 30s`)),
+          }),
+        )
         if (isJsonRpcResponse<T>(received) && received.id === id) return received
       }
     })

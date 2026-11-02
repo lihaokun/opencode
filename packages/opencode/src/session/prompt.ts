@@ -46,9 +46,10 @@ import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { AGENT_TOOL_ID } from "@/tool/agent"
+import { AGENT_LIST_TOOL_ID, AGENT_TOOL_ID } from "@/tool/agent"
 import { AgentManagement } from "@/agent-management/schema"
 import { AgentDelegation } from "@/agent-management/delegation"
+import { AgentRun } from "@/agent-management/run"
 import { AgentEvent } from "@opencode-ai/schema/agent-event"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -59,8 +60,8 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
+import { StepTail } from "./step-tail"
 import { AgentTree } from "@/agent-management/tree"
-import { AgentStatusProjection } from "@/agent-management/status"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
 
@@ -135,7 +136,6 @@ const layer = Layer.effect(
     const status = yield* SessionStatus.Service
     const sessions = yield* Session.Service
     const agentTree = yield* AgentTree.Service
-    const agentStatus = yield* AgentStatusProjection.Service
     const agents = yield* Agent.Service
     const provider = yield* Provider.Service
     const processor = yield* SessionProcessor.Service
@@ -1208,14 +1208,163 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    // The stop hook (issue #81; subplan agentmgmt-2-run-state §5.1.2): asked when
+    // the model gave a final answer, before the run settles. "continue" means
+    // a plugin blocked the stop and its reason is now the next user message;
+    // "exit" means the run may end. Runs that end on an error, a refusal, a
+    // truncation, an interruption or the step limit never get here.
+    type StopDecision = { decision: "allow" | "block"; reason?: string }
+    // A fresh object per call: plugins mutate it in place.
+    const allow = (): StopDecision => ({ decision: "allow" })
+    const stopGate = Effect.fn("SessionPrompt.stopGate")(function* (input: {
+      sessionID: SessionID
+      parentID: SessionID | undefined
+      user: SessionV1.User
+      message: SessionV1.WithParts
+      continuations: number
+      cap: number
+      lastStepReached: boolean
+    }) {
+      // Step S1: the configured step limit is a hard edge; a block would need
+      // one more step past it.
+      if (input.lastStepReached) {
+        yield* Effect.logInfo("stop hook skipped at step limit", { "session.id": input.sessionID })
+        return "exit" as const
+      }
+      // Step S2: the cap on consecutive continuations; a cap of 0 never asks.
+      if (input.continuations >= input.cap) {
+        yield* Effect.logInfo("stop hook cap reached", {
+          "session.id": input.sessionID,
+          continuations: input.continuations,
+        })
+        return "exit" as const
+      }
+      // Step S3: a plugin that throws cannot be repaired from here, so its
+      // failure allows the stop. Plugins share the output; the last write wins.
+      const output = yield* plugin
+        .trigger(
+          "experimental.session.stop",
+          {
+            sessionID: input.sessionID,
+            parentID: input.parentID,
+            agent: input.user.agent,
+            message: input.message,
+            continuations: input.continuations,
+          },
+          allow(),
+        )
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("stop hook failed", { "session.id": input.sessionID, cause }).pipe(Effect.as(allow())),
+          ),
+        )
+      // Step S4: allow, or a block with nothing to say, ends the run.
+      if (output.decision !== "block") return "exit" as const
+      const reason = output.reason?.trim() ?? ""
+      if (reason.length === 0) {
+        yield* Effect.logWarning("stop hook blocked without a reason", { "session.id": input.sessionID })
+        return "exit" as const
+      }
+      // Step S5: the reason becomes the next user message, synthetic like the
+      // compaction continue message, and the same run goes on. It keeps the
+      // turn's own system text and tool switches: the request reads both off
+      // the latest user message, so dropping them here would change the
+      // system and the tool set for the rest of the run.
+      const now = Date.now()
+      const message = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: input.sessionID,
+        time: { created: now },
+        agent: input.user.agent,
+        model: input.user.model,
+        ...(input.user.system === undefined ? {} : { system: input.user.system }),
+        ...(input.user.tools === undefined ? {} : { tools: input.user.tools }),
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: message.id,
+        sessionID: input.sessionID,
+        type: "text",
+        text: reason,
+        synthetic: true,
+        metadata: { kind: AgentManagement.STOP_HOOK_METADATA_KIND, reason },
+        time: { start: now, end: now },
+      })
+      yield* Effect.logInfo("stop hook blocked", {
+        "session.id": input.sessionID,
+        continuations: input.continuations + 1,
+      })
+      return "continue" as const
+    })
+
+    // Step S14: the view and agent_list expose the same thing, so a session
+    // denied the tool is not handed it by another route — merged the way
+    // tools.ts merges it. Any failure drops the section and keeps the step.
+    const subagentView = Effect.fn("SessionPrompt.subagentView")(function* (input: {
+      session: Session.Info
+      agent: Agent.Info
+      now: number
+      windowStart: number
+    }) {
+      const ruleset = Permission.merge(input.agent.permission ?? [], input.session.permission ?? [])
+      if (Permission.evaluate(AGENT_LIST_TOOL_ID, "*", ruleset).action === "deny") return undefined
+      return yield* Effect.gen(function* () {
+        const children = yield* StepTail.collectSubagents({ sessions, status, parentID: input.session.id })
+        return StepTail.renderSubagents({
+          now: input.now,
+          children,
+          windowStart: input.windowStart,
+          viewer: input.session.id,
+        })
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("subagent view dropped", { "session.id": input.session.id, cause }).pipe(
+            Effect.as(undefined),
+          ),
+        ),
+      )
+    })
+
+    const runLoop: (
+      sessionID: SessionID,
+      viewState: { previousStepStart?: number },
+    ) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
+      function* (sessionID: SessionID, viewState: { previousStepStart?: number }) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
         // This bounds one in-memory overflow-recovery episode and intentionally resets with this runLoop.
         let compactionToken: "none" | "compacted" | "skip" = "none"
+        // Assistants this loop created. If the newest assistant belongs to the
+        // latest turn but was not created here, another loop is answering this
+        // turn right now (two loops on one session, #85) — starting a step on
+        // top of it would feed the model its own placeholder output as
+        // history. Second line of defense: the runner-level fixes make the
+        // parallel loops unreachable; this only bounds the damage if they
+        // ever regress. Breaking is safe for message consumption: the loop
+        // that owns the turn re-reads messages at the top of every iteration
+        // and consumes whatever lands.
+        const ownAssistants = new Set<MessageID>()
+        // Step-to-step repeat counting for the step tail. Scoped to this run on
+        // purpose: a repeat across runs may be the agent's own choice.
+        let previousStep: StepTail.StepSignature | undefined
+        let repeat = StepTail.NO_REPEAT
+        // Stop hook state. The count is cleared at the top of the loop by any
+        // user message the hook did not write, and below by a tool call.
+        let continuations = 0
+        let lastStepReached = false
+        const stopHookCap = (yield* config.get()).stop_hook_block_cap ?? 8
+        // Step S15: the time of the previous view the model read bounds this
+        // view's window; on the first step that is the run's start. Moved only
+        // once a step's response is in: an iteration without a view
+        // (compaction, a subtask), a step the overflow check withdrew before
+        // sending and one the provider rejected all leave it alone, or a long
+        // one would hide what ended during the step before it.
+        // The work owns this state: an ordinary re-arm calls runLoop again
+        // without starting a new logical run or discarding its previous view.
+        viewState.previousStepStart ??= Date.now()
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1228,6 +1377,16 @@ const layer = Layer.effect(
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+          // Step S6: a user message the hook did not write is a new stop
+          // attempt, whether a re-arm consumed it or it landed mid-run and is
+          // read here; only the hook's own continuation carries the count.
+          const continuation = msgs
+            .findLast((msg) => msg.info.id === lastUser.id)
+            ?.parts.some(
+              (part) => part.type === "text" && part.metadata?.kind === AgentManagement.STOP_HOOK_METADATA_KIND,
+            )
+          if (!continuation) continuations = 0
 
           const lastAssistantBelongsToLatestTurn =
             lastAssistant !== undefined &&
@@ -1252,6 +1411,8 @@ const layer = Layer.effect(
             lastAssistantMsg?.parts.some(
               (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
             ) ?? false
+          // Step S6: a tool call resets the stop hook's continuation count.
+          if (hasToolCalls) continuations = 0
 
           if (
             lastAssistant?.finish &&
@@ -1270,7 +1431,44 @@ const layer = Layer.effect(
                 callID: orphan.callID,
               })
             }
+            if (lastAssistantMsg) {
+              const gate = yield* stopGate({
+                sessionID,
+                parentID: session.parentID,
+                user: lastUser,
+                message: lastAssistantMsg,
+                continuations,
+                cap: stopHookCap,
+                lastStepReached,
+              })
+              if (gate === "continue") {
+                continuations += 1
+                continue
+              }
+            }
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
+            break
+          }
+
+          // An unfinished assistant newer than anything this loop created:
+          // another loop is mid-flight on this turn. Do not stack a step onto
+          // it — see the ownAssistants note above. Skipped on the first
+          // iteration: a freshly started loop legitimately takes over an
+          // unfinished assistant left by a shell command (no finish until an
+          // LLM round exists), and after this loop has produced work, only a
+          // genuinely parallel loop can own a newer one.
+          if (
+            step > 0 &&
+            lastAssistant &&
+            !lastAssistant.finish &&
+            lastAssistantBelongsToLatestTurn &&
+            !ownAssistants.has(lastAssistant.id)
+          ) {
+            yield* Effect.logWarning("loop exit: another loop is answering the latest turn", {
+              "session.id": sessionID,
+              step,
+              messageID: lastAssistant.id,
+            })
             break
           }
 
@@ -1328,15 +1526,13 @@ const layer = Layer.effect(
           }
           const maxSteps = agent.steps ?? Infinity
           const isLastStep = step >= maxSteps
+          // Step S6: remembered for the exit branch, which runs at the top of
+          // the next iteration where this step's locals are gone.
+          if (isLastStep) lastStepReached = true
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(FSUtil.Service, fsys),
             Effect.provideService(Session.Service, sessions),
-          )
-          msgs = yield* SessionReminders.applyAgentRoster({ messages: msgs, session, agent }).pipe(
-            Effect.provideService(Session.Service, sessions),
-            Effect.provideService(AgentTree.Service, agentTree),
-            Effect.provideService(AgentStatusProjection.Service, agentStatus),
           )
 
           const msg: SessionV1.Assistant = {
@@ -1354,6 +1550,7 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             sessionID,
           }
+          ownAssistants.add(msg.id)
           yield* sessions.updateMessage(msg)
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
@@ -1410,6 +1607,7 @@ const layer = Layer.effect(
                 },
               })
             }
+            SessionTools.refuseRepeats(tools, { agent, session })
 
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
@@ -1431,8 +1629,24 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            const now = Date.now()
+            const view = yield* subagentView({
+              session,
+              agent,
+              now,
+              windowStart: StepTail.windowStart(now, viewState.previousStepStart ?? now),
+            })
+            const body = [view, StepTail.renderRepeat(repeat)]
+            // The clock rides with any section and never alone (§4.5).
+            const tail = StepTail.render(
+              body.some((section) => section !== undefined)
+                ? [StepTail.renderClock({ now, run: AgentRun.read(session.metadata)?.number, step }), ...body]
+                : body,
+            )
+            if (tail) yield* Effect.logInfo("step tail", { "session.id": sessionID, step, text: tail })
             const messages = [
               ...modelMsgs,
+              ...(tail ? [StepTail.message(tail)] : []),
               ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
             ]
             const streamInput: LLM.StreamInput = {
@@ -1470,6 +1684,11 @@ const layer = Layer.effect(
               { ...streamInput, preparedPayload },
               { recoverContextOverflow: compactionToken === "none" && canCompact },
             )
+            // A finished response has read this view, even if it ends this
+            // runLoop (content filtering, length, structured output). A re-arm
+            // must continue from this step, not replay an older view's window.
+            // Preflight withdrawals and rejected requests have no finish.
+            if (handle.message.finish) viewState.previousStepStart = now
 
             if (handle.message.error?.name === "MessageOutputLengthError" || handle.message.finish === "length") {
               return "break" as const
@@ -1509,17 +1728,27 @@ const layer = Layer.effect(
             }
 
             if (result === "stop") return "break" as const
+            // The provider rejected the request as too long: no response finished.
+            const rejected = result === "compact" && !handle.message.finish
             if (result === "compact") {
-              const overflow = !handle.message.finish
-              if (overflow) compactionToken = "compacted"
+              if (rejected) compactionToken = "compacted"
               yield* compaction.create({
                 sessionID,
                 agent: lastUser.agent,
                 model: lastUser.model,
                 auto: true,
-                overflow,
+                overflow: rejected,
               })
             }
+            // Only a step whose response finished counts. One withdrawn above for
+            // compaction before sending, or rejected by the provider as too long, is
+            // not a step (fix doc session-fix-step-tail-repeat-and-agents §3.2).
+            if (rejected) return "continue" as const
+            const current = StepTail.signature(
+              yield* MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database)),
+            )
+            repeat = StepTail.nextRepeat(previousStep, current, repeat)
+            previousStep = current
             return "continue" as const
           }).pipe(
             Effect.ensuring(instruction.clear(handle.message.id)),
@@ -1537,35 +1766,171 @@ const layer = Layer.effect(
     // Re-arm predicate for the run loop: true when the latest user message is
     // newer than the latest assistant, i.e. a turn landed after the loop's last
     // read and would otherwise sit unconsumed once the run goes idle (#32).
-    // Read failures fall back to false — the pre-fix behavior.
+    // Read failures fall back to false — the pre-fix behavior. Evaluated as a
+    // single indexed row ("is the latest message a user?") — equivalent to the
+    // full comparison, and O(1) instead of loading the session (#62): this
+    // runs inside finishRun's critical section, so its cost bounds the lock
+    // hold time (#85).
     const hasUnconsumedTurn = (sessionID: SessionID) =>
-      MessageV2.filterCompactedEffect(sessionID).pipe(
-        Effect.map((msgs) => {
-          const { user, assistant } = MessageV2.latest(msgs)
-          return Boolean(user && (!assistant || MessageV2.compareChronology(user, assistant) > 0))
-        }),
+      MessageV2.latestRole(sessionID).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.map((role) => role === "user"),
         Effect.catch((error) =>
           Effect.logWarning("re-arm check failed; run will go idle", { "session.id": sessionID, error }).pipe(
             Effect.as(false),
           ),
         ),
-        Effect.provideService(Database.Service, database),
       )
+
+    // Step S11: a run opens its record (subplan agentmgmt-2-run-state §5.2.2)
+    // and learns which number it owns: the one it opened, or on a re-arm the
+    // one it already owned while that is still the open record. Failures are
+    // logged and the run goes on without a number: the record is bookkeeping,
+    // and a run that cannot write it is still a run — but it owns nothing, so
+    // it closes nothing later, and a re-arm of it claims nothing either, not
+    // even the leftover it was started over (I5). begin closes a leftover open
+    // record as lost on a fresh start and writes nothing for a re-arm over the
+    // record it owns.
+    const recordRunStart = Effect.fn("SessionPrompt.recordRunStart")(function* (
+      sessionID: SessionID,
+      parentID: SessionID,
+      fresh: boolean,
+      own: number | undefined,
+    ) {
+      return yield* Effect.gen(function* () {
+        const parent = yield* sessions.get(parentID)
+        const name = parent.metadata?.[AgentManagement.METADATA_AGENT_NAME]
+        // The message that woke this run is the latest one, and only its first
+        // text part's metadata is read: one row and its parts.
+        const latest = (yield* sessions.messages({ sessionID, limit: 1 }))[0]
+        const now = Date.now()
+        // Read, decided and written under the session's patch lock: the run
+        // this one follows may be winding down at this very moment, and
+        // neither write may overtake the other's read.
+        const result = yield* sessions.updateMetadata({
+          sessionID,
+          update: (current) => {
+            const previous = AgentRun.read(current)
+            const next = AgentRun.begin(
+              previous,
+              now,
+              AgentRun.wakeSource({
+                number: (previous?.number ?? 0) + 1,
+                parent: {
+                  id: parentID,
+                  ...(typeof name === "string" ? { name } : {}),
+                  ...(parent.agent === undefined ? {} : { agent: parent.agent }),
+                },
+                message: latest,
+              }),
+              fresh,
+              own,
+            )
+            return next ? { ...current, [AgentManagement.METADATA_AGENT_RUN]: next } : undefined
+          },
+        })
+        const record = AgentRun.read(result.after)
+        if (result.after !== result.before) return record?.number
+        // Nothing written: a re-arm keeps what it owned while that is the open
+        // record; anything else open is not this run's.
+        return record !== undefined && record.number === own && record.ended_at === undefined ? own : undefined
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("run record not opened", { "session.id": sessionID, cause }).pipe(Effect.as(undefined)),
+        ),
+      )
+    })
+
+    // Step S12: a run closes the record it owns and hands it to the report, so
+    // the report names the run it closes (I6). It never touches another run's
+    // record: a cancelled run's wind-down can overlap the next run's start,
+    // which has already closed this one as lost and opened its own; and a run
+    // whose open write failed owns nothing, however a leftover may look.
+    // Either way the report goes out without a run. Ownership is judged and
+    // the record written under the same permit, or the overlap above could
+    // still land this run's stale row over the next run's open.
+    const recordRunEnd = Effect.fn("SessionPrompt.recordRunEnd")(function* (
+      sessionID: SessionID,
+      outcome: AgentManagement.RunOutcome,
+      own: number | undefined,
+    ) {
+      return yield* Effect.gen(function* () {
+        const now = Date.now()
+        const result = yield* sessions.updateMetadata({
+          sessionID,
+          update: (current) => {
+            const record = AgentRun.read(current)
+            if (own === undefined || !record || record.number !== own) return undefined
+            const next = AgentRun.end(record, now, outcome)
+            return next ? { ...current, [AgentManagement.METADATA_AGENT_RUN]: next } : undefined
+          },
+        })
+        if (result.after === result.before) {
+          yield* Effect.logWarning("run record left alone at run end", {
+            "session.id": sessionID,
+            outcome,
+            own,
+            current: AgentRun.read(result.before),
+          })
+          return undefined
+        }
+        return AgentRun.read(result.after)
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("run record not closed", { "session.id": sessionID, cause }).pipe(Effect.as(undefined)),
+        ),
+      )
+    })
 
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       const parentID = session.parentID
-      // A subagent reports to its parent at the end of every run. Hooked on the
-      // work itself rather than on the idle event: the runner executes the work
-      // exactly once per run (a re-arm is the next run, and joined callers only
-      // share the result), whereas idle can be published more than once for one
-      // run and also for a session that never ran.
-      const work =
-        parentID && session.metadata?.[AgentManagement.METADATA_AGENT_NOTIFY] === true
-          ? runLoop(input.sessionID).pipe(Effect.onExit((exit) => reportRunEnd(session, parentID, exit)))
-          : runLoop(input.sessionID)
+      const notify = session.metadata?.[AgentManagement.METADATA_AGENT_NOTIFY] === true
+      // A subagent's runs are recorded on its session, and reported to its
+      // parent when it was created to report. Hooked on the work itself rather
+      // than on the idle event: the runner executes the work once per run and
+      // re-executes the same work object on a re-arm (H9), whereas idle can be
+      // published more than once for one run and also for a session that
+      // never ran. `started` lives in this closure for the same reason: the
+      // first execution opens a run, every later one continues it (Step S10).
+      let started = false
+      // The run number this execution owns, for the close: set on every
+      // (re)start, undefined when the open write failed.
+      let own: number | undefined
+      const viewState: { previousStepStart?: number } = {}
+      const work = parentID
+        ? Effect.gen(function* () {
+            const fresh = !started
+            started = true
+            // Busy before the record opens, or a reader in between sees an
+            // open record on an idle session and calls the run cut off (H9b).
+            yield* status.set(input.sessionID, { type: "busy" })
+            const next = yield* recordRunStart(input.sessionID, parentID, fresh, own)
+            // The continuation window can open the next run on this same
+            // work object. Only a new record resets its view window.
+            if (next !== undefined && next !== own) viewState.previousStepStart = undefined
+            own = next
+            return yield* runLoop(input.sessionID, viewState)
+          }).pipe(
+            Effect.onExit((exit) =>
+              Effect.gen(function* () {
+                // One read of the re-arm predicate for both the record and the
+                // report, so they agree on whether this run is over (H10). A
+                // message landing between this read and the runner's own is the
+                // continuation window: the record closes here, and the re-arm
+                // that follows opens the next number (§6, point 16).
+                const unconsumed = Exit.isSuccess(exit) && (yield* hasUnconsumedTurn(input.sessionID))
+                const outcome = unconsumed ? undefined : classifyExit(input.sessionID, exit, yield* truncate.limits())
+                const closed = outcome
+                  ? yield* recordRunEnd(input.sessionID, AgentRun.outcomeOf(outcome.kind), own)
+                  : undefined
+                if (notify) yield* reportRunEnd(session, parentID, outcome, closed)
+              }),
+            ),
+          )
+        : runLoop(input.sessionID, viewState)
       return yield* state.ensureRunning(
         input.sessionID,
         lastAssistant(input.sessionID),
@@ -1603,21 +1968,18 @@ const layer = Layer.effect(
     const reportRunEnd = Effect.fn("SessionPrompt.reportRunEnd")(function* (
       child: Session.Info,
       parentID: SessionID,
-      exit: Exit.Exit<SessionV1.WithParts>,
+      outcome: AgentDelegation.Outcome | undefined,
+      closed: AgentManagement.AgentRun | undefined,
     ) {
+      // No outcome: a message landed inside the run's last iteration and the
+      // runner starts the next run straight away (#32). The child is not
+      // stopping, so there is nothing to report yet; that run reports.
+      if (!outcome) return
       const settled = events.publish(AgentEvent.Delegation, {
         sessionID: child.id,
         caller: parentID,
         status: "settled",
       })
-      // A message that landed inside the run's last iteration makes the runner
-      // start the next run straight away (#32): the child is not stopping, so
-      // there is nothing to report yet. Same predicate the runner uses, read
-      // just before it does; a message arriving in between only means the
-      // next run reports too, never that none does.
-      if (Exit.isSuccess(exit) && (yield* hasUnconsumedTurn(child.id))) return
-      const limits = yield* truncate.limits()
-      const outcome = classifyExit(child.id, exit, limits)
       if (outcome.kind === "cancelled") return yield* settled
       // A stop with one of its own agents still running is not the end of the
       // child's work either: that agent reports to it when it finishes, which
@@ -1628,7 +1990,12 @@ const layer = Layer.effect(
       // The summary's wording is owned here: the TUI displays it verbatim and
       // never re-derives it from state or description.
       const description = child.metadata?.[AgentManagement.METADATA_AGENT_DESCRIPTION] ?? child.title
-      const summary = outcome.kind === "completed" ? `Agent completed: ${description}` : `Agent failed: ${description}`
+      const name = child.metadata?.[AgentManagement.METADATA_AGENT_NAME]
+      // Step S18: the run this report closes, from the record closed a moment
+      // ago. Without a closed record there is no number to claim (I6).
+      const ended = closed ? AgentRun.ended(closed) : undefined
+      const suffix = ended ? ` (run ${ended.number}, ended ${AgentRun.formatClock(ended.ended_at)})` : ""
+      const summary = `${outcome.kind === "completed" ? "Agent completed" : "Agent failed"}: ${description}${suffix}`
       // Forked: the parent's run is awaited so that `settled` means the result
       // has been read, and awaiting it here would keep the child busy for as
       // long as the parent takes.
@@ -1658,10 +2025,18 @@ const layer = Layer.effect(
                 state: outcome.kind === "completed" ? "completed" : "error",
                 summary,
                 text: outcome.text,
+                ...(ended ? { run: ended.number, ended: AgentRun.formatInstant(ended.ended_at) } : {}),
               }),
               // The TUI renders one line from this metadata and never parses
-              // the model-facing text above.
-              metadata: { kind: AgentManagement.NOTIFICATION_METADATA_KIND, summary },
+              // the model-facing text above. The sender is for the record of
+              // the parent's next run, which this report wakes (Step S13).
+              metadata: {
+                kind: AgentManagement.NOTIFICATION_METADATA_KIND,
+                summary,
+                sender: child.id,
+                ...(typeof name === "string" ? { sender_name: name } : {}),
+                ...(child.agent === undefined ? {} : { sender_agent: child.agent }),
+              },
             },
           ],
         })
@@ -1938,7 +2313,6 @@ export const node = LayerNode.make({
     Session.node,
     Agent.node,
     AgentTree.node,
-    AgentStatusProjection.node,
     Provider.node,
     SessionProcessor.node,
     SessionCompaction.node,
