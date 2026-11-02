@@ -348,16 +348,54 @@ def configure_path(directory):
 
 
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=MODES, default="release")
-    parser.add_argument("--channel", choices=CHANNELS, help="release channel (default: stable)")
-    parser.add_argument("--version", help="exact fork release tag, with or without v")
-    parser.add_argument("--ref", help="fork branch/tag to clone for build (default: dev)")
-    parser.add_argument("--source", type=Path, help="build a local checkout without switching branches")
-    parser.add_argument("--install-dir", type=Path, default=Path.home() / ".opencode" / "bin")
+    parser = argparse.ArgumentParser(
+        description=__doc__ + "\nWith no options, download and install the latest stable fork release.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples (run from the repository root; on Windows use python instead of python3):
+  python3 script/fm-install.py                           # latest stable release
+  python3 script/fm-install.py --channel beta            # latest beta release
+  python3 script/fm-install.py --version v1.18.31-fmv3-beta.18
+  python3 script/fm-install.py --mode build              # clone and build fork dev
+  python3 script/fm-install.py --mode build --ref main   # clone and build fork main
+  python3 script/fm-install.py --mode build --source .   # build this local checkout
+
+Defaults shared by ALL modes:
+  Set global autoupdate=false and disable providers opencode and opencode-go.
+  Preserve custom providers, credentials, other settings and existing disabled providers.
+  Download programs and clone source only from lihaokun/opencode.
+  Add the install directory to your user PATH unless --no-modify-path is given.
+  Global defaults remain subject to OpenCode's normal configuration precedence.
+
+Requirements:
+  Python 3.9+. Download mode does not require Bun.
+  Release platforms: Linux/macOS x64 or arm64, and Windows x64.
+  Linux packages require glibc; x64 packages require AVX2.
+  Build mode also requires Git, rg (ripgrep), the checkout's packageManager Bun
+  version, and native build dependencies. It does not install these tools for you.
+  Builds always use OPENCODE_CHANNEL=dev to retain the opencode-dev.db data directory.
+
+After installing, reopen your terminal and check opencode --version.
+To update this fork, rerun this installer; opencode upgrade uses the upstream channel.
+More details: FORK_INSTALL.md
+""",
+    )
+    parser.add_argument("--mode", choices=MODES, default="release",
+                        help="download a release or compile from source (default: release)")
+    parser.add_argument("--channel", choices=CHANNELS,
+                        help="release mode only: stable or beta (default: stable, or inferred from --version)")
+    parser.add_argument("--version",
+                        help="release mode only: exact fork tag, with or without v; must match an explicit --channel")
+    parser.add_argument("--ref",
+                        help="build mode only: fork branch/tag to clone (default: dev); cannot combine with --source")
+    parser.add_argument("--source", type=Path,
+                        help="build mode only: use a local checkout without switching branches; writes dependencies and dist; cannot combine with --ref")
+    parser.add_argument("--install-dir", type=Path, default=Path.home() / ".opencode" / "bin",
+                        help="directory for opencode and rg (default: ~/.opencode/bin)")
     parser.add_argument("--config-dir", type=Path,
-                        default=Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")) / "opencode")
-    parser.add_argument("--no-modify-path", action="store_true")
+                        default=Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")) / "opencode",
+                        help="global config directory to update (default: $XDG_CONFIG_HOME/opencode or ~/.config/opencode); does not change OpenCode's runtime config path")
+    parser.add_argument("--no-modify-path", action="store_true",
+                        help="do not edit shell profiles or Windows user PATH; add --install-dir to PATH yourself")
     args = parser.parse_args(argv)
     if args.mode == "build" and (args.channel or args.version):
         parser.error("--channel and --version are release-only; use --ref for builds")

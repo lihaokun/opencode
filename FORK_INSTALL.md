@@ -7,6 +7,7 @@
 已有仓库时，在仓库根目录执行：
 
 ```bash
+python3 script/fm-install.py --help          # 查看参数、默认策略与示例
 python3 script/fm-install.py                 # 下载最新正式版（默认）
 python3 script/fm-install.py --channel beta  # 下载最新 beta
 ```
