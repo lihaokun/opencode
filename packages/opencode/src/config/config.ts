@@ -11,7 +11,8 @@ import { Flag } from "@opencode-ai/core/flag/flag"
 import { Auth } from "../auth"
 import { Env } from "../env"
 import { applyEdits, modify } from "jsonc-parser"
-import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
+import { InstallationLocal, PluginSdkVersion } from "@opencode-ai/core/installation/version"
+import { Glob } from "@opencode-ai/core/util/glob"
 import { existsSync } from "fs"
 import { Account } from "@/account/account"
 import { isRecord } from "@/util/record"
@@ -326,6 +327,15 @@ const layer = Layer.effect(
       }
     })
 
+    // Local plugins under `.opencode/plugin(s)` are the only consumers of the
+    // installed @opencode-ai/plugin SDK. Skip the install entirely when a
+    // directory has none (issue #67): no plugin files, no npm work, no warnings.
+    const hasPluginFiles = (dir: string) =>
+      Effect.promise(() => Glob.scan("{plugin,plugins}/*.{ts,js}", { cwd: dir, absolute: true, dot: true })).pipe(
+        Effect.map((files) => files.length > 0),
+        Effect.catch(() => Effect.succeed(false)),
+      )
+
     const loadInstanceState = Effect.fn("Config.loadInstanceState")(
       function* (ctx: InstanceContext) {
         const auth = yield* authSvc.all().pipe(Effect.orDie)
@@ -450,26 +460,31 @@ const layer = Layer.effect(
 
           yield* ensureGitignore(dir).pipe(Effect.orDie)
 
-          const dep = yield* npmSvc
-            .install(dir, {
-              add: [
-                {
-                  name: "@opencode-ai/plugin",
-                  version: InstallationLocal ? undefined : InstallationVersion,
-                },
-              ],
-            })
-            .pipe(
-              Effect.exit,
-              Effect.tap((exit) =>
-                Exit.isFailure(exit)
-                  ? Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) })
-                  : Effect.void,
-              ),
-              Effect.asVoid,
-              Effect.forkDetach,
-            )
-          deps.push(dep)
+          // Local plugins under `.opencode/plugin(s)` are the only consumers of
+          // the installed @opencode-ai/plugin SDK — skip the install when a
+          // directory has none (issue #67). Everything below still loads.
+          if (yield* hasPluginFiles(dir)) {
+            const dep = yield* npmSvc
+              .install(dir, {
+                add: [
+                  {
+                    name: "@opencode-ai/plugin",
+                    version: InstallationLocal ? undefined : PluginSdkVersion,
+                  },
+                ],
+              })
+              .pipe(
+                Effect.exit,
+                Effect.tap((exit) =>
+                  Exit.isFailure(exit)
+                    ? Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) })
+                    : Effect.void,
+                ),
+                Effect.asVoid,
+                Effect.forkDetach,
+              )
+            deps.push(dep)
+          }
 
           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
           result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))

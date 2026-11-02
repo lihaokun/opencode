@@ -1,74 +1,63 @@
 import type { Argv } from "yargs"
 import { UI } from "../ui"
 import * as prompts from "@clack/prompts"
-import { Installation } from "../../installation"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import { Installation } from "../../installation"
+import { compareVersion, parseVersion } from "../../installation/version-compare"
 
 export const UpgradeCommand = {
   command: "upgrade [target]",
-  describe: "upgrade opencode to the latest or a specific version",
+  describe: "upgrade fmcode to the latest or a specific release",
   builder: (yargs: Argv) => {
-    return yargs
-      .positional("target", {
-        describe: "version to upgrade to, for ex '0.1.48' or 'v0.1.48'",
-        type: "string",
-      })
-      .option("method", {
-        alias: "m",
-        describe: "installation method to use",
-        type: "string",
-        choices: ["curl", "npm", "pnpm", "bun", "brew", "choco", "scoop"],
-      })
+    return yargs.positional("target", {
+      describe: "version to upgrade to, for ex '1.18.31-fmv2.1' or 'v1.18.31-fmv2.1'",
+      type: "string",
+    })
   },
-  handler: async (args: { target?: string; method?: string }) => {
+  handler: async (args: { target?: string }) => {
     UI.empty()
     UI.println(UI.logo("  "))
     UI.empty()
     prompts.intro("Upgrade")
-    const detectedMethod = await Installation.method()
-    const method = (args.method as Installation.Method) ?? detectedMethod
+    const method = await Installation.method()
     if (method === "unknown") {
-      prompts.log.error(`opencode is installed to ${process.execPath} and may be managed by a package manager`)
-      const install = await prompts.select({
-        message: "Install anyways?",
-        options: [
-          { label: "Yes", value: true },
-          { label: "No", value: false },
-        ],
-        initialValue: false,
-      })
-      if (!install) {
-        prompts.outro("Done")
-        return
-      }
-    }
-    prompts.log.info("Using method: " + method)
-    const target = args.target ? args.target.replace(/^v/, "") : await Installation.latest()
-
-    if (InstallationVersion === target) {
-      prompts.log.warn(`opencode upgrade skipped: ${target} is already installed`)
+      prompts.log.warn("fmcode was not installed from a release; self-upgrade is unavailable")
       prompts.outro("Done")
       return
     }
 
-    prompts.log.info(`From ${InstallationVersion} → ${target}`)
+    const target = args.target
+      ? args.target.replace(/^v/, "")
+      : await Installation.latest(parseVersion(InstallationVersion)?.channel ?? "stable")
+
+    const parsed = parseVersion(target)
+    if (!parsed) {
+      prompts.log.error(`unknown version format: ${target}`)
+      prompts.outro("Done")
+      return
+    }
+
+    // Manual command: an explicit target is the user's instruction — downgrades
+    // and cross-channel moves are allowed. Only the exact re-install of the
+    // running version is skipped.
+    if (!args.target && compareVersion(parsed, parseVersion(InstallationVersion) ?? parsed) <= 0) {
+      prompts.log.warn(`fmcode upgrade skipped: ${target} is already installed`)
+      prompts.outro("Done")
+      return
+    }
+
+    prompts.log.info(`Installed: ${InstallationVersion}`)
+    prompts.log.info(`Upgrading to: ${target}`)
     const spinner = prompts.spinner()
     spinner.start("Upgrading...")
-    const err = await Installation.upgrade(method, target).catch((err) => err)
+    const err: unknown = await Installation.upgrade(method, target).catch((err) => err)
     if (err) {
       spinner.stop("Upgrade failed", 1)
-      if (err instanceof Installation.UpgradeFailedError) {
-        // necessary because choco only allows install/upgrade in elevated terminals
-        if (method === "choco" && err.stderr.includes("not running from an elevated command shell")) {
-          prompts.log.error("Please run the terminal as Administrator and try again")
-        } else {
-          prompts.log.error(err.stderr)
-        }
-      } else if (err instanceof Error) prompts.log.error(err.message)
+      prompts.log.error(err instanceof Error ? err.message : String(err))
       prompts.outro("Done")
       return
     }
-    spinner.stop("Upgrade complete")
+    spinner.stop("Upgrade complete — restart fmcode to run the new version")
     prompts.outro("Done")
   },
 }
