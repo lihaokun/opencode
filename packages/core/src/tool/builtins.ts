@@ -3,7 +3,6 @@ export * as BuiltInTools from "./builtins"
 import { makeLocationNode } from "../effect/app-node"
 import { Layer } from "effect"
 import { BashTool } from "./bash"
-import { ApplyPatchTool } from "./apply-patch"
 import { EditTool } from "./edit"
 import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
@@ -32,7 +31,6 @@ export const node = makeLocationNode({
   name: "built-in-tools",
   layer: Layer.empty,
   deps: [
-    ApplyPatchTool.node,
     BashTool.node,
     EditTool.node,
     GlobTool.node,

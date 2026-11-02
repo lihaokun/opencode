@@ -322,6 +322,59 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
+  test.each(["completed", "error"] as const)(
+    "preserves historical apply_patch %s in model messages",
+    async (status) => {
+      const input = { patchText: "*** Begin Patch\n*** Add File: note.txt\n+hello\n*** End Patch" }
+      const output = "Success. Updated the following files:\nA note.txt"
+      const error = "Failed to find expected lines"
+      const messages: SessionV1.WithParts[] = [
+        {
+          info: assistantInfo("m-patch", "m-user"),
+          parts: [
+            {
+              ...basePart("m-patch", "p-patch"),
+              type: "tool",
+              tool: "apply_patch",
+              callID: "call-patch",
+              state:
+                status === "completed"
+                  ? {
+                      status,
+                      input,
+                      output,
+                      title: "Patched note.txt",
+                      metadata: { files: [{ filePath: "note.txt", type: "add", diff: "+hello\n" }] },
+                      time: { start: 1, end: 2 },
+                    }
+                  : { status, input, error, time: { start: 1, end: 2 } },
+            },
+          ],
+        },
+      ]
+      const converted = await MessageV2.toModelMessages(messages, model)
+      expect(converted).toHaveLength(2)
+      expect(converted[0]).toMatchObject({
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: "call-patch", toolName: "apply_patch", input }],
+      })
+      expect(converted[1]).toMatchObject({
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-patch",
+            toolName: "apply_patch",
+            output: {
+              type: status === "completed" ? "text" : "error-text",
+              value: status === "completed" ? output : error,
+            },
+          },
+        ],
+      })
+    },
+  )
+
   test("converts assistant tool completion into tool-call + tool-result messages with attachments", async () => {
     const userID = "m-user"
     const assistantID = "m-assistant"

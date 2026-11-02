@@ -11,8 +11,6 @@ import PROMPT_GPT from "./prompt/gpt.txt"
 import PROMPT_ASTRA from "./prompt/gpt-astra.txt"
 import PROMPT_KIMI from "./prompt/kimi.txt"
 import PROMPT_META from "./prompt/meta.txt"
-
-import PROMPT_CODEX from "./prompt/codex.txt"
 import PROMPT_TRINITY from "./prompt/trinity.txt"
 import type { Provider } from "@/provider/provider"
 import type { Agent } from "@/agent/agent"
@@ -34,9 +32,6 @@ export function provider(model: Provider.Model) {
     return [PROMPT_BEAST]
   if (model.api.id.includes("gpt")) {
     if (model.api.id.includes("gpt-6")) return [PROMPT_ASTRA]
-    if (model.api.id.includes("codex")) {
-      return [PROMPT_CODEX]
-    }
     return [PROMPT_GPT]
   }
   if (model.api.id.includes("gemini-")) return [PROMPT_GEMINI]

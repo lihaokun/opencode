@@ -9,6 +9,9 @@ import type { Provider } from "../../src/provider/provider"
 import { SystemPrompt } from "../../src/session/system"
 import { MCP } from "../../src/mcp"
 import { testEffect } from "../lib/effect"
+import PROMPT_GPT from "../../src/session/prompt/gpt.txt"
+import PROMPT_ASTRA from "../../src/session/prompt/gpt-astra.txt"
+import PROMPT_BEAST from "../../src/session/prompt/beast.txt"
 
 const skills: Skill.Info[] = [
   {
@@ -107,6 +110,32 @@ describe("session.system", () => {
       const prompt = SystemPrompt.provider({ providerID, api: { id: "k3" } } as Provider.Model)[0]
       expect(prompt).toContain("# Prompt and Tool Use")
     }
+  })
+
+  test("routes codex-family gpt models to the shared gpt prompt", () => {
+    for (const id of ["gpt-5.3-codex", "gpt-5.5-codex-max", "gpt-5.5", "openai/gpt-5.5"]) {
+      const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)[0]
+      expect(prompt).toBe(PROMPT_GPT)
+      expect(prompt).not.toContain("apply_patch")
+    }
+  })
+
+  test.each([
+    ["gpt-6-luna", PROMPT_ASTRA],
+    ["gpt-6-codex", PROMPT_ASTRA],
+    ["gpt-4.1", PROMPT_BEAST],
+    ["gpt-4-codex", PROMPT_BEAST],
+    ["o1", PROMPT_BEAST],
+    ["o3-mini", PROMPT_BEAST],
+    ["gpt-6-o3-codex", PROMPT_BEAST],
+  ])("preserves higher-priority routing for %s", (id, expected) => {
+    expect(SystemPrompt.provider({ api: { id } } as Provider.Model)).toEqual([expected])
+  })
+
+  test("the gpt prompt never names apply_patch", () => {
+    const prompt = SystemPrompt.provider({ api: { id: "gpt-5.5" } } as Provider.Model)[0]
+    expect(prompt).not.toContain("apply_patch")
+    expect(prompt).toContain("Edit/Write")
   })
 
   it.effect("skills output is sorted by name and stable across calls", () =>
