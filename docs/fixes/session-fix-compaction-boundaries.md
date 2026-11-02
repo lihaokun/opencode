@@ -82,9 +82,9 @@
 
 | 文件 | 改动 | 状态 |
 |---|---|---|
-| session/compaction.ts | marker 前范围、overflow fallback、同步清空 stale tail | 已实施，提交号在验证收尾提交回填 |
-| session/message-v2.ts | 实际边界定位、模型重排、最后过滤失败摘要 | 已实施，提交号在验证收尾提交回填 |
-| test/session 下相关测试 | 固定回归、FastCheck 投影属性、真实执行轨迹与全 wire oracle | 已实施并验证 |
+| session/compaction.ts | marker 前范围、overflow fallback、同步清空 stale tail | 已实施：`1c35bc01` |
+| session/message-v2.ts | 实际边界定位、模型重排、最后过滤失败摘要 | 已实施：`1c35bc01` |
+| test/session 下相关测试 | 固定回归、FastCheck 投影属性、真实执行轨迹与全 wire oracle | 已实施并验证：`1c35bc01` |
 
 ## 八、文档更新清单
 
@@ -92,6 +92,6 @@
 |---|---|---|
 | 本文 | 契约、论证、测试、独立审核与基线超时说明 | 已完成 |
 | docs/devlog/2026-10-27-issue77-compaction-summary-anchor.md | 新修复链接、过滤时机、TUI 旧用量回退说明 | 已完成 |
-| /tmp/pr86-fix-delivery-2026-11-02.md | 审核、验证、提交和 CI 状态 | 提交后填写 |
+| /tmp/pr86-fix-delivery-2026-11-02.md | 审核、验证、提交和 CI 状态 | 交付报告单独保存 |
 
 本次修复补足既有 #77 契约，不迁移或矫正旧数据，不扩大到其它已延期功能。
