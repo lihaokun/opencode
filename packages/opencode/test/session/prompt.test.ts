@@ -7,6 +7,7 @@ import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect, setSystemTime } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { FastCheck } from "effect/testing"
 import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -2155,7 +2156,21 @@ it.instance(
   "a run after a cancelled summary re-consumes the task anchored to the marker (#77)",
   () =>
     Effect.gen(function* () {
-      const { llm } = yield* useServerConfig(preflightCfg)
+      const { llm } = yield* useServerConfig((url) => {
+        const config = preflightCfg(url)
+        return {
+          ...config,
+          provider: {
+            test: {
+              ...config.provider.test,
+              models: {
+                ...config.provider.test.models,
+                "replacement-model": { ...config.provider.test.models["test-model"], id: "replacement-model" },
+              },
+            },
+          },
+        }
+      })
       const prompt = yield* SessionPrompt.Service
       const sessions = yield* Session.Service
       const chat = yield* sessions.create({ title: "Pinned" })
@@ -2199,7 +2214,11 @@ it.instance(
       // A newer user turn arrives while the task is still pending.
       const later = yield* prompt.prompt({
         sessionID: chat.id,
-        agent: "build",
+        agent: "plan",
+        model: { providerID: ref.providerID, modelID: ModelV2.ID.make("replacement-model") },
+        variant: "careful",
+        system: "Keep the replacement system instruction.",
+        tools: { glob: false },
         noReply: true,
         parts: [{ type: "text", text: "mid-summary-later-arrival-marker" }],
       })
@@ -2213,9 +2232,21 @@ it.instance(
         "later answer",
       )
 
-      yield* awaitWithTimeout(prompt.loop({ sessionID: chat.id }), "retry run did not terminate", "20 seconds")
+      const result = yield* awaitWithTimeout(
+        prompt.loop({ sessionID: chat.id }),
+        "retry run did not terminate",
+        "20 seconds",
+      )
       const hits = yield* llm.hits
+      expect(hits.map((hit) => hit.body.model)).toEqual(["test-model", "replacement-model", "replacement-model"])
+      expect(result.info).toMatchObject({ agent: "plan", modelID: "replacement-model", variant: "careful" })
       const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(MessageV2.latest(messages).user).toMatchObject({
+        agent: "plan",
+        model: { ...later.info.model, variant: "careful" },
+        system: "Keep the replacement system instruction.",
+        tools: { glob: false },
+      })
       const aborted = messages.find(
         (message) => message.info.role === "assistant" && message.info.summary && message.info.error,
       )
@@ -2388,6 +2419,181 @@ it.instance(
   30_000,
 )
 
+// The generated action log chooses configuration independently from the marker,
+// summary boundary and replay content. FastCheck can shrink arrival sequences.
+for (const dedicated of [false, true]) {
+  it.instance(
+    `compaction configuration follows user arrivals (dedicated model: ${dedicated})`,
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig((url) => {
+          const config = providerCfg(url)
+          return {
+            ...config,
+            compaction: { tail_turns: 1, preserve_recent_tokens: 1000 },
+            agent: { compaction: dedicated ? { model: "test/summary-model" } : {} },
+            provider: {
+              test: {
+                ...config.provider.test,
+                models: Object.fromEntries(
+                  ["test-model", "replacement-model", "summary-model"].map((id) => [
+                    id,
+                    {
+                      ...config.provider.test.models["test-model"],
+                      id,
+                      variants: { low: { reasoningEffort: "low" }, high: { reasoningEffort: "high" } },
+                    },
+                  ]),
+                ),
+              },
+            },
+          }
+        })
+        const sessions = yield* Session.Service
+        const prompt = yield* SessionPrompt.Service
+        const compaction = yield* SessionCompaction.Service
+        const run = Effect.runPromiseWith(yield* Effect.context<Session.Service | Database.Service>())
+        const selection = FastCheck.record({
+          agent: FastCheck.constantFrom("build", "plan"),
+          modelID: FastCheck.constantFrom("test-model", "replacement-model"),
+          variant: FastCheck.constantFrom(undefined, "low", "high"),
+          system: FastCheck.constantFrom(undefined, "Use the current system instruction."),
+          tools: FastCheck.constantFrom(undefined, { glob: false }),
+          format: FastCheck.constantFrom(undefined, { type: "text" as const }),
+        })
+        const changed = {
+          agent: "plan",
+          modelID: "replacement-model",
+          variant: "high",
+          system: "Use the current system instruction.",
+          tools: { glob: false },
+          format: { type: "text" as const },
+        } as const
+        yield* Effect.promise(() =>
+          FastCheck.assert(
+            FastCheck.asyncProperty(
+              FastCheck.record({
+                overflow: FastCheck.boolean(),
+                before: FastCheck.array(selection, { maxLength: 2 }),
+                during: FastCheck.array(selection, { maxLength: 2 }),
+              }),
+              (actions) =>
+                run(
+                  Effect.gen(function* () {
+                    const chat = yield* sessions.create({ title: "Pinned" })
+                    const prefix = `configuration-prefix-${chat.id}`
+                    const currentText = `configuration-replay-${chat.id}`
+                    yield* seed(chat.id, { finish: "stop", userText: prefix })
+                    const original = yield* prompt.prompt({
+                      sessionID: chat.id,
+                      agent: "build",
+                      model: ref,
+                      noReply: true,
+                      parts: [{ type: "text", text: currentText }],
+                    })
+                    if (original.info.role !== "user") throw new Error("expected original user")
+                    yield* compaction.create({
+                      sessionID: chat.id,
+                      agent: "build",
+                      model: ref,
+                      auto: true,
+                      overflow: actions.overflow,
+                    })
+                    const marker = (yield* sessions.messages({ sessionID: chat.id })).at(-1)!
+                    const arrivals: SessionV1.WithParts[] = []
+                    const arrive = Effect.fnUntraced(function* (choice: (typeof actions.before)[number]) {
+                      const message = yield* prompt.prompt({
+                        sessionID: chat.id,
+                        noReply: true,
+                        agent: choice.agent,
+                        model: { providerID: ref.providerID, modelID: ModelV2.ID.make(choice.modelID) },
+                        variant: choice.variant,
+                        system: choice.system,
+                        tools: choice.tools,
+                        format: choice.format ? new SessionV1.OutputFormatText(choice.format) : undefined,
+                        parts: [{ type: "text", text: `configuration-arrival-${chat.id}-${arrivals.length}` }],
+                      })
+                      arrivals.push(message)
+                      return message.info
+                    })
+                    for (const choice of actions.before) yield* arrive(choice)
+                    const initial = arrivals.at(-1)?.info ?? original.info
+                    if (initial.role !== "user") throw new Error("expected initial user")
+                    const gate = yield* Deferred.make<void>()
+                    const calls = yield* llm.calls
+                    yield* llm.push(
+                      reply().text(`configuration-summary-${chat.id}`).wait(deferredAsPromise(gate)).stop(),
+                    )
+                    yield* llm.text(`configuration-answer-${chat.id}`)
+                    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+                    yield* awaitWithTimeout(llm.wait(calls + 1), "configuration summary never started", "10 seconds")
+                    for (const choice of actions.during) yield* arrive(choice)
+                    const expected = arrivals.at(-1)?.info ?? original.info
+                    if (expected.role !== "user") throw new Error("expected current user")
+                    yield* Deferred.succeed(gate, void 0)
+                    const answer = yield* awaitWithTimeout(
+                      Fiber.join(fiber),
+                      "configuration run did not finish",
+                      "20 seconds",
+                    )
+                    const hits = (yield* llm.hits).slice(calls)
+                    expect(hits.map((hit) => hit.body.model)).toEqual([
+                      dedicated ? "summary-model" : initial.model.modelID,
+                      expected.model.modelID,
+                    ])
+                    expect(hits[0]?.body.reasoning_effort).toBe(initial.model.variant)
+                    expect(hits[1]?.body.reasoning_effort).toBe(expected.model.variant)
+                    expect(answer.info).toMatchObject({ agent: expected.agent, modelID: expected.model.modelID })
+                    expect(answer.info.role === "assistant" && answer.info.variant).toBe(expected.model.variant)
+                    const stored = yield* sessions.messages({ sessionID: chat.id })
+                    const latest = MessageV2.latest(stored).user
+                    expect(latest?.agent).toBe(expected.agent)
+                    expect(latest?.model).toEqual(expected.model)
+                    expect(latest?.system).toBe(expected.system)
+                    expect(latest?.tools).toEqual(expected.tools)
+                    expect(latest?.format).toEqual(expected.format)
+                    const summary = stored.find((message) => message.info.role === "assistant" && message.info.summary)
+                    expect(summary?.info).toMatchObject({ parentID: marker.info.id })
+                    expect(summary?.info.role === "assistant" && summary.info.variant).toBe(initial.model.variant)
+                    const summaryBody = JSON.stringify(hits[0]?.body)
+                    const finalBody = JSON.stringify(hits[1]?.body)
+                    expect(summaryBody).toContain(prefix)
+                    expect(summaryBody).not.toContain(currentText)
+                    expect(finalBody).not.toContain(prefix)
+                    expect(finalBody).toContain(currentText)
+                    for (const arrival of arrivals) {
+                      const part = arrival.parts.find((part) => part.type === "text")
+                      if (part?.type !== "text") throw new Error("expected arrival text")
+                      expect(summaryBody).not.toContain(part.text)
+                      expect(finalBody).toContain(part.text)
+                    }
+                    if (expected.system) expect(finalBody).toContain(expected.system)
+                    const projection = yield* MessageV2.filterCompactedEffect(chat.id)
+                    expect(
+                      projection.filter((message) =>
+                        message.parts.some((part) => part.type === "text" && part.text === currentText),
+                      ),
+                    ).toHaveLength(1)
+                  }).pipe(Effect.scoped),
+                ),
+            ),
+            {
+              seed: 86079,
+              numRuns: 12,
+              examples: [
+                [{ overflow: false, before: [changed], during: [] }],
+                [{ overflow: true, before: [changed], during: [] }],
+                [{ overflow: false, before: [], during: [changed] }],
+                [{ overflow: true, before: [], during: [changed] }],
+              ],
+            },
+          ),
+        )
+      }),
+    120_000,
+  )
+}
+
 // The action log owns expected attempts and sentinels. Assertions inspect every
 // wire request, including summaries, without choosing requests by their content.
 for (let seedNumber = 1; seedNumber <= 8; seedNumber++) {
@@ -2403,6 +2609,15 @@ for (let seedNumber = 1; seedNumber <= 8; seedNumber++) {
         const overflow = seedNumber > 4
         const { llm } = yield* useServerConfig((url) => ({
           ...providerCfg(url),
+          provider: {
+            test: {
+              ...providerCfg(url).provider.test,
+              models: {
+                ...cfg.provider.test.models,
+                "replacement-model": { ...cfg.provider.test.models["test-model"], id: "replacement-model" },
+              },
+            },
+          },
           compaction: { tail_turns: seedNumber % 3 === 0 ? 0 : 1, preserve_recent_tokens: 1000 },
         }))
         const prompt = yield* SessionPrompt.Service
@@ -2443,7 +2658,7 @@ for (let seedNumber = 1; seedNumber <= 8; seedNumber++) {
         const marker = (yield* sessions.messages({ sessionID: chat.id })).at(-1)!
         const plans = [[], ["cancelled"], ["length"], ["cancelled", "length"]] as const
         const plan = [...plans[seedNumber % 4]!, "success"] as const
-        const late: Array<{ id: MessageID; text: string }> = []
+        const late: Array<{ id: MessageID; text: string; info: SessionV1.User }> = []
         const failedIDs = [historical.id]
         for (const [attempt, outcome] of plan.entries()) {
           const addLate = Effect.fnUntraced(function* () {
@@ -2451,11 +2666,19 @@ for (let seedNumber = 1; seedNumber <= 8; seedNumber++) {
               const text = `pbt-late-${seedNumber}-${attempt}-${late.length}`
               const message = yield* prompt.prompt({
                 sessionID: chat.id,
-                agent: "build",
+                agent: random(2) ? "plan" : "build",
+                model: {
+                  providerID: ref.providerID,
+                  modelID: ModelV2.ID.make(random(2) ? "replacement-model" : "test-model"),
+                },
+                variant: random(2) ? "high" : undefined,
+                system: random(2) ? `configuration-system-${seedNumber}-${attempt}-${late.length}` : undefined,
+                tools: random(2) ? { glob: false } : undefined,
                 noReply: true,
                 parts: [{ type: "text", text }],
               })
-              late.push({ id: message.info.id, text })
+              if (message.info.role !== "user") throw new Error("expected generated user")
+              late.push({ id: message.info.id, text, info: message.info })
             }
           })
           yield* addLate()
@@ -2476,6 +2699,7 @@ for (let seedNumber = 1; seedNumber <= 8; seedNumber++) {
             object: "chat.completion.chunk",
             choices: [{ delta, ...(finish ? { finish_reason: finish } : {}) }],
           })
+          const before = late.at(-1)?.info ?? (marker.info as SessionV1.User)
           const calls = yield* llm.calls
           yield* llm.push(
             raw({
@@ -2502,7 +2726,10 @@ for (let seedNumber = 1; seedNumber <= 8; seedNumber++) {
           const storedAttempt = yield* MessageV2.get({ sessionID: chat.id, messageID: partialID })
           expect(storedAttempt.parts).toContainEqual(expect.objectContaining({ type: "text", text }))
           expect(storedAttempt.parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: reason }))
-          const summaryBody = JSON.stringify((yield* llm.hits)[calls]?.body)
+          const summaryHit = (yield* llm.hits)[calls]
+          expect(summaryHit?.body.model).toBe(before.model.modelID)
+          expect(storedAttempt.info.role === "assistant" && storedAttempt.info.variant).toBe(before.model.variant)
+          const summaryBody = JSON.stringify(summaryHit?.body)
           expect(summaryBody).toContain(oldText)
           for (const message of late) expect(summaryBody).not.toContain(message.text)
           if (overflow || seedNumber % 3 !== 0) expect(summaryBody).not.toContain(currentText)
@@ -2517,10 +2744,17 @@ for (let seedNumber = 1; seedNumber <= 8; seedNumber++) {
             })
           }
           if (outcome === "success") {
+            const expected = late.at(-1)?.info ?? (marker.info as SessionV1.User)
+            expect(result.info).toMatchObject({ agent: expected.agent, modelID: expected.model.modelID })
+            expect(result.info.role === "assistant" && result.info.variant).toBe(expected.model.variant)
+            const latest = MessageV2.latest(yield* sessions.messages({ sessionID: chat.id })).user
+            expect(latest?.system).toBe(expected.system)
+            expect(latest?.tools).toEqual(expected.tools)
             expect(result.parts).toContainEqual(
               expect.objectContaining({ type: "text", text: `pbt-answer-${seedNumber}` }),
             )
             const hits = yield* llm.hits
+            expect(hits.at(-1)?.body.model).toBe(expected.model.modelID)
             const body = JSON.stringify(hits.at(-1)?.body)
             expect(body).toContain(text)
             expect(body).not.toContain(oldText)

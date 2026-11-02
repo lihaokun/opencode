@@ -1516,6 +1516,163 @@ describe("session.compaction.process", () => {
     }).pipe(withCompaction({ plugin: autocontinue(false) })),
   )
 
+  itCompaction.instance("keeps the replay configuration on overflow when no newer user arrives", () => {
+    const stub = llm()
+    stub.push(reply("summary"))
+    return Effect.gen(function* () {
+      const ssn = yield* SessionNs.Service
+      const compact = yield* SessionCompaction.Service
+      const session = yield* ssn.create({})
+      yield* createUserMessage(session.id, "root")
+      const original = yield* ssn.updateMessage({
+        ...(yield* createUserMessage(session.id, "replay this turn")),
+        agent: "plan",
+        model: { providerID: ref.providerID, modelID: ModelV2.ID.make("replacement-model"), variant: "high" },
+        system: "Keep this replay system instruction.",
+        tools: { bash: false },
+        format: new SessionV1.OutputFormatJsonSchema({
+          type: "json_schema",
+          schema: { type: "object", properties: { answer: { type: "string" } } },
+          retryCount: 3,
+        }),
+      })
+      yield* compact.create({ sessionID: session.id, agent: "build", model: ref, auto: true, overflow: true })
+      const messages = yield* ssn.messages({ sessionID: session.id })
+      const marker = messages.at(-1)!
+      expect(
+        yield* compact.process({
+          parentID: marker.info.id,
+          messages,
+          sessionID: session.id,
+          auto: true,
+          overflow: true,
+        }),
+      ).toBe("continue")
+      const replay = MessageV2.latest(yield* ssn.messages({ sessionID: session.id })).user
+      expect(replay?.id).not.toBe(original.id)
+      expect(replay?.id).not.toBe(marker.info.id)
+      expect(replay?.agent).toBe(original.agent)
+      expect(replay?.model).toEqual(original.model)
+      expect(replay?.system).toBe(original.system)
+      expect(replay?.tools).toEqual(original.tools)
+      expect(replay?.format).toEqual(original.format)
+    }).pipe(withCompaction({ llm: stub.llmLayer }))
+  })
+
+  itCompaction.instance("keeps JS chronology when continuation users have custom Unicode IDs", () => {
+    const stub = llm()
+    stub.push(reply("summary"))
+    return Effect.gen(function* () {
+      const ssn = yield* SessionNs.Service
+      const compact = yield* SessionCompaction.Service
+      const session = yield* ssn.create({})
+      yield* createUserMessage(session.id, "root")
+      yield* compact.create({ sessionID: session.id, agent: "build", model: ref, auto: true })
+      const marker = (yield* ssn.messages({ sessionID: session.id })).at(-1)!
+      const created = Date.now()
+      // SQLite sorts the emoji last; JS sorts the BMP private-use character
+      // last. Continuation selection must match prompt.latest's JS ordering.
+      for (const [id, agent] of [
+        ["msg_custom_\uE000", "plan"],
+        ["msg_custom_\u{1F600}", "build"],
+      ] as const) {
+        yield* ssn.updateMessage({
+          id: MessageID.make(id),
+          role: "user",
+          sessionID: session.id,
+          time: { created },
+          agent,
+          model: { ...ref, variant: agent },
+        })
+      }
+      expect(
+        yield* compact.process({
+          parentID: marker.info.id,
+          messages: yield* ssn.messages({ sessionID: session.id }),
+          sessionID: session.id,
+          auto: true,
+        }),
+      ).toBe("continue")
+      const continuation = (yield* ssn.messages({ sessionID: session.id })).find((message) =>
+        message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+      )
+      expect(continuation?.info).toMatchObject({ agent: "plan", model: { ...ref, variant: "plan" } })
+    }).pipe(withCompaction({ llm: stub.llmLayer }))
+  })
+
+  itCompaction.instance("refreshes continuation configuration after the autocontinue plugin awaits a user", () =>
+    Effect.gen(function* () {
+      const ready = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const calls: Array<{ agent: string; model: Provider.Model; message: SessionV1.User }> = []
+      const stub = llm()
+      stub.push(reply("summary"))
+      yield* Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const compact = yield* SessionCompaction.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "root")
+        yield* compact.create({ sessionID: session.id, agent: "build", model: ref, auto: true })
+        const marker = (yield* ssn.messages({ sessionID: session.id })).at(-1)!
+        const before = yield* ssn.updateMessage({
+          ...(yield* createUserMessage(session.id, "before plugin")),
+          agent: "plan",
+          model: { ...ref, variant: "high" },
+          system: "before system",
+          tools: { glob: false },
+          format: new SessionV1.OutputFormatText({ type: "text" }),
+        })
+        const run = yield* compact
+          .process({
+            parentID: marker.info.id,
+            messages: yield* ssn.messages({ sessionID: session.id }),
+            sessionID: session.id,
+            auto: true,
+          })
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(ready).pipe(Effect.timeout("10 seconds"))
+        expect(calls).toHaveLength(1)
+        expect(calls[0]?.agent).toBe(before.agent)
+        expect(calls[0]?.model.id).toBe(before.model.modelID)
+        expect(calls[0]?.message).toEqual(before)
+        const during = yield* ssn.updateMessage({
+          ...(yield* createUserMessage(session.id, "during plugin")),
+          agent: "build",
+          model: { providerID: ref.providerID, modelID: ModelV2.ID.make("replacement-model"), variant: "low" },
+          system: "during system",
+          tools: { bash: false },
+          format: new SessionV1.OutputFormatJsonSchema({
+            type: "json_schema",
+            schema: { type: "object" },
+            retryCount: 3,
+          }),
+        })
+        yield* Deferred.succeed(release, void 0)
+        expect(yield* Fiber.join(run)).toBe("continue")
+        const next = MessageV2.latest(yield* ssn.messages({ sessionID: session.id })).user
+        expect(next?.id).not.toBe(during.id)
+        expect(next?.agent).toBe(during.agent)
+        expect(next?.model).toEqual(during.model)
+        expect(next?.system).toBe(during.system)
+        expect(next?.tools).toEqual(during.tools)
+        expect(next?.format).toEqual(during.format)
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          plugin: Layer.mock(Plugin.Service)({
+            trigger: <Name extends string, Input, Output>(name: Name, input: Input, output: Output) => {
+              if (name !== "experimental.compaction.autocontinue") return Effect.succeed(output)
+              calls.push(input as (typeof calls)[number])
+              return Deferred.succeed(ready, void 0).pipe(Effect.andThen(Deferred.await(release)), Effect.as(output))
+            },
+            list: () => Effect.succeed([]),
+            init: () => Effect.void,
+          }),
+        }),
+      )
+    }),
+  )
+
   it.instance(
     "replays the prior user turn on overflow when earlier context exists",
     Effect.gen(function* () {

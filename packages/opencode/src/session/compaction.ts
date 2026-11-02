@@ -12,7 +12,7 @@ import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
 
-import { Effect, Layer, Context } from "effect"
+import { Effect, Layer, Context, Option } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -340,6 +340,15 @@ const layer = Layer.effect(
       }
     })
 
+    const latestUser = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const found = yield* session.findMessage(sessionID, (message) => message.info.role === "user").pipe(Effect.orDie)
+      if (Option.isNone(found) || found.value.info.role !== "user") return undefined
+      // Generated IDs agree with SQLite ordering. A custom Unicode winner can
+      // disagree with JS chronology at the same timestamp (see latestRole).
+      if (!/[\uD800-\uDFFF]/.test(found.value.info.id)) return found.value.info
+      return MessageV2.latest(yield* session.messages({ sessionID }).pipe(Effect.orDie)).user
+    })
+
     const processCompaction = Effect.fn("SessionCompaction.process")(function* (input: {
       parentID: MessageID
       messages: SessionV1.WithParts[]
@@ -351,7 +360,9 @@ const layer = Layer.effect(
       if (!parent || parent.info.role !== "user") {
         throw new Error(`Compaction parent must be a user message: ${input.parentID}`)
       }
-      const userMessage = parent.info
+      // The marker owns the history boundary, while the newest user owns the
+      // execution configuration. They differ when a failed summary is retried.
+      const userMessage = MessageV2.latest(input.messages).user ?? parent.info
       const compactionPart = parent.parts.find((part): part is SessionV1.CompactionPart => part.type === "compaction")
 
       // A retry can have new inputs after its marker. Those belong to the
@@ -492,8 +503,10 @@ const layer = Layer.effect(
       }
 
       if (result === "continue" && input.auto) {
+        // A user can change configuration while the summary is streaming.
+        const current = (yield* latestUser(input.sessionID)) ?? userMessage
         if (replay) {
-          const original = replay.info
+          const original = current.id === parent.info.id ? replay.info : current
           const replayMsg = yield* session.updateMessage({
             id: MessageID.ascending(),
             role: "user",
@@ -526,34 +539,42 @@ const layer = Layer.effect(
         }
 
         if (!replay) {
-          const info = yield* provider.getProvider(userMessage.model.providerID)
+          const info = yield* provider.getProvider(current.model.providerID)
           if (
             (yield* plugin.trigger(
               "experimental.compaction.autocontinue",
               {
                 sessionID: input.sessionID,
-                agent: userMessage.agent,
-                model: yield* provider
-                  .getModel(userMessage.model.providerID, userMessage.model.modelID)
-                  .pipe(Effect.orDie),
+                agent: current.agent,
+                model: yield* provider.getModel(current.model.providerID, current.model.modelID).pipe(Effect.orDie),
                 provider: {
                   source: info.source,
                   info,
                   options: info.options,
                 },
-                message: userMessage,
+                message: current,
                 overflow: input.overflow === true,
               },
               { enabled: true },
             )).enabled
           ) {
+            // The plugin may await external work while another user arrives.
+            const next = (yield* latestUser(input.sessionID)) ?? current
             const continueMsg = yield* session.updateMessage({
               id: MessageID.ascending(),
               role: "user",
               sessionID: input.sessionID,
               time: { created: Date.now() },
-              agent: userMessage.agent,
-              model: userMessage.model,
+              agent: next.agent,
+              model: next.model,
+              format:
+                next.format?.type === "json_schema"
+                  ? new SessionV1.OutputFormatJsonSchema(next.format)
+                  : next.format?.type === "text"
+                    ? new SessionV1.OutputFormatText(next.format)
+                    : undefined,
+              tools: next.tools,
+              system: next.system,
             })
             const text =
               (input.overflow
