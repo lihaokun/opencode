@@ -6,7 +6,7 @@ issue #77（fermat CCodeVerify 主会话实测）确认了三个独立缺陷的�
 
 分支：`fix-compaction-summary-anchor`（基于 dev `d9d7de31fb`），commit `3a333d27ec`。
 
-2026-11-02 审核后补修：见 [压缩边界修复方案](../fixes/session-fix-compaction-boundaries.md)。摘要范围限定为任务 marker 之前；投影先解释完整持久边界并重排，再隐藏失败摘要；新增区间与真实执行属性测试。下文原轮次的测试数字不代表补修后的验证结果。
+2026-11-02 审核后补修：见 [压缩边界修复方案](../fixes/session-fix-compaction-boundaries.md)。摘要范围限定为任务 marker 之前；投影先解释完整持久边界并重排，再隐藏失败摘要；新增区间与真实执行属性测试。下文原轮次的测试数字不代表补修后的验证结果。进一步复核发现 marker 的旧 agent/model 会覆盖取消后新输入的选择；追加修复把 marker 历史边界与执行配置分离，摘要取启动时最新 user，ordinary/overflow 续写在摘要完成后重读配置，普通插件 await 后再读一次，并保留 variant/system/tools/format。专用 compaction 模型仍优先，只影响摘要。
 
 ## 改动
 

@@ -95,3 +95,81 @@
 | /tmp/pr86-fix-delivery-2026-11-02.md | 审核、验证、提交和 CI 状态 | 交付报告单独保存 |
 
 本次修复补足既有 #77 契约，不迁移或矫正旧数据，不扩大到其它已延期功能。
+
+## 追加修复：摘要锚点与执行配置分离（2026-11-02）
+
+本轮基线 `76bb54cc`；在已有边界修复上补齐执行配置回归，按用户授权完成实现与验证。
+
+### 一、现象与复现
+
+`Build/model A → 自动摘要输出部分正文/推理 → cancel → Plan/model B 新输入 → retry`：摘要 parent 正确落在旧 marker，但摘要和后续普通请求仍使用 A，最终 assistant 又成为 Build。真实回归扩展 `prompt.test.ts` 的 cancelled-summary 用例，同时断言三次 wire model、最终 agent/variant、失败输出隔离与旧 marker 锚点。
+
+### 二、根因
+
+`processCompaction` 将 `parent.info` 同时当作历史边界和执行配置。修复 #77 的 parent 后，最新输入的配置也意外变回 marker 的旧配置。overflow 从 replay 原始 user 复制配置存在同类问题；仅传入最新 user 也不足以处理摘要流式输出期间新到的配置。
+
+### 三、参考对照
+
+参照既有 `prompt.runLoop` 每轮按 `MessageV2.latest(msgs).user` 解析 model/agent 的契约，以及 stop-hook continuation 保留 system/tools 的实现。原 dev 用 latest user 作 parent，虽有锚点错误，却在取消→切换→重试路径保持 Plan/B；本次保留 #77 的正确 parent，单独恢复该执行配置行为。`MessageV2.latest` 根据持久时间与 ID 比较，不能用模型投影的数组末位替代。
+
+### 四、修复方案与不变量 C4
+
+- 摘要 `parentID`、head/tail、overflow replay 内容仍由 marker 前区间决定，保持 C1–C3。
+- 摘要执行配置来自调用快照内最新 user，显式 compaction agent model 继续优先于该 user model；variant 沿用最新 user model.variant，遵守既有 LLM variant 合并规则。
+- 自动续写前重新读取持久最新 user；普通 continuation 和 overflow replay 的 agent/model/variant、system/tools/format 均不能覆盖回旧 marker/replay 配置。没有较新输入时，overflow 保留原 replay 的完整配置。
+- 摘要期间新增 user 不改变已发出的摘要请求或摘要范围，但决定之后的续写配置。普通 autocontinue 插件接收摘要完成时的当前选择；插件运行后再读取一次，避免插件等待期间新增输入被覆盖。
+- 不改公开 Protocol/HttpApi、schema、V2、Runner、停止/重试语义。
+
+字段来源（`U0` 是调用快照中按持久 chronology 最新的 user；`U1` 是摘要完成时最新的持久 user；`U2` 是 autocontinue 插件返回后重新读取的最新 user；`R` 是 marker 前的 overflow replay user）：
+
+| 字段/用途 | 来源 |
+|---|---|
+| summary.parentID / head / tail_start_id | marker ID / marker 前历史区间，完全不取 U0/U1/U2 的 ID 作锚点 |
+| summary model/provider | `compaction` agent 显式 model 优先，否则 U0.model；不使用会话 agent 的默认模型覆盖显式选择 |
+| summary variant / LLM user.system | U0.model.variant / U0.system；专用模型下仍按现有 LLM variant 合并规则，不新增 compaction agent.variant 优先级 |
+| summary agent / tools / format | 始终 compaction agent / 空工具集合；U0 的 format 不改变摘要纯文本协议 |
+| ordinary autocontinue 插件输入 | U1.agent / U1.model / U1 全消息；插件 enabled 语义不变 |
+| ordinary continuation agent/model/variant/system/tools/format | U2 对应字段；undefined 保持 undefined，不从旧 marker 补回 |
+| overflow replay 内容/附件 | R.parts，原有媒体转文字占位规则不变 |
+| overflow continuation agent/model/variant/system/tools/format | U1 比 marker 更新时完整取 U1；仍是 marker 时完整取 R，保持无新输入时原 replay 配置 |
+| manual（auto=false） | 只产生摘要，不新增 continuation/replay |
+
+读取复用 `Session.findMessage` 的 50 条分页早停；只在 SQLite 排序选出的最新 user ID 含 UTF-16 surrogate 时回退全历史 `MessageV2.latest`（与现有 latestRole 的 Unicode 防护一致）。因此常见生成 ID 不重复扫描长会话，Unicode 边界保持既有 `(time,id)` JS chronology。
+
+这些读取建立在已有单 Session Runner 所有权上，不新增排队、锁或原子写事务；不声称解决任意外部写入与 continuation 持久化同时交错的竞态。
+
+### 五、正确性论证
+
+边界与配置分别取值，修改配置不能改变摘要父子关系或 head/tail。每次摘要请求只使用一个已确定的配置快照，结束后重新取值使运行期间的新输入影响下一请求。续写复制同一 user 的配置字段，防止 agent/model 与 system/tools/format 拼接成不一致配置。overflow 重放保持原内容及附件降级，只有被新输入明确替换的执行配置变化。无较新输入的 replay 保持既有行为。
+
+### 六、测试清单
+
+| 类型 | 用例 | 状态 |
+|---|---|---|
+| 回归 | 真实取消部分输出→Plan/B/variant→retry，wire 与最终 agent | RED：三次请求均 A；GREEN：A/B/B，最终 Plan/B/careful，失败正文/推理隔离不变 |
+| 新增 | ordinary/overflow × 输入在摘要前/中变化 × compaction 专用模型；system/tools/format/variant | 两组 FastCheck wire 用例通过，含真实 reasoning_effort |
+| 新增 | 插件 await 期间换配置；Unicode 同毫秒 chronology；无新输入 overflow 保留与 marker 不同的 R 配置 | 三个 service 边界用例通过；R 包含 JSON schema/retryCount、system/tools/variant |
+| 属性 | 生成不同 agent/model/variant/用户字段/到达时机，检查范围与执行配置独立 | 两组 FastCheck，seed=86079、各 numRuns=12，含 ordinary/overflow × before/during 固定 examples；原 8 种子取消/length/retry 轨迹也加入配置变更并通过 |
+| 回归集 | compaction、投影、message-v2/pagination、prompt、Runner/run-state/step-tail | 8 文件完整集：412 pass、2 skip（既有 V2 projector disabled）、0 fail，11,445 断言；复审追加 R 回退边界单跑 1 pass/8 断言 |
+| 静态 | opencode package `bun typecheck`；diff whitespace | 全部通过 |
+
+验证命令在 `packages/opencode` 执行：`bun test --timeout 30000` 加上述 8 个相关测试文件，以及复审新增 `keeps the replay configuration` 单例。日志为 `/tmp/pr86-config-full-final.log`、`/tmp/pr86-config-replay-boundary.log`、`/tmp/pr86-config-typecheck-final.log`；取消配置回归的 RED/GREEN 为 `/tmp/pr86-config-red.log` / `/tmp/pr86-config-green.log`。
+
+失败分析：早期新增 fixture 直接传 plain output format，违反既有 Schema.Class 输入要求，已改为类实例；持久化省略 undefined variant，因此用字段读取后的严格 `toBe` 比较验证其缺省值。增强原 8 种子时，system 字段误复用了 late 正文 sentinel，导致正文隔离断言在合法 system 配置中匹配；改为独立生成的配置 sentinel，原正文隔离断言未改。首次完整命令误漏 package 标准 `--timeout 30000`，在大历史 fixture 的 Bun 默认 5 秒限额失败后停止；最终标准命令该 fixture 26.5 秒通过，索引查询 500ms 断言未放宽。其余最终验证无失败。
+
+独立复审补充了无新输入 overflow 的 R≠marker 配置用例，并要求分页读取的 Unicode chronology 对照；两项都已落实。主 agent 负责最终独立审核和推送，本轮未 push、merge 或发送 GitHub 评论。
+
+### 七、代码更新清单
+
+| 文件 | 改动 | 状态 |
+|---|---|---|
+| `src/session/compaction.ts` | 分开历史锚点、摘要配置、续写配置；分页读取与 Unicode 回退 | `39987659` |
+| `test/session/prompt.test.ts` | 取消真实回归、配置属性与时序边界 | `39987659` |
+| `test/session/compaction.test.ts` | 插件 await、Unicode chronology、无新输入 R 配置回退 | `39987659` |
+
+### 八、文档更新清单
+
+| 文档 | 改动 | 状态 |
+|---|---|---|
+| 本文追加部分 | C4、根因、验证与限制 | 已完成；实现提交 `39987659` |
+| `docs/devlog/2026-10-27-issue77-compaction-summary-anchor.md` | 补充执行配置与边界分离说明 | 已完成 |
