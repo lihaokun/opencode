@@ -2162,7 +2162,16 @@ it.instance(
       const oldMarker = "mid-summary-old-history-marker"
       const currentMarker = "mid-summary-current-marker"
       const summaryMarker = "mid-summary-summary-marker"
-      const gate = yield* Deferred.make<void>()
+      const partialText = "cancelled-summary-partial-text"
+      const partialReason = "cancelled-summary-partial-reasoning"
+      const ready = yield* Deferred.make<void>()
+      const events = yield* EventV2Bridge.Service
+      const off = yield* events.listen((event) => {
+        if (event.type !== MessageV2.Event.PartDelta.type) return Effect.void
+        const data = event.data as typeof MessageV2.Event.PartDelta.data.Type
+        return data.sessionID === chat.id && data.delta === partialText ? Deferred.succeed(ready, void 0) : Effect.void
+      })
+      yield* Effect.addFinalizer(() => off)
 
       yield* seed(chat.id, { finish: "stop", userText: `${oldMarker}\n${"x".repeat(280_000)}` })
       yield* prompt.prompt({
@@ -2172,23 +2181,20 @@ it.instance(
         parts: [{ type: "text", text: currentMarker }],
       })
       // The summary attempt hangs; cancel the run mid-summary. The task part
-      // survives (only the assistant attempt is removed), so a later run must
-      // re-consume it.
+      // and partial output survive durably, so a later run must re-consume
+      // the task without feeding that output back into the provider.
       yield* llm.pushMatch(
         (hit) => JSON.stringify(hit.body).includes(oldMarker),
-        reply().wait(deferredAsPromise(gate)).text(summaryMarker).stop(),
+        reply().reason(partialReason).text(partialText).hang(),
       )
 
       const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
       yield* awaitWithTimeout(llm.wait(1), "summary request never started", "5 seconds")
+      // Deltas are published while streaming; cancellation flushes the partial
+      // text into the durable part. Wait on the real event, not an empty row.
+      yield* awaitWithTimeout(Deferred.await(ready), "summary partial output was not received", "10 seconds")
       yield* prompt.cancel(chat.id)
-      yield* awaitWithTimeout(
-        Fiber.join(run),
-        "cancelled run did not terminate",
-        "10 seconds",
-      )
-      yield* Deferred.succeed(gate, void 0)
-      yield* Effect.sleep("50 millis")
+      yield* awaitWithTimeout(Fiber.join(run), "cancelled run did not terminate", "10 seconds")
 
       // A newer user turn arrives while the task is still pending.
       const later = yield* prompt.prompt({
@@ -2207,13 +2213,18 @@ it.instance(
         "later answer",
       )
 
-      yield* awaitWithTimeout(
-        prompt.loop({ sessionID: chat.id }),
-        "retry run did not terminate",
-        "20 seconds",
-      )
+      yield* awaitWithTimeout(prompt.loop({ sessionID: chat.id }), "retry run did not terminate", "20 seconds")
       const hits = yield* llm.hits
       const messages = yield* sessions.messages({ sessionID: chat.id })
+      const aborted = messages.find(
+        (message) => message.info.role === "assistant" && message.info.summary && message.info.error,
+      )
+      expect(aborted?.parts).toContainEqual(expect.objectContaining({ type: "text", text: partialText }))
+      expect(aborted?.parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: partialReason }))
+      for (const hit of hits) {
+        expect(JSON.stringify(hit.body)).not.toContain(partialText)
+        expect(JSON.stringify(hit.body)).not.toContain(partialReason)
+      }
 
       // The cancelled attempt stays in the transcript (aborted assistant);
       // only the settled summary counts for the contract.
@@ -2280,7 +2291,11 @@ it.instance(
       // overflow), so the arm stops its run with the task still pending.
       yield* llm.pushMatch(
         (hit) => JSON.stringify(hit.body).includes(oldMarker),
-        reply().wait(deferredAsPromise(gate)).text("aborted summary prefix").length(),
+        reply()
+          .wait(deferredAsPromise(gate))
+          .reason("truncated summary reasoning")
+          .text("aborted summary prefix")
+          .length(),
       )
 
       const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
@@ -2294,17 +2309,26 @@ it.instance(
       if (lateSubmitted.info.role !== "user") throw new Error("expected a user message")
       const late = lateSubmitted.info
 
-      // Settle the held summary with a length finish: the attempt ends
-      // terminally, the arm breaks its run, and the task stays pending.
-      yield* Deferred.succeed(gate, void 0)
-
-      // The next run re-consumes the pending task and answers the late turn.
+      // Queue recovery before releasing the failure: the existing runner
+      // re-arms for the durable late input, without a second concurrent loop.
       yield* llm.pushMatch((hit) => JSON.stringify(hit.body).includes(oldMarker), reply().text(summaryMarker).stop())
       yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes(lateMarker), "late answer")
-      const retryRun = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-      yield* awaitWithTimeout(
-        Fiber.join(retryRun),
-        "retry run did not terminate",
+      yield* Deferred.succeed(gate, void 0)
+      yield* awaitWithTimeout(Fiber.join(run), "failed run did not terminate", "20 seconds")
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.find(
+                (message) =>
+                  message.info.role === "assistant" &&
+                  message.info.finish &&
+                  message.parts.some((part) => part.type === "text" && part.text === "late answer"),
+              ),
+            ),
+          ),
+        "re-armed run did not answer the late input",
         "20 seconds",
       )
 
@@ -2333,11 +2357,17 @@ it.instance(
       expect(markerUser).toBeDefined()
       expect(retryParentID).not.toBe(late.id)
       // The failed attempt never reaches any later request…
-      const lateBodies = hits.filter((hit) => JSON.stringify(hit.body).includes(lateMarker))
-      expect(lateBodies.length).toBeGreaterThanOrEqual(1)
-      for (const hit of lateBodies) {
+      for (const hit of hits) {
         expect(JSON.stringify(hit.body)).not.toContain("aborted summary prefix")
+        expect(JSON.stringify(hit.body)).not.toContain("truncated summary reasoning")
       }
+      const failed = messages.find(
+        (message) => message.info.role === "assistant" && message.info.summary && message.info.error,
+      )
+      expect(failed?.parts).toContainEqual(expect.objectContaining({ type: "text", text: "aborted summary prefix" }))
+      expect(failed?.parts).toContainEqual(
+        expect.objectContaining({ type: "reasoning", text: "truncated summary reasoning" }),
+      )
       // …and there is exactly one summary-bearing request against the old
       // history: the failed first attempt must not have been serialized into
       // the retry's input.
@@ -2357,6 +2387,170 @@ it.instance(
     }),
   30_000,
 )
+
+// The action log owns expected attempts and sentinels. Assertions inspect every
+// wire request, including summaries, without choosing requests by their content.
+for (let seedNumber = 1; seedNumber <= 8; seedNumber++) {
+  it.instance(
+    `compaction event sequences preserve boundaries and failed payloads (seed ${seedNumber})`,
+    () =>
+      Effect.gen(function* () {
+        let randomState = seedNumber
+        const random = (max: number) => {
+          randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0
+          return randomState % max
+        }
+        const overflow = seedNumber > 4
+        const { llm } = yield* useServerConfig((url) => ({
+          ...providerCfg(url),
+          compaction: { tail_turns: seedNumber % 3 === 0 ? 0 : 1, preserve_recent_tokens: 1000 },
+        }))
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const compaction = yield* SessionCompaction.Service
+        const events = yield* EventV2Bridge.Service
+        const chat = yield* sessions.create({ title: "Pinned" })
+        const oldText = `pbt-old-prefix-${seedNumber}`
+        const currentText = `pbt-current-turn-${seedNumber}`
+        const base = yield* seed(chat.id, { finish: "stop", userText: oldText })
+        // A legacy failed attempt lies inside the next summary's head. Without
+        // projection filtering it would be serialized, even with marker slicing.
+        const historical = yield* sessions.updateMessage({
+          ...base.assistant,
+          id: MessageID.ascending(),
+          summary: true,
+          time: { created: Date.now() },
+          error: new SessionV1.AbortedError({ message: "cancelled" }).toObject(),
+        })
+        const forbidden = [`pbt-legacy-text-${seedNumber}`, `pbt-legacy-reason-${seedNumber}`]
+        for (const [index, type] of (["text", "reasoning"] as const).entries()) {
+          yield* sessions.updatePart({
+            id: PartID.ascending(),
+            sessionID: chat.id,
+            messageID: historical.id,
+            type,
+            text: forbidden[index]!,
+            time: { start: Date.now(), end: Date.now() },
+          })
+        }
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: currentText }],
+        })
+        yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: true, overflow })
+        const marker = (yield* sessions.messages({ sessionID: chat.id })).at(-1)!
+        const plans = [[], ["cancelled"], ["length"], ["cancelled", "length"]] as const
+        const plan = [...plans[seedNumber % 4]!, "success"] as const
+        const late: Array<{ id: MessageID; text: string }> = []
+        const failedIDs = [historical.id]
+        for (const [attempt, outcome] of plan.entries()) {
+          const addLate = Effect.fnUntraced(function* () {
+            for (let i = random(3); i > 0; i--) {
+              const text = `pbt-late-${seedNumber}-${attempt}-${late.length}`
+              const message = yield* prompt.prompt({
+                sessionID: chat.id,
+                agent: "build",
+                noReply: true,
+                parts: [{ type: "text", text }],
+              })
+              late.push({ id: message.info.id, text })
+            }
+          })
+          yield* addLate()
+          const text = `pbt-${outcome}-text-${seedNumber}-${attempt}`
+          const reason = `pbt-${outcome}-reason-${seedNumber}-${attempt}`
+          const gate = yield* Deferred.make<void>()
+          const ready = yield* Deferred.make<MessageID>()
+          const off = yield* events.listen((event) => {
+            if (event.type !== MessageV2.Event.PartDelta.type) return Effect.void
+            const data = event.data as typeof MessageV2.Event.PartDelta.data.Type
+            return data.sessionID === chat.id && data.delta === text
+              ? Deferred.succeed(ready, data.messageID)
+              : Effect.void
+          })
+          yield* Effect.addFinalizer(() => off)
+          const chunk = (delta: Record<string, unknown>, finish?: string) => ({
+            id: "chatcmpl-test",
+            object: "chat.completion.chunk",
+            choices: [{ delta, ...(finish ? { finish_reason: finish } : {}) }],
+          })
+          const calls = yield* llm.calls
+          yield* llm.push(
+            raw({
+              head: [chunk({ role: "assistant" }), chunk({ reasoning_content: reason }), chunk({ content: text })],
+              wait: deferredAsPromise(gate),
+              tail: [chunk({}, outcome === "length" ? "length" : "stop")],
+            }),
+          )
+          if (outcome === "success") yield* llm.text(`pbt-answer-${seedNumber}`)
+          const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+          yield* awaitWithTimeout(llm.wait(calls + 1), "generated summary request did not start", "10 seconds")
+          const partialID = yield* awaitWithTimeout(
+            Deferred.await(ready),
+            "generated summary delta did not arrive",
+            "10 seconds",
+          )
+          yield* off
+          const partial = yield* MessageV2.get({ sessionID: chat.id, messageID: partialID })
+          expect(partial.info).toMatchObject({ role: "assistant", summary: true, parentID: marker.info.id })
+          if (outcome !== "length") yield* addLate()
+          if (outcome === "cancelled") yield* prompt.cancel(chat.id)
+          yield* Deferred.succeed(gate, void 0)
+          const result = yield* awaitWithTimeout(Fiber.join(run), "generated attempt did not finish", "20 seconds")
+          const storedAttempt = yield* MessageV2.get({ sessionID: chat.id, messageID: partialID })
+          expect(storedAttempt.parts).toContainEqual(expect.objectContaining({ type: "text", text }))
+          expect(storedAttempt.parts).toContainEqual(expect.objectContaining({ type: "reasoning", text: reason }))
+          const summaryBody = JSON.stringify((yield* llm.hits)[calls]?.body)
+          expect(summaryBody).toContain(oldText)
+          for (const message of late) expect(summaryBody).not.toContain(message.text)
+          if (overflow || seedNumber % 3 !== 0) expect(summaryBody).not.toContain(currentText)
+          else expect(summaryBody).toContain(currentText)
+          if (outcome !== "success") {
+            forbidden.push(text, reason)
+            failedIDs.push(partial.info.id)
+            expect(result.info).toMatchObject({
+              role: "assistant",
+              summary: true,
+              error: { name: outcome === "length" ? "MessageOutputLengthError" : "MessageAbortedError" },
+            })
+          }
+          if (outcome === "success") {
+            expect(result.parts).toContainEqual(
+              expect.objectContaining({ type: "text", text: `pbt-answer-${seedNumber}` }),
+            )
+            const hits = yield* llm.hits
+            const body = JSON.stringify(hits.at(-1)?.body)
+            expect(body).toContain(text)
+            expect(body).not.toContain(oldText)
+            if (overflow || seedNumber % 3 !== 0) expect(body).toContain(currentText)
+            else expect(body).not.toContain(currentText)
+            for (const message of late) expect(body).toContain(message.text)
+            expect(hits).toHaveLength(plan.length + 1)
+            const projected = yield* MessageV2.filterCompactedEffect(chat.id)
+            for (const message of late) expect(projected.filter((item) => item.info.id === message.id)).toHaveLength(1)
+          }
+          for (const hit of yield* llm.hits) {
+            for (const sentinel of forbidden) expect(JSON.stringify(hit.body)).not.toContain(sentinel)
+          }
+          const stored = yield* sessions.messages({ sessionID: chat.id })
+          for (const id of failedIDs)
+            expect(
+              stored.some(
+                (message) => message.info.id === id && message.info.role === "assistant" && message.info.error,
+              ),
+            ).toBe(true)
+          const projection = yield* MessageV2.filterCompactedEffect(chat.id)
+          for (const id of failedIDs) expect(projection.some((message) => message.info.id === id)).toBe(false)
+          expect(stored.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(
+            1,
+          )
+        }
+      }),
+    60_000,
+  )
+}
 
 withOversizedTool.instance("loop excludes disabled tools from preflight payload sizing", () =>
   Effect.gen(function* () {

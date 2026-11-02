@@ -354,7 +354,10 @@ const layer = Layer.effect(
       const userMessage = parent.info
       const compactionPart = parent.parts.find((part): part is SessionV1.CompactionPart => part.type === "compaction")
 
-      let messages = input.messages
+      // A retry can have new inputs after its marker. Those belong to the
+      // next turn, not to this summary or its retained tail.
+      const history = compactionPart ? input.messages.slice(0, input.messages.indexOf(parent)) : input.messages
+      let messages = history
       let replay:
         | {
             info: SessionV1.User
@@ -375,7 +378,7 @@ const layer = Layer.effect(
           replay && messages.some((m) => m.info.role === "user" && !m.parts.some((p) => p.type === "compaction"))
         if (!hasContent) {
           replay = undefined
-          messages = input.messages
+          messages = history
         }
       }
 
@@ -384,12 +387,11 @@ const layer = Layer.effect(
         ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
         : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
       const cfg = yield* config.get()
-      const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
-      const prior = completedCompactions(history)
+      const prior = completedCompactions(messages)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
       const previousSummary = prior.at(-1)?.summary
       const selected = yield* select({
-        messages: history.filter((_, index) => !hidden.has(index)),
+        messages: messages.filter((_, index) => !hidden.has(index)),
         cfg,
         model,
       })
@@ -482,7 +484,7 @@ const layer = Layer.effect(
         return "stop"
       }
 
-      if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
+      if (compactionPart && compactionPart.tail_start_id !== selected.tail_start_id) {
         yield* session.updatePart({
           ...compactionPart,
           tail_start_id: selected.tail_start_id,

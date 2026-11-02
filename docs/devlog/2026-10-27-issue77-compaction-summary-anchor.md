@@ -6,6 +6,8 @@ issue #77（fermat CCodeVerify 主会话实测）确认了三个独立缺陷的�
 
 分支：`fix-compaction-summary-anchor`（基于 dev `d9d7de31fb`），commit `3a333d27ec`。
 
+2026-11-02 审核后补修：见 [压缩边界修复方案](../fixes/session-fix-compaction-boundaries.md)。摘要范围限定为任务 marker 之前；投影先解释完整持久边界并重排，再隐藏失败摘要；新增区间与真实执行属性测试。下文原轮次的测试数字不代表补修后的验证结果。
+
 ## 改动
 
 ### 1. 摘要挂到压缩标记所在消息（根因 1）
@@ -15,7 +17,7 @@ issue #77（fermat CCodeVerify 主会话实测）确认了三个独立缺陷的�
 
 ### 2. 失败/取消的摘要不进入模型上下文（根因 2）
 
-- `filterCompacted()` 主循环：`summary && (!finish || error)` 的 assistant 直接跳过（不计入 result，不参与 retain 段切分）。转录仍完整保留，TUI 可查。
+- `filterCompacted()`：`summary && (!finish || error)` 的 assistant 最终从模型投影排除。补修后，它们仍参与持久 tail 边界定位，截断和重排完成后才隐藏正文。转录仍完整保留，TUI 可查。
 - `filterCompacted()` 重排段：summaryIndex 的匹配加 `finish && !error` 约束——挂错消息的旧摘要（即使成功）也不会被当作标记的结算。
 
 与 `completedCompactions()`（compaction.ts）和 restoration 的 settled 谓词同款：`summary && finish && !error && parentID 指向标记`。至此四处判定（filterCompacted 主循环、filterCompacted 重排、completedCompactions、restoration）全部一致。
@@ -27,7 +29,7 @@ issue #77（fermat CCodeVerify 主会话实测）确认了三个独立缺陷的�
 ## 有意不做（本包边界）
 
 - **`small: true`（丢弃 reasoning variant）**：用户要求先讨论，未实施。数据支持做（22:41 那次摘要输出 21 万字符推理、23.5 分钟全在推理通道），但 `smallOptions()` 对 GLM 类 provider 返回首个 variant 或 `{}`，语义是"小模型选项"而非"低推理强度"，直接复用可能改变 temperature/store 等其它参数；更干净的做法是给 `StreamInput` 加独立的 `reasoningEffort`/`reasoning: false` 通道。留待包 2（摘要请求预算设计）一并处理。
-- **TUI"压缩后待更新"占位文案**：空读数已消除误导（显示 0/无），占位文案属 UX 打磨。
+- **TUI"压缩后待更新"占位文案**：没有普通助手用量时显示空读数；否则暂时沿用最近普通助手的旧用量，不代表压缩后的新估值。占位文案继续留待 UX 打磨。
 - **core `packages/core/src/session/compaction.ts`**：V2 路径，产品主路径（CLI/TUI）零消费者（CLAUDE.md 已知限制），不动。
 - **#83/#84 渐进摘要恢复**：需先过 §4 设计三阶段（chunked summarization、checkpoint 持久化、无进展失败状态），另开子计划。
 

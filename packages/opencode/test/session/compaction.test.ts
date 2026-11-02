@@ -965,6 +965,123 @@ describe("session.compaction.prune", () => {
 })
 
 describe("session.compaction.process", () => {
+  for (const auto of [false, true]) {
+    itCompaction.instance(`ordinary retry keeps late inputs outside its marker boundary (auto=${auto})`, () => {
+      const stub = llm()
+      const requests: string[] = []
+      stub.push(reply("replacement-summary", (input) => requests.push(JSON.stringify(input.messages))))
+      return Effect.gen(function* () {
+        const context = yield* TestInstance
+        const sessions = yield* SessionNs.Service
+        const chat = yield* sessions.create({})
+        const old = yield* createUserMessage(chat.id, "old-prefix")
+        yield* createAssistantMessage(chat.id, old.id, context.directory)
+        const retained = yield* createUserMessage(chat.id, "retained-tail")
+        yield* createSummaryCompaction(chat.id)
+        const marker = (yield* sessions.messages({ sessionID: chat.id })).at(-1)!
+        const failed = yield* createSummaryAssistantMessage(
+          chat.id,
+          marker.info.id,
+          context.directory,
+          "failed-attempt",
+        )
+        yield* sessions.updateMessage({
+          ...failed,
+          error: new SessionV1.AbortedError({ message: "cancelled" }).toObject(),
+        })
+        const late = yield* createUserMessage(chat.id, "late-input")
+        yield* SessionCompaction.use.process({
+          parentID: marker.info.id,
+          sessionID: chat.id,
+          auto,
+          messages: yield* MessageV2.filterCompactedEffect(chat.id),
+        })
+        const stored = yield* sessions.messages({ sessionID: chat.id })
+        const part = stored
+          .find((message) => message.info.id === marker.info.id)!
+          .parts.find((part) => part.type === "compaction")
+        expect(part?.type === "compaction" && part.tail_start_id).toBe(retained.id)
+        const projected = yield* MessageV2.filterCompactedEffect(chat.id)
+        expect(projected.map((message) => message.info.id)).not.toContain(old.id)
+        expect(projected.map((message) => message.info.id)).not.toContain(failed.id)
+        expect(projected.slice(2, 4).map((message) => message.info.id)).toEqual([retained.id, late.id])
+        expect(projected[1]?.info).toMatchObject({ role: "assistant", parentID: marker.info.id, summary: true })
+        expect(requests).toHaveLength(1)
+        expect(requests[0]).toContain("old-prefix")
+        for (const text of ["retained-tail", "late-input", "failed-attempt"]) expect(requests[0]).not.toContain(text)
+        expect(stored.find((message) => message.info.id === failed.id)?.parts).toContainEqual(
+          expect.objectContaining({ type: "text", text: "failed-attempt" }),
+        )
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 1000 }) }))
+    })
+  }
+
+  itCompaction.instance("a retry with no retained tail clears the previous attempt's tail", () => {
+    const stub = llm()
+    stub.push(reply("full replacement summary"))
+    return Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const chat = yield* sessions.create({})
+      const old = yield* createUserMessage(chat.id, "must-be-summarized")
+      yield* createSummaryCompaction(chat.id)
+      const marker = (yield* sessions.messages({ sessionID: chat.id })).at(-1)!
+      const part = marker.parts.find((part) => part.type === "compaction")!
+      yield* sessions.updatePart({ ...part, tail_start_id: old.id })
+      yield* SessionCompaction.use.process({
+        parentID: marker.info.id,
+        sessionID: chat.id,
+        auto: false,
+        messages: yield* MessageV2.filterCompactedEffect(chat.id),
+      })
+      const projected = yield* MessageV2.filterCompactedEffect(chat.id)
+      expect(projected).toHaveLength(2)
+      expect(projected[0]?.info.id).toBe(marker.info.id)
+      expect(projected[0]?.parts.find((part) => part.type === "compaction")?.tail_start_id).toBeUndefined()
+    }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 0 }) }))
+  })
+
+  itCompaction.instance("overflow fallback summarizes only the history before its marker", () => {
+    const stub = llm()
+    const requests: string[] = []
+    stub.push(reply("fallback summary", (input) => requests.push(JSON.stringify(input.messages))))
+    return Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const chat = yield* sessions.create({})
+      const old = yield* createUserMessage(chat.id, "only-old-user")
+      yield* createSummaryCompaction(chat.id)
+      const marker = (yield* sessions.messages({ sessionID: chat.id })).at(-1)!
+      const late = yield* createUserMessage(chat.id, "fallback-late-input")
+      yield* SessionCompaction.use.process({
+        parentID: marker.info.id,
+        sessionID: chat.id,
+        auto: true,
+        overflow: true,
+        messages: yield* MessageV2.filterCompactedEffect(chat.id),
+      })
+      expect(requests).toHaveLength(1)
+      expect(requests[0]).toContain("only-old-user")
+      expect(requests[0]).not.toContain("fallback-late-input")
+      const projected = yield* MessageV2.filterCompactedEffect(chat.id)
+      expect(projected.slice(0, 3).map((message) => message.info.id)).toEqual([
+        marker.info.id,
+        expect.any(String),
+        late.id,
+      ])
+      expect(projected.map((message) => message.info.id)).not.toContain(old.id)
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      expect(
+        stored.filter(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.text === "only-old-user"),
+        ),
+      ).toHaveLength(1)
+      expect(stored.at(-1)?.parts).toContainEqual(
+        expect.objectContaining({ type: "text", text: expect.stringContaining("previous request exceeded") }),
+      )
+    }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 0 }) }))
+  })
+
   it.instance(
     "throws when parent is not a user message",
     Effect.gen(function* () {
