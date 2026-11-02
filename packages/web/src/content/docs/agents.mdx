@@ -438,7 +438,7 @@ The available permission keys are:
 | `list`               | `list`                                                           |
 | `bash`               | `bash`                                                           |
 | `agent`              | `agent`                                                          |
-| `agent_list`         | `agent_list`                                                     |
+| `agent_list`         | `agent_list`, `agent_status`                                     |
 | `agent_send`         | `agent_send`                                                     |
 | `agent_stop`         | `agent_stop`                                                     |
 | `task`               | Deprecated name for `agent`; still read, renamed on load         |
@@ -449,7 +449,7 @@ The available permission keys are:
 | `lsp`                | `lsp`                                                            |
 | `skill`              | `skill`                                                          |
 | `question`           | `question`                                                       |
-| `doom_loop`          | Recovery prompts when an agent appears stuck                     |
+| `doom_loop`          | Repeated tool calls within one model response                    |
 
 `read`, `edit`, `glob`, `grep`, `list`, `bash`, `agent`, `agent_list`, `agent_send`, `agent_stop`, `external_directory`, `lsp`, and `skill` accept either a shorthand action (`"allow" | "ask" | "deny"`) or an object of glob/pattern → action for fine-grained control. The remaining keys accept the shorthand action only.
 
@@ -625,11 +625,12 @@ Control which subagents an agent can invoke via the `agent` tool with `permissio
 
 When set to `deny`, the subagent is removed from the `agent` tool description entirely, so the model won't attempt to invoke it.
 
-The three companion tools take their own keys: `agent_list` for reading the Agent
+The companion tools take their own keys: `agent_list` for reading the Agent
 tree, `agent_send` for messaging another Agent, and `agent_stop` for stopping
-one. Denying `agent_list` also withholds the subagent roster and the neighbour
-snapshot, so a subagent that cannot list other Agents is not told about them by
-another route.
+one. `agent_status`, which shows one Agent's run, follows `agent_list`: denying
+`agent_list` hides and refuses both, and also withholds the step tail's view of
+the subagents and the neighbour snapshot, so a subagent that cannot list other
+Agents is not told about them by another route.
 
 :::note
 `permission.task` was this key's name before the tool was renamed. It is still

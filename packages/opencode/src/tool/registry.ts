@@ -3,6 +3,7 @@ import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { PlanExitTool } from "./plan"
 import { Session } from "@/session/session"
+import { SessionStatus } from "@/session/status"
 import { QuestionTool } from "./question"
 import { ShellTool } from "./shell"
 import { EditTool } from "./edit"
@@ -12,6 +13,7 @@ import { ReadTool } from "./read"
 import {
   AgentTool,
   AgentListTool,
+  AgentStatusTool,
   AgentSendTool,
   AgentStopTool,
   AGENT_TOOL_ID,
@@ -120,6 +122,7 @@ const layer = Layer.effect(
     const invalid = yield* InvalidTool
     const agentTool = yield* AgentTool
     const agentListTool = yield* AgentListTool
+    const agentStatusTool = yield* AgentStatusTool
     const agentSendTool = yield* AgentSendTool
     const agentStopTool = yield* AgentStopTool
     const agentTree = yield* AgentTree.Service
@@ -238,6 +241,7 @@ const layer = Layer.effect(
           write: Tool.init(writetool),
           agent: Tool.init(agentTool),
           agentList: Tool.init(agentListTool),
+          agentStatus: Tool.init(agentStatusTool),
           agentSend: Tool.init(agentSendTool),
           agentStop: Tool.init(agentStopTool),
           fetch: Tool.init(webfetch),
@@ -263,6 +267,7 @@ const layer = Layer.effect(
             tool.write,
             tool.agent,
             tool.agentList,
+            tool.agentStatus,
             tool.agentSend,
             tool.agentStop,
             tool.fetch,
@@ -490,6 +495,7 @@ export const node = LayerNode.make({
     AgentLifecycle.node,
     AgentInbox.node,
     AgentStatusProjection.node,
+    SessionStatus.node,
   ],
 })
 

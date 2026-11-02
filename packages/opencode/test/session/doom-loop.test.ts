@@ -1,10 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { DoomLoop } from "../../src/session/doom-loop"
-
-type Call = {
-  tool: string
-  input: Record<string, unknown>
-}
+import { oracle, type Call } from "../lib/doom-loop-oracle"
 
 function calls(pattern: readonly Call[], repetitions: number) {
   return Array.from({ length: repetitions }, () => pattern).flat()
@@ -13,28 +9,6 @@ function calls(pattern: readonly Call[], repetitions: number) {
 function results(sequence: readonly Call[], maxPeriod?: number) {
   const detector = maxPeriod === undefined ? DoomLoop.create() : DoomLoop.create(maxPeriod)
   return sequence.map((call) => detector.check(call.tool, call.input))
-}
-
-function signature(call: Call) {
-  return JSON.stringify([call.tool, call.input])
-}
-
-function oracle(sequence: readonly Call[], maxPeriod: number) {
-  const signatures = sequence.map(signature)
-  for (let period = 1; period <= maxPeriod; period++) {
-    if (signatures.length < 3 * period) continue
-    const start = signatures.length - 3 * period
-    let same = true
-    for (let offset = 0; offset < period; offset++) {
-      const first = signatures[start + offset]
-      if (first !== signatures[start + period + offset] || first !== signatures[start + 2 * period + offset]) {
-        same = false
-        break
-      }
-    }
-    if (same) return true
-  }
-  return false
 }
 
 describe("doom-loop detector", () => {
