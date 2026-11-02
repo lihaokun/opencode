@@ -4,6 +4,8 @@
 
 按 `docs/fixes/issue-74-model-conditional-tools.md` 的修正方案，彻底移除 apply_patch：
 
+2026-11-02 补修见 [审核缺口修复文档](../fixes/model-tool-fix-review-gaps.md)。补齐 Core parser 清理、语义 PBT、真实执行与历史 fallback 回归，并同步用户工具/权限指南。下列原轮次度量保留历史含义，补修验证以新文档为准。
+
 1. **A 工具注销**（`574bee6b71`）：registry 删 ApplyPatchTool 注册与 `modelID.includes("gpt-")` 的 usePatch 过滤；删 `tool/apply_patch.ts`/`apply_patch.txt`/`patch/index.ts`（Codex patch DSL 解析器，生产代码零消费者）；删 cli run patch 面板与 demo emitPatch。净删 ~2164 行。
 2. **B 权限/配置**（`116e3a1adf`）：`permission.disabled()` edits 组删 apply_patch；config `tools` 折叠表删 `"patch"` 别名。
 3. **C core 包**（`82572f2b80`）：V2 runner 侧同款摘除（`core/src/tool/apply-patch.ts`、builtins 注册、测试 fixture）。
@@ -17,9 +19,10 @@
 
 ## 关键决策
 
-- **展示层保留**：TUI/session-ui/app/ACP 的存量 part 渲染分支零改动——历史会话消息库里有 apply_patch part，工具消失 ≠ 名字消失。
-- **`patch` 别名一并清除**：config 折叠表的 `"patch"` 别名同样无对应工具，落成悬空 per-tool 规则（无害），不做静默吞掉。
+- **展示层保留**：TUI/session-ui/app/ACP 保留存量 part 专用展示，模型历史转换仍可读取旧调用；CLI run 移除专用 diff/文件概要，改为通用工具展示。
+- **`patch` 别名一并清除**：旧 `tools.patch:false` 不再限制 write/edit，`true` 也不再启用编辑；需要保留限制时迁移为对应作用域的 `permission.edit`。旧键仍是同名规则，自定义工具可能使用，不能称作永远悬空无害。
 - **质量代价显式化**：GPT 系放弃训练分布匹配收益（外科手术式编辑 oldString 匹配失败率可能上升），列入上线后观测项而非功能回归——用户已拍板。
+- **操作能力取舍**：write/edit 保留文件创建/更新，不替代 legacy patch 的删除/移动或 Core patch 的删除入口；这些操作需要其它已获准的工具。
 
 ## 踩过的坑
 

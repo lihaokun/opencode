@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { ToolPart } from "@opencode-ai/sdk/v2"
 import { entryBody, entryCanStream, entryDone } from "@/cli/cmd/run/entry.body"
+import { toolInlineInfo, toolSnapshot, toolView } from "@/cli/cmd/run/tool"
 import type { StreamCommit, ToolSnapshot } from "@/cli/cmd/run/types"
 
 function commit(input: Partial<StreamCommit> & Pick<StreamCommit, "kind" | "text" | "phase" | "source">): StreamCommit {
@@ -50,6 +51,36 @@ function structured(next: StreamCommit) {
 }
 
 describe("run entry body", () => {
+  test("renders historical apply_patch success and failure through the generic fallback", () => {
+    const input = { patchText: "*** Begin Patch\n*** Add File: src/a.ts\n+export const a = 1\n*** End Patch" }
+    const success = toolCommit({
+      tool: "apply_patch",
+      state: {
+        status: "completed",
+        input,
+        output: "Success. Updated the following files:\nA src/a.ts",
+        title: "Patched src/a.ts",
+        metadata: { files: [{ filePath: "src/a.ts", type: "add", diff: "+export const a = 1\n" }] },
+        time: { start: 1, end: 1 },
+      },
+    })
+    const failure = toolCommit({
+      tool: "apply_patch",
+      toolState: "error",
+      state: { status: "error", input, error: "Failed to find expected lines", time: { start: 1, end: 1 } },
+    })
+    expect(entryBody(success)).toEqual({ type: "text", content: "apply_patch completed" })
+    expect(entryBody(failure)).toEqual({
+      type: "text",
+      content: "✖ apply_patch failed: Failed to find expected lines",
+    })
+    expect(toolView("apply_patch").snap).toBeUndefined()
+    expect(toolSnapshot(success, "")).toBeUndefined()
+    expect(toolSnapshot(failure, "")).toBeUndefined()
+    expect(toolInlineInfo(success.part as ToolPart)).toEqual({ icon: "⚙", title: "apply_patch Patched src/a.ts" })
+    expect(toolInlineInfo(failure.part as ToolPart).title).toContain("apply_patch")
+  })
+
   test("renders assistant, reasoning, and user entries in their display formats", () => {
     expect(
       entryBody(

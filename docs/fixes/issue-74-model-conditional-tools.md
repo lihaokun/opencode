@@ -5,6 +5,8 @@
 > 文档性质：问题 + 根因 + 调研 + 修正方案（工作流 §7.1 八部分），合一文档。
 > 状态：**已实施**（2026-10-21，`fix/issue-74-model-conditional-tools` 分支，实施 commits 见第七部分回填）。
 
+2026-11-02 审核补齐见 [#79 审核缺口补齐](model-tool-fix-review-gaps.md)：补强语义 PBT、真实执行和历史 fallback 验证，清理 Core parser 副本，并准确说明下面的权限迁移与展示/能力变化。
+
 ## 第一部分：现象与复现
 
 ### 1.1 现象
@@ -180,7 +182,7 @@ for (const [tool, enabled] of Object.entries(result.tools)) {
 - ❌ 保留 apply_patch + hook 归一化子计划（§6 v2）：为无人要求的工具增加 plugin 契约面，违反剃刀原则（无现消费者的 seam 整体砍掉）。
 - ✅ **彻底移除**（已确认）：apply_patch 的唯一选择条件就是 GPT ID 前缀；fork 无其他消费者；删除后 GPT 与所有模型共享同一工具面，根因整体消除。质量代价（放弃 OpenAI 训练分布匹配收益、外科手术式编辑 oldString 匹配失败率可能上升）已显式披露并被接受，列为上线后观测项而非功能回归。
 
-**总原则**：工具从模型视野与生产代码中消失；但历史会话数据中的存量 `apply_patch` tool part 必须仍可渲染——**展示/协议兼容层保留，产生新调用的链路全删**。
+**总原则**：内置工具及其执行器从生产链路移除，历史 `apply_patch` tool part 仍可读取和转成模型历史。TUI/session-ui/app/ACP 保留专用展示；CLI run 按本方案移除专用面板，旧记录改用通用工具完成/错误展示。用户自定义同名工具不受内置工具删除限制。
 
 ### 4.1 修改清单（按依赖顺序）
 
@@ -209,6 +211,7 @@ for (const [tool, enabled] of Object.entries(result.tools)) {
 |---|---|---|
 | `packages/core/src/tool/apply-patch.ts` | 全文件 | 删除 |
 | `packages/core/src/tool/builtins.ts` | :6 import、:35 `ApplyPatchTool.node` | 删除 |
+| `packages/core/src/patch.ts`、`packages/core/test/patch.test.ts` | 全文件 | 审核补齐：删除已无生产 consumer 的 Core DSL 副本及其专用测试 |
 | `packages/core/src/file-mutation.ts` | :205 TODO 注释 | 删除该注释（提及 apply_patch 的多文件事务 TODO 随工具消失） |
 
 #### D. 提示词
@@ -244,7 +247,9 @@ for (const [tool, enabled] of Object.entries(result.tools)) {
 
 1. `registry` 测试：`modelID = "gpt-6-luna"`（及一个 `codex` 系 ID）时 `tools()` 含 `write`、`edit`，不含 `apply_patch`；对照组 `claude-*` 不变。
 2. `system` 提示词测试：`gpt-5.3-codex` → `PROMPT_GPT`（不再有独立 codex 提示词）；gpt.txt 内容不含 `apply_patch` 字样（文本级守卫，防止回归再引入）。
-3. config 折叠测试：`tools.patch = false` 不再产生 `edit: deny`（别名已删）；`tools.apply_patch = false` 产生 `apply_patch: deny` 规则（悬空但无害——工具不存在时规则永不匹配，保留行为简单性）。
+3. config 折叠测试：`tools.patch = false` 不再产生 `edit: deny`；`tools.apply_patch = false` 保持同名规则。审核补齐覆盖全局、Agent 与 Core 迁移三入口的 true/false、混合配置和显式 permission 优先级；不能用 schema 合法性代替规则语义。
+
+**旧配置迁移**：`tools.patch:false` 原来能禁止 write/edit，删除别名后在默认允许策略下会恢复这些工具的编辑能力；`tools.patch:true` 也不再启用它们。需要保持原限制时，在同一全局或 Agent 配置中使用 `permission.edit`。旧 patch/apply_patch 键保留为同名工具规则，自定义同名工具存在时仍可匹配，因此不能称为永远悬空、无害。
 
 ### 4.3 明确不做
 
@@ -257,9 +262,9 @@ for (const [tool, enabled] of Object.entries(result.tools)) {
 **1. 根因消除**：根因是模型条件化工具面分叉。删除后 `registry.tools()` 的过滤逻辑不再含任何 `modelID` 条件（`webSearchEnabled` 按 providerID 的开关除外，属既有 C 类正当逻辑），所有模型走同一工具面判定，分叉不复存在。外部路径门控对 GPT 模型恢复与 Claude 等相同的 `(tool ∈ {write, edit}, filePath)` 契约——#74 的授权输入域失配从源头消失。
 
 **2. 不变量保持**：
-- *工具面完备性*：任一模型的编辑能力不变（write/edit 本就由同一套 execute 支撑，apply_patch 仅是第三种入口）。gpt.txt 改造后指令与工具集一致（不再引用不存在的工具）。
-- *历史数据可读性*：存量 part 的渲染链（tui/session-ui/app/acp）零改动，旧会话打开行为逐字节不变。
-- *权限面单调性*：`edits` 数组缩短只影响 `disabled()` 对名为 `apply_patch` 的工具的归类——该工具名此后不可能出现在 `tools()` 结果中，`visibleTools` 行为对现存工具集不变。config 折叠删 `"patch"` 别名同理（用户配置里写 `tools.patch` 会变成悬空键，落 `perms.patch = action`，无工具匹配，无害）。
+- *创建/更新能力*：固定 provider、Agent、权限与 flags 时，模型 ID 不再切换内置编辑工具。write/edit 保留内容创建/更新能力及结构化 filePath；它们并非 apply_patch 的同一 executor，不提供原 legacy patch 的 delete/move 或 Core patch 的 delete 操作。只放行 edit、禁止其它相关工具的配置将失去这些专用操作入口。
+- *历史数据可读性*：tui/session-ui/app/acp 的专用展示和两条模型历史转换链保留；CLI 的 patch 专用 diff/文件概要降为通用工具展示，不能承诺所有旧展示逐字节不变。
+- *权限规则*：剩余 write/edit 仍共享 edit 权限，既有询问和拒绝链不变。删除 patch 别名是行为变化，按上述迁移说明处理；自定义 apply_patch 不再因 edit deny 被整工具隐藏，应使用自身对应规则。
 
 **3. 无回归引入**：依赖第六部分用例。风险点及对策：
 - GPT 编辑质量回退（oldString 匹配失败率）——非功能回归，观测项，上线后跟踪；#74 场景的恢复由回归测试 1 直接保证。
@@ -288,6 +293,7 @@ for (const [tool, enabled] of Object.entries(result.tools)) {
 | `packages/opencode/src/permission/index.ts` | :241 | edits 数组删 apply_patch | 已改: 116e3a1adf |
 | `packages/opencode/src/config/config.ts` | :572 | 折叠表删 "patch" | 已改: 116e3a1adf |
 | `packages/core/src/tool/apply-patch.ts` + `builtins.ts` | 全文件/import+注册 | 删除/摘除 | 已改: 82572f2b80 |
+| `packages/core/src/patch.ts` + `test/patch.test.ts` | 全文件 | 清理遗漏的无生产 consumer DSL 副本 | 2026-11-02 审核补齐，提交见补修文档 |
 | `packages/core/src/file-mutation.ts` | :205 TODO | 删 TODO 注释 | 已改: 82572f2b80 |
 | `packages/core/src/v1/config/agent.ts` | normalize 折叠 | 删 "patch" 别名（实施中新发现，见下） | 已改: a0f412e6a7 |
 | `packages/core/src/v1/config/migrate.ts` | normalizeAction | 删 "patch"→edit 归一（实施中新发现，见下） | 已改: a0f412e6a7 |

@@ -8,7 +8,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect, setSystemTime } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
-import { fileURLToPath } from "url"
+import { fileURLToPath, pathToFileURL } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -67,6 +67,8 @@ import { AgentManagement } from "@/agent-management/schema"
 import { AgentRun } from "@/agent-management/run"
 import { AGENT_SEND_TOOL_ID } from "@/tool/agent"
 import { AgentEvent } from "@opencode-ai/schema/agent-event"
+import { Npm } from "@opencode-ai/core/npm"
+import { NpmTest } from "../fake/npm"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -348,7 +350,7 @@ const failingMetadataSession = LayerNode.make({
 function makeHttp(input?: {
   mcpInstructions?: MCP.ServerInstructions[]
   processor?: "blocking"
-  plugin?: "oversized-tool" | "stop-hook"
+  plugin?: "oversized-tool" | "stop-hook" | "file-loaded"
   session?: "failing-metadata"
 }) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
@@ -367,6 +369,10 @@ function makeHttp(input?: {
   if (input?.plugin === "stop-hook") {
     return LayerNode.compile(root, [...replacements, [Plugin.node, stopHookPlugin]])
   }
+  if (input?.plugin === "file-loaded") {
+    // The plugin is a local file without dependencies; keep loading and hooks real.
+    return LayerNode.compile(root, [...replacements, [Npm.node, NpmTest.noop]])
+  }
   if (input?.session === "failing-metadata") {
     return LayerNode.compile(root, [...replacements, [Session.node, failingMetadataSession]])
   }
@@ -380,6 +386,7 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 const it = testEffect(makeHttp())
 const withOversizedTool = testEffect(makeHttp({ plugin: "oversized-tool" }))
 const withStopHook = testEffect(makeHttp({ plugin: "stop-hook" }))
+const withFilePlugin = testEffect(makeHttp({ plugin: "file-loaded" }))
 const withFailingMetadata = testEffect(makeHttp({ session: "failing-metadata" }))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
@@ -2633,6 +2640,102 @@ it.instance("loop continues when finish is unknown", () =>
       expect(result.info.finish).toBe("stop")
     }
   }),
+)
+
+withFilePlugin.instance(
+  "GPT write/edit traverse a file-loaded path gate and mutate only allowed files",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const llm = yield* TestLLMServer
+      const file = path.join(test.directory, "allowed.txt")
+      const denied = path.join(test.directory, "denied.txt")
+      const missing = path.join(test.directory, "denied-new.txt")
+      const log = path.join(test.directory, "hook-log.json")
+      const plugin = path.join(test.directory, "path-gate.ts")
+      yield* writeText(denied, "untouched\n")
+      yield* writeText(
+        plugin,
+        [
+          "export default async () => {",
+          "  const seen = []",
+          "  return {",
+          '    "tool.execute.before": async (input, output) => {',
+          "      seen.push({ tool: input.tool, args: output.args })",
+          `      await Bun.write(${JSON.stringify(log)}, JSON.stringify(seen))`,
+          `      if (output.args.filePath !== ${JSON.stringify(file)}) throw new Error("path gate denied")`,
+          "    },",
+          "  }",
+          "}",
+        ].join("\n"),
+      )
+      const config = providerCfg(llm.url)
+      yield* writeConfig(test.directory, {
+        ...config,
+        model: "test/gpt-5.5-codex",
+        plugin: [pathToFileURL(plugin).href],
+        provider: {
+          test: {
+            ...config.provider.test,
+            models: { "gpt-5.5-codex": { ...cfg.provider.test.models["test-model"], id: "gpt-5.5-codex" } },
+          },
+        },
+      })
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const session = yield* sessions.create({
+        title: "GPT path gate regression",
+        permission: Permission.fromConfig({ "*": "allow", bash: "deny" }),
+      })
+      const calls = [
+        { tool: "write", args: { filePath: file, content: "first\n" } },
+        { tool: "edit", args: { filePath: file, oldString: "first", newString: "second" } },
+        { tool: "write", args: { filePath: missing, content: "forbidden\n" } },
+        { tool: "edit", args: { filePath: denied, oldString: "untouched", newString: "forbidden" } },
+      ]
+      yield* Effect.forEach(calls, (call) => llm.tool(call.tool, call.args))
+      yield* llm.text("done")
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        model: { providerID: ref.providerID, modelID: ModelV2.ID.make("gpt-5.5-codex") },
+        noReply: true,
+        parts: [{ type: "text", text: "Create and update the allowed file, then try the denied paths." }],
+      })
+      yield* prompt.loop({ sessionID: session.id })
+      expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("second\n")
+      expect(yield* Effect.promise(() => Bun.file(denied).text())).toBe("untouched\n")
+      expect(yield* Effect.promise(() => Bun.file(missing).exists())).toBe(false)
+      expect(yield* Effect.promise(() => Bun.file(log).json())).toEqual(calls)
+      const tools = (yield* MessageV2.filterCompactedEffect(session.id))
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool")
+      expect(tools.map((part) => [part.tool, part.state.status])).toEqual([
+        ["write", "completed"],
+        ["edit", "completed"],
+        ["write", "error"],
+        ["edit", "error"],
+      ])
+      for (const part of tools.slice(2)) {
+        expect(part.state.status === "error" && part.state.error).toContain("path gate denied")
+      }
+      const requests = yield* llm.inputs
+      expect(requests).toHaveLength(5)
+      for (const request of requests) {
+        expect(request.model).toBe("gpt-5.5-codex")
+        const offered = request.tools as Array<{ function: { name: string; parameters: { required: string[] } } }>
+        expect(offered.map((tool) => tool.function.name)).toContain("write")
+        expect(offered.map((tool) => tool.function.name)).toContain("edit")
+        expect(offered.map((tool) => tool.function.name)).not.toContain("apply_patch")
+        expect(offered.map((tool) => tool.function.name)).not.toContain("bash")
+        for (const name of ["write", "edit"]) {
+          expect(offered.find((tool) => tool.function.name === name)?.function.parameters.required).toContain(
+            "filePath",
+          )
+        }
+      }
+    }),
+  30_000,
 )
 
 it.instance("glob tool keeps instance context during prompt runs", () =>

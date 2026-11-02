@@ -6,6 +6,7 @@ import { Cause, Effect, Exit, Layer, Logger, Option } from "effect"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { Config } from "@/config/config"
+import { Permission } from "@/permission"
 import { ConfigManaged } from "@/config/managed"
 import { ConfigParse } from "../../src/config/parse"
 import { ConfigV2Compat } from "../../src/config/v2-compat"
@@ -1320,6 +1321,63 @@ it.effect("keeps plugin origins aligned with merged plugin list", () =>
 )
 
 // Legacy tools migration tests
+
+for (const [tool, enabled, action, expected] of [
+  ["patch", true, "patch", "allow"],
+  ["patch", false, "patch", "deny"],
+  ["apply_patch", true, "apply_patch", "allow"],
+  ["apply_patch", false, "apply_patch", "deny"],
+  ["write", true, "edit", "allow"],
+  ["write", false, "edit", "deny"],
+  ["edit", true, "edit", "allow"],
+  ["edit", false, "edit", "deny"],
+] as const) {
+  it.instance(`migrates top-level tools ${tool}:${enabled} without reviving patch aliases`, () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* writeConfigEffect(test.directory, { tools: { [tool]: enabled } })
+      const config = yield* Config.use.get()
+      expect(config.permission).toEqual({ [action]: expected })
+      const rules = Permission.fromConfig(config.permission ?? {})
+      expect(Permission.evaluate("edit", "src/file.ts", rules).action).toBe(action === "edit" ? expected : "ask")
+    }),
+  )
+}
+
+for (const writeLast of [true, false]) {
+  it.instance(`top-level mixed tools use the last editing rule with write last=${writeLast}`, () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* writeConfigEffect(test.directory, {
+        tools: writeLast
+          ? { patch: false, apply_patch: true, edit: false, write: true }
+          : { patch: false, apply_patch: true, write: true, edit: false },
+      })
+      const config = yield* Config.use.get()
+      expect(config.permission).toEqual({ patch: "deny", apply_patch: "allow", edit: writeLast ? "allow" : "deny" })
+    }),
+  )
+  for (const override of ["allow", "deny", "ask"] as const) {
+    it.instance(`top-level mixed tools preserve explicit ${override} paths with write last=${writeLast}`, () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* writeConfigEffect(test.directory, {
+          tools: writeLast
+            ? { patch: false, apply_patch: true, edit: false, write: true }
+            : { patch: false, apply_patch: true, write: true, edit: false },
+          permission: { edit: { "allowed/**": override }, patch: "ask" },
+        })
+        const config = yield* Config.use.get()
+        expect(config.permission).toEqual({ edit: { "allowed/**": override }, patch: "ask", apply_patch: "allow" })
+        const rules = Permission.fromConfig(config.permission ?? {})
+        expect(Permission.evaluate("edit", "allowed/file.ts", rules).action).toBe(override)
+        expect(Permission.evaluate("edit", "other/file.ts", rules).action).toBe("ask")
+        expect(Permission.evaluate("patch", "file.ts", rules).action).toBe("ask")
+        expect(Permission.evaluate("apply_patch", "file.ts", rules).action).toBe("allow")
+      }),
+    )
+  }
+}
 
 it.instance("migrates legacy tools config to permissions - allow", () =>
   Effect.gen(function* () {
