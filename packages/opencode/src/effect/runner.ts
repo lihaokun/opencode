@@ -5,8 +5,13 @@ export interface Runner<A, E = never> {
   readonly busy: boolean
   readonly ensureRunning: (work: Effect.Effect<A, E>) => Effect.Effect<A, E>
   readonly startShell: (work: Effect.Effect<A, E>, ready?: Latch.Latch) => Effect.Effect<A, E | Busy>
-  readonly cancel: Effect.Effect<void>
+  // Resolves with the state the cancel found: what it stopped, if anything.
+  // A reader cannot find that out afterwards, and reading before cancelling
+  // is a race (subplan agentmgmt-2-run-state §5.4.2).
+  readonly cancel: Effect.Effect<StateTag>
 }
+
+export type StateTag = State<unknown, unknown>["_tag"]
 
 export class Cancelled extends Schema.TaggedErrorClass<Cancelled>()("RunnerCancelled", {}) {}
 export class Busy extends Schema.TaggedErrorClass<Busy>()("RunnerBusy", {}) {}
@@ -197,36 +202,39 @@ export const make = <A, E = never>(
       }),
     ).pipe(Effect.flatten)
 
-  const cancel = SynchronizedRef.modify(ref, (st) => {
+  const cancel = SynchronizedRef.modify(ref, (st): readonly [Effect.Effect<StateTag>, State<A, E>] => {
     switch (st._tag) {
       case "Idle":
-        return [Effect.void, st] as const
+        return [Effect.succeed(st._tag), st]
       case "Running":
         return [
           Effect.gen(function* () {
             yield* Fiber.interrupt(st.run.fiber)
             yield* Deferred.fail(st.run.done, new Cancelled()).pipe(Effect.asVoid)
             yield* idleIfCurrent()
+            return st._tag
           }),
-          { _tag: "Idle" } as const,
-        ] as const
+          { _tag: "Idle" },
+        ]
       case "Shell":
         return [
           Effect.gen(function* () {
             yield* stopShell(st.shell)
             yield* idleIfCurrent()
+            return st._tag
           }),
-          { _tag: "Idle" } as const,
-        ] as const
+          { _tag: "Idle" },
+        ]
       case "ShellThenRun":
         return [
           Effect.gen(function* () {
             yield* stopShell(st.shell)
             yield* Deferred.fail(st.run.done, new Cancelled()).pipe(Effect.asVoid)
             yield* idleIfCurrent()
+            return st._tag
           }),
-          { _tag: "Idle" } as const,
-        ] as const
+          { _tag: "Idle" },
+        ]
     }
   }).pipe(Effect.flatten)
 

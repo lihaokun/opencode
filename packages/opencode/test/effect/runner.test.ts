@@ -133,7 +133,8 @@ describe("Runner", () => {
       expect(runner.busy).toBe(true)
       expect(runner.state._tag).toBe("Running")
 
-      yield* runner.cancel
+      // What the cancel found is its result: the only reliable account of it.
+      expect(yield* runner.cancel).toBe("Running")
       expect(runner.busy).toBe(false)
 
       const exit = yield* Fiber.await(fiber)
@@ -146,8 +147,27 @@ describe("Runner", () => {
     Effect.gen(function* () {
       const s = yield* Scope.Scope
       const runner = Runner.make<string>(s)
-      yield* runner.cancel
+      expect(yield* runner.cancel).toBe("Idle")
       expect(runner.busy).toBe(false)
+    }),
+  )
+
+  it.live(
+    "cancel reports what it found: a shell, or a shell with a run queued behind it",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s, { onInterrupt: Effect.succeed("fallback") })
+      const shell = yield* runner.startShell(Effect.never.pipe(Effect.as("sh"))).pipe(Effect.forkChild)
+      yield* waitForState(runner, "Shell")
+      expect(yield* runner.cancel).toBe("Shell")
+      yield* Fiber.await(shell)
+
+      const again = yield* runner.startShell(Effect.never.pipe(Effect.as("sh"))).pipe(Effect.forkChild)
+      yield* waitForState(runner, "Shell")
+      const queued = yield* runner.ensureRunning(Effect.succeed("run")).pipe(Effect.forkChild)
+      yield* waitForState(runner, "ShellThenRun")
+      expect(yield* runner.cancel).toBe("ShellThenRun")
+      yield* Effect.all([Fiber.await(again), Fiber.await(queued)])
     }),
   )
 
