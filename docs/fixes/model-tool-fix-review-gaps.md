@@ -72,14 +72,14 @@ Prompt oracle 使用实际模板精确相等，覆盖既有优先级。配置的
 
 | 路径 | 改动 | 状态 |
 |---|---|---|
-| core/src/patch.ts、core/test/patch.test.ts | 删除无生产用途的 parser 副本及测试 | 已实施；提交号随收尾回填 |
-| opencode/core 的相关 test | 路由、配置、stock 工具性质、真实执行、历史 fallback | 已实施并验证；提交号随收尾回填 |
+| core/src/patch.ts、core/test/patch.test.ts | 删除无生产用途的 parser 副本及测试 | 已实施：`0ef0439d` |
+| opencode/core 的相关 test | 路由、配置、stock 工具性质、真实执行、历史 fallback | 已实施并验证：`0ef0439d` |
 
 ## 八、文档更新清单
 
 | 文档 | 改动 | 状态 |
 |---|---|---|
-| 本文 | 契约、论证、验证与 commit 回填 | 已完成；提交号随收尾回填 |
+| 本文 | 契约、论证、验证与 commit 回填 | 已完成；实现提交 `0ef0439d` |
 | 原 issue-74 fix 文档和 devlog | 去除过宽承诺，补迁移/能力/CLI 差异说明 | 已更新 |
 | web 英文 tools/agents/permissions、Core tool AGENTS | 当前工具表和迁移说明 | 已更新；不声称本轮重译所有本地化页面 |
 
