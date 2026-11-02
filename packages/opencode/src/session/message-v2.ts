@@ -550,7 +550,10 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
   const result = [] as WithParts[]
   const completed = new Set<string>()
   let retain: MessageID | undefined
+  let boundary: WithParts | undefined
   for (const msg of msgs) {
+    // Keep even hidden summary attempts until the durable boundary has been
+    // interpreted: old tail_start_id values can point at those messages.
     result.push(msg)
     if (retain) {
       if (msg.info.id === retain) break
@@ -559,44 +562,43 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
     if (msg.info.role === "user" && completed.has(msg.info.id)) {
       const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
       if (!part) continue
+      boundary = msg
       if (!part.tail_start_id) break
       retain = part.tail_start_id
       if (msg.info.id === retain) break
       continue
     }
-    if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((part) => part.type === "compaction"))
-      break
     if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
       completed.add(msg.info.parentID)
   }
   result.reverse()
-  const compactionIndex = result.findLastIndex(
-    (msg) =>
-      msg.info.role === "user" &&
-      msg.parts.some((item): item is CompactionPart => item.type === "compaction" && item.tail_start_id !== undefined),
-  )
-  const compaction = result[compactionIndex]
-  const part = compaction?.parts.find(
-    (item): item is CompactionPart => item.type === "compaction" && item.tail_start_id !== undefined,
-  )
-  const summaryIndex = compaction
+  const compactionIndex = boundary ? result.indexOf(boundary) : -1
+  const summaryIndex = boundary
     ? result.findIndex(
         (msg, index) =>
           index > compactionIndex &&
           msg.info.role === "assistant" &&
           msg.info.summary &&
-          msg.info.parentID === compaction.info.id,
+          msg.info.finish &&
+          !msg.info.error &&
+          msg.info.parentID === boundary.info.id,
       )
     : -1
-  const tailIndex = part?.tail_start_id ? result.findIndex((msg) => msg.info.id === part.tail_start_id) : -1
-  if (tailIndex >= 0 && tailIndex < compactionIndex && summaryIndex > compactionIndex) {
-    return [
-      ...result.slice(compactionIndex, summaryIndex + 1),
-      ...result.slice(tailIndex, compactionIndex),
-      ...result.slice(summaryIndex + 1),
-    ]
-  }
-  return result
+  // Only the settled boundary controls the layout. Inputs arriving between
+  // its marker and summary follow the retained tail, in their original order.
+  const ordered =
+    boundary && summaryIndex > compactionIndex
+      ? [
+          boundary,
+          result[summaryIndex]!,
+          ...result.slice(0, compactionIndex),
+          ...result.slice(compactionIndex + 1, summaryIndex),
+          ...result.slice(summaryIndex + 1),
+        ]
+      : result
+  return ordered.filter(
+    (msg) => msg.info.role !== "assistant" || !msg.info.summary || (msg.info.finish && !msg.info.error),
+  )
 }
 
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -623,7 +625,9 @@ export function latest(msgs: WithParts[]) {
   const tasks = msgs.flatMap((m) =>
     finished && compareChronology(m.info, finished) <= 0
       ? []
-      : m.parts.filter((p): p is CompactionPart | SubtaskPart => p.type === "compaction" || p.type === "subtask"),
+      : m.parts
+          .filter((p): p is CompactionPart | SubtaskPart => p.type === "compaction" || p.type === "subtask")
+          .map((p) => ({ part: p, message: m.info })),
   )
   return { user, assistant, finished, tasks }
 }

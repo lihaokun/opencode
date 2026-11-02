@@ -1656,7 +1656,7 @@ describe("session.message-v2.latest", () => {
 
     expect(state.finished?.id).toBe(assistantID)
     expect(state.user?.id).toBe(taskID)
-    expect(state.tasks).toEqual([task])
+    expect(state.tasks).toEqual([{ part: task, message: expect.objectContaining({ id: taskID }) }])
   })
 
   test("filterCompacted preserves latest chronology across the ID rollover", () => {
@@ -1849,7 +1849,8 @@ describe("session.message-v2.latest", () => {
     expect(state.finished?.id).toBe(SUMMARY_ASSISTANT)
     expect(state.user?.id).toBe(NEW_COMPACTION_USER)
     expect(state.tasks).toHaveLength(1)
-    expect(state.tasks[0]).toMatchObject({ type: "compaction", auto: true })
+    expect(state.tasks[0].part).toMatchObject({ type: "compaction", auto: true })
+    expect(state.tasks[0].message.id).toBe(NEW_COMPACTION_USER)
   })
 
   test("selects compaction and subtask work after the finished boundary by creation time", () => {
@@ -1878,6 +1879,7 @@ describe("session.message-v2.latest", () => {
     const state = MessageV2.latest([newTask, { info: finished, parts: [] }, oldTask])
 
     expect(state.tasks).toHaveLength(1)
-    expect(state.tasks[0]).toMatchObject({ type: "subtask", prompt: "inspect" })
+    expect(state.tasks[0].part).toMatchObject({ type: "subtask", prompt: "inspect" })
+    expect(state.tasks[0].message.id).toBe(newTask.info.id)
   })
 })

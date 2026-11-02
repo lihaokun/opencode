@@ -17,7 +17,14 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   const cost = createMemo(() => session()?.cost ?? 0)
 
   const state = createMemo(() => {
-    const last = msg().findLast((item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0)
+    // Compaction summaries are skipped: right after a compaction the newest
+    // assistant is the summary request itself, whose input is the entire old
+    // history — reading it would report the pre-compaction size until the
+    // next real step lands (#77).
+    const last = msg().findLast(
+      (item): item is AssistantMessage =>
+        item.role === "assistant" && !item.summary && item.tokens.output > 0,
+    )
     if (!last) {
       return {
         tokens: 0,
