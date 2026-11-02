@@ -6153,6 +6153,45 @@ for (const seed of [1501, 1502]) {
   }
 }
 
+it.instance("a newer unfinished foreign assistant stops a running loop, and a new prompt can still resume", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2Bridge.Service
+    const chat = yield* sessions.create({ title: "foreign assistant guard", permission: allowAll })
+    let foreign: MessageID | undefined
+    const off = yield* events.listen((event) => {
+      if (foreign || event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
+      const data = event.data as { info: SessionV1.Info }
+      if (data.info.sessionID !== chat.id || data.info.role !== "assistant" || data.info.finish !== "tool-calls")
+        return Effect.void
+      foreign = MessageID.ascending()
+      return sessions
+        .updateMessage({
+          ...data.info,
+          id: foreign,
+          time: { created: Date.now() },
+          finish: undefined,
+          error: undefined,
+        })
+        .pipe(Effect.asVoid)
+    })
+    yield* Effect.addFinalizer(() => off)
+    yield* user(chat.id, "work")
+    yield* llm.tool("glob", { pattern: "**/*.absent" })
+    const first = yield* prompt.loop({ sessionID: chat.id })
+    expect(foreign).toBeDefined()
+    expect(first.info.id).toBe(foreign!)
+    expect(yield* llm.calls).toBe(1)
+    yield* user(chat.id, "resume")
+    yield* llm.text("resumed")
+    const resumed = yield* prompt.loop({ sessionID: chat.id })
+    expect(resumed.parts).toContainEqual(expect.objectContaining({ type: "text", text: "resumed" }))
+    expect(yield* llm.calls).toBe(2)
+  }),
+)
+
 it.instance("no view without children, and none for a parent denied agent_list", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

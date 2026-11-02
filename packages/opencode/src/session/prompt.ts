@@ -1337,6 +1337,16 @@ const layer = Layer.effect(
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
         // This bounds one in-memory overflow-recovery episode and intentionally resets with this runLoop.
         let compactionToken: "none" | "compacted" | "skip" = "none"
+        // Assistants this loop created. If the newest assistant belongs to the
+        // latest turn but was not created here, another loop is answering this
+        // turn right now (two loops on one session, #85) — starting a step on
+        // top of it would feed the model its own placeholder output as
+        // history. Second line of defense: the runner-level fixes make the
+        // parallel loops unreachable; this only bounds the damage if they
+        // ever regress. Breaking is safe for message consumption: the loop
+        // that owns the turn re-reads messages at the top of every iteration
+        // and consumes whatever lands.
+        const ownAssistants = new Set<MessageID>()
         // Step-to-step repeat counting for the step tail. Scoped to this run on
         // purpose: a repeat across runs may be the agent's own choice.
         let previousStep: StepTail.StepSignature | undefined
@@ -1440,6 +1450,28 @@ const layer = Layer.effect(
             break
           }
 
+          // An unfinished assistant newer than anything this loop created:
+          // another loop is mid-flight on this turn. Do not stack a step onto
+          // it — see the ownAssistants note above. Skipped on the first
+          // iteration: a freshly started loop legitimately takes over an
+          // unfinished assistant left by a shell command (no finish until an
+          // LLM round exists), and after this loop has produced work, only a
+          // genuinely parallel loop can own a newer one.
+          if (
+            step > 0 &&
+            lastAssistant &&
+            !lastAssistant.finish &&
+            lastAssistantBelongsToLatestTurn &&
+            !ownAssistants.has(lastAssistant.id)
+          ) {
+            yield* Effect.logWarning("loop exit: another loop is answering the latest turn", {
+              "session.id": sessionID,
+              step,
+              messageID: lastAssistant.id,
+            })
+            break
+          }
+
           step++
           if (step === 1)
             yield* title({
@@ -1512,6 +1544,7 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             sessionID,
           }
+          ownAssistants.add(msg.id)
           yield* sessions.updateMessage(msg)
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
@@ -1727,19 +1760,20 @@ const layer = Layer.effect(
     // Re-arm predicate for the run loop: true when the latest user message is
     // newer than the latest assistant, i.e. a turn landed after the loop's last
     // read and would otherwise sit unconsumed once the run goes idle (#32).
-    // Read failures fall back to false — the pre-fix behavior.
+    // Read failures fall back to false — the pre-fix behavior. Evaluated as a
+    // single indexed row ("is the latest message a user?") — equivalent to the
+    // full comparison, and O(1) instead of loading the session (#62): this
+    // runs inside finishRun's critical section, so its cost bounds the lock
+    // hold time (#85).
     const hasUnconsumedTurn = (sessionID: SessionID) =>
-      MessageV2.filterCompactedEffect(sessionID).pipe(
-        Effect.map((msgs) => {
-          const { user, assistant } = MessageV2.latest(msgs)
-          return Boolean(user && (!assistant || MessageV2.compareChronology(user, assistant) > 0))
-        }),
+      MessageV2.latestRole(sessionID).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.map((role) => role === "user"),
         Effect.catch((error) =>
           Effect.logWarning("re-arm check failed; run will go idle", { "session.id": sessionID, error }).pipe(
             Effect.as(false),
           ),
         ),
-        Effect.provideService(Database.Service, database),
       )
 
     // Step S11: a run opens its record (subplan agentmgmt-2-run-state §5.2.2)
