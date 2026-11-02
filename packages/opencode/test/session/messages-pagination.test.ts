@@ -26,7 +26,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Identifier } from "../../src/id/id"
 import { Database } from "@opencode-ai/core/database/database"
-import { PartTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { eq } from "drizzle-orm"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionNs.node, MessageV2.node, SessionProjector.node])))
@@ -542,82 +542,135 @@ describe("MessageV2.latestRole", () => {
     ),
   )
 
-  // Seeded finite-random histories (workflow §5.3 random-test layer): for a
-  // random legal history — arbitrary interleavings of roles, timestamp
-  // collisions, out-of-order wall-clock writes, and JSON-embedded times that
-  // disagree with the persisted column — `latestRole` must equal the role of
-  // the (time_created, id) maximum recomputed independently. That maximum is
-  // exactly what `compareChronology` orders by, so this mechanizes the
-  // equivalence claim in the #85 fix (single-row query ≡ latest-user-vs-
-  // assistant comparison over the full history).
-  it.instance("matches the (time_created, id) maximum on random histories", () =>
-    withSession(({ sessionID }) =>
+  it.instance("preserves JS chronology for valid custom Unicode IDs at the same timestamp", () =>
+    Effect.gen(function* () {
+      for (const [userID, assistantID, expected] of [
+        ["msg_\uE000", "msg_\u{10000}", "user"],
+        ["msg_\u{10000}", "msg_\uE000", "assistant"],
+        ["msg_z", "msg_a", "user"],
+      ] as const) {
+        yield* withSession((input) =>
+          Effect.gen(function* () {
+            const user = yield* addUser(input.sessionID, undefined, { id: MessageID.make(userID), created: 100 })
+            yield* addAssistant(input.sessionID, user, { id: MessageID.make(assistantID), created: 100 })
+            const latest = MessageV2.latest(yield* MessageV2.filterCompactedEffect(input.sessionID))
+            expect(yield* MessageV2.latestRole(input.sessionID)).toBe(expected)
+            expect(
+              Boolean(
+                latest.user && (!latest.assistant || MessageV2.compareChronology(latest.user, latest.assistant) > 0),
+              ),
+            ).toBe(expected === "user")
+          }),
+        )
+      }
+    }),
+  )
+
+  it.instance("matches the old predicate when compaction reorders retained history", () =>
+    withSession((input) =>
       Effect.gen(function* () {
-        const session = yield* SessionNs.Service
-        const rand = lcg(20261030)
-
-        const histories: Array<Array<{ role: "user" | "assistant"; t: number; json?: number }>> = [
-          [], // empty
-          [{ role: "user", t: 100 }], // user-only
-          [{ role: "assistant", t: 100 }], // assistant-only
-        ]
-        for (let h = 0; h < 12; h++) {
-          const size = 1 + Math.floor(rand() * 30)
-          const history: Array<{ role: "user" | "assistant"; t: number; json?: number }> = []
-          // Timestamps drawn from a small window (collisions likely), written
-          // in random order relative to their values (out-of-order inserts).
-          let clock = 1000
-          for (let i = 0; i < size; i++) {
-            clock += Math.floor(rand() * 3) // often equal → id tie-break
-            history.push({
-              role: rand() < 0.5 ? "user" : "assistant",
-              t: clock,
-              ...(rand() < 0.3 ? { json: clock + Math.floor(rand() * 100) } : {}),
-            })
-          }
-          histories.push(history)
-        }
-
-        // One session accumulates every history; the oracle tracks the
-        // running (t, id) max across all writes, so insertion order vs
-        // timestamp order is fully arbitrary.
-        let maxKey: { role: "user" | "assistant"; t: number; id: string } | undefined
-        for (const history of histories) {
-          for (const m of history) {
-            const id = MessageID.ascending()
-            yield* session.updateMessage({
-              id,
-              sessionID,
-              role: m.role,
-              // json deliberately disagreeing with the persisted column:
-              // info() must overlay row.time_created, not trust the JSON.
-              time: { created: m.json ?? m.t },
-              ...(m.role === "assistant"
-                ? {
-                    parentID: MessageID.ascending(),
-                    mode: "build",
-                    agent: "build",
-                    path: { cwd: "/tmp", root: "/tmp" },
-                    cost: 0,
-                    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-                    modelID: "test",
-                    providerID: "test",
-                  }
-                : { agent: "test", model: { providerID: "test", modelID: "test" }, tools: {}, mode: "" }),
-            } as unknown as SessionV1.Info)
-            // Independent oracle: (t, id) lexicographic max over all writes.
-            // MessageID.ascending() is monotonic, so later writes have larger
-            // ids — for equal t the later write wins.
-            if (!maxKey || m.t > maxKey.t || (m.t === maxKey.t && id > maxKey.id)) {
-              maxKey = { role: m.role, t: m.t, id }
-            }
-          }
-        }
-        const role = yield* MessageV2.latestRole(sessionID)
-        expect(role).toBe(maxKey?.role)
+        yield* addUser(input.sessionID, "old", { created: 100 })
+        const tail = yield* addUser(input.sessionID, "retained", { created: 200 })
+        const marker = yield* addUser(input.sessionID, undefined, { created: 300 })
+        yield* addCompactionPart(input.sessionID, marker, tail)
+        const summary = yield* addAssistant(input.sessionID, marker, { created: 301, summary: true, finish: "stop" })
+        const filtered = yield* MessageV2.filterCompactedEffect(input.sessionID)
+        expect(filtered.map((message) => message.info.id)).toEqual([marker, summary, tail])
+        expect(yield* MessageV2.latestRole(input.sessionID)).toBe("assistant")
+        const latest = MessageV2.latest(filtered)
+        expect(latest.user && latest.assistant && MessageV2.compareChronology(latest.user, latest.assistant) < 0).toBe(
+          true,
+        )
+        yield* addUser(input.sessionID, "continue", { created: 302 })
+        expect(yield* MessageV2.latestRole(input.sessionID)).toBe("user")
       }),
     ),
   )
+
+  it.instance("custom ID fallback respects the completed compaction boundary", () =>
+    withSession((input) => Effect.gen(function* () {
+      const hidden = yield* addUser(input.sessionID, "compacted", { id: MessageID.make("msg_\uE000"), created: 100 })
+      const marker = yield* addUser(input.sessionID, undefined, { id: MessageID.make("msg_\u{10001}"), created: 100 })
+      yield* addCompactionPart(input.sessionID, marker)
+      const summary = yield* addAssistant(input.sessionID, marker, {
+        id: MessageID.make("msg_\u{10002}"), created: 100, summary: true, finish: "stop",
+      })
+      const filtered = yield* MessageV2.filterCompactedEffect(input.sessionID)
+      expect(filtered.map(message => message.info.id)).toEqual([marker, summary])
+      expect(filtered.some(message => message.info.id === hidden)).toBe(false)
+      expect(yield* MessageV2.latestRole(input.sessionID)).toBe("assistant")
+    })),
+  )
+
+  // Independent sessions and a check after every write. Updating an existing
+  // message changes JSON data while the projector preserves time_created;
+  // verify that mismatch exists instead of merely claiming it in the fixture.
+  it.instance("matches persisted chronology after every randomized insert and JSON-time update", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const rand = lcg(20261030)
+      const histories: Array<Array<{ role: "user" | "assistant"; t: number; json?: number }>> = [
+        [],
+        [{ role: "user", t: 100 }],
+        [{ role: "assistant", t: 100 }],
+        [
+          { role: "user", t: 20, json: 0 },
+          { role: "assistant", t: 10, json: 1000 },
+        ],
+      ]
+      for (let h = 0; h < 12; h++) {
+        histories.push(
+          Array.from({ length: 1 + Math.floor(rand() * 30) }, () => ({
+            role: rand() < 0.5 ? ("user" as const) : ("assistant" as const),
+            t: 1000 + Math.floor(rand() * 7),
+            ...(rand() < 0.3 ? { json: 2000 + Math.floor(rand() * 100) } : {}),
+          })),
+        )
+      }
+      let mismatches = 0
+      for (const [h, history] of histories.entries()) {
+        yield* withSession((input) =>
+          Effect.gen(function* () {
+            let max: { role: "user" | "assistant"; t: number; id: MessageID } | undefined
+            expect(yield* MessageV2.latestRole(input.sessionID)).toBeUndefined()
+            for (const [i, message] of history.entries()) {
+              const char = ["a", "z", "\uE000", "\u{10000}", "\u{1F600}"][Math.floor(rand() * 5)]!
+              const id = MessageID.make("msg_" + char + "_" + h + "_" + i)
+              if (message.role === "user") {
+                yield* addUser(input.sessionID, undefined, { id, created: message.t })
+              } else {
+                yield* addAssistant(input.sessionID, MessageID.make("msg_parent"), { id, created: message.t })
+              }
+              if (message.json !== undefined) {
+                const stored = yield* MessageV2.get({ sessionID: input.sessionID, messageID: id })
+                yield* input.session.updateMessage({
+                  ...stored.info,
+                  time: { ...stored.info.time, created: message.json },
+                })
+                const row = yield* database.db.select().from(MessageTable).where(eq(MessageTable.id, id)).get()
+                expect(row?.time_created).toBe(message.t)
+                expect(row?.data.time.created).toBe(message.json)
+                mismatches++
+              }
+              if (!max || message.t > max.t || (message.t === max.t && id > max.id)) {
+                max = { role: message.role, t: message.t, id }
+              }
+              const role = yield* MessageV2.latestRole(input.sessionID)
+              expect(role, "history " + h + " write " + i).toBe(max?.role)
+              const latest = MessageV2.latest(yield* MessageV2.filterCompactedEffect(input.sessionID))
+              expect(role === "user").toBe(
+                Boolean(
+                  latest.user && (!latest.assistant || MessageV2.compareChronology(latest.user, latest.assistant) > 0),
+                ),
+              )
+            }
+          }),
+        )
+      }
+      expect(mismatches).toBeGreaterThan(0)
+    }),
+  )
+
 })
 
 describe("MessageV2.parts", () => {

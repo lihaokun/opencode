@@ -10,7 +10,8 @@ import { SessionStatus } from "./status"
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
-  readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  /** Resolves with what the cancel found, as Runner.cancel does; `Idle` when there was no runner. */
+  readonly cancel: (sessionID: SessionID) => Effect.Effect<Runner.StateTag>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -89,9 +90,9 @@ const layer = Layer.effect(
       const existing = data.runners.get(sessionID)
       if (!existing) {
         yield* status.set(sessionID, { type: "idle" })
-        return
+        return "Idle" as const
       }
-      yield* existing.cancel
+      return yield* existing.cancel
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (

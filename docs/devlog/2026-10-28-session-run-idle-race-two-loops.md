@@ -1,5 +1,7 @@
 # 开发日志 — 2026-10-28 session runner 收尾竞态双循环（issue #85）
 
+> 2026-11-02 与最新 dev（#97）整合时，补实了并发门和随机历史测试，处理了自定义 Unicode ID 的旧判定兼容，并要求基准使用显式内存库。范围与真实验证结果见 `docs/fixes/session-fix-pr89-integration.md`；下面保留各历史阶段的记录。
+
 ## 做了什么
 
 修复 `SessionRunState` 与 `Runner` 的收尾竞态：一个 run 结束、另一个写入方已排队时，旧代码把 idle 转换放在 `Runner` 临界区之外执行（`SessionRunState.onIdle` 删 map + 发 idle 状态），排队者在"已转换 Idle"与"onIdle 执行完"之间起跑——在一个服务已不认识的 runner 上运行（孤儿），下一条消息新建第二个 runner，同一会话两条循环互相把对方当"没说完"，反复输出占位回复（10-08 与 10-27 两次事故，9-52 条重叠 assistant 消息）。

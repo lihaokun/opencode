@@ -173,6 +173,18 @@
 
 > 本仓库尚无 Runner / SessionRunState 的契约文档（`docs/design/`、`docs/research/` 不存在）；本修复不改变 schema/枚举/对外 API。行为契约变更（会话级串行不变量显式化、runner 生命周期改为 process-lifetime、循环顶部守卫语义）以本文档第四部分为首次记载，issue #85 为分析底稿。
 
+## 与最新 dev 的整合修订（2026-11-02）
+
+整合目标为 `dev@b999dd248f`（含 #97），原 PR head 为 `cbd60a1f82`。完整记录见 [整合检查](session-fix-pr89-integration.md)。
+
+以下为对前文历史结论的修正，以本节和实现为准：
+
+- Runner 生命周期为 Instance 生命周期，work 仍逐次创建；普通 re-arm 才复用同一 work。保留 #97 的 cancel StateTag、run 记录归属、窗口和停止钩子。
+- 单行索引读取与 JS 排序对普通生成 ID 一致；合法自定义非 BMP ID 可能不同。候选含代理字符时回退原 filtered-history 判定，连同压缩边界一起保留。常规路径不随历史量线性增长，罕见兼容路径保留旧扫描成本；不宣称任意外部钩子的执行时间都有硬上界。
+- 原 Runner PBT 是顺序执行，慢通知门的 Effect 判定也没有生效。本轮改为有真实 Deferred 窗口的 seeded 场景，验证 join 结果、取消、shell 队列、re-arm、idle 顺序与通知/谓词 defect。Session 层收尾窗口也改为显式门，不靠固定 sleep 猜测时机。
+- 原 latestRole PBT 没有真正制造列/JSON 时间不一致，且仅在末尾断言。本轮每份历史独立、每次写入即对照，通过再次更新同一 ID 的 JSON 时间验证持久化列不变；另覆盖压缩重排和 Unicode+压缩组合。
+- 基准脚本必须显式指定 `OPENCODE_DB=:memory:`；临时 Instance 本身不隔离全局数据库。后文的旧测量记录保留为历史数据，不视为裸脚本运行的隔离保证。
+
 ## 验证记录（Step 5）
 
 基座：`dev` @ `d9d7de31fb`，分支 `fix/session-run-idle-race-85`。

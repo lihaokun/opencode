@@ -1,8 +1,9 @@
 /**
  * Query benchmark for #85's performance half: on a session with 20k
  * persisted messages, the re-arm predicate (hasUnconsumedTurn) must cost
- * milliseconds, not seconds. Fills a real SQLite database inside a tmpdir
- * instance, then times both predicate implementations against it:
+ * milliseconds, not seconds. Requires OPENCODE_DB=:memory:; the temporary
+ * instance isolates the project, not the global database. Then times both
+ * predicate implementations against the same SQLite data:
  *
  *   1. bulk-fill the session with ~20k messages (real DB writes)
  *   2. OLD: MessageV2.filterCompactedEffect — the full-load predicate
@@ -33,6 +34,10 @@ import { InstanceStore } from "@/project/instance-store"
 import { withTmpdirInstance } from "../test/fixture/fixture"
 
 const COUNT = Number(process.env.FILL_COUNT ?? 20000)
+
+if (process.env.OPENCODE_DB !== ":memory:") {
+  throw new Error("Run this benchmark with OPENCODE_DB=:memory:; it must not write to the default user database")
+}
 
 const layer = LayerNode.compile(
   LayerNode.group([

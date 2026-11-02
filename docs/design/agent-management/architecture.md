@@ -8,7 +8,12 @@
   跨 directory 投递**可路由**（原"做不到"的判断有误，缺口 12 删除）；legacy `task` 权限改为
   **原地改名**；roster 改为**边沿触发、回合边界投递**并如实记录其增长；新增**兄弟快照**；
   `startDelegation` 增内部 `notify`；`AgentPromptOps` 增 `deliverAsync`。
-- 工具表面：四个（调研 §12 撤销 `agent_get`；§13 把恢复统一交给 `agent_send`）
+- 2026-10-23 第五次实质修订（子计划 `agentmgmt-2-run-state`，依据 issue #75 / #81 / #73 与
+  `docs/fixes/session-fix-step-tail-repeat-and-agents.md`）：工具表面由四个改为**五个**，新增 `agent_status`
+  （撤销调研 §12 的收敛，理由见调研 §18）；子 agent 的每次 run 有编号、起止时间、唤醒来源与结局
+  （会话元数据 `agentRun`）；结束报告与 `agent_send` 的返回标明 run，停止通知仅附取消后的最新 run 记录快照；`agent_list` 有参数与上限；
+  每步末尾附不入历史的子 agent 节；新增插件停止钩子，**run 结束 = 循环退出且钩子放行**。
+- 工具表面：五个（调研 §12 曾收敛为四个，§18 恢复单项查询为 `agent_status`；§13 把恢复统一交给 `agent_send`）
 - 日期：2026-09-04，末次修订 2026-09-14
 - 对应问题：[lihaokun/opencode#23](https://github.com/lihaokun/opencode/issues/23)
 - 上游依据：`docs/research/agent-management-research.md`（§16、§17 为后续修订，以 §17 为准）
@@ -19,11 +24,13 @@
 | 编号 | 目标 | 调研出处 |
 |---|---|---|
 | G1 | 可靠列出当前 Agent 树及各成员状态 | §1 缺口 1 |
-| G2 | 查询指定 Agent 的身份、关系与状态 | §1 缺口 2；由 roster 行承载，不单列工具（§12） |
+| G2 | 查询指定 Agent 的身份、关系与状态 | §1 缺口 2；由 `agent_status` 承载（§18 撤销 §12 的收敛；子计划 2） |
 | G3 | 邻居（父 / 子 / 兄弟）间任意方向的直接消息 | §1 缺口 3；范围见 §14 |
 | G4 | 主动停止不再需要或失控的 Agent，保留上下文 | §1 缺口 4 |
 | G5 | 身份统一为可寻址、可恢复的 Session，消除 `task_id` 的语义错位 | §1 缺口 5 |
 | G6 | 为每个 Agent 准备独立工作目录，降低并行改同一份 checkout 的冲突 | §15、§16.10–16.11 |
+| G7 | 插件能在一次 run 结束前把关，不放行则同一 run 继续 | issue #81；子计划 2 §4.4 |
+| G8 | 每次 run 有可对号的身份：编号、起止时间、唤醒来源、结局 | issue #75；子计划 2 §4.1–4.2 |
 
 非目标沿用调研 §6。本文档额外承担调研甩给架构阶段的四笔欠账：工具 schema（§4.6）、
 状态枚举（§3 `AgentStatus`）、停止级联与终止通知契约（§4.4）、消息交付顺序（§4.3）。
@@ -34,7 +41,7 @@
 
 ```
 模型
- └─ M5 AgentTools（唯一对模型暴露的表面：四个工具 + 子 Agent 列表 reminder）
+ └─ M5 AgentTools（唯一对模型暴露的表面：五个工具 + 子 Agent 列表 reminder + 每步末尾段的子 agent 节）
      ├─ 解析：M1 AgentTree     ← Session store 的 parentID 链
      ├─ 权限：M5 ctx.ask（key = agent）+ M1 直接子判定（仅 agent_stop）
      └─ 执行：
@@ -42,10 +49,14 @@
          agent_list      → M1 neighborhood（skeleton）+ M2 of（状态）→ M5 组装 AgentInfo
          agent_send      → M3 deliver（fork 进普通异步消息入口，只回 accepted）
          agent_stop      → M4 stop（自底向上无条件 cancel → 向 caller 发一条 cancelled）
+         agent_status    → M1 resolveTarget(neighbor) + M2 of + 会话元数据 agentRun → M5 渲染一个成员
 
      上下文注入：M5 roster —— 每轮比较，变化时落盘一条子 Agent 列表
      自动结局交付：子 Agent **每次 run 结束**向父报告一次（`SessionPrompt.reportRunEnd`，
-                   初始委托与 agent_send 驱动的 run 同一条路），复用既有 classify / renderOutput
+                   初始委托与 agent_send 驱动的 run 同一条路），复用既有 classify / renderOutput；
+                   报告标明关闭的 run 与结束时间
+     run 边界：     runLoop 正常退出 → 插件钩子 experimental.session.stop 放行 → run 记录关闭 → 报告 → idle。
+                   钩子阻止则同一 run 继续，以上一概不发生（子计划 2 §4.4）
 ```
 
 四条值得单独展开的路径：
@@ -384,7 +395,8 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
 ```
 
 ```
-数据结构：SubagentRoster
+数据结构：SubagentRoster（**子计划 2 撤销**：末尾段的进度视图每步刷新且不占历史，二者重叠；
+  commit 3 删除注入，保留 sentinel 常量供旧记录识别。以下为撤销前的定义。）
 
 字段：
   - text: string — 渲染成一行的直接子列表
@@ -408,9 +420,56 @@ idle 时自然起新 run。调用方只拿到 `accepted`——**不自动回复�
 跨模块共享性：跨模块共享 — producer: M5 AgentTools；consumer: 既有 SessionReminders 注入点
 ```
 
+```
+数据结构：AgentRun（子计划 2 §4.1，2026-10-29 修订）
+
+存放：Session.Info.metadata["agentRun"]，只对有 parentID 的会话写入；只保留当前 run 与上一个 run 的结束。
+
+字段：
+  - number: PositiveInt — 当前 run 的编号，从 1 起
+  - started_at: number — 开始的 epoch ms
+  - woken_by: WakeSource — 唤醒来源
+  - ended_at?: number — 关闭的 epoch ms
+  - outcome?: "completed" | "failed" | "stopped" | "lost"
+  - previous?: { number, ended_at, outcome } — 上一个 run 的结束
+
+类型不变量：
+  - ended_at 存在 ⇔ outcome 存在；ended_at ≥ started_at；previous.number = number − 1
+  - number 只在新 run 开始时加一；新 run 与 re-arm 的区分来自 loop() 的 work 闭包标志，不来自记录（子计划 2 I5）
+  - lost 只由新 run 开始时关闭遗留的打开记录产生（崩溃或结束写失败），没有报告
+  - 写入方只有 SessionPrompt.loop 的 work 包装；Session.patch 按会话串行（子计划 2 H6/H6b/H6c，I11）
+
+跨模块共享性：跨模块共享 — producer: SessionPrompt.loop；consumer: M5（agent_status / agent_list /
+  agent_send / 末尾段进度视图）、reportRunEnd、M4 renderTermination
+```
+
+```
+数据结构：WakeSource（子计划 2 §4.2）
+
+字段：
+  - kind: "agent" | "user" | "system"
+  - session? / name? / agent? — kind = agent 时的发送方
+
+推导：首次 run 的来源是创建者（父）；此后取唤醒消息首个 text part 的 metadata：
+  agent_message 或 agent_notification ⇒ agent（含子 agent 的结束报告）；user_message ⇒ user（只有 TUI 的
+  agent-message 路由打这个标记）；其余 ⇒ system（含人经普通 prompt 端点发进子会话的消息）。
+渲染：从会话 S 看，session = S ⇒ `your message`；其他 agent ⇒ 其名字或 session id；user；system。
+```
+
+```
+数据结构：消息 part 的 metadata（子计划 2 §4.3；#73 服务端）
+
+  agent 发送方的消息          { kind: "agent_message", sender, sender_name?, sender_agent? }
+  人经 TUI 发进子会话的头行   { kind: "user_message" }
+  子 agent 的结束报告         既有 { kind: "agent_notification", summary } + sender 三字段
+  钩子阻止后的继续消息        { kind: "stop_hook", reason }，part 为 synthetic（TUI 渲染见 #90）
+
+类型不变量：模型可见文本逐字不变；只供 TUI 识别与 WakeSource 推导；旧记录无标记，读者容忍缺失。
+```
+
 ## 4. 模块划分与功能规约
 
-**五个模块**。M1–M4 是机制，M5 是唯一对模型暴露的表面（四个工具 + roster 注入）。
+**五个模块**。M1–M4 是机制，M5 是唯一对模型暴露的表面（五个工具 + roster 注入 + 末尾段子 agent 节）。
 
 ### 4.1 M1 AgentTree
 
@@ -494,6 +553,8 @@ Claude Code 的 `ListAgents` 同样只给 busy / idle。本模块**不读 `Backg
   - 目标的 running / idle 由现有异步入口与 Session Runner 处理，
     **本模块不判断目标状态，也不手工启动执行**
   - 不自动回复、不承诺结果、不建 BackgroundJob、不注册 watcher
+  - 投递的 text part 带发送方标记（agent 路 `agent_message` 三字段；user 路头行 `user_message`），
+    模型可见文本不变（子计划 2 §4.3）
 
 不变式（Invariants）：
   - 本模块不持有任何跨调用状态
@@ -596,7 +657,10 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 读到 running 之后、cancel 之前目标可能自行结束。与其假装测得准，不如不报告这个维度。
 
 **为什么终止通知仍然存在**：取消不能静默结束。它复用完成/失败的同一条通道与同一个状态词
-`cancelled`（调研 §5.4），强度同为"至多发起一次"。
+`cancelled`（调研 §5.4），强度同为"至多发起一次"。通知带被停 run 的编号与时间（子计划 2 §4.6）。
+
+**run 记录不在 M4**：`agentRun` 由 `SessionPrompt.loop` 的 work 包装在每次 run 的开始与结束写入
+（与 `reportRunEnd` 同处，同一个 re-arm 判据），M4 只读它。命令子任务的子也记录，虽然不发报告。
 
 #### 4.4.1 工作目录准备（G6）
 
@@ -655,15 +719,24 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 ```
 模块名称：AgentTools
 
-功能描述：四个模型可调用工具的参数 schema（§4.6）、权限门、上下文读取、输出渲染，
-  以及**子 Agent 列表的上下文注入**；本 feature 唯一对模型暴露的表面。
+功能描述：五个模型可调用工具的参数 schema（§4.6）、权限门、上下文读取、输出渲染，
+  **子 Agent 列表的上下文注入**，以及每步末尾段的子 agent 节；本 feature 唯一对模型暴露的表面。
 
 前置条件（Requires）：
   - 工具调用发生在某个 Session 的工具执行上下文中，调用者 SessionID 可知
-  - roster 注入发生在 runLoop 的 reminder 阶段，可见历史与 Session 可知
+  - roster 注入发生在 runLoop 的 reminder 阶段，可见历史与 Session 可知（子计划 2 撤销 roster，改为每步末尾段进度视图，入参为状态投影与直接子的会话行）
 
 后置条件（Ensures）：
-  - 对模型暴露且仅暴露 agent / agent_list / agent_send / agent_stop（调研 §12）
+  - 对模型暴露且仅暴露 agent / agent_list / agent_send / agent_stop / agent_status（调研 §12、§18）
+  - agent_status 的可见性与执行权限与 agent_list 完全相同：工具表中同生同灭，执行期按 agent_list 的
+    权限键求值（子计划 2 I9）
+  - agent_list 有 status / relation / query / limit 参数，默认上限 50，末尾一行计数；每行带 run 号与最近活动时间
+  - agent_send 的返回在 deliver 之前取目标状态与 agentRun 的快照，空闲目标写 "starts run N+1 (sent …)"，
+    在跑目标写 "is in run N (started …)"（子计划 2 §4.6）
+  - **末尾段进度视图**：有直接子且 agent_list 非 deny 的会话，每步请求末尾附一张快照——当前时间与自身
+    run 号 / 步号、直接子的总数与在跑 / 空闲数、在跑列表（开始早的在前，至多 10 行，带上一个 run 的结束）、
+    10 分钟内（至少上一步以来）结束的列表（结束晚的在前，至多 10 行）；不写入历史、不进压缩输入、缓存断点
+    跳过；数据采集每步一次 SQL（子计划 2 §4.5；机制见 `docs/fixes/session-fix-step-tail-repeat-and-agents.md` §4.1）
   - **`task` 工具已删除**：运行时 tool ID 只剩 `agent`，不保留隐藏可执行别名。
     旧权限配置键 `task` 在读取时规范化为 `agent`；历史 transcript 的 `task` tool part
     继续在展示层可读；旧插件新发起的 `task` 调用按未知工具处理
@@ -678,7 +751,7 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
   - `agent` 经 `ctx.ask({ permission: "agent", patterns: [subagent_type], always: ["*"] })` 求值；
     默认 `*: allow` 使其不弹窗，但 deny 与显式 ask 仍生效
   - agent_list / agent_send / agent_stop 不新增逐次确认
-  - **roster 注入（面向父）**：在**回合边界**求值——命中"最后一条 user message 之后尚无
+  - **roster 注入（面向父，子计划 2 撤销，由末尾段进度视图取代）**：在**回合边界**求值——命中"最后一条 user message 之后尚无
     assistant message"（即 `idle→running`）或"可见历史含 compaction part 且其后无 roster"；
     命中后渲染当前直接子列表，与可见历史中最近一条比较，不同或不存在则**落盘**一条。
     无直接子不注入；调用者 `agent_list` 为 deny 不注入
@@ -689,14 +762,14 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 不变式（Invariants）：
   - 权限判定先于任何副作用；判定失败的调用不写入任何消息、不中断任何执行
 
-副作用：委托给 M1–M4；roster 注入写入一条 synthetic part
+副作用：委托给 M1–M4；roster 注入写入一条 synthetic part（子计划 2 后：不再写入 synthetic part；进度视图不落盘）
 ```
 
 **权限的不对称**：`agent_send` 可发给任一邻居，`agent_stop` 只能停直接子。
 理由是破坏性不同——投递一条消息由接收方自行决定如何处理；停止则单方面中断对方的执行。
 
-**roster 为什么在 M5**：它是模型看得见的东西，与四个工具同属"对模型暴露的表面"。
-它不是新的执行机制，只是把 M1+M2 已有的读取结果按既有 reminder 通道呈现。
+**roster 为什么在 M5**（子计划 2 已撤销 roster，本段理由同样适用于取代它的末尾段进度视图）：它是模型看得见的
+东西，与五个工具同属"对模型暴露的表面"。它不是新的执行机制，只是把 M1+M2 已有的读取结果呈现给模型。
 
 ### 4.6 工具 schema
 
@@ -711,13 +784,24 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 返回：已创建并启动的说明，含 session_id / name / 建议工作目录。**不含实时 status**
 
 工具：agent_list
-  （无参数；范围恒为调用者的邻居：父、子、兄弟）
-返回：每行含 session_id / name / agent_type / relation / status / title / workdir
+  status?:   "running" | "idle"
+  relation?: "self" | "parent" | "child" | "sibling"
+  query?:    string    — 名字或标题子串
+  limit?:    PositiveInt — 默认 50
+  （范围恒为调用者的邻居：父、子、兄弟）
+返回：每行含 session_id / name / agent_type / relation / status / run / last / title / workdir；
+  在跑在前，其余按最近活动倒序；末尾 `showing <n> of <total> (<r> running, <i> idle)`
+
+工具：agent_status
+  target:         string    — session_id，或调用者邻居中某个 Agent 的实例名
+返回：该成员的 session_id / name / agent_type / relation / status / run（编号、开始时间与来源，
+  或结束时间与结局）/ workdir。范围、解析与权限与 agent_list 相同
 
 工具：agent_send
   target:         string    — session_id，或调用者邻居中某个 Agent 的实例名
   message:        string    — 正文；系统前缀由 M3 添加，调用方不可覆盖
-返回：accepted（已接受/已调度，不保证已送达或将被处理）
+返回：accepted（已接受/已调度，不保证已送达或将被处理），加目标在投递那一刻的 run 状态与
+  `agent_status` 提示行（子计划 2 §4.6）
 
 工具：agent_stop
   target:         string    — session_id，或调用者直接子中某个 Agent 的实例名
@@ -873,25 +957,32 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 
 ```
 G1 「列出 Agent 树及状态」   → M1（skeleton）+ M2（状态）+ M5（组装与渲染，含 roster）
-G2 「查询指定 Agent」        → 与 G1 同路径
+G2 「查询指定 Agent」        → M1 resolveTarget + M2 + agentRun → M5 agent_status（子计划 2）
+G7 「run 结束前把关」        → SessionPrompt.runLoop 退出分支 + Plugin（子计划 2 §4.4）
+G8 「run 身份」              → SessionPrompt.loop 的 work 包装写 agentRun；M5 与 reportRunEnd 读（子计划 2）
 G3 「邻居间任意方向消息」    → M3 AgentInbox（主）
-G4 「停止并保留上下文」      → M4（主）+ M1（直接子判定 + 后代展开）+ M5（roster 兜信息）
+G4 「停止并保留上下文」      → M4（主）+ M1（直接子判定 + 后代展开）+ M5（roster 兜信息）（子计划 2 后由末尾段进度视图兜信息）
 G5 「身份统一」              → M5（表面约束）+ M1（身份与名称解析）
-G6 「独立工作目录」          → M4 §4.4.1（准备）+ M5（在初始消息与 roster 中呈现）
+G6 「独立工作目录」          → M4 §4.4.1（准备）+ M5（在初始消息与 roster 中呈现）（子计划 2 后 roster 改为进度视图）
 ```
 
 ### 模块协作论证
 
 **G1/G2**：M1 保证 AgentNeighborhood 覆盖父/子/兄弟三类且有稳定序（三元组排序，毫秒并列不致换序），
 即可寻址集合完整；M2 保证每个成员得到 running / idle 之一且二者互斥穷尽；M5 把两者拼成完整
-AgentInfo。故"完整成员集合 × 明确状态"成立。G2 是 G1 在单成员上的投影。
+AgentInfo。故"完整成员集合 × 明确状态"成立。G2 由 `agent_status` 承载：同一解析范围与权限键，
+输出多了 run 记录；它存在的理由是 #75 的竞态——发消息的当下需要目标的 run 号与时间，而 roster
+只在回合边界更新（调研 §18）。
+
+**G7 / G8**：子计划 2 的 I5–I10 给出 run 号单调、报告对号、钩子先于一切结束效果、末尾段不入历史、
+agent_status ≡ agent_list、标记不改文本；论证在该子计划 §5 各函数处。
 
 **G3**：M3 对任一存在的目标 Session 均可投递，故邻居这一子集必然覆盖。处理保证由现有 Runner 承担：
 running 时现有 loop 在下一个 provider turn 边界重读历史读到它，idle 时新起 run。
 **强度限定**：G3 成立到"投递已被接受并调度"这一强度，**不到"必被处理"**——
 受 issue #32 的 lost-wake 窗口影响（§10 缺口 5），且 `Accepted` 本身不保证已持久化。
 这是既有渠道的既有强度，本 feature 不加强也不削弱。roster（§4.5）把"通知丢了"的后果
-从无声挂起降级为一轮延迟，但那是缓解不是保证。
+从无声挂起降级为一轮延迟，但那是缓解不是保证。（子计划 2 后该缓解由末尾段进度视图承担，每步刷新。）
 
 **G4**：M4 的后置条件给出"终止执行、不删除任何 Session 与历史、可恢复、幂等"。
 "等待方不被静默挂起"这一半由两件事共同给出：
@@ -1088,6 +1179,15 @@ Rely-Guarantee 条件：
     再派生子 Agent 的情形。
 11. **重名不可恢复**。两个并发创建产生同名后，二者从此只能用 `session_id` 寻址；
     本 feature 不提供改名。
+12. **run 记录只保留当前 run 与上一个 run 的结束**（子计划 2）。再往前的起止时间不保留；记账失败的 run 在下一次
+    新 run 开始时关为 `lost`，`agent_status` 如实显示。记录存于会话元数据，没有索引，不供查询。
+13. **停止钩子不触发于结构化输出的 run**，也不提供 `additionalContext` 非阻止反馈（子计划 2 §1）。
+14. **`Session.patch` 曾无锁、整行后写者胜**（子计划 2 H6）。运行中并发 patch 同一会话的写入方有 `touch`、
+    `setAgentModel`、`setTitle` 与 HTTP `session.update`；子计划 2 在 `Session.patch` 内按会话串行化（I11）。
+    HTTP `session.update` 以客户端旧副本整体替换元数据仍会抹掉 `agentRun` 等键，保持替换语义，读者容忍缺失。
+15. **没有默认步数上限**（子计划 2 §6 第 13 点）。上游 V1/V2、Claude Code 交互模式均无默认；`steps` 为按 agent
+    的选择项。到达上限的那一步不询问停止钩子。
+16. **停止钩子无超时，多插件后写者胜**；阻止后的继续消息在 TUI 不可见（#90）。
 ### 实现阶段未自动化覆盖的三项
 
 以下三条按设计成立，但**没有自动化测试**，只靠代码审读保证。列出来是为了让它们可见，
