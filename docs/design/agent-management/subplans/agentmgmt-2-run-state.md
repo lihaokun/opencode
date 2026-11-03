@@ -267,22 +267,22 @@ output（默认 { decision: "allow" }）：
 
   Now: 2026-10-27T19:54:07+08:00. You are in run 6, step 12.
 
-  Your subagents: 9 direct, 8 running, 1 idle.
+  Your subagents: 4 direct, 2 running, 2 idle.
   Running now:
-    ses_e8322dba1ffeym7PA3fbSUOgkq  cw-b572  run 2 since 19:40:56 (your message), last step 19:52:30; run 1 ended 19:38:10 (completed)
+    ses_e8322dba1ffeym7PA3fbSUOgkq  cw-b572  run 2 since 19:45:56 (your message), last step 19:52:30; run 1 ended 19:44:10 (completed)
     ses_e82d509c7ffegJiVTIGVydNkNW  cw-b584  run 1 since 19:50:08 (your message), last step 19:51:40
-    … and 6 more running
   Finished in the last 10 minutes, now idle:
     ses_e82e64cadffe1q2diMobtJb5ag  cw-b582  run 5 ended 19:49:18 (stopped)
     ses_e8333f0e1ffeIYpJBQz5jqZosm  cw-b569  run 3 cut off since 18:20:06 (not yet recorded as lost)
-    … and 2 more finished
 
   Your last step repeated the tool calls of the step before it: 2 times in a row; the results were identical too: 2 times in a row.
 
 四个部分：
   1. 时钟与自身位置：当前时间带日期与时区；run 号与步号是本会话自己的。主会话没有 run 号，只写
      `You are at step 12.`
-  2. 子 agent 总览与在跑列表：直接子 agent 的总数、在跑数、空闲数。在跑的逐个列出，每行 session_id、名字
+  2. 子 agent 总览与在跑列表：本视图纳入的直接子 agent 总数、在跑数、空闲数。总览与两个列表共用筛选：
+     在跑项全部纳入；空闲项只纳入第 3 部分的集合；计数在每列表 10 行截断前计算。已结束且过窗、空闲且无 run 记录的子不计入。
+     在跑的逐个列出，每行 session_id、名字
      （无名字时省略）、run 号、开始时间、唤醒来源、最后一步时间（状态投影最近一次置 busy 的时间，H12）；
      若其上一个 run 在窗口内结束，分号后带上"run N ended <时间> (<结局>)"——这一句专门对付 #75 的竞态
   3. 窗口内结束、现在空闲的列表：每行 session_id、名字、run 号、结束时间、结局（四种之一）。
@@ -302,7 +302,7 @@ output（默认 { decision: "allow" }）：
   - 省略行不计入 10 行；整段至多 30 行（时钟 1 + 空行 1 + 总览 1 + 标题 2 + 列表 20 + 省略 2 + 空行 1 + 重复计数 1 + 余量）
 
 出现条件：
-  - 第 2、3 部分只在有直接子 agent、且 agent_list 权限不是 deny 时出现
+  - 第 2、3 部分只在筛选后至少一个直接子 agent 纳入视图、且 agent_list 权限不是 deny 时出现；两个列表都空则连总览一起省略
   - 第 4 部分只在计数大于 0 时出现
   - 四部分都没有时整段不附带；第 1 部分随任一部分出现，不单独出现
 
@@ -536,9 +536,10 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
   1. `running = children.filter(c => c.running)`，按 `run?.started_at ?? created` 升序、并列按 id；取前 10；超出记 `omittedRunning`。
   2. `finished = children.filter(c => !c.running && (c.run?.ended_at !== undefined ? c.run.ended_at >= windowStart : c.run !== undefined))`——已关闭的按窗口筛，未关闭的（cut off）不筛；按 `ended_at ?? started_at` 降序、并列按 id；取前 10；超出记 `omittedFinished`。
   3. 渲染 4.5 的格式：时钟与自身位置；总览行；在跑列表（每行 id、名字、run 号、since、来源、last step；若 `run.previous.ended_at >= windowStart` 附分号句）；已结束列表（已关闭行 / cut off 行）；省略行。
-  4. 两个列表都为空时只返回总览行（时钟行由调用方按"随任一节出现"的规则加在整段最前）。已结束列表的标题：窗口恰为 10 分钟时写 `Finished in the last 10 minutes, now idle:`，更长时写 `Finished since HH:MM:SS, now idle:`。在跑而记录缺失或已关闭（开始写入未完成、已失败，或续跑窗口）的行写 `running (run record not updated yet)`，与 agent_send 的措辞一致。
+  4. 两个列表都为空时返回 undefined；否则总览 direct = running.length + finished.length，idle = finished.length，均在截断前计算。时钟行由调用方按"随任一节出现"的规则添加，独立的重复计数不受影响。已结束列表的标题：窗口恰为 10 分钟时写 `Finished in the last 10 minutes, now idle:`，更长时写 `Finished since HH:MM:SS, now idle:`。在跑而记录缺失或已关闭（开始写入未完成、已失败，或续跑窗口）的行写 `running (run record not updated yet)`，与 agent_send 的措辞一致。
+  > [已废弃，2026-11-03] 原“两列表都空时只返回总览”会让早已完成的子永久计入 idle；由 `session-fix-tail-window-counts.md` 的统一筛选替代。Session 数据与 agent_list / agent_status 查询范围不变。
 - **正确性论证**：纯函数；行数上界 30；排序有确定的第二键（id）；`finished` 的筛选条件与 4.5 定义逐字对应；cut off 行不受窗口限制故崩溃遗留可见直到被新 run 关闭。
-- 测试（`step-tail.test.ts`）：无子返回空；有子无变化只有总览；在跑按开始时间升序、无记录的按创建时间混排、记录已关闭的写 not updated yet、超 10 截断保留最早的；已结束按结束时间降序、超 10 截断保留最新的；cut off 行出现且不受窗口限制；上一个 run 在窗口内时附带分号句、不在窗口内不带；四种结局；来源三种；名字转义后仍是一行；标题两种；主会话第一行无 run 号；窗口取 10 分钟与上一步开始的较早者。
+- 测试（`step-tail.test.ts`）：无子或筛选集合为空返回空；过窗结束项同时退出明细和总览，新运行项不带回旧 idle 计数；在跑按开始时间升序、无记录的按创建时间混排、记录已关闭的写 not updated yet、超 10 截断保留最早的；已结束按结束时间降序、超 10 截断保留最新的；cut off 行出现且不受窗口限制；上一个 run 在窗口内时附带分号句、不在窗口内不带；四种结局；来源三种；名字转义后仍是一行；标题两种；主会话第一行无 run 号；窗口取 10 分钟与上一步开始的较早者。FastCheck 验证筛选计数、过期项加入不影响输出和时间推进后的退出。
 
 #### 5.3.2 `runLoop` 中的数据采集（`prompt.ts:1434` 组装 tail 处）
 

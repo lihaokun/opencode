@@ -101,9 +101,9 @@
 
 **进度视图（commit 3）**
 
-- S14 门：无直接子或 `agent_list` deny → 不附带
+- S14 门：无直接子或 `agent_list` deny → 不附带；筛选后无有效项同样不附带子 Agent 节
 - S15 采集：一次 children SQL 和一次 status.list；窗口下界取 `min(now − 10min, previousStepStart)`。状态由 work 持有，首步初始化，同号 re-arm 保留（含根），新号或新 loop 重置；收到带 finish 的响应即推进，先于各提前退出分支；预检撤回/provider 拒绝不推进。
-- S16 渲染：在跑升序（`started_at ?? created`）、已结束降序（`ended_at ?? started_at`）、cut off 行不受窗口限制、各 10 行、省略行、上一个 run 的分号句；节序在重复计数之前
+- S16 渲染：在跑升序（`started_at ?? created`）、已结束降序（`ended_at ?? started_at`）、cut off 行不受窗口限制、各 10 行、省略行、上一个 run 的分号句；总览计数为两个列表截断前的集合，过窗结束/空闲无记录项不计数；两列表空时整节省略，重复计数独立保留；节序在重复计数之前
 - S17 删除花名册注入（`applyAgentRoster` 调用与实现），保留 sentinel 常量
 
 **报告与 agent_send（commit 4）**
@@ -148,7 +148,7 @@
 
 ## 7. 不变量契约（property-based）
 
-> **框架声明**：仓库未引入 property-based 框架。沿用 `step-tail` 分支的做法：种子化随机生成 + 按定义重算的参照实现，一次失败即报种子。
+> **框架声明**：原 T 系列沿用种子化随机生成 + 按定义重算的参照实现，一次失败即报种子。2026-11-03 总览退窗修复另用 `effect/testing` 的 FastCheck 验证分类计数、过期项不影响输出和跨时间边界退出。
 
 - **INV-5（= I5）** 任意事件序列（发送到空闲的子、中途插入消息、re-arm、续跑窗口、完成 / 失败 / 被停、并发多子、崩溃遗留的打开记录、注入一次结束写失败、注入一次开始写失败、取消收尾时下一 run 已开启）经真实 `loop` 执行后，每个子的 run 号序列严格递增且每次只加一；普通 re-arm 不改变它，续跑窗口加一；写失败与遗留的记录在下一次开始时被记为 lost 且号不重复；一次 run 只关闭自己持有号的记录：取消收尾不动下一 run 的记录，开始写失败的 run 不冒用遗留记录、其报告无 run 属性，它被 re-arm 后同样不认领（晚到消息与写失败是两个独立抽取的维度）；每条记录打开时会话已是 busy。—— T3 加两条定值用例（钩子阻止不加号由定值用例覆盖）
 - **INV-6（= I6）** 每份结束报告的 run 号等于发出时该子已关闭的 run，按结束顺序一一对应；同号报告至多一份；结束写失败的那份报告不带 run 属性；`ended ≥ started`。—— T3（停止通知的独立快照性质见 INV-14）
@@ -156,7 +156,7 @@
 - **INV-7（= I7）** 对任意步序列（工具步、询问钩子的最终回答、带中途插入新消息的最终回答）与任意 cap（1–8），钩子连续阻止长度不限：父收到的报告恰一份，其创建时间不早于最后一次询问；每次询问的 `continuations` 等于按定义推进的参照值；每个请求的最后一条用户消息文本等于当时最新的 reason 或插入消息；每次询问之前子会话的 `SessionStatus` 事件序列中没有 idle。—— T8
 - **INV-7b** 每段连续无工具、无新输入的退出尝试中询问与阻止次数 ≤ cap；一步含工具调用或钩子之外的新用户消息后计数从 0 重新累积。—— T8（steer、超 cap 的阻止）；定值用例（新 run 再次询问）
 - **INV-8（= I8）** 相邻两步请求的历史部分逐字相同（R1 扩展到带进度视图的会话）；视图文本不出现在会话历史与压缩输入中。
-- **INV-8b** 随机生成子集合（状态、记录、创建时间、最后一步时间）与窗口：在跑列表恰等于投影 running 的子按 `started_at ?? created` 升序取前 10；已结束列表恰等于空闲且（已关闭且 `ended_at ≥ windowStart`，或未关闭）的子按 `ended_at ?? started_at` 降序取前 10；省略计数等于被截去的数量；行数恰为标题、各行与省略行之和（名字与唤醒来源名含换行、制表符、`]` 时也不多出一行）；同一输入两次渲染文本相同。—— T7
+- **INV-8b** 随机生成子集合（状态、记录、创建时间、最后一步时间）与窗口：在跑列表恰等于投影 running 的子按 `started_at ?? created` 升序取前 10；已结束列表恰等于空闲且有 run 记录且（已关闭且 `ended_at ≥ windowStart`，或未关闭）的子按 `ended_at ?? started_at` 降序取前 10；总览 direct/running/idle 为这两个集合截断前的大小，总数等于两分项之和；过窗结束项/空闲无记录项加入输入不影响输出；集合空返回 undefined。省略计数等于被截去的数量；非空视图行数恰为标题、各行与省略行之和（名字与唤醒来源名含换行、制表符、`]` 时也不多出一行）；同一输入两次渲染文本相同。—— T7 与 FastCheck 退窗性质
 - **INV-9（= I9）** 对权限规则形态 {无规则、`agent_list: deny` 通配、`agent_list` 具体 pattern 的 deny（`Permission.disabled` 只认 `pattern === "*"`，故不隐藏）、`agent_status: deny`} × 深度 {< limit, ≥ limit} 的全部组合，工具表中 `agent_status ∈ tools ⇔ agent_list ∈ tools`；`agent_list` 通配 deny 时 `agent_status` 执行被拒。—— 枚举
 - **INV-10（= I10）** 对任意发送方字段，`render()` 的输出与基线逐字相同；四条路径的 metadata 形状固定。—— 枚举
 - **INV-11（= I11）** 对同一会话的任意并发 patch 序列（随机的 setTitle / setMetadata / touch / setAgentModel；另 `updateMetadata` 并发自增 N 次恰得 N，每次写入的值各不相同），锁内按序发布的 `session.updated` 行序列中，title / metadata.note / agent / model.id 四个字段都不会回到出现过的值（丢失的更新就是回退），每次写入的值都在某一行出现过，最终行等于最后一个事件的行。这蕴含"每个字段等于最后一次写该字段的值"。—— T9
