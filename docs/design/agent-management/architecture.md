@@ -733,10 +733,10 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
   - agent_list 有 status / relation / query / limit 参数，默认上限 50，末尾一行计数；每行带 run 号与最近活动时间
   - agent_send 的返回在 deliver 之前取目标状态与 agentRun 的快照，空闲目标写 "starts run N+1 (sent …)"，
     在跑目标写 "is in run N (started …)"（子计划 2 §4.6）
-  - **末尾段进度视图**：有直接子且 agent_list 非 deny 的会话，每步请求末尾附一张快照——当前时间与自身
-    run 号 / 步号、直接子的总数与在跑 / 空闲数、在跑列表（开始早的在前，至多 10 行，带上一个 run 的结束）、
+  - **末尾段进度视图**：有有效直接子项且 agent_list 非 deny 的会话，每步请求末尾附一张快照——当前时间与自身
+    run 号 / 步号、视图纳入的直接子总数与在跑 / 空闲数、在跑列表（开始早的在前，至多 10 行，带上一个 run 的结束）、
     10 分钟内（至少上一步以来）结束的列表（结束晚的在前，至多 10 行）；不写入历史、不进压缩输入、缓存断点
-    跳过；数据采集每步一次 SQL（子计划 2 §4.5；机制见 `docs/fixes/session-fix-step-tail-repeat-and-agents.md` §4.1）
+    跳过；总览与列表共同排除过窗结束项，未结算的 cut off 项保留，筛选后无项则整节省略。数据采集每步一次 SQL（子计划 2 §4.5；机制见 `docs/fixes/session-fix-step-tail-repeat-and-agents.md` §4.1）
   - **`task` 工具已删除**：运行时 tool ID 只剩 `agent`，不保留隐藏可执行别名。
     旧权限配置键 `task` 在读取时规范化为 `agent`；历史 transcript 的 `task` tool part
     继续在展示层可读；旧插件新发起的 `task` 调用按未知工具处理

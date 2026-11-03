@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { FastCheck } from "effect/testing"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { StepTail } from "../../src/session/step-tail"
 import { AgentRun } from "../../src/agent-management/run"
@@ -233,10 +234,24 @@ describe("step tail: subagent view", () => {
     expect(view([])).toBeUndefined()
   })
 
-  test("the overview alone when nobody is running and nobody finished inside the window", () => {
-    expect(view([child(1, { run: closed(1, 20 * 60_000) }), child(2, {})])).toBe(
-      "Your subagents: 2 direct, 0 running, 2 idle.",
-    )
+  test("expired children leave the overview as well as the finished list", () => {
+    const expired = Array.from({ length: 4 }, (_, i) => child(i, { run: closed(1, 120 * 60_000) }))
+    expect(view(expired)).toBeUndefined()
+    expect(view([...expired, child(4, {})])).toBeUndefined()
+    const active = child(5, { running: true, run: open(2, 1_000) })
+    expect(view([...expired, active])).toBe(view([active]))
+    expect(view([...expired, active])).toStartWith("Your subagents: 1 direct, 1 running, 0 idle.")
+  })
+
+  test("finished children count at the inclusive window edge, and leave it one millisecond later", () => {
+    const rows = [-1, 0, 1].map((delta, i) => child(i, { run: closed(1, StepTail.WINDOW_MS + delta) }))
+    const text = view(rows)!
+    expect(text).toStartWith("Your subagents: 2 direct, 0 running, 2 idle.")
+    expect(text).toContain(id(0))
+    expect(text).toContain(id(1))
+    expect(text).not.toContain(id(2))
+    expect(view(rows, now - StepTail.WINDOW_MS + 1)).toStartWith("Your subagents: 1 direct, 0 running, 1 idle.")
+    expect(view(rows, now - StepTail.WINDOW_MS + 2)).toBeUndefined()
   })
 
   test("running rows: longest-running first, with the source, the last step and the previous run inside the window", () => {
@@ -295,7 +310,7 @@ describe("step tail: subagent view", () => {
     ]
     expect(view(rows)).toBe(
       [
-        "Your subagents: 5 direct, 0 running, 5 idle.",
+        "Your subagents: 4 direct, 0 running, 4 idle.",
         "Finished in the last 10 minutes, now idle:",
         `  ${id(2)}  run 1 ended ${clock(now - 30_000)} (failed)`,
         `  ${id(1)}  run 3 ended ${clock(now - 60_000)} (stopped)`,
@@ -397,10 +412,6 @@ describe("step tail: subagent view", () => {
         next() < 0.5 ? now - StepTail.WINDOW_MS : now - StepTail.WINDOW_MS - Math.floor(next() * 50 * 60_000)
       const text = StepTail.renderSubagents({ now, children, windowStart, viewer })
       const label = `seed ${9500 + n}`
-      if (count === 0) {
-        expect(text, label).toBeUndefined()
-        continue
-      }
       const start = (row: StepTail.Child) => row.run?.started_at ?? row.created
       const end = (row: StepTail.Child) => row.run?.ended_at ?? row.run?.started_at ?? 0
       const byId = (a: StepTail.Child, b: StepTail.Child) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
@@ -409,9 +420,14 @@ describe("step tail: subagent view", () => {
         .filter((row) => !row.running && row.run && (row.run.ended_at === undefined || row.run.ended_at >= windowStart))
         .toSorted((a, b) => end(b) - end(a) || byId(a, b))
 
+      if (running.length + finished.length === 0) {
+        expect(text, label).toBeUndefined()
+        continue
+      }
+
       const lines = text!.split("\n")
       expect(lines[0], label).toBe(
-        `Your subagents: ${count} direct, ${running.length} running, ${count - running.length} idle.`,
+        `Your subagents: ${running.length + finished.length} direct, ${running.length} running, ${finished.length} idle.`,
       )
       const runningAt = lines.indexOf("Running now:")
       const finishedAt = lines.findIndex((line) => line.startsWith("Finished "))
@@ -451,5 +467,85 @@ describe("step tail: subagent view", () => {
       expect(lines.length, label).toBeLessThanOrEqual(25)
       expect(StepTail.renderSubagents({ now, children, windowStart, viewer }), label).toBe(text)
     }
+  })
+
+  test("PBT: overview counts follow visibility classes and ignore expired history", () => {
+    FastCheck.assert(
+      FastCheck.property(
+        FastCheck.integer({ min: 0, max: 50 * 60_000 }),
+        FastCheck.array(
+          FastCheck.record({
+            kind: FastCheck.constantFrom(
+              "running",
+              "running-unrecorded",
+              "running-closed",
+              "recent",
+              "expired",
+              "cut-off",
+              "unrecorded",
+            ),
+            age: FastCheck.integer({ min: 0, max: 3_600_000 }),
+            outcome: FastCheck.constantFrom<AgentManagement.RunOutcome>("completed", "failed", "stopped", "lost"),
+          }),
+          { maxLength: 60 },
+        ),
+        FastCheck.array(FastCheck.integer({ min: 1, max: 3_600_000 }), { maxLength: 20 }),
+        (extension, cases, ages) => {
+          const width = StepTail.WINDOW_MS + extension
+          const children = cases.map((item, i) => {
+            const running = item.kind.startsWith("running")
+            const run =
+              item.kind === "unrecorded" || item.kind === "running-unrecorded"
+                ? undefined
+                : item.kind === "running" || item.kind === "cut-off"
+                  ? open(2, width + item.age + 1)
+                  : closed(2, item.kind === "recent" ? item.age % (width + 1) : width + item.age + 1, item.outcome)
+            return child(i, { running, ...(run ? { run } : {}) })
+          })
+          // The oracle uses generated lifecycle classes, not the production
+          // timestamp predicate. Counts cover the whole sets before truncation.
+          const running = cases.filter((item) => item.kind.startsWith("running")).length
+          const idle = cases.filter((item) => item.kind === "recent" || item.kind === "cut-off").length
+          const before = structuredClone(children)
+          const text = view(children, now - width)
+          expect(text?.split("\n")[0]).toBe(
+            running + idle === 0
+              ? undefined
+              : `Your subagents: ${running + idle} direct, ${running} running, ${idle} idle.`,
+          )
+          const history = ages.flatMap((age, i) => [
+            child(1000 + i, { run: closed(1, width + age) }),
+            child(2000 + i, {}),
+          ])
+          expect(view([...history, ...children], now - width)).toBe(text)
+          expect(children).toEqual(before)
+        },
+      ),
+      { numRuns: 200, seed: 97103 },
+    )
+  })
+
+  test("PBT: advancing past expiry drops closed runs while running and cut-off rows remain", () => {
+    FastCheck.assert(
+      FastCheck.property(
+        FastCheck.integer({ min: 0, max: 3_600_000 }),
+        FastCheck.constantFrom<AgentManagement.RunOutcome>("completed", "failed", "stopped", "lost"),
+        (age, outcome) => {
+          const ended = child(1, { run: closed(1, age, outcome) })
+          const persistent = [
+            child(2, { running: true, run: open(2, age + 1_000) }),
+            child(3, { run: open(1, age + 2_000) }),
+          ]
+          const at = now - age + StepTail.WINDOW_MS
+          const render = (time: number, children: StepTail.Child[]) =>
+            StepTail.renderSubagents({ now: time, children, windowStart: time - StepTail.WINDOW_MS, viewer })
+          expect(render(at, [ended, ...persistent])).toStartWith("Your subagents: 3 direct, 1 running, 2 idle.")
+          expect(render(at + 1, [ended, ...persistent])).toBe(render(at + 1, persistent))
+          expect(render(at + 1, persistent)).toStartWith("Your subagents: 2 direct, 1 running, 1 idle.")
+          expect(render(at + 1, [ended])).toBeUndefined()
+        },
+      ),
+      { numRuns: 100, seed: 97104 },
+    )
   })
 })

@@ -161,9 +161,9 @@ export const collectSubagents = Effect.fn("StepTail.collectSubagents")(function*
 
 /**
  * Step S16, parts 2 and 3 of the view: the overview, who is running and who
- * finished inside the window. Nothing without children; the overview alone
- * when both lists are empty. Rows are facts in a fixed shape — the reader
- * holds the tool descriptions, so no line here tells it what to call.
+ * finished inside the window. The overview counts those same sets before
+ * truncation; nothing when both are empty. Rows are facts in a fixed shape —
+ * the reader holds the tool descriptions, so no line here tells it what to call.
  */
 export function renderSubagents(input: {
   now: number
@@ -184,8 +184,9 @@ export function renderSubagents(input: {
     .flatMap((child) => (child.running || !child.run ? [] : [{ child, run: child.run }]))
     .filter((item) => item.run.ended_at === undefined || item.run.ended_at >= input.windowStart)
     .toSorted((a, b) => endOf(b.run) - endOf(a.run) || compare(a.child.id, b.child.id))
+  if (running.length === 0 && finished.length === 0) return undefined
   const lines = [
-    `Your subagents: ${input.children.length} direct, ${running.length} running, ${input.children.length - running.length} idle.`,
+    `Your subagents: ${running.length + finished.length} direct, ${running.length} running, ${finished.length} idle.`,
   ]
   if (running.length > 0) {
     lines.push("Running now:", ...running.slice(0, LIST_ROWS).map((child) => runningRow(child, input)))

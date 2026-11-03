@@ -1045,7 +1045,8 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 - 见子计划 2 §4.5、§5.3：`runLoop` 组装 tail 时以一次 SQL 取全部直接子的 id / metadata / time_updated，
   状态来自内存投影；纯函数 `StepTail.renderSubagents` 渲染时钟与自身位置、总览、在跑列表（开始早的在前）、
   窗口内结束列表（结束晚的在前），各至多 10 行；窗口取 10 分钟与上一步开始以来的较长者。门与被撤销的
-  花名册相同（无子或 `agent_list` deny 不附带）。不写入历史、不进压缩输入、缓存断点跳过。
+  花名册一样受 `agent_list` deny 控制；总览只计两个列表截断前的集合，过窗结束项与空闲无记录项不计入；
+  无有效项不附带子 Agent 节，运行项与未结算 cut off 项保留。Session 不清理。不写入历史、不进压缩输入、缓存断点跳过。
 
 ### 5.6 停止钩子  *（子计划 2，#81）*
 

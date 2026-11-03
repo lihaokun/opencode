@@ -6672,6 +6672,72 @@ it.instance("each step ends with the clock and the subagent view, and the histor
   }),
 )
 
+it.instance("expired subagent counts disappear from requests without deleting sessions or hiding repeat facts", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const status = yield* SessionStatus.Service
+    const t0 = Date.now()
+    setSystemTime(t0)
+    yield* Effect.addFinalizer(() => Effect.sync(() => setSystemTime()))
+    const parent = yield* sessions.create({ title: "expired view", permission: allowAll })
+    const children = yield* Effect.forEach(Array.from({ length: 4 }), () =>
+      sessions.create({
+        parentID: parent.id,
+        metadata: {
+          agentRun: {
+            number: 1,
+            started_at: t0 - 120_000,
+            ended_at: t0 - 60_000,
+            outcome: "completed",
+            woken_by: { kind: "system" },
+          },
+        },
+      }),
+    )
+    yield* user(parent.id, "continue working")
+    const first = defer<void>()
+    const second = defer<void>()
+    const third = defer<void>()
+    yield* llm.push(reply().wait(first.promise).tool("glob", { pattern: "*.expired-tail" }).stop())
+    yield* llm.push(reply().wait(second.promise).tool("glob", { pattern: "*.expired-tail" }).stop())
+    yield* llm.push(reply().wait(third.promise).tool("glob", { pattern: "*.other-tail" }).stop())
+    yield* llm.text("done")
+
+    const run = yield* prompt.loop({ sessionID: parent.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "initial view missing", "10 seconds")
+    setSystemTime(t0 + 11 * 60_000)
+    first.resolve()
+    yield* awaitWithTimeout(llm.wait(2), "expired view never sent", "10 seconds")
+    second.resolve()
+    yield* awaitWithTimeout(llm.wait(3), "repeat view never sent", "10 seconds")
+    yield* sessions.setMetadata({
+      sessionID: children[0]!.id,
+      metadata: { agentRun: { number: 2, started_at: Date.now(), woken_by: { kind: "system" } } },
+    })
+    yield* status.set(children[0]!.id, { type: "busy" })
+    third.resolve()
+    yield* awaitWithTimeout(Fiber.await(run), "view regression never finished", "10 seconds")
+
+    const inputs = yield* llm.inputs
+    expect(inputs).toHaveLength(4)
+    expect(lastUserContent(inputs[0]!)).toContain("Your subagents: 4 direct, 0 running, 4 idle.")
+    expect(JSON.stringify(inputs[1]!.messages)).not.toContain("Your subagents:")
+    expect(JSON.stringify(inputs[1]!.messages)).not.toContain("Now: ")
+    expect(lastUserContent(inputs[2]!)).toContain("Your last step repeated the tool calls")
+    expect(lastUserContent(inputs[2]!)).not.toContain("Your subagents:")
+    expect(lastUserContent(inputs[2]!)).toStartWith("Now: ")
+    expect(lastUserContent(inputs[3]!)).toContain("Your subagents: 1 direct, 1 running, 0 idle.")
+    for (const child of children.slice(1)) expect(lastUserContent(inputs[3]!)).not.toContain(child.id)
+    expect(yield* sessions.children(parent.id)).toHaveLength(4)
+    for (const child of children.slice(1)) {
+      expect(AgentRun.read((yield* sessions.get(child.id)).metadata)?.ended_at).toBe(t0 - 60_000)
+    }
+    expect(JSON.stringify(yield* sessions.messages({ sessionID: parent.id }))).not.toContain("Your subagents:")
+  }),
+)
+
 // A view the model never read must not move the window's floor (the second
 // external review, R2): the overflow check withdraws a step after its view was
 // built, and the compaction that follows can run long. Were the floor moved by
@@ -6873,13 +6939,18 @@ for (const seed of [1501, 1502]) {
           expect(inputs).toHaveLength(prefix ? 3 : 2)
           const request = inputs.at(-1)!
           const tail = JSON.stringify(Array.isArray(request.messages) ? request.messages.at(-1) : undefined)
-          expect(tail).toContain(`Your subagents: ${children.length} direct, 0 running, ${children.length} idle.`)
+          // Count the same contract intervals used for row visibility, before
+          // any display cap; expired sessions remain stored but not counted.
+          const visible = children.filter(
+            (_, index) =>
+              ends[index]! >= resumed - 600_000 ||
+              ((mode === "rearm" || mode === "root") && ends[index]! >= stepStart),
+          )
+          expect(tail).toContain(`Your subagents: ${visible.length} direct, 0 running, ${visible.length} idle.`)
           for (const [index, child] of children.entries()) {
             // The oracle is the contract's two intervals, independent of the
             // production window helper or its lifecycle state.
-            const expected =
-              ends[index]! >= resumed - 600_000 ||
-              ((mode === "rearm" || mode === "root") && ends[index]! >= stepStart)
+            const expected = visible.includes(child)
             expect(tail.includes(child.id), `${mode}/${seed}: child ${index}, ended ${ends[index]}`).toBe(expected)
           }
           expect(before?.number).toBe(mode === "root" ? undefined : 1)
@@ -7014,7 +7085,9 @@ it.instance(
 
       expect(calls).toEqual(["children"])
       expect(children).toHaveLength(600)
-      expect(text).toContain("Your subagents: 600 direct, 300 running, 300 idle.")
+      // 300 running; among the idle half, 100 have a recent closed run and
+      // 200 have never run. Only the first two groups belong in this view.
+      expect(text).toContain("Your subagents: 400 direct, 300 running, 100 idle.")
       expect(text?.split("\n").length).toBeLessThanOrEqual(25)
       expect(elapsed).toBeLessThan(50)
     }),
