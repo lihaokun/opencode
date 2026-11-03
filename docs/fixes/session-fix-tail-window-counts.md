@@ -62,19 +62,19 @@ V = ∅ ⇒ 不输出子 Agent 段
 
 ## 第七部分：代码更新清单
 
-| 文件                                             | 改动                               | 状态               |
-| ------------------------------------------------ | ---------------------------------- | ------------------ |
-| packages/opencode/src/session/step-tail.ts       | renderSubagents 的统计集合及空视图 | 已实施，提交后回填 |
-| packages/opencode/test/session/step-tail.test.ts | 回归、边界、FastCheck、T7 oracle   | 已实施，提交后回填 |
-| packages/opencode/test/session/prompt.test.ts    | 请求集成、T11/600 子计数           | 已实施，提交后回填 |
+| 文件                                             | 改动                               | 状态                 |
+| ------------------------------------------------ | ---------------------------------- | -------------------- |
+| packages/opencode/src/session/step-tail.ts       | renderSubagents 的统计集合及空视图 | 已实施：`e5c1bba9a1` |
+| packages/opencode/test/session/step-tail.test.ts | 回归、边界、FastCheck、T7 oracle   | 已实施：`e5c1bba9a1` |
+| packages/opencode/test/session/prompt.test.ts    | 请求集成、T11/600 子计数           | 已实施：`e5c1bba9a1` |
 
 ## 第八部分：文档更新清单
 
-| 文档                                                             | 更新                             | 状态               |
-| ---------------------------------------------------------------- | -------------------------------- | ------------------ |
-| docs/design/agent-management/subplans/agentmgmt-2-run-state.md   | §4.5/§5.3/测试口径及旧规则替代   | 已同步，提交后回填 |
-| docs/design/agent-management/architecture.md、detailed-design.md | 视图出现条件与计数范围           | 已同步，提交后回填 |
-| docs/research/agent-management-research.md                       | 记录已结束项共同退窗的澄清       | 已同步，提交后回填 |
-| docs/fixes/session-fix-step-tail-repeat-and-agents.md            | §4.9 指向统一口径                | 已同步，提交后回填 |
-| docs/audits/agentmgmt-2-run-state/expectations.md                | S14/S16、INV-8b 及 PBT           | 已同步，提交后回填 |
-| docs/audits/agentmgmt-2-run-state/decisions.md、audit-report.md  | 保留历史审核、追加本补丁独立复核 | 待同步             |
+| 文档                                                             | 更新                             | 状态                                          |
+| ---------------------------------------------------------------- | -------------------------------- | --------------------------------------------- |
+| docs/design/agent-management/subplans/agentmgmt-2-run-state.md   | §4.5/§5.3/测试口径及旧规则替代   | 已同步：`e5c1bba9a1`                          |
+| docs/design/agent-management/architecture.md、detailed-design.md | 视图出现条件与计数范围           | 已同步：`e5c1bba9a1`                          |
+| docs/research/agent-management-research.md                       | 记录已结束项共同退窗的澄清       | 已同步：`e5c1bba9a1`                          |
+| docs/fixes/session-fix-step-tail-repeat-and-agents.md            | §4.9 指向统一口径                | 已同步：`e5c1bba9a1`                          |
+| docs/audits/agentmgmt-2-run-state/expectations.md                | S14/S16、INV-8b 及 PBT           | 已同步：`e5c1bba9a1`                          |
+| docs/audits/agentmgmt-2-run-state/decisions.md、audit-report.md  | 保留历史审核、追加本补丁独立复核 | 已追加：audit-report §3.5 / decisions D51–D53 |
