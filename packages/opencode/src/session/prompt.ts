@@ -1640,7 +1640,7 @@ const layer = Layer.effect(
             // The clock rides with any section and never alone (§4.5).
             const tail = StepTail.render(
               body.some((section) => section !== undefined)
-                ? [StepTail.renderClock({ now, run: AgentRun.read(session.metadata)?.number, step }), ...body]
+                ? [StepTail.renderClock({ now }), ...body]
                 : body,
             )
             if (tail) yield* Effect.logInfo("step tail", { "session.id": sessionID, step, text: tail })

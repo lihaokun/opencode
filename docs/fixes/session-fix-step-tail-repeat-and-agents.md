@@ -221,7 +221,7 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 ### 4.9 #75 末尾段的进度视图
 
 - 仅当会话有筛选后有效的直接子 agent 且 `agent_list` 权限非 deny 时附带；总览与明细共同退窗（2026-11-03 修正，见 `session-fix-tail-window-counts.md`）。
-- 第一行：当前时间（带日期与时区）与自身位置，如 `Now: 2026-10-27T19:54:07+08:00. You are in run 6, step 12.`
+- 第一行：只显示当前时间（带日期与时区），如 `Now: 2026-10-27T19:54:07+08:00.`，主会话与子会话相同。2026-11-04 移除模型可见的自身 run 号与步号，内部记录、计数与日志保留，子 agent 列表和重复提醒不变。
 - 总览行：`Your subagents: 9 direct, 8 running, 1 idle.`；计数取在跑列表与窗口内结束/未结算列表的完整集合（截断前），不是历史子 Session 总数。两个列表都空时整节省略。
 - 在跑列表：每行 session_id、名字、run 号、开始时间、唤醒来源、最后活动时间；上一个 run 在窗口内结束时附 `; run 5 ended 19:49:18 (completed)`。开始早的在前，最多 10 行，超出写 `… and N more running`。
 - 窗口内结束、现在空闲的列表：每行 session_id、名字、run 号、结束时间、结局。结束晚的在前，最多 10 行，超出写 `… and N more finished`。
