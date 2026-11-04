@@ -4,7 +4,7 @@
 - 初稿日期：2026-11-02
 - 对应问题：[#98](https://github.com/lihaokun/opencode/issues/98)（自定义 provider 无元数据时静默施加 32k 上限）
 - 前序修复：`docs/fixes/subagent-fix-output-length.md`（Issue #1/#2：reasoning 模型使用声明额度 + length 终态如实上报）
-- 影响模块：`packages/opencode` provider transform、LLM request prep、session overflow；测试 `test/provider`、`test/session`
+- 影响模块：`packages/opencode` provider transform、LLM request prep、session overflow；`packages/llm` anthropic 协议；测试 `test/provider`、`test/session`
 - workflow 路径：`docs/workflow.md` §7 bug-fix flow + §7.1 八部分修正方案
 
 ---
@@ -38,6 +38,11 @@ assistant 消息的 `reasoning + output` 恒等于 **32,000**，`finish = length
   reasoning** 模型同样返回 32000（`min(131072, 32_000)`）。
 - **逃生通道确认**：显式 `outputTokenMax = 64000` 时返回 64000，用户显式
   覆盖路径正常。
+- **服务端默认行为探针**（2026-11-04，本机网关）：省略 `max_tokens` 请求无限
+  重复生成任务，流式 570 秒持续输出 72,757 字符（约 4.5–6 万 token）仍无
+  `finish_reason`——被探针主动掐断，非服务端终止。结论：该 provider 省略时
+  没有小的服务端默认；不发送 ≠ 无限生成，真上限未探出，方案对服务端默认
+  不做假设。
 
 影响范围：
 
@@ -75,8 +80,8 @@ ProviderTransform.maxOutputTokens(model({ output: 131_072 }, false))
 - 调用链：`session/llm/request.ts:97` → `normalizeReasoningBudget`（要求正整数）
   → `transportMaxOutputTokens` → AI SDK `streamText({maxOutputTokens})`
   / native `generation.maxTokens` → wire `max_tokens`/`max_output_tokens`。
-- 关联：`session/overflow.ts:16-19` 用同一函数推导压缩保留区，未知额度时被
-  `min(20k, 32k)` 缠上同一个伪造数值。
+- 关联：`session/overflow.ts:16-19` 用同一函数推导压缩保留区与溢出判定，
+  未知额度时被同一个伪造数值缠上。
 - 预期：无配置 ⇒ 不注入客户端限制（不发送该参数），服务端默认生效；
   实际：静默注入 32000。
 
@@ -107,8 +112,7 @@ fallback，在前序修复（Issue #1/#2）只放开 reasoning 路径后，仍�
 
 ## 第三部分：参考实现对照
 
-算法类对照按规则需对照参考实现；本修复属接口契约语义修正，对照两处外部
-行为契约：
+本修复属接口契约语义修正，对照两处外部行为契约：
 
 1. **AI SDK 契约**（`@ai-sdk/anthropic@3.0.111`）：`maxOutputTokens == null`
    时已知模型用声明额度、未知模型回落 **4096 并发 compatibility warning**
@@ -122,15 +126,6 @@ fallback，在前序修复（Issue #1/#2）只放开 reasoning 路径后，仍�
    `output.maxOutputTokens = undefined`（注释 "omit maxOutputTokens for gpt
    models"）——undefined 通道是既有受支持的形态，本修复把该能力从插件特例
    提升为核心默认策略。
-3. **服务端默认实测**（2026-11-04，本机网关 `zhipuai-coding-plan` → new-api
-   → `glm-5.3-flash`，只读探针）：省略 `max_tokens` 请求无限重复生成任务，
-   流式 570 秒持续输出 72,757 字符（约 4.5–6 万 token）仍无 `finish_reason`
-   ——被探针主动掐断，非服务端终止。结论：该 provider 省略时**没有小的
-   服务端默认**（不是 4k/8k 量级）。同时确认：(a) 不发送 ≠ 无限生成，真
-   上限未探出，方案不做假设（4.3）；(b) 省略后失控成本（do-loop 烧 token）
-   是真实风险面，靠 `omitted-server-default` 日志暴露而非静默保险丝（4.6）；
-   (c) 事故的 17 轮 32,000 恰好截断说明当时请求带了 32k 且服务端尊重它——
-   若当初不发送，按本实测该任务大概率能跑完。
 
 差异点即根因确认：opencode 在 SDK 之前就把 32k 写进 `maxOutputTokens`，
 SDK 的"unknown ⇒ 显式警告 + 保守默认"机制被短路。
@@ -173,8 +168,8 @@ Ensures:
 | 2 | `request.ts:97-112` | `coreMaxOutputTokens` 可为 undefined：`normalizeReasoningBudget` 在 envelope 为 undefined 时跳过预算夹逼（无已知上限，不推理预算合法性，不 fail）；`transportMaxOutputTokens` envelope 为 undefined 时直接返回 undefined（预算相减无意义） |
 | 3 | AI SDK 路径 `llm.ts:328` | `streamText({ maxOutputTokens: undefined })` 已有类型通道（`CallSettings.maxOutputTokens?`），SDK 丢键不发送；codex/cerebras/copilot 插件已用同一形态，无改动 |
 | 4 | native 路径 | `native-request.ts` generation 构造已有 undefined 剔除；协议层 `openai-chat/openai-responses/gemini` 均 `generation?.maxTokens` 透传省略（Bedrock `inferenceConfig` 在全 undefined 时整体省略，Gemini/OpenAI JSON 丢键）。**例外：Anthropic Messages 协议必填，且有两处独立处理**：(a) AI-SDK 路径——SDK 对未知模型回落 4096 + compatibility warning，若有 numeric thinking budget 则 wire = 4096 + budget（适配器声明组合，非静默）；(b) native 路径——`anthropic-messages.ts:510` 的 `?? 4096` 兜底**在 `defaults.limits.output = 0` 时不生效**（`??` 不跳过 0，而 `native-request.ts:162` 无条件传 `output: model.limit.output`），直接省略 envelope 会发出 `max_tokens: 0`。因此该行需加 0 值守卫（`0 → 4096`，与 ai-sdk 侧回落对齐并告警）。实施时两者都必须有 wire 断言，不能只测 ai-sdk 侧 |
-| 5 | `overflow.ts:10-34` | 解耦 `maxOutputTokens`，但**两个分支语义不同，不能统一成一个"保留区"**：(a) `reserved`（L15-16，供 `limit.input` 分支用）：已知额度 `min(COMPACTION_BUFFER, limit.output)`、未知 `COMPACTION_BUFFER`——数值与现状等价（`min(20k, 32k)=20k`）；(b) 无 `limit.input` 分支（L19）：现状是 `context - 完整 output envelope`（如 200k 上下文 / 131k 输出 ⇒ usable=68,928，**不减 20k**）——若按"保留区"公式统一会显著放宽溢出判定（400k-20k=380k vs 现状 272k），在输出计入上下文的 provider 上会把 context overflow 掩成漏检。新逻辑：已知额度保持 `context - limit.output`；未知额度以 `context - COMPACTION_BUFFER` 兜底（预检是本地启发式，有界的本地常数合法；与 wire 注入不同，它不声称来自模型能力）。既有测试 L376-395 三个数值锚定该分支行为，改造后必须逐值相等 |
-| 6 | 诊断日志 | `request.ts` prep 完成后 logInfo 一条：`provider/model`、生效值、来源 ∈ {`explicit-flag`, `model-declared`, `omitted-server-default`}；undefined 必须以 `omitted-server-default` 显式出现，不伪装已知。**三桶而非 issue 叙述中的四桶**（目录 vs config 显式声明不区分），决策依据见 4.5。可测性：来源判定抽成纯函数导出（如 `outputTokenMaxSource(model, flags)`），日志只打印其结果——测试断言纯函数而非捕获日志（现有测试 harness 无 log 捕获设施） |
+| 5 | `overflow.ts:10-34` | 解耦 `maxOutputTokens`，两个分支语义不同，分别处理：(a) `reserved`（L15-16，供 `limit.input` 分支用）：已知额度 `min(COMPACTION_BUFFER, limit.output)`、未知 `COMPACTION_BUFFER`——数值与现状等价（`min(20k, 32k)=20k`）；(b) 无 `limit.input` 分支（L19）：现状是 `context - 完整 output envelope`（如 200k 上下文 / 131k 输出 ⇒ usable=68,928，不减 20k）。新逻辑：已知额度保持 `context - limit.output`；未知额度以 `context - COMPACTION_BUFFER` 兜底（预检是本地启发式，有界的本地常数合法；与 wire 注入不同，它不声称来自模型能力）。既有测试 L376-395 三个数值锚定该分支行为，改造后必须逐值相等 |
+| 6 | 诊断日志 | `request.ts` prep 完成后 logInfo 一条：`provider/model`、生效值、来源 ∈ {`explicit-flag`, `model-declared`, `omitted-server-default`}；undefined 必须以 `omitted-server-default` 显式出现，不伪装已知。三桶与 issue 期望行为的对应：issue 列的"用户覆盖"→`explicit-flag`；"目录 + provider metadata"→`model-declared`（两者在 `provider.ts:1599-1602` 合并进同一字段，请求时不可区分，且区分两者不影响"不把未知伪装成已知"的验收义务）；"服务端默认"→`omitted-server-default`。可测性：来源判定抽成纯函数导出（如 `outputTokenMaxSource(model, flags)`），日志只打印其结果——测试断言纯函数而非捕获日志（现有测试 harness 无 log 捕获设施） |
 | 7 | `transform.ts:2025` `budgetVariants` / `:2157` `catalogOutputLimit` | **保留 32k**：这是用户主动选 numeric variant 时的预算建议构造，属"用户已选择参与"的场景，且这些预算经显式变体进入请求，非静默限制。文档记录其与 `maxOutputTokens` 语义分叉的理由 |
 | 8 | `session/llm.ts:33` re-export | 删除（全仓无 consumer，grep 确认）；`OUTPUT_TOKEN_MAX` 常量保留在 `transform.ts` 供 §4.2-7 使用 |
 
@@ -199,44 +194,6 @@ Ensures:
 - `finish=length` 依旧 `MessageOutputLengthError`。
 - native Anthropic + 无 limit：wire `max_tokens: 4096`（协议必填的显式回落，
   守卫见 4.2-4b）。
-
-### 4.5 决策记录：诊断来源三桶而非四桶
-
-Issue 期望行为列了四个诊断来源："用户覆盖、目录、provider metadata、服务端
-默认"。本修复落地为三桶：`explicit-flag`（用户显式
-`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`）、`model-declared`（目录与 config
-声明的额度，合并后不再区分）、`omitted-server-default`（未知，省略参数）。
-
-**不区分目录与 config 显式声明的原因**：
-
-1. **信息在合并点已丢失**：`provider.ts:1599-1602` 把 config 声明的 limit 与
-   目录已有 limit 合并进同一个 `model.limit.output` 字段，请求时无从回溯。
-   要区分需给 `Provider.Model`（`provider.ts:1096`，被 15 个文件引用的共享
-   类型）加 provenance 字段，并在 4 个 Model 构造/合并点（`:704`、`:1320`、
-   `:1512`、`:1599`）逐一写标记，另需覆盖 plugin 覆盖目录这条 issue 未列的
-   第五种来源的归属决策。
-2. **代价超出诉求**：共享类型加字段经 `toPublicInfo`（`provider.ts:1157`，
-   JSON 全量透传）改变对外 API 的 model 形状；provider 加载测试需补
-   provenance 断言，合并矩阵至少 6-8 个新用例。而 issue 的**验收标准**只
-   要求"已知能力、用户显式上限和 provider 必填参数分别有回归覆盖"——
-   四分桶出现在期望行为的叙述中，未进入验收。硬性义务是"不能把未知伪装成
-   已知能力"，三桶完全满足：undefined 只可能来自真实的无声明，任何已声明
-   额度都以具体数值 + `model-declared` 出现。
-3. **seam 纪律**：为"未来可能想区分"预留 provenance 通道而没有第二个消费
-   者，属于应整体砍掉的预留 seam。恢复条件（出现以下任一再做，按独立子计划
-   走）：(a) 出现需要区分"目录声明"与"用户 config 声明"的第二个消费者
-   （如诊断 UI 按来源分层显示、按来源加权的额度校验）；(b) plugin 来源
-   （`provider.ts:1503` models 回调）需要独立归属。届时的可复用件：本修复
-   的日志出口在 `request.ts` 单点，扩展为四桶只改该点与 provider 加载层，
-   wire/overflow/测试矩阵不受影响。
-
-### 4.6 决策记录：未知额度一律省略，不为 reasoning 保留大常数
-
-实施前讨论过的保守变体——未知额度 + reasoning 模型时保留一个大常数（如
-128k）而非省略——被否决：issue 第一条明确要求"不以另一个任意常数替代"，
-任何常数都复刻同一根因（把未知编码为具体数值），只是换了数值。成本风险
-（模型 do-loop 时输出无界直到服务端上限）由 `omitted-server-default` 日志
-暴露，不靠静默保险丝；实测证据见第三部分。
 
 ---
 
@@ -270,8 +227,7 @@ variant 预算建议（用户显式参与场景），静默路径为零。
   等价（`min(20k, limit.output)` 与 `min(20k, 32k)=20k`）；无 input 分支
   已知额度保持 `context - limit.output` 逐值不变（L376/L394 测试锚定），
   未知额度从 `context - 32k` 变为 `context - 20k`——判定边界**收紧** 12k
-  （更早触发压缩预检），方向是保守侧，不会引入漏检；放宽（原方案的统一
-  保留区公式）才是危险方向。
+  （更早触发压缩预检），方向是保守侧，不会引入漏检。
 
 **无回归引入**：受影响面 = `maxOutputTokens` 全部调用方（request prep、
 overflow）与两个测试组；reasoning 已知额度路径（前序修复的验证面）行为
@@ -293,7 +249,7 @@ undefined。第六部分回归清单兜底。
 | 新增 | wire 级：显式 `flags.outputTokenMax = 64000`（经 `drainWith(llmLayerWithExecutor({flags}))`）+ 未知额度 ⇒ body `max_tokens === 64000`（用户显式上限对未知模型继续生效） | 待加 |
 | 新增 | normalizeReasoningBudget：envelope undefined + options 含 numeric budget ⇒ 原样返回不 throw（skip 分支）；envelope defined 的既有 fail 分支（L6238+）全部保持通过 | 待加 |
 | 新增 | transportMaxOutputTokens：envelope undefined + Anthropic thinking budget 存在 ⇒ 返回 undefined（无 NaN 产生） | 待加 |
-| 新增 | **native Anthropic 0 值守卫**：模型 `limit.output = 0` 走 native Anthropic 协议 ⇒ body `max_tokens === 4096`（`?? `不跳 0 的守卫点，见 4.2-4b；llm 包协议级测试） | 待加 |
+| 新增 | **native Anthropic 0 值守卫**：模型 `limit.output = 0` 走 native Anthropic 协议 ⇒ body `max_tokens === 4096`（`??` 不跳 0 的守卫点，见 4.2-4b；llm 包协议级测试） | 待加 |
 | 新增 | 诊断来源纯函数：`outputTokenMaxSource` 三桶断言——undefined ⇒ `omitted-server-default`；已声明额度 ⇒ `model-declared`；flags 覆盖 ⇒ `explicit-flag`（含 override+未知 ⇒ `explicit-flag`） | 待加 |
 | 回归 | 既有 `finish=length → MessageOutputLengthError` 断言全部保持通过（不新增，不放松）；request-prep 组 L1343-1362（known-limit Anthropic envelope 组合）逐值不变 | 待跑 |
 
@@ -304,7 +260,7 @@ undefined。第六部分回归清单兜底。
 | `packages/opencode/src/provider/transform.ts` | `maxOutputTokens` / L1507-1512 | 返回 `number \| undefined`，删两条 32k fallback 路径；override + 未知 ⇒ override | 待改 |
 | `packages/opencode/src/provider/transform.ts` | `normalizeReasoningBudget` / L1624 | envelope undefined 时整体 skip（含 L1696 隐式预算检查） | 待改 |
 | `packages/opencode/src/provider/transform.ts` | `transportMaxOutputTokens` / L1708 | envelope undefined 时先于 budget 相减 early-return | 待改 |
-| `packages/llm/src/protocols/anthropic-messages.ts` | L510 | `outputLimit` 加 0 值守卫（0 → 4096），`?? ` 不跳 0（见 4.2-4b） | 待改 |
+| `packages/llm/src/protocols/anthropic-messages.ts` | L510 | `outputLimit` 加 0 值守卫（0 → 4096），`??` 不跳 0（见 4.2-4b） | 待改 |
 | `packages/opencode/src/session/llm/request.ts` | L97-112, L127-145 | undefined 贯通 + 生效额度来源纯函数与日志 | 待改 |
 | `packages/opencode/src/session/overflow.ts` | `usable` / L10-20 | 两分支分别解耦（4.2-5）：reserved 用 `min(20k, limit.output)`/20k；无 input 分支 `context - limit.output`/`context - 20k` | 待改 |
 | `packages/opencode/src/session/llm.ts` | L33 | 删除 `OUTPUT_TOKEN_MAX` re-export | 待改 |
@@ -323,10 +279,3 @@ undefined。第六部分回归清单兜底。
 
 本修复触及对外行为契约（wire 请求形状、`maxOutputTokens` 签名），文档清单
 不允许可写"无"。
-
-### 8.1 已否决的扩展：诊断 provenance 四桶（决策 2026-11-04）
-
-Issue 期望行为叙述中的四来源诊断（目录 vs config 显式声明分列）经评估**不在
-本修复实施**，三桶方案及理由见 4.5。此条记录防止后续实施轮被误加回来：
-provenance 字段动 `Provider.Model` 共享类型（15 个 consumer 文件）与对外
-model API 形状，须按独立子计划走 §6 v2 流程，不作为本修复的附带改动。
