@@ -251,7 +251,7 @@ undefined。第六部分回归清单兜底。
 | 新增 | transportMaxOutputTokens：envelope undefined + Anthropic thinking budget 存在 ⇒ 返回 undefined（无 NaN 产生） | 待加 |
 | 新增 | **native Anthropic 0 值守卫**：模型 `limit.output = 0` 走 native Anthropic 协议 ⇒ body `max_tokens === 4096`（`??` 不跳 0 的守卫点，见 4.2-4b；llm 包协议级测试） | 待加 |
 | 新增 | 诊断来源纯函数：`outputTokenMaxSource` 三桶断言——undefined ⇒ `omitted-server-default`；已声明额度 ⇒ `model-declared`；flags 覆盖 ⇒ `explicit-flag`（含 override+未知 ⇒ `explicit-flag`） | 待加 |
-| 回归 | 既有 `finish=length → MessageOutputLengthError` 断言全部保持通过（不新增，不放松）；request-prep 组 L1343-1362（known-limit Anthropic envelope 组合）逐值不变 | 待跑 |
+| 回归 | 既有 `finish=length → MessageOutputLengthError` 断言全部保持通过（不新增，不放松）；request-prep 组 L1346-1359（known-limit Anthropic envelope 组合）逐值不变 | 待跑 |
 
 ## 第七部分：代码更新清单
 
