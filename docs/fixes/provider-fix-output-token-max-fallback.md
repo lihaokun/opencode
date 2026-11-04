@@ -153,11 +153,16 @@ Requires:
 
 Ensures:
   - outputTokenMax 存在时：返回正数且 ≤ outputTokenMax；
-    limit.output > 0 时另 ≤ limit.output
+    其中 limit.output > 0 时返回 min(limit.output, outputTokenMax)；
+    limit.output = 0 时返回 outputTokenMax（显式覆盖对未知额度同样生效——
+    这是既有逃生通道，回归测试 L6221 "override 48000 → 48000" 锚定，不得
+    因 undefined 语义被切断）
   - outputTokenMax 不存在时：
       limit.output > 0 → 恰返回 limit.output（不再按 reasoning 分叉）
       limit.output = 0 → 返回 undefined
-  - 返回值 ≤ limit.output（已知额度是服务能力边界，永远不被客户端放大）
+  - 返回值非 undefined 时 ≤ limit.output（已知额度是服务能力边界，永远不
+    被客户端放大）；undefined 不是数值，不受此界约束，也不得被下游当作 0
+    或任何数值解释
 ```
 
 ### 4.2 各下游点
@@ -167,9 +172,9 @@ Ensures:
 | 1 | `transform.ts:1507` `maxOutputTokens` | 返回类型 `number \| undefined`，按 4.1 规约重写 |
 | 2 | `request.ts:97-112` | `coreMaxOutputTokens` 可为 undefined：`normalizeReasoningBudget` 在 envelope 为 undefined 时跳过预算夹逼（无已知上限，不推理预算合法性，不 fail）；`transportMaxOutputTokens` envelope 为 undefined 时直接返回 undefined（预算相减无意义） |
 | 3 | AI SDK 路径 `llm.ts:328` | `streamText({ maxOutputTokens: undefined })` 已有类型通道（`CallSettings.maxOutputTokens?`），SDK 丢键不发送；codex/cerebras/copilot 插件已用同一形态，无改动 |
-| 4 | native 路径 | `native-request.ts` generation 构造已有 undefined 剔除；协议层 `openai-chat/openai-responses/gemini` 均 `generation?.maxTokens` 透传省略。**唯一例外：Anthropic Messages 协议必填**——保留 `?? outputLimit`（已知额度缺失时回落 4096 并告警），符合"适配器必须有数值时明确处理并解释来源" |
-| 5 | `overflow.ts:10-34` | 解耦：不再调 `maxOutputTokens`。已知额度时保留区 = `min(COMPACTION_BUFFER, limit.output)`（与现状数值等价，来源却从"伪造 32k"变为"真实额度"）；未知额度（undefined）时保留区 = `COMPACTION_BUFFER`（20k）。生成上限与服务端上下文治理分开：`context=0` 跳过检查的现状不变（#83/#84 范畴，不在本修复） |
-| 6 | 诊断日志 | `request.ts` prep 完成后 logInfo 一条：`provider/model`、生效值、来源 ∈ {`explicit-flag`, `model-declared`, `omitted-server-default`}；undefined 必须以 `omitted-server-default` 显式出现，不伪装已知。**三桶而非 issue 叙述中的四桶**（目录 vs config 显式声明不区分），决策依据见 4.5 |
+| 4 | native 路径 | `native-request.ts` generation 构造已有 undefined 剔除；协议层 `openai-chat/openai-responses/gemini` 均 `generation?.maxTokens` 透传省略（Bedrock `inferenceConfig` 在全 undefined 时整体省略，Gemini/OpenAI JSON 丢键）。**例外：Anthropic Messages 协议必填，且有两处独立处理**：(a) AI-SDK 路径——SDK 对未知模型回落 4096 + compatibility warning，若有 numeric thinking budget 则 wire = 4096 + budget（适配器声明组合，非静默）；(b) native 路径——`anthropic-messages.ts:510` 的 `?? 4096` 兜底**在 `defaults.limits.output = 0` 时不生效**（`??` 不跳过 0，而 `native-request.ts:162` 无条件传 `output: model.limit.output`），直接省略 envelope 会发出 `max_tokens: 0`。因此该行需加 0 值守卫（`0 → 4096`，与 ai-sdk 侧回落对齐并告警）。实施时两者都必须有 wire 断言，不能只测 ai-sdk 侧 |
+| 5 | `overflow.ts:10-34` | 解耦 `maxOutputTokens`，但**两个分支语义不同，不能统一成一个"保留区"**：(a) `reserved`（L15-16，供 `limit.input` 分支用）：已知额度 `min(COMPACTION_BUFFER, limit.output)`、未知 `COMPACTION_BUFFER`——数值与现状等价（`min(20k, 32k)=20k`）；(b) 无 `limit.input` 分支（L19）：现状是 `context - 完整 output envelope`（如 200k 上下文 / 131k 输出 ⇒ usable=68,928，**不减 20k**）——若按"保留区"公式统一会显著放宽溢出判定（400k-20k=380k vs 现状 272k），在输出计入上下文的 provider 上会把 context overflow 掩成漏检。新逻辑：已知额度保持 `context - limit.output`；未知额度以 `context - COMPACTION_BUFFER` 兜底（预检是本地启发式，有界的本地常数合法；与 wire 注入不同，它不声称来自模型能力）。既有测试 L376-395 三个数值锚定该分支行为，改造后必须逐值相等 |
+| 6 | 诊断日志 | `request.ts` prep 完成后 logInfo 一条：`provider/model`、生效值、来源 ∈ {`explicit-flag`, `model-declared`, `omitted-server-default`}；undefined 必须以 `omitted-server-default` 显式出现，不伪装已知。**三桶而非 issue 叙述中的四桶**（目录 vs config 显式声明不区分），决策依据见 4.5。可测性：来源判定抽成纯函数导出（如 `outputTokenMaxSource(model, flags)`），日志只打印其结果——测试断言纯函数而非捕获日志（现有测试 harness 无 log 捕获设施） |
 | 7 | `transform.ts:2025` `budgetVariants` / `:2157` `catalogOutputLimit` | **保留 32k**：这是用户主动选 numeric variant 时的预算建议构造，属"用户已选择参与"的场景，且这些预算经显式变体进入请求，非静默限制。文档记录其与 `maxOutputTokens` 语义分叉的理由 |
 | 8 | `session/llm.ts:33` re-export | 删除（全仓无 consumer，grep 确认）；`OUTPUT_TOKEN_MAX` 常量保留在 `transform.ts` 供 §4.2-7 使用 |
 
@@ -190,8 +195,10 @@ Ensures:
 - 无 limit + 无 override：wire 请求**不含** `max_tokens`；日志出现
   `omitted-server-default`。
 - `limit.output=131072` 非 reasoning：wire `max_tokens: 131072`。
-- 显式 override 64000：wire `max_tokens: 64000`（与现状一致）。
+- 无 limit + 显式 override 64000：wire `max_tokens: 64000`（与现状一致）。
 - `finish=length` 依旧 `MessageOutputLengthError`。
+- native Anthropic + 无 limit：wire `max_tokens: 4096`（协议必填的显式回落，
+  守卫见 4.2-4b）。
 
 ### 4.5 决策记录：诊断来源三桶而非四桶
 
@@ -242,21 +249,29 @@ variant 预算建议（用户显式参与场景），静默路径为零。
 
 **不变量保持**：
 
-- `返回值 ≤ limit.output`（已知时）：新规则已知额度直返，恒成立；override
-  路径 `min` 保持。现状中被 `min(limit.output, 32k)` 满足的该性质由更弱
+- `返回值非 undefined 时 ≤ limit.output`：新规则已知额度直返，恒成立；override
+  路径 `min` 保持；override + 未知额度返回 override（escape hatch，见 4.1
+  规约注记）。现状中被 `min(limit.output, 32k)` 满足的该性质由更弱
   （更少截断）的边界替代——上限方向单向放宽，无放大。
 - `normalizeReasoningBudget` 契约：envelope undefined ⇒ 无 numeric budget
   path 夹逼义务（其夹逼目的就是"预算装进 envelope"，envelope 不存在时义务
-  消失）；envelope 存在时全部现有 fail 分支保留（正整数检查等仅对已知
-  envelope 生效）。
-- Anthropic 必填适配器：`?? outputLimit` 回落是适配器层的**显式**来源
-  （4096 + warning），满足"不把未知伪装成已知"——伪装发生在客户端静默注入，
-  不发生在适配器声明回落。
-- `usable()` 数值不变量：已知额度时 `min(20k, limit.output) ≤ 20k` 与现状
-  `min(20k, maxOutputTokens(...))` 在 `limit.output ≥ 20k` 时相等；
-  `limit.output < 20k` 时现状会取到更小值（如 output=8k ⇒ min(20k, 8k)=8k），
-  新逻辑保留该 `min(limit.output)` 分支，数值等价。未知额度时从
-  `min(20k, 32k)=20k` 保持 20k——**数值不变，来源改变**（不再声称来自额度）。
+  消失），含 L1696-1703 的 Anthropic 隐式预算 fail 检查（`undefined <= 1024`
+  为 false，天然不触发）；envelope 存在时全部现有 fail 分支保留（正整数检查
+  等仅对已知 envelope 生效）。用户显式选 numeric variant 时 budget 不再被
+  envelope 夹逼——budget 本身是显式选择，非静默注入，与 4.2-7 同一理据。
+- `transportMaxOutputTokens`：envelope undefined 时**先于** budget 相减
+  early-return，杜绝 `undefined - budget = NaN` 进 wire。副作用组合：AI-SDK
+  Anthropic 路径 envelope undefined + options 带 numeric budget ⇒ SDK 计算
+  `4096 + budget`（适配器声明行为，见 4.2-4）。
+- Anthropic 必填适配器：ai-sdk 侧 SDK 回落（4096 + warning）与 native 侧
+  0 值守卫回落（4.2-4b）都是适配器层的**显式**来源，满足"不把未知伪装成
+  已知"——伪装发生在客户端静默注入，不发生在适配器声明回落。
+- `usable()` 两分支分别论证（详见 4.2-5）：`reserved` 分支已知/未知均数值
+  等价（`min(20k, limit.output)` 与 `min(20k, 32k)=20k`）；无 input 分支
+  已知额度保持 `context - limit.output` 逐值不变（L376/L394 测试锚定），
+  未知额度从 `context - 32k` 变为 `context - 20k`——判定边界**收紧** 12k
+  （更早触发压缩预检），方向是保守侧，不会引入漏检；放宽（原方案的统一
+  保留区公式）才是危险方向。
 
 **无回归引入**：受影响面 = `maxOutputTokens` 全部调用方（request prep、
 overflow）与两个测试组；reasoning 已知额度路径（前序修复的验证面）行为
@@ -270,28 +285,33 @@ undefined。第六部分回归清单兜底。
 
 | 类型 | 用例描述 | 状态（修复后回填） |
 |------|---------|------------------|
-| 回归 | helper 矩阵改造：`transform.test.ts:6196` "keeps the 32k default for non-reasoning" → 期望返回声明额度全额；"uses a positive fallback when output zero" → 期望 `undefined` | 待改 |
-| 回归 | `overflow.ts`：未知额度时 `usable` 保留区 = 20k（数值断言），已知额度数值不变 | 待加 |
-| 新增 | **wire 级**：自定义 provider（仅 name，无 limit）+ 无 override ⇒ 真实序列化请求 body **不含** `max_tokens` 键（复用 `llm.test.ts` Bun.serve + `waitRequest` 捕获通道，非 helper 返回值） | 待加 |
+| 回归 | helper 矩阵改造：`transform.test.ts:6196` "keeps the 32k default for non-reasoning" → 期望返回声明额度全额；"uses a positive fallback when output zero"（L6219-6222）→ 无 override 期望 `undefined`，**带 override 48000 期望恰返回 48000**（escape hatch 保持） | 待改 |
+| 回归 | `variants` 路径不变：`transform.test.ts:6224-6235` "generates positive built-in Anthropic numeric variants when output is zero" 保持通过（budgetVariants 仍基于 OUTPUT_TOKEN_MAX 构造建议） | 待跑 |
+| 回归 | `overflow.ts`：既有 L376/L383/L394 三个 usable 数值锚定**逐值相等**（4.2-5b 已知额度分支不变）；新增：未知额度 + 无 input ⇒ `usable = context - 20_000`；未知额度 + 有 input ⇒ `usable = input - 20_000` | 待改/待加 |
+| 新增 | **wire 级**：自定义 provider（仅 name，无 limit）+ 无 override ⇒ 真实序列化请求 body **不含** `max_tokens` 键（复用 `llm.test.ts` Bun.serve + `waitRequest` 捕获通道，config 手写无 limit 的模型条目，非 helper 返回值） | 待加 |
 | 新增 | wire 级：已知 131072 非 reasoning 模型 ⇒ body `max_tokens === 131072`（SDK/adapter 未重新注入 32k） | 待加 |
-| 新增 | wire 级：显式 `flags.outputTokenMax = 64000` ⇒ body `max_tokens === 64000`（用户显式上限继续生效） | 待加 |
-| 新增 | Anthropic 适配器缺额度：native 协议 body `max_tokens === 4096`（协议必填的显式回落有覆盖） | 待加 |
-| 新增 | 诊断：undefined 路径 log 含 `omitted-server-default`，已声明额度路径含 `model-declared`，override 含 `explicit-flag`（三桶依据见 4.5） | 待加 |
-| 回归 | 既有 `finish=length → MessageOutputLengthError` 断言全部保持通过（不新增，不放松） | 待跑 |
+| 新增 | wire 级：显式 `flags.outputTokenMax = 64000`（经 `drainWith(llmLayerWithExecutor({flags}))`）+ 未知额度 ⇒ body `max_tokens === 64000`（用户显式上限对未知模型继续生效） | 待加 |
+| 新增 | normalizeReasoningBudget：envelope undefined + options 含 numeric budget ⇒ 原样返回不 throw（skip 分支）；envelope defined 的既有 fail 分支（L6238+）全部保持通过 | 待加 |
+| 新增 | transportMaxOutputTokens：envelope undefined + Anthropic thinking budget 存在 ⇒ 返回 undefined（无 NaN 产生） | 待加 |
+| 新增 | **native Anthropic 0 值守卫**：模型 `limit.output = 0` 走 native Anthropic 协议 ⇒ body `max_tokens === 4096`（`?? `不跳 0 的守卫点，见 4.2-4b；llm 包协议级测试） | 待加 |
+| 新增 | 诊断来源纯函数：`outputTokenMaxSource` 三桶断言——undefined ⇒ `omitted-server-default`；已声明额度 ⇒ `model-declared`；flags 覆盖 ⇒ `explicit-flag`（含 override+未知 ⇒ `explicit-flag`） | 待加 |
+| 回归 | 既有 `finish=length → MessageOutputLengthError` 断言全部保持通过（不新增，不放松）；request-prep 组 L1343-1362（known-limit Anthropic envelope 组合）逐值不变 | 待跑 |
 
 ## 第七部分：代码更新清单
 
 | 文件 | 函数 / 行号 | 改动概述 | 状态（修复后回填） |
 |------|------------|---------|------------------|
-| `packages/opencode/src/provider/transform.ts` | `maxOutputTokens` / L1507-1512 | 返回 `number \| undefined`，删两条 32k fallback 路径 | 待改 |
-| `packages/opencode/src/provider/transform.ts` | `normalizeReasoningBudget` / L1624 | envelope undefined 时跳过夹逼 | 待改 |
-| `packages/opencode/src/provider/transform.ts` | `transportMaxOutputTokens` / L1708 | envelope undefined 时返回 undefined | 待改 |
-| `packages/opencode/src/session/llm/request.ts` | L97-112, L127-145 | undefined 贯通 + 生效额度来源日志 | 待改 |
-| `packages/opencode/src/session/overflow.ts` | `usable` / L10-20 | 保留区计算与 `maxOutputTokens` 解耦（20k / `min(20k, limit.output)`） | 待改 |
+| `packages/opencode/src/provider/transform.ts` | `maxOutputTokens` / L1507-1512 | 返回 `number \| undefined`，删两条 32k fallback 路径；override + 未知 ⇒ override | 待改 |
+| `packages/opencode/src/provider/transform.ts` | `normalizeReasoningBudget` / L1624 | envelope undefined 时整体 skip（含 L1696 隐式预算检查） | 待改 |
+| `packages/opencode/src/provider/transform.ts` | `transportMaxOutputTokens` / L1708 | envelope undefined 时先于 budget 相减 early-return | 待改 |
+| `packages/llm/src/protocols/anthropic-messages.ts` | L510 | `outputLimit` 加 0 值守卫（0 → 4096），`?? ` 不跳 0（见 4.2-4b） | 待改 |
+| `packages/opencode/src/session/llm/request.ts` | L97-112, L127-145 | undefined 贯通 + 生效额度来源纯函数与日志 | 待改 |
+| `packages/opencode/src/session/overflow.ts` | `usable` / L10-20 | 两分支分别解耦（4.2-5）：reserved 用 `min(20k, limit.output)`/20k；无 input 分支 `context - limit.output`/`context - 20k` | 待改 |
 | `packages/opencode/src/session/llm.ts` | L33 | 删除 `OUTPUT_TOKEN_MAX` re-export | 待改 |
-| `packages/opencode/test/provider/transform.test.ts` | L6196-6236 | helper 矩阵按新契约改写 + 新增 undefined 断言 | 待改 |
-| `packages/opencode/test/session/llm.test.ts` | wire 用例区 | 新增 3 条 wire 级用例（无 limit 不发送 / 非 reasoning 全额 / override 生效） | 待加 |
-| `packages/opencode/test/session/compaction.test.ts` | `usable` 组 | 未知额度保留区 20k 用例 | 待加 |
+| `packages/opencode/test/provider/transform.test.ts` | L6196-6236 | helper 矩阵按新契约改写（含 override+unknown 锚定）+ undefined 断言 | 待改 |
+| `packages/opencode/test/session/llm.test.ts` | wire 用例区 | 新增 3 条 wire 级用例（无 limit 不发送 / 非 reasoning 全额 / override+未知生效） | 待加 |
+| `packages/opencode/test/session/compaction.test.ts` | `usable` 组 | 未知额度两分支用例 + 既有数值锚定保持 | 待加 |
+| `packages/opencode/test/session/llm-native.test.ts` | 协议请求构造区 | native Anthropic 0 值守卫用例 | 待加 |
 
 ## 第八部分：文档更新清单
 
