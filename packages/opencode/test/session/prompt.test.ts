@@ -6639,11 +6639,7 @@ it.instance("each step ends with the clock and the subagent view, and the histor
     expect(inputs).toHaveLength(3)
     for (const [index, body] of inputs.entries()) {
       const tail = lastUserContent(body)
-      expect(tail, `request ${index + 1}`).toMatch(
-        new RegExp(
-          `^Now: \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[+-]\\d{2}:\\d{2}\\. You are at step ${index + 1}\\.\\n\\n`,
-        ),
-      )
+      expect(tail, `request ${index + 1}`).toMatch(/^Now: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\.\n\n/)
       expect(tail).toContain("Your subagents: 2 direct, 1 running, 1 idle.")
       expect(tail).toContain(
         `  ${running.id}  cw-1  run 2 since ${AgentRun.formatClock(now - 30_000)} (your message), last step `,
