@@ -155,9 +155,9 @@ Ensures:
   - outputTokenMax 不存在时：
       limit.output > 0 → 恰返回 limit.output（不再按 reasoning 分叉）
       limit.output = 0 → 返回 undefined
-  - 返回值非 undefined 时 ≤ limit.output（已知额度是服务能力边界，永远不
-    被客户端放大）；undefined 不是数值，不受此界约束，也不得被下游当作 0
-    或任何数值解释
+  - 已知额度（limit.output > 0）时返回值 ≤ limit.output（已知额度是服务
+    能力边界，永远不被客户端放大）；undefined 不是数值，不受此界约束，也不
+    得被下游当作 0 或任何数值解释
 ```
 
 ### 4.2 各下游点
@@ -168,7 +168,7 @@ Ensures:
 | 2 | `request.ts:97-112` | `coreMaxOutputTokens` 可为 undefined：`normalizeReasoningBudget` 在 envelope 为 undefined 时跳过预算夹逼（无已知上限，不推理预算合法性，不 fail）；`transportMaxOutputTokens` envelope 为 undefined 时直接返回 undefined（预算相减无意义） |
 | 3 | AI SDK 路径 `llm.ts:328` | `streamText({ maxOutputTokens: undefined })` 已有类型通道（`CallSettings.maxOutputTokens?`），SDK 丢键不发送；codex/cerebras/copilot 插件已用同一形态，无改动 |
 | 4 | native 路径 | `native-request.ts` generation 构造已有 undefined 剔除；协议层 `openai-chat/openai-responses/gemini` 均 `generation?.maxTokens` 透传省略（Bedrock `inferenceConfig` 在全 undefined 时整体省略，Gemini/OpenAI JSON 丢键）。**例外：Anthropic Messages 协议必填，且有两处独立处理**：(a) AI-SDK 路径——SDK 对未知模型回落 4096 + compatibility warning，若有 numeric thinking budget 则 wire = 4096 + budget（适配器声明组合，非静默）；(b) native 路径——`anthropic-messages.ts:510` 的 `?? 4096` 兜底**在 `defaults.limits.output = 0` 时不生效**（`??` 不跳过 0，而 `native-request.ts:162` 无条件传 `output: model.limit.output`），直接省略 envelope 会发出 `max_tokens: 0`。因此该行需加 0 值守卫（`0 → 4096`，与 ai-sdk 侧回落对齐并告警）。实施时两者都必须有 wire 断言，不能只测 ai-sdk 侧 |
-| 5 | `overflow.ts:10-34` | 解耦 `maxOutputTokens`，两个分支语义不同，分别处理：(a) `reserved`（L15-16，供 `limit.input` 分支用）：已知额度 `min(COMPACTION_BUFFER, limit.output)`、未知 `COMPACTION_BUFFER`——数值与现状等价（`min(20k, 32k)=20k`）；(b) 无 `limit.input` 分支（L19）：现状是 `context - 完整 output envelope`（如 200k 上下文 / 131k 输出 ⇒ usable=68,928，不减 20k）。新逻辑：已知额度保持 `context - limit.output`；未知额度以 `context - COMPACTION_BUFFER` 兜底（预检是本地启发式，有界的本地常数合法；与 wire 注入不同，它不声称来自模型能力）。既有测试 L376-395 三个数值锚定该分支行为，改造后必须逐值相等 |
+| 5 | `overflow.ts:10-34` | 解耦 `maxOutputTokens`，两个分支语义不同，分别处理：(a) `reserved`（L15-16，供 `limit.input` 分支用）：规则改为 `min(COMPACTION_BUFFER, limit.output)`（未知 `COMPACTION_BUFFER`），**不再经过 `maxOutputTokens`/override**——reserve 是压缩头寸，按模型声明能力预留，与客户端上限解耦；常规形态（无 override，或 override ≥ output）数值与现状等价，仅 override < output < 20k 的罕见组合下 reserve 变大（usable 收紧，方向保守）。(b) 无 `limit.input` 分支（L19）：现状是 `context - 完整 output envelope`（如 200k 上下文 / 131k 输出 ⇒ usable=68,928，不减 20k）。新逻辑：经 `maxOutputTokens`（override 仍生效）：已知额度保持 `context - limit.output`；未知额度（无 override）以 `context - COMPACTION_BUFFER` 兜底（预检是本地启发式，有界的本地常数合法；与 wire 注入不同，它不声称来自模型能力）。既有测试 L376-395 三个数值锚定该分支行为，改造后必须逐值相等 |
 | 6 | 诊断日志 | `request.ts` prep 完成后 logInfo 一条：`provider/model`、生效值、来源 ∈ {`explicit-flag`, `model-declared`, `omitted-server-default`}；undefined 必须以 `omitted-server-default` 显式出现，不伪装已知。三桶与 issue 期望行为的对应：issue 列的"用户覆盖"→`explicit-flag`；"目录 + provider metadata"→`model-declared`（两者在 `provider.ts:1599-1602` 合并进同一字段，请求时不可区分，且区分两者不影响"不把未知伪装成已知"的验收义务）；"服务端默认"→`omitted-server-default`。可测性：来源判定抽成纯函数导出（如 `outputTokenMaxSource(model, flags)`），日志只打印其结果——测试断言纯函数而非捕获日志（现有测试 harness 无 log 捕获设施） |
 | 7 | `transform.ts:2025` `budgetVariants` / `:2157` `catalogOutputLimit` | **保留 32k**：这是用户主动选 numeric variant 时的预算建议构造，属"用户已选择参与"的场景，且这些预算经显式变体进入请求，非静默限制。文档记录其与 `maxOutputTokens` 语义分叉的理由 |
 | 8 | `session/llm.ts:33` re-export | 删除（全仓无 consumer，grep 确认）；`OUTPUT_TOKEN_MAX` 常量保留在 `transform.ts` 供 §4.2-7 使用 |
@@ -223,11 +223,13 @@ variant 预算建议（用户显式参与场景），静默路径为零。
 - Anthropic 必填适配器：ai-sdk 侧 SDK 回落（4096 + warning）与 native 侧
   0 值守卫回落（4.2-4b）都是适配器层的**显式**来源，满足"不把未知伪装成
   已知"——伪装发生在客户端静默注入，不发生在适配器声明回落。
-- `usable()` 两分支分别论证（详见 4.2-5）：`reserved` 分支已知/未知均数值
-  等价（`min(20k, limit.output)` 与 `min(20k, 32k)=20k`）；无 input 分支
-  已知额度保持 `context - limit.output` 逐值不变（L376/L394 测试锚定），
-  未知额度从 `context - 32k` 变为 `context - 20k`——判定边界**收紧** 12k
-  （更早触发压缩预检），方向是保守侧，不会引入漏检。
+- `usable()` 两分支分别论证（详见 4.2-5）：`reserved` 分支按模型声明能力预留
+  （`min(20k, limit.output)` / 未知 20k），不再经过 `maxOutputTokens`——常规
+  形态数值与现状等价；唯一偏离是 override < output < 20k 的组合下 reserve 变大
+  （usable 收紧，保守侧，不会漏检）。无 input 分支已知额度保持
+  `context - limit.output` 逐值不变（L376/L394 测试锚定），未知额度从
+  `context - 32k` 变为 `context - 20k`——判定边界**收紧** 12k（更早触发压缩
+  预检），方向是保守侧，不会引入漏检。
 
 **无回归引入**：受影响面 = `maxOutputTokens` 全部调用方（request prep、
 overflow）与两个测试组；reasoning 已知额度路径（前序修复的验证面）行为
