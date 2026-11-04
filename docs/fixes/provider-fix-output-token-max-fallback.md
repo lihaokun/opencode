@@ -1,6 +1,6 @@
 # 修正方案 — 未配置输出额度时移除静默 32k 客户端上限
 
-- 状态：方案待确认；未实施
+- 状态：已实施（第六/七/八部分已回填实际状态）
 - 初稿日期：2026-11-02
 - 对应问题：[#98](https://github.com/lihaokun/opencode/issues/98)（自定义 provider 无元数据时静默施加 32k 上限）
 - 前序修复：`docs/fixes/subagent-fix-output-length.md`（Issue #1/#2：reasoning 模型使用声明额度 + length 终态如实上报）
@@ -241,41 +241,42 @@ undefined。第六部分回归清单兜底。
 
 | 类型 | 用例描述 | 状态（修复后回填） |
 |------|---------|------------------|
-| 回归 | helper 矩阵改造：`transform.test.ts:6196` "keeps the 32k default for non-reasoning" → 期望返回声明额度全额；"uses a positive fallback when output zero"（L6219-6222）→ 无 override 期望 `undefined`，**带 override 48000 期望恰返回 48000**（escape hatch 保持） | 待改 |
-| 回归 | `variants` 路径不变：`transform.test.ts:6224-6235` "generates positive built-in Anthropic numeric variants when output is zero" 保持通过（budgetVariants 仍基于 OUTPUT_TOKEN_MAX 构造建议） | 待跑 |
-| 回归 | `overflow.ts`：既有 L376/L383/L394 三个 usable 数值锚定**逐值相等**（4.2-5b 已知额度分支不变）；新增：未知额度 + 无 input ⇒ `usable = context - 20_000`；未知额度 + 有 input ⇒ `usable = input - 20_000` | 待改/待加 |
-| 新增 | **wire 级**：自定义 provider（仅 name，无 limit）+ 无 override ⇒ 真实序列化请求 body **不含** `max_tokens` 键（复用 `llm.test.ts` Bun.serve + `waitRequest` 捕获通道，config 手写无 limit 的模型条目，非 helper 返回值） | 待加 |
-| 新增 | wire 级：已知 131072 非 reasoning 模型 ⇒ body `max_tokens === 131072`（SDK/adapter 未重新注入 32k） | 待加 |
-| 新增 | wire 级：显式 `flags.outputTokenMax = 64000`（经 `drainWith(llmLayerWithExecutor({flags}))`）+ 未知额度 ⇒ body `max_tokens === 64000`（用户显式上限对未知模型继续生效） | 待加 |
-| 新增 | normalizeReasoningBudget：envelope undefined + options 含 numeric budget ⇒ 原样返回不 throw（skip 分支）；envelope defined 的既有 fail 分支（L6238+）全部保持通过 | 待加 |
-| 新增 | transportMaxOutputTokens：envelope undefined + Anthropic thinking budget 存在 ⇒ 返回 undefined（无 NaN 产生） | 待加 |
-| 新增 | **native Anthropic 0 值守卫**：模型 `limit.output = 0` 走 native Anthropic 协议 ⇒ body `max_tokens === 4096`（`??` 不跳 0 的守卫点，见 4.2-4b；llm 包协议级测试） | 待加 |
-| 新增 | 诊断来源纯函数：`outputTokenMaxSource` 三桶断言——undefined ⇒ `omitted-server-default`；已声明额度 ⇒ `model-declared`；flags 覆盖 ⇒ `explicit-flag`（含 override+未知 ⇒ `explicit-flag`） | 待加 |
-| 回归 | 既有 `finish=length → MessageOutputLengthError` 断言全部保持通过（不新增，不放松）；request-prep 组 L1346-1359（known-limit Anthropic envelope 组合）逐值不变 | 待跑 |
+| 回归 | helper 矩阵改造：`transform.test.ts` "keeps the 32k default for non-reasoning" → 改写为 "returns the declared output limit for non-reasoning models"（期望声明额度全额）；"uses a positive fallback when output zero" → 拆为 "keeps the explicit override as the escape hatch for unknown output limits"（48000 → 48000）与 "omits the client limit when the model declares output zero without an override"（期望 `undefined`，reasoning 与非 reasoning 双断言） | 已改（RED 先行验证 2 例，M1 后转绿） |
+| 回归 | `variants` 路径不变："generates positive built-in Anthropic numeric variants when output is zero" 保持通过（budgetVariants 仍基于 OUTPUT_TOKEN_MAX 构造建议） | 已跑：transform.test.ts 601 pass / 0 fail |
+| 回归 | `overflow.ts`：既有 usable 三个数值锚定（L376/L383/L394）**逐值相等**（272_000 / 252_000 / 336_000，4.2-5 已知额度分支不变）；新增 "falls back to the compaction buffer when the output limit is unknown (#98)"：未知额度 + 无 input ⇒ `context - 20_000 = 380_000`；未知额度 + 有 input ⇒ `input - 20_000 = 252_000` | 已改/已加（RED 先行验证，M2 后转绿；compaction.test.ts 74 pass / 0 fail） |
+| 新增 | **wire 级**：自定义 provider（仅 name，无 limit）+ 无 override ⇒ 真实序列化请求 body **不含** `max_tokens` 键（`llm.test.ts` Bun.serve + `waitRequest` 捕获通道，config 手写无 limit 的模型条目） | 已加（RED 先行验证 32000→改键缺失，M1 后转绿） |
+| 新增 | wire 级：已知 131072 非 reasoning 模型 ⇒ body `max_tokens === 131072`（SDK/adapter 未重新注入 32k） | 已加（RED 先行验证 32000，M1 后转绿） |
+| 新增 | wire 级：显式 `flags.outputTokenMax = 64_000`（经 `drainWith(llmLayerWithExecutor({flags}))`）+ 未知额度 ⇒ body `max_tokens === 64_000`（用户显式上限对未知模型继续生效）。测试标注 30s 超时：隔离 runtime 构建在负载高的共享机上可能超过 bun 默认 5s | 已加（修复前后均通过，preservation anchor） |
+| 新增 | normalizeReasoningBudget：envelope undefined + options 含 numeric budget ⇒ 原样返回不 throw（skip 分支，transport 同断言 undefined 无 NaN）；envelope defined 的既有 fail 分支全部保持通过 | 已加（RED 先行验证，M1 后转绿） |
+| 新增 | transportMaxOutputTokens：envelope undefined + Anthropic thinking budget 存在 ⇒ 返回 undefined（无 NaN 产生）——并入上一条 skip 用例双断言 | 已加 |
+| 新增 | **native Anthropic 0 值守卫**：`packages/llm/test/anthropic-output-limit.test.ts`（新文件，协议级 `LLMClient.prepare` 直接断言序列化 body）：`limits.output = 0` + 无 generation.maxTokens ⇒ `max_tokens === 4096`（RED 先行验证实际发出 0）；无 limits ⇒ 4096；显式 `generation.maxTokens = 8192` ⇒ 8192 胜过回落 | 已加（位于 llm 包协议级而非 `llm-native.test.ts`——该文件只测 opencode 侧 request 映射，不触协议序列化；3 pass / 0 fail） |
+| 新增 | 诊断来源纯函数：`outputTokenMaxSource` 三桶断言——无额度无覆盖 ⇒ `omitted-server-default`；已声明额度 ⇒ `model-declared`；flags 覆盖 ⇒ `explicit-flag`（含 override+未知 ⇒ `explicit-flag`） | 已加（transform.test.ts 独立 describe，3 断言组） |
+| 回归 | 既有 `finish=length → MessageOutputLengthError` 断言全部保持通过（不新增，不放松）；request-prep 组（known-limit Anthropic envelope 组合）逐值不变 | 已跑：session 套件 731 pass / 0 fail（含全部 length 终态用例） |
 
 ## 第七部分：代码更新清单
 
 | 文件 | 函数 / 行号 | 改动概述 | 状态（修复后回填） |
 |------|------------|---------|------------------|
-| `packages/opencode/src/provider/transform.ts` | `maxOutputTokens` / L1507-1512 | 返回 `number \| undefined`，删两条 32k fallback 路径；override + 未知 ⇒ override | 待改 |
-| `packages/opencode/src/provider/transform.ts` | `normalizeReasoningBudget` / L1624 | envelope undefined 时整体 skip（含 L1696 隐式预算检查） | 待改 |
-| `packages/opencode/src/provider/transform.ts` | `transportMaxOutputTokens` / L1708 | envelope undefined 时先于 budget 相减 early-return | 待改 |
-| `packages/llm/src/protocols/anthropic-messages.ts` | L510 | `outputLimit` 加 0 值守卫（0 → 4096），`??` 不跳 0（见 4.2-4b） | 待改 |
-| `packages/opencode/src/session/llm/request.ts` | L97-112, L127-145 | undefined 贯通 + 生效额度来源纯函数与日志 | 待改 |
-| `packages/opencode/src/session/overflow.ts` | `usable` / L10-20 | 两分支分别解耦（4.2-5）：reserved 用 `min(20k, limit.output)`/20k；无 input 分支 `context - limit.output`/`context - 20k` | 待改 |
-| `packages/opencode/src/session/llm.ts` | L33 | 删除 `OUTPUT_TOKEN_MAX` re-export | 待改 |
-| `packages/opencode/test/provider/transform.test.ts` | L6196-6236 | helper 矩阵按新契约改写（含 override+unknown 锚定）+ undefined 断言 | 待改 |
-| `packages/opencode/test/session/llm.test.ts` | wire 用例区 | 新增 3 条 wire 级用例（无 limit 不发送 / 非 reasoning 全额 / override+未知生效） | 待加 |
-| `packages/opencode/test/session/compaction.test.ts` | `usable` 组 | 未知额度两分支用例 + 既有数值锚定保持 | 待加 |
-| `packages/opencode/test/session/llm-native.test.ts` | 协议请求构造区 | native Anthropic 0 值守卫用例 | 待加 |
+| `packages/opencode/src/provider/transform.ts` | `maxOutputTokens` / L1507 | 返回 `number \| undefined`，删两条 32k fallback 路径；override + 未知 ⇒ override | 已改（本分支 commit） |
+| `packages/opencode/src/provider/transform.ts` | `outputTokenMaxSource` / L1525（新增） | 诊断来源纯函数：`explicit-flag` / `model-declared` / `omitted-server-default` | 已改 |
+| `packages/opencode/src/provider/transform.ts` | `normalizeReasoningBudget` / L1643 | envelope undefined 时整体 skip（隐式预算检查天然不触发：`undefined <= 1024` 为 false）；`reasoningBudgetError` 入参类型同步放宽 | 已改 |
+| `packages/opencode/src/provider/transform.ts` | `transportMaxOutputTokens` / L1731 | envelope undefined 时先于 budget 相减 early-return，杜绝 NaN | 已改 |
+| `packages/llm/src/protocols/anthropic-messages.ts` | L514-521 | `outputLimit` 0 值守卫（`resolvedMaxTokens = generation?.maxTokens ?? (outputLimit > 0 ? outputLimit : 4096)`）+ 未知模型回落时 logWarning 显式声明适配器默认 | 已改 |
+| `packages/opencode/src/session/llm/request.ts` | L97-120 | undefined 贯通 + prep 后 `logInfo("llm output limit")`（生效值或 `omitted` + source 三桶） | 已改 |
+| `packages/opencode/src/session/overflow.ts` | `usable` / L10-30 | 两分支分别解耦（4.2-5）：reserve 已知 `min(20k, limit.output)` / 未知 20k；无 input 分支 `context - limit.output` / `context - 20k` | 已改 |
+| `packages/opencode/src/session/llm.ts` | L33 | 删除 `OUTPUT_TOKEN_MAX` re-export（全仓无 consumer，grep 确认） | 已改 |
+| `packages/opencode/test/provider/transform.test.ts` | maxOutputTokens / outputTokenMaxSource describe | helper 矩阵按新契约改写（含 override+unknown 锚定）+ undefined 断言 + 来源三桶 | 已改 |
+| `packages/opencode/test/session/llm.test.ts` | wire 用例区 | 新增 3 条 wire 级用例（无 limit 不发送 / 非 reasoning 全额 / override+未知生效） | 已改 |
+| `packages/opencode/test/session/compaction.test.ts` | `usable` 组 | 未知额度两分支用例 + 既有数值锚定保持 | 已改 |
+| `packages/llm/test/anthropic-output-limit.test.ts` | 新文件 | native Anthropic 0 值守卫用例 ×3（协议级 prepare 断言 wire body） | 已改（替代原计划的 `llm-native.test.ts`，理由见第六部分） |
 
 ## 第八部分：文档更新清单
 
 | 文档路径 | 要改什么 | 状态（修复后回填） |
 |---------|---------|------------------|
-| `docs/fixes/subagent-fix-output-length.md` | 第四部分"新规则"保留的 `output=0 → OUTPUT_TOKEN_MAX fallback` 分支标注被本修复取代（防止后人按旧文档恢复） | 待改 |
-| `CLAUDE.md` 已知限制 | 视实施结果追加一条：`OUTPUT_TOKEN_MAX` 仅存于 variant 预算建议；`maxOutputTokens` undefined 语义 = 不发送 | 待定 |
-| `docs/devlog/2026-11-02-provider-output-token-max-fallback.md` | 修复日志 + 度量表 | 待加 |
+| `docs/fixes/subagent-fix-output-length.md` | 第四部分"新规则"保留的 `output=0 → OUTPUT_TOKEN_MAX fallback` 分支标注被本修复取代（防止后人按旧文档恢复） | 已改（标注 deprecated 指向本文档） |
+| `CLAUDE.md` 已知限制 | 追加一条：`OUTPUT_TOKEN_MAX` 仅存于 variant 预算建议；`maxOutputTokens` undefined 语义 = 不发送参数（服务端默认生效）；native Anthropic 协议 0 值守卫回落 4096 | 已改 |
+| `docs/devlog/2026-11-02-provider-output-token-max-fallback.md` | 修复日志 + 度量表 | 已改 |
 
 本修复触及对外行为契约（wire 请求形状、`maxOutputTokens` 签名），文档清单
 不允许可写"无"。
