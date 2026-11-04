@@ -257,7 +257,7 @@ undefined。第六部分回归清单兜底。
 
 | 文件 | 函数 / 行号 | 改动概述 | 状态（修复后回填） |
 |------|------------|---------|------------------|
-| `packages/opencode/src/provider/transform.ts` | `maxOutputTokens` / L1507 | 返回 `number \| undefined`，删两条 32k fallback 路径；override + 未知 ⇒ override | 已改（本分支 commit） |
+| `packages/opencode/src/provider/transform.ts` | `maxOutputTokens` / L1507 | 返回 `number \| undefined`，删两条 32k fallback 路径；override + 未知 ⇒ override | 已改：commit `0ecd670535` |
 | `packages/opencode/src/provider/transform.ts` | `outputTokenMaxSource` / L1525（新增） | 诊断来源纯函数：`explicit-flag` / `model-declared` / `omitted-server-default` | 已改 |
 | `packages/opencode/src/provider/transform.ts` | `normalizeReasoningBudget` / L1643 | envelope undefined 时整体 skip（隐式预算检查天然不触发：`undefined <= 1024` 为 false）；`reasoningBudgetError` 入参类型同步放宽 | 已改 |
 | `packages/opencode/src/provider/transform.ts` | `transportMaxOutputTokens` / L1731 | envelope undefined 时先于 budget 相减 early-return，杜绝 NaN | 已改 |
