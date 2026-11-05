@@ -5,7 +5,7 @@ import { writeFile } from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { cliIt } from "../../lib/cli-process"
-import { expectOk } from "./acp-test-client"
+import { ACP_TEST_TIMEOUT_MS, expectOk } from "./acp-test-client"
 import { createAcpClient, initialize, newSession, verifierConfig } from "./helpers"
 
 const tinyPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII="
@@ -70,7 +70,7 @@ describe("opencode acp prompt content subprocess", () => {
 
         expect(linked.stopReason).toBe("end_turn")
       }),
-    60_000,
+    ACP_TEST_TIMEOUT_MS,
   )
 })
 

@@ -20,6 +20,7 @@ GPT 模板混入了当前宿主不存在的并行接口名称。
 [#31566](https://github.com/anomalyco/opencode/pull/31566) 重构时丢失了 V1 的 file 参数。
 当前 [上游 grep](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/plugin/grep.ts)
 和本库 Core 文件系统搜索都按文件类型传入 basename。这里只修 V1，不改 V2。
+复审时再次核对上游 `b6f3294e9d`：其 `tool/plugin/grep.ts` 仍传裸 basename，`ripgrep.ts` 仍把该值作为文件参数。因此 `-` 边界并未由上游处理；本补丁根据 ripgrep 的 stdin 约定额外保留 `./` 前缀，并用真实工具回归验证。
 并行调用使用宿主原有的一次回复包含多个独立工具调用的能力，不新增工具。
 
 ## 4. 方案

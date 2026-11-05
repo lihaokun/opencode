@@ -60,3 +60,17 @@ Windows runner 上的长耗时尚未在本机复现；保留真实 CI 失败作�
 ## 8. 文档更新清单
 
 本文件记录失败证据、超时层级、验证与局限。未改变生产接口、用户配置或 Agent 契约。
+
+## 9. ACP 冷启动预算（PR #107 复审 CI）
+
+在 `5d6659ea41` 的 [Windows unit 1/3](https://github.com/lihaokun/opencode/actions/runs/41988525669/job/127114925693)
+中，`config-options.test.ts` 首项在等待 ACP initialize 响应时超过 30 秒，含清理共约 34.7 秒失败。
+该分片 1569 pass / 1 fail；其余单测分片、两端 E2E、typecheck 均通过。前一 HEAD 的同组 CI 也已通过。
+这次失败没有涉及 grep 断言；日志不能证明首次冷启动为何超过预算。
+
+调整仅限 ACP 子进程测试：Windows initialize 接收预算 60 秒，外层测试 120 秒；Linux 保持 30/60 秒。
+普通 ACP 请求仍为 30 秒，通知等待仍用原预算。初始化前关闭 stdin 的用例也包含冷启动，复用初始化预算；
+初始化后的 EOF 退出仍限 15 秒。五个 ACP 测试文件引用统一外层常量，避免只改内层导致外层先超时。
+成功条件、协议断言、生产代码、并发和失败重试策略均不改变。
+
+验证：Bun 1.4.4 / Linux 下完整 ACP 子进程测试 16 pass / 0 fail，108 个断言，约 48.8 秒；`bun typecheck` 通过。Windows 稳定性由新 CI 验证，不把预算调整当作底层卡死已根治。
