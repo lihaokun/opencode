@@ -665,3 +665,120 @@ it.instance("restored body reaches the model when the only prior copy was compac
     expect(wire).toContain("[Old tool result content cleared]")
   }),
 )
+
+// Self-audit P2-b (G4: at most one restoration block per context): a second
+// compaction whose retained tail still holds the first sentinel's carrier
+// message used to leave BOTH blocks model-visible — two "Context restored"
+// headers, each up to budget_tokens, both claiming to be current. The fresh
+// write must retire every prior sentinel (ignored: true, same part id — an
+// in-place flip, not an append), and the projection must show exactly one.
+it.instance("a second compaction retires the previous restoration block", () =>
+  Effect.gen(function* () {
+    const fs = yield* FSUtil.Service
+    const ssn = yield* SessionNs.Service
+    const dir = (yield* TestInstance).directory
+    const session = yield* ssn.create({})
+    const sessionID = session.id
+
+    // Compaction 1 settles; apply writes sentinel 1 on the marker's message.
+    yield* fs.writeWithDirs(`${dir}/one.md`, "FIRST RESTORE BODY\n")
+    yield* seedRestorable(sessionID, `${dir}/one.md`, "FIRST RESTORE BODY\n")
+    yield* apply({ sessionID })
+    const afterFirst = yield* ssn.messages({ sessionID })
+    const firstSentinel = afterFirst.flatMap((m) => m.parts).find(
+      (p): p is SessionV1.TextPart => p.type === "text" && p.text.startsWith(RESTORATION_SENTINEL),
+    )
+    if (!firstSentinel) throw new Error("expected the first restoration block")
+
+    // Compaction 2: a NEW marker+summary pair, retained tail anchored at the
+    // first marker's message — the exact shape that keeps sentinel 1 inside
+    // the model-visible window. A different file gives the second block
+    // different content, so the byte-dedup cannot suppress the write.
+    yield* fs.writeWithDirs(`${dir}/two.md`, "SECOND RESTORE BODY\n")
+    const marker2 = yield* ssn.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID,
+      agent: "build",
+      model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+      time: { created: Date.now() },
+    })
+    // A read of the second file rides an assistant message in the retained
+    // region so collectCandidates picks it up.
+    const assistant2 = yield* ssn.updateMessage({
+      id: MessageID.ascending(),
+      parentID: marker2.id,
+      role: "assistant",
+      sessionID,
+      mode: "build",
+      agent: "build",
+      path: { cwd: dir, root: dir },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ModelV2.ID.make("test-model"),
+      providerID: ProviderV2.ID.make("test"),
+      time: { created: Date.now() },
+    })
+    yield* ssn.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant2.id,
+      sessionID,
+      type: "tool",
+      tool: "read",
+      callID: "call_two",
+      state: {
+        status: "completed",
+        input: { filePath: `${dir}/two.md` },
+        output: `read ${dir}/two.md`,
+        title: "two.md",
+        metadata: { display: { type: "file", path: `${dir}/two.md` } },
+        time: { start: 0, end: 1 },
+      },
+    })
+    yield* ssn.updatePart({
+      id: PartID.ascending(),
+      messageID: marker2.id,
+      sessionID,
+      type: "compaction",
+      auto: false,
+      // Anchor the retained tail at the FIRST marker's turn: seedRestorable's
+      // messages stay visible, sentinel 1 with them.
+      tail_start_id: afterFirst.find((m) => m.info.role === "user" && m.parts.some((p) => p.type === "compaction"))!
+        .info.id,
+    })
+    yield* ssn.updateMessage({
+      id: MessageID.ascending(),
+      parentID: marker2.id,
+      role: "assistant",
+      sessionID,
+      mode: "compaction",
+      agent: "compaction",
+      summary: true,
+      finish: "stop",
+      path: { cwd: dir, root: dir },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ModelV2.ID.make("test-model"),
+      providerID: ProviderV2.ID.make("test"),
+      time: { created: Date.now() },
+    })
+
+    yield* apply({ sessionID })
+
+    // Storage: sentinel 1 still exists (audit trail) but is retired.
+    const stored = yield* ssn.messages({ sessionID })
+    const storedSentinels = stored.flatMap((m) => m.parts).filter(
+      (p): p is SessionV1.TextPart => p.type === "text" && p.text.startsWith(RESTORATION_SENTINEL),
+    )
+    expect(storedSentinels.length).toBeGreaterThanOrEqual(2)
+    expect(storedSentinels.find((p) => p.text.includes("FIRST RESTORE BODY"))?.ignored).toBe(true)
+
+    // Projection: exactly one restoration header reaches the model.
+    const active = yield* MessageV2.filterCompactedEffect(sessionID)
+    const visible = active.flatMap((m) => m.parts).filter(
+      (p): p is SessionV1.TextPart => p.type === "text" && !p.ignored && p.text.startsWith(RESTORATION_SENTINEL),
+    )
+    expect(visible).toHaveLength(1)
+    expect(visible[0].text).toContain("SECOND RESTORE BODY")
+  }),
+)

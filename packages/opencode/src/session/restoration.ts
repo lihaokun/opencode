@@ -339,7 +339,10 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
         compactionIdx = index
         tailStartID = part.tail_start_id
       }
-      if (part.type === "text" && part.text.startsWith(RESTORATION_SENTINEL)) restorationIdx = index
+      // Retired (ignored) blocks do not count as "already restored" — a
+      // transcript whose only sentinels are ignored must re-fire.
+      if (part.type === "text" && !part.ignored && part.text.startsWith(RESTORATION_SENTINEL))
+        restorationIdx = index
     }
   })
   // Step P3: trigger decision — no compaction, or a sentinel already newer
@@ -367,11 +370,32 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
   if (!text) return
 
   // Step P7: byte-identical comparison against the previous sentinel — only a
-  // changed block is persisted.
+  // changed block is persisted. An ignored sentinel is not "the previous
+  // block"; it is retired history (see G4 retirement below), so a re-fire
+  // after retirement still writes.
   const previous = userMessage.parts.findLast(
-    (part): part is SessionV1.TextPart => part.type === "text" && part.text.startsWith(RESTORATION_SENTINEL),
+    (part): part is SessionV1.TextPart =>
+      part.type === "text" && !part.ignored && part.text.startsWith(RESTORATION_SENTINEL),
   )
   if (previous?.text === text) return
+
+  // G4 ("at most one restoration block per context"): every prior sentinel —
+  // on any message — is retired the moment a fresh one is written. Without
+  // this, a second compaction whose retained tail still holds the first
+  // block's carrier message would leave two full "Context restored" blocks
+  // (each up to budget_tokens) model-visible at once, both claiming to be the
+  // current restoration. Retirement reuses each part's own id: updatePart
+  // upserts the same PartTable row (projector onConflictDoUpdate), so this is
+  // an in-place flag flip, not an append — the transcript keeps the audit
+  // trail while toModelMessagesEffect and the compaction serializer both skip
+  // ignored text parts.
+  for (const msg of messages) {
+    for (const part of msg.parts) {
+      if (part.type !== "text" || part.ignored || !part.text.startsWith(RESTORATION_SENTINEL)) continue
+      if (previous?.id === part.id) continue
+      yield* sessions.updatePart({ ...part, ignored: true })
+    }
+  }
 
   const part = yield* sessions.updatePart({
     id: PartID.ascending(),
