@@ -201,7 +201,7 @@ resultRepeat(steps) := 末尾满足 steps[i].calls = steps[i-1].calls 且 steps[
 - 目标在跑、记录未关闭：`ses_xxx (cw-b333) is in run 5 (started <时间>); it reads this at its next step.`
 - 目标在跑、记录已关闭或缺失：`is running (its run record is not updated yet)`，不预告号
 - 目标没有 `agentRun` 也不是子会话（如主会话）：只写 `running` 或 `idle`
-- 末尾一行：`Current state of one agent: agent_status(target="ses_xxx").`
+- 2026-11-05 修订：不再附带 agent_status 调用提示；创建 Agent 的成功返回也移除 agent_list 查询引导。查询用法由完整工具描述提供，状态事实、异步确认和自动通知说明保留。
 
 ### 4.7 #75 新增 agent_status
 

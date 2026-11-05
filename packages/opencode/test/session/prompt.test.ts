@@ -7128,7 +7128,8 @@ it.instance("agent_send predicts the run number the next report carries", () =>
     } as never)
     const output = String(result.output)
     expect(output).toContain("was idle; this message starts run 2 (sent ")
-    expect(output).toContain(`Current state of one agent: agent_status(target="${child.id}").`)
+    expect(output).toContain(`Accepted for ${child.id}.`)
+    expect(output).not.toContain("Current state of one agent:")
 
     const list = yield* awaitNotices(parent.id, 2)
     expect(list[1].part.text).toContain(`<agent id="${child.id}" state="completed" run="2" ended="`)

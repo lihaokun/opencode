@@ -3,6 +3,11 @@ import type { SessionConfigOption, SessionConfigSelectOption } from "@agentclien
 import { Duration, Effect } from "effect"
 import type { AcpHandle } from "../../lib/cli-process"
 
+// Initialization includes cold CLI startup. Leave room in the outer test
+// for subsequent protocol requests and process cleanup on Windows CI.
+export const ACP_STARTUP_TIMEOUT_MS = process.platform === "win32" ? 60_000 : 30_000
+export const ACP_TEST_TIMEOUT_MS = ACP_STARTUP_TIMEOUT_MS * 2
+
 type JsonRpcRequest = {
   readonly jsonrpc: "2.0"
   readonly id: number
@@ -39,17 +44,19 @@ export function createAcpClient(acp: AcpHandle): AcpClient {
   const request = <T>(method: string, params?: unknown) =>
     Effect.gen(function* () {
       const id = state.nextId++
+      const timeoutMs = method === "initialize" ? ACP_STARTUP_TIMEOUT_MS : 30_000
       const message: JsonRpcRequest =
         params === undefined ? { jsonrpc: "2.0", id, method } : { jsonrpc: "2.0", id, method, params }
       yield* acp.send(message)
 
       while (true) {
-        // Cold CLI startup on a shared Windows runner is part of this wait.
-        // Keep the receive budget below the enclosing 60s subprocess test.
         const received = yield* acp.receive.pipe(
           Effect.timeoutOrElse({
-            duration: Duration.seconds(30),
-            orElse: () => Effect.fail(new Error(`Timed out waiting for ACP ${method} response (id ${id}) after 30s`)),
+            duration: Duration.millis(timeoutMs),
+            orElse: () =>
+              Effect.fail(
+                new Error(`Timed out waiting for ACP ${method} response (id ${id}) after ${timeoutMs / 1000}s`),
+              ),
           }),
         )
         if (isJsonRpcResponse<T>(received) && received.id === id) return received

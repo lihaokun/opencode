@@ -47,7 +47,7 @@
 | 摘要后缀                                          | ` (run <n>, ended HH:MM:SS)`（与属性同条件）                                                                                                                                                                                                           | 主契约 §4.6   | `session/prompt.ts` reportRunEnd            | server 独占措辞；TUI 原样显示                                                        |
 | renderTermination 操作与记录行 | 操作行由 cancel 返回状态决定；独立的 `Latest run record after cancellation: N, ...` 为读取快照；无记录省略后者 | 主契约 §4.6 / §5.4.2 | `agent-management/lifecycle.ts` | 不声称取消的执行号 |
 | `Runner.cancel` / `SessionRunState.cancel` 返回值 | 取消前状态标签 `Idle \| Running \| Shell \| ShellThenRun`（无 runner 时 `Idle`）                                                                                                                                                                       | 主契约 §5.4.2 | `effect/runner.ts`、`session/run-state.ts`  | renderTermination 操作行                                                             |
-| agent_send 返回首句                               | 六种写法见主契约 §4.6；末尾恒加 `Current state of one agent: agent_status(target="…").`                                                                                                                                                                | 主契约 §4.6   | `tool/agent.ts`                             | 测试六例                                                                             |
+| agent_send 返回首句                               | 六种写法见主契约 §4.6；保留 Accepted、单向消息与通知说明，不附带状态查询调用提示                                                                                                                                                                | 主契约 §4.6   | `tool/agent.ts`                             | 测试六例                                                                             |
 | agent_status 参数                                 | `{ target: string }`                                                                                                                                                                                                                                   | 主契约 §4.7   | `tool/agent.ts`                             | schema                                                                               |
 | agent_status 返回行                               | `session_id / name / agent_type / relation / status / run / previous run / last step / workdir`，run 行五种写法；非子会话无 run 与 previous run 行，在跑时有 last step 行                                                                              | 主契约 §4.7   | 同上                                        | 测试逐行                                                                             |
 | agent_status 失败文本                             | 被拒 `agent_list is denied for you, and agent_status shows the same information.`；非邻居 `<id> is not one of your neighbours; only yourself, your parent, your direct children and your siblings can be looked up.`；名字零匹配 / 多匹配同 agent_send | 主契约 §3     | `tool/agent.ts`                             | 测试两例                                                                             |
@@ -111,7 +111,7 @@
 - S18 `reportRunEnd` 读关闭后的 agentRun → 已关闭才加 run / ended 属性与摘要后缀
 - S19 `Runner.cancel` / `SessionRunState.cancel` 返回取消前状态标签
 - S20 `renderTermination`：cancel → 读取最新记录；操作行与记录快照行独立，不从前后记录推导被取消的 run。
-- S21 `agent_send` 在 deliver **之前**取状态与 agentRun 快照 → 六种措辞 + agent_status 提示行；投递失败不输出
+- S21 `agent_send` 在 deliver **之前**取状态与 agentRun 快照 → 六种措辞与既有接受/单向消息说明；不附带状态查询提示，投递失败不输出
 
 **agent_status / agent_list（commit 5）**
 
@@ -128,7 +128,7 @@
 - run 号只在新 run 开始时加一：work 首次执行，或续跑时记录已被 `onExit` 关闭；普通 re-arm 不加；遗留打开记录在新 run 开始时关为 lost。
 - 首次 run 的唤醒来源是创建者（父）；结束报告唤醒的 run 来源记为发报告的子；人经 TUI 的 agent-message 路由记 `user`，经普通 prompt 端点记 `system`；其余记 `system`。
 - 结束报告标明实际关闭的 run，停止通知只附最新记录快照、不声称取消身份；run 号允许不连续，不回溯补发报告；同一 run 号的报告至多一份；lost 的 run 没有报告；崩溃后不补发通知。
-- `agent_send` 的六种措辞按投递前快照选择；非子会话只写 running / idle；末尾恒附 `agent_status` 提示行；既有三句单向消息说明保留；stopped / lost 的第二句不假定停止者是调用者。
+- `agent_send` 的六种措辞按投递前快照选择；非子会话只写 running / idle；不附带 `agent_status` 查询提示；既有三句单向消息说明保留；stopped / lost 的第二句不假定停止者是调用者。
 - `agent_status` 的可查范围、解析与权限与 `agent_list` 完全相同；`agent_list` 被禁用时 `agent_status` 不出现在工具表、执行也被拒（有意的不对称：`agent_list` 自身无执行期检查）。
 - `agent_list` 不带参数时默认上限 50；计数行按过滤后、截断前的集合统计；`query` 不匹配 `agent_type`；自己的行恒在第一行（§6 第 18 点）。
 - 进度视图只在有直接子且 `agent_list` 非 deny 的会话出现；两个列表各最多 10 行；窗口至少覆盖上一次带视图的步开始以来（压缩等不出视图的迭代不推进它），首步为 run 开始以来；cut off 行不受窗口限制；"last step" 是状态投影最近一次置 busy 的时间；花名册不再写入历史。

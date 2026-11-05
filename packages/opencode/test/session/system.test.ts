@@ -117,6 +117,7 @@ describe("session.system", () => {
       const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)[0]
       expect(prompt).toBe(PROMPT_GPT)
       expect(prompt).not.toContain("apply_patch")
+      expect(prompt).not.toContain("multi_tool_use.parallel")
     }
   })
 
