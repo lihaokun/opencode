@@ -190,8 +190,68 @@ it.effect("collectCandidates keeps the most recent ref and appends todos", () =>
       "file:/f/two",
     ])
 
+    // Self-audit P3-b: the todo candidate carries the HIGHEST lastUseSeq
+    // (seq + 1) and is the cheapest material — it must ride at the TOP of the
+    // descending sort, not be appended after it. Appending processed it last,
+    // so any budget pressure degraded the whole current todo list first.
     const withTodos = collectCandidates(messages, [{ content: "ship it" } as Todo.Info])
-    expect(withTodos.at(-1)).toMatchObject({ kind: "todo", ref: "todo" })
+    expect(withTodos[0]).toMatchObject({ kind: "todo", ref: "todo" })
+    expect(withTodos.slice(1).map((c) => `${c.kind}:${c.ref}`)).toStrictEqual([
+      "skill:pdf",
+      "file:/f/one",
+      "file:/f/two",
+    ])
+  }),
+)
+
+it.effect("todo survives budget pressure that degrades files to references", () =>
+  Effect.gen(function* () {
+    // P3-b: the todo rides first (highest lastUseSeq, cheapest material), so
+    // budget pressure that degrades files still inlines the todo list; and
+    // should the todo itself ever degrade, its reason must not point at a
+    // nonexistent read-tool path (there is no todo-reading tool).
+    const todos = [{ content: "ship it" }] as unknown as Todo.Info[]
+    const tight = { ...cfg, budget_tokens: 10 }
+    const order = collectCandidates(
+      [
+        {
+          info: { id: "m" },
+          parts: [{ type: "tool", tool: "read", state: { status: "completed", metadata: { display: { type: "file", path: "/f/big" } } } }] as unknown as SessionV1.Part,
+        },
+      ] as unknown as SessionV1.WithParts[],
+      todos,
+    )
+    expect(order[0]).toMatchObject({ kind: "todo" })
+
+    // A budget too small for any file still inlines the todo (it is tiny and
+    // processed first); the file's degradation keeps the read-tool guidance,
+    // which IS honest for files.
+    const materials = yield* materializeCandidates(order, "", {
+      fs: {
+        stat: () => Effect.succeed({ type: "File", size: 100_000 }),
+        readFileStringSafe: () => Effect.succeed("x".repeat(100_000)),
+      } as unknown as FSUtil.Interface,
+      skill: Option.none(),
+      todos,
+      cfg: tight,
+    })
+    expect(materials[0]).toMatchObject({ candidate: { kind: "todo" }, status: "inlined" })
+    expect(JSON.stringify(materials[0])).toContain("ship it")
+    const fileMaterial = materials.find((m) => m.candidate.kind === "file")!
+    expect(fileMaterial.status).toBe("reference")
+    expect(fileMaterial.reason).toContain("read it with the read tool")
+    // The todo's own degradation reason (forced here via an already-exhausted
+    // budget path in renderMaterials) no longer mentions the read tool.
+    const rendered = renderMaterials(
+      [
+        ...materials,
+        { candidate: { kind: "todo", ref: "todo", lastUseSeq: 99 }, status: "inlined", content: JSON.stringify(todos) },
+        { candidate: { kind: "todo", ref: "todo", lastUseSeq: 99 }, status: "reference", reason: "restoration budget exhausted; the todo list was not re-inlined" },
+      ],
+      tight,
+    )!
+    expect(rendered).toContain("the todo list was not re-inlined")
+    expect(rendered).not.toContain("todo (skipped: restoration budget exhausted; read it with the read tool")
   }),
 )
 

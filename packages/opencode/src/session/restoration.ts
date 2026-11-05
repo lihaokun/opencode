@@ -131,8 +131,13 @@ export function collectCandidates(
     }
   }
   const candidates = [...byRef.values()].toSorted((a, b) => b.lastUseSeq - a.lastUseSeq)
-  if (todos.length > 0) candidates.push({ kind: "todo", ref: "todo", lastUseSeq: seq + 1 })
-  return candidates
+  // The todo list rides at the TOP of the sort, not the bottom: its
+  // lastUseSeq (seq + 1) makes it the most recent candidate, and it is the
+  // smallest material by far. Appending it after the sort processed it LAST,
+  // so any budget pressure degraded the whole current todo list to a
+  // reference line — the cheapest item paid first.
+  const todo = todos.length > 0 ? [{ kind: "todo" as const, ref: "todo", lastUseSeq: seq + 1 }] : []
+  return [...todo, ...candidates]
 }
 
 export function materializeCandidates(
@@ -156,7 +161,17 @@ export function materializeCandidates(
     (candidate) =>
       Effect.gen(function* () {
         if (spent >= deps.cfg.budget_tokens) {
-          return { candidate, status: "reference" as const, reason: "restoration budget exhausted" }
+          // Kind-specific honest guidance: skills and files are reloadable
+          // with their tools, but there is no todo-reading tool — pointing
+          // the model at "the read tool" for a todo list is a dead end.
+          return {
+            candidate,
+            status: "reference" as const,
+            reason:
+              candidate.kind === "todo"
+                ? "restoration budget exhausted; the todo list was not re-inlined"
+                : "restoration budget exhausted",
+          }
         }
         if (candidate.kind === "todo") {
           const content = JSON.stringify(deps.todos, null, 2)
@@ -275,7 +290,13 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
       if (overBudget || used + cost > cfg.budget_tokens) {
         overBudget = true
         pushLine(
-          `- ${clipRef(material.candidate.ref)} (skipped: restoration budget exhausted; read it with the read tool if needed)`,
+          `- ${clipRef(material.candidate.ref)} (skipped: restoration budget exhausted; ${
+            kind === "file"
+              ? "read it with the read tool if needed"
+              : kind === "skill"
+                ? "reload it with the skill tool if needed"
+                : "the todo list was not re-inlined"
+          })`,
         )
         continue
       }
