@@ -7,7 +7,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
@@ -16,6 +16,7 @@ import { Session } from "@/session/session"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { Truncate } from "@/tool/truncate"
+import { Tool } from "@/tool/tool"
 import { AgentLifecycle } from "@/agent-management/lifecycle"
 import { AgentInbox } from "@/agent-management/inbox"
 import { AgentStatusProjection } from "@/agent-management/status"
@@ -165,7 +166,8 @@ describe("agent tool", () => {
       )
 
       expect(result.output).toContain("session_id:")
-      expect(result.output).toContain("agent_list")
+      expect(result.output).toContain("Its result will arrive as a message when it finishes.")
+      expect(result.output).not.toContain("Use agent_list for its current status.")
       expect(result.output).not.toContain("status: running")
     }),
   )
@@ -238,7 +240,7 @@ describe("agent_send tool", () => {
 })
 
 // Subplan agentmgmt-2-run-state §4.6: what the message walks into, from a
-// snapshot taken before the delivery, and a pointer to agent_status.
+// snapshot taken before the delivery, without a follow-up query hint.
 describe("agent_send reports the target's run state", () => {
   const run = (number: number, extra: Record<string, unknown> = {}) => ({
     [AgentManagement.METADATA_AGENT_RUN]: { number, started_at: 1_000, woken_by: { kind: "system" }, ...extra },
@@ -247,6 +249,7 @@ describe("agent_send reports the target's run state", () => {
     const def = yield* (yield* AgentSendTool).init()
     const { ops } = stubOps()
     const result = yield* def.execute({ target, message: "carry on" }, context(caller, messageID, ops) as never)
+    expect(result.output).not.toContain("Current state of one agent:")
     return result.output.split("\n")
   })
 
@@ -280,9 +283,8 @@ describe("agent_send reports the target's run state", () => {
       expect(lines[1]).toBe(
         `Its run 5 ended at ${AgentRun.formatInstant(2_000)} (completed); that report reaches you as a separate message.`,
       )
-      expect(lines[2]).toBe(`Current state of one agent: agent_status(target="${done.id}").`)
-      expect(lines[3]).toBe(`Accepted for ${done.id}.`)
-      expect(lines[4]).toContain("one-way")
+      expect(lines[2]).toBe(`Accepted for ${done.id}.`)
+      expect(lines[3]).toContain("one-way")
 
       expect((yield* send(chat.id, assistant.id, stopped.id))[1]).toBe(
         `Its run 7 ended at ${AgentRun.formatInstant(2_000)} (stopped); no completion report exists for a stopped run.`,
@@ -302,7 +304,7 @@ describe("agent_send reports the target's run state", () => {
 
       const first = yield* send(chat.id, assistant.id, fresh.id)
       expect(first[0]).toMatch(new RegExp(`^${fresh.id} was idle; this message starts run 1 \\(sent `))
-      expect(first[1]).toContain("agent_status")
+      expect(first[1]).toBe(`Accepted for ${fresh.id}.`)
 
       const second = yield* send(chat.id, assistant.id, cut.id)
       expect(
@@ -461,6 +463,23 @@ describe("tool visibility", () => {
       // stop; offering either would only cost the model a turn to discover.
       const atLimit = yield* visibleAgentTools(current.id)
       expect(atLimit.toSorted()).toEqual(["agent_list", "agent_send", "agent_status"])
+
+      const source = yield* Tool.define(
+        "large-output",
+        Effect.succeed({
+          description: "Return a large test result",
+          parameters: Schema.Struct({}),
+          execute: () =>
+            Effect.succeed({ title: "large output", metadata: {}, output: "x".repeat(Truncate.MAX_BYTES + 1) }),
+        }),
+      )
+      const tool = yield* source.init()
+      const result = yield* tool.execute({}, context(current.id, MessageID.ascending(), stubOps().ops) as never)
+      expect(result.metadata).toMatchObject({ truncated: true, outputPath: expect.any(String) })
+      expect(result.output).toContain("Grep")
+      expect(result.output).toContain("Read with offset/limit")
+      expect(result.output).not.toContain("agent tool")
+      expect(result.output).not.toContain("Do NOT read")
     }),
   )
 })

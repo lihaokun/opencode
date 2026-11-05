@@ -159,6 +159,7 @@ describe("tool.grep", () => {
       const test = yield* TestInstance
       const file = path.join(test.directory, "test.txt")
       yield* Effect.promise(() => Bun.write(file, "line1\nline2\nline3"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "sibling.txt"), "line2\n"))
       const info = yield* GrepTool
       const grep = yield* info.init()
       const result = yield* grep.execute(
@@ -171,6 +172,81 @@ describe("tool.grep", () => {
       expect(result.metadata.matches).toBe(1)
       expect(result.output).toContain(file)
       expect(result.output).toContain("Line 2: line2")
+      expect(result.output).not.toContain("sibling.txt")
+    }),
+  )
+
+  it.instance("a file with no matches does not search its siblings", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const file = path.join(test.directory, "target.txt")
+      yield* Effect.promise(() => Bun.write(file, "unrelated text\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "sibling.txt"), "needle\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const result = yield* grep.execute({ pattern: "needle", path: file }, ctx)
+      expect(result.metadata.matches).toBe(0)
+      expect(result.output).toBe("No files found")
+      const directory = yield* grep.execute({ pattern: "needle", path: test.directory }, ctx)
+      expect(directory.metadata.matches).toBe(1)
+      expect(directory.output).toContain("sibling.txt")
+    }),
+  )
+
+  it.instance("relative file paths with special names remain exact with include", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const file = path.join(test.directory, "nested", "-target [1].txt")
+      yield* Effect.promise(() => Bun.write(file, "needle\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "nested", "sibling.txt"), "needle\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const input = { pattern: "needle", path: path.relative(test.directory, file) }
+      const result = yield* grep.execute({ ...input, include: "*.txt" }, ctx)
+      expect(result.metadata.matches).toBe(1)
+      expect(result.output).toContain("-target [1].txt")
+      expect(result.output).not.toContain("sibling.txt")
+      // Like the existing backend, an explicit file wins over include globs.
+      const explicit = yield* grep.execute({ ...input, include: "*.md" }, ctx)
+      expect(explicit.metadata.matches).toBe(1)
+      expect(explicit.output).not.toContain("sibling.txt")
+    }),
+  )
+
+  it.instance("missing search paths fail instead of searching their parent", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "sibling.txt"), "needle\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      for (const name of ["missing.txt", "missing-dir"]) {
+        const exit = yield* grep
+          .execute({ pattern: "needle", path: path.join(test.directory, name) }, ctx)
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          expect(String(Cause.squash(exit.cause))).toContain("Search path not found:")
+          expect(String(Cause.squash(exit.cause))).toContain(name)
+        }
+      }
+    }),
+  )
+
+  it.instance("an exact file named dash is not treated as stdin", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const file = path.join(test.directory, "-")
+      yield* Effect.promise(() => Bun.write(file, "needle\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "sibling.txt"), "needle\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      for (const target of [file, "./-"]) {
+        const result = yield* grep.execute({ pattern: "needle", path: target }, ctx)
+        expect(result.metadata.matches).toBe(1)
+        expect(result.output).toContain(`${file}:`)
+        expect(result.output).toContain("Line 1: needle")
+        expect(result.output).not.toContain("sibling.txt")
+      }
     }),
   )
 
@@ -430,6 +506,28 @@ describe("tool.grep", () => {
         grep.execute({ pattern: "needle", path: test.directory, head_limit: 0 }, ctx),
       )
       expect(Exit.isFailure(zeroLimit)).toBe(true)
+    }),
+  )
+
+  // #107: single-file scoping — an exact file target searches only that file
+  // (a bare "-" basename would read stdin to rg; symlinks keep the requested
+  // name and never leak sibling matches). Applies to the multi-mode tool too.
+  it.instance("an exact symlink file keeps its requested name and excludes siblings", () =>
+    Effect.gen(function* () {
+      if (process.platform === "win32") return
+      const test = yield* TestInstance
+      const real = path.join(test.directory, "real.txt")
+      const alias = path.join(test.directory, "alias.txt")
+      yield* Effect.promise(() => Bun.write(real, "needle\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "sibling.txt"), "needle\n"))
+      yield* Effect.promise(() => fs.symlink(real, alias))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const result = yield* grep.execute({ pattern: "needle", path: alias }, ctx)
+      expect(result.metadata.matches).toBe(1)
+      expect(result.output).toContain(alias)
+      expect(result.output).not.toContain(real)
+      expect(result.output).not.toContain("sibling.txt")
     }),
   )
 })

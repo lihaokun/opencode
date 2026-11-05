@@ -4,6 +4,7 @@ import { Effect } from "effect"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { cliIt } from "../../lib/cli-process"
+import { ACP_TEST_TIMEOUT_MS } from "./acp-test-client"
 import { createAcpClient, initialize, newSession, verifierConfig, verifierSkill } from "./helpers"
 
 describe("opencode acp skills subprocess", () => {
@@ -33,6 +34,6 @@ describe("opencode acp skills subprocess", () => {
 
         expect(update.params?.sessionId).toBe(session.sessionId)
       }),
-    60_000,
+    ACP_TEST_TIMEOUT_MS,
   )
 })

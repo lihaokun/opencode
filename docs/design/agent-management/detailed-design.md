@@ -839,8 +839,8 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 > **子计划 2 修订**：步骤 5 之前取目标状态投影与 `agentRun` 的快照；步骤 6 的 Accepted 渲染按快照分六种：
 > 空闲且记录已关闭 `was idle; this message starts run N+1 (sent …). Its run N ended at … (<outcome>); …`、空闲无记录
 > （省第二句）、空闲且记录未关闭（崩溃遗留，写 cut off 并预告 N+1）、在跑且记录未关闭 `is in run N (started …); it
-> reads this at its next step.`、在跑且记录已关闭或缺失（不预告号）、非子会话（只写 running / idle）；末尾恒加
-> `Current state of one agent: agent_status(target="…").`；既有三句保留。成立性论证见子计划 2 §5.4.3。
+> reads this at its next step.`、在跑且记录已关闭或缺失（不预告号）、非子会话（只写 running / idle）。
+> 既有三句保留；不再附带状态查询调用提示，用法由工具描述提供。成立性论证见子计划 2 §5.4.3。
 
 - **实现思路**：
   1. caller 取自 `ctx.sessionID`。
@@ -1043,7 +1043,7 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 #### 5.5.9 末尾段进度视图  *（子计划 2）*
 
 - 见子计划 2 §4.5、§5.3：`runLoop` 组装 tail 时以一次 SQL 取全部直接子的 id / metadata / time_updated，
-  状态来自内存投影；纯函数 `StepTail.renderSubagents` 渲染时钟与自身位置、总览、在跑列表（开始早的在前）、
+  状态来自内存投影；纯函数 `StepTail.renderSubagents` 渲染总览、在跑列表（开始早的在前）、
   窗口内结束列表（结束晚的在前），各至多 10 行；窗口取 10 分钟与上一步开始以来的较长者。门与被撤销的
   花名册一样受 `agent_list` deny 控制；总览只计两个列表截断前的集合，过窗结束项与空闲无记录项不计入；
   无有效项不附带子 Agent 节，运行项与未结算 cut off 项保留。Session 不清理。不写入历史、不进压缩输入、缓存断点跳过。

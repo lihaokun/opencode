@@ -261,11 +261,11 @@ output（默认 { decision: "allow" }）：
 ```
 数据结构：StepTail 进度视图（模型可见文本，只存在于本步请求）
 
-目的：给模型一张"此刻"的仪表盘——现在几点、自己在哪、谁在跑、谁刚停——而不是一条事件流。
+目的：给模型一张"此刻"的仪表盘——现在几点、谁在跑、谁刚停——而不是一条事件流。
 
 完整样子（两个列表都有内容时）：
 
-  Now: 2026-10-27T19:54:07+08:00. You are in run 6, step 12.
+  Now: 2026-10-27T19:54:07+08:00.
 
   Your subagents: 4 direct, 2 running, 2 idle.
   Running now:
@@ -278,8 +278,8 @@ output（默认 { decision: "allow" }）：
   Your last step repeated the tool calls of the step before it: 2 times in a row; the results were identical too: 2 times in a row.
 
 四个部分：
-  1. 时钟与自身位置：当前时间带日期与时区；run 号与步号是本会话自己的。主会话没有 run 号，只写
-     `You are at step 12.`
+  1. 时钟：只显示带日期与时区的当前时间，主会话与子会话相同。
+     不向模型展示自身 run 号与步号，避免模型复述计数或把新执行时的归零误解为压缩；内部记录、计数与日志保留。
   2. 子 agent 总览与在跑列表：本视图纳入的直接子 agent 总数、在跑数、空闲数。总览与两个列表共用筛选：
      在跑项全部纳入；空闲项只纳入第 3 部分的集合；计数在每列表 10 行截断前计算。已结束且过窗、空闲且无 run 记录的子不计入。
      在跑的逐个列出，每行 session_id、名字
@@ -356,10 +356,13 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
   目标在跑，记录已关闭或缺失（开始写入尚未完成、已失败，或 §5.2.2 的续跑窗口）：
     `ses_xxx (cw-b333) is running (its run record is not updated yet); it reads this at its next step.`
   目标不是子会话（如主会话）：只写 `is running` / `is idle`，不写 run 号
-  末尾恒加一行：`Current state of one agent: agent_status(target="ses_xxx").`
+  不附带 agent_status 查询调用提示；工具用法仅在工具描述中说明
   既有的三句"单向消息"说明保留在上述内容之后
   投递失败时工具返回失败文本，不输出以上任何一句
 ```
+
+2026-11-05 修订：创建 Agent 的成功返回也不再附带 `Use agent_list for its current status.`。
+两处仅移除重复的查询引导；状态事实、自动通知说明、工具描述与查询能力不变。
 
 ### 4.7 工具 schema（commit 5）
 
@@ -531,15 +534,15 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 
 #### 5.3.1 `StepTail.renderSubagents(input) -> string | undefined`（纯函数）
 
-- 入参：`{ now, self: { run?: number, step: number }, children: Child[], windowStart: number, viewer: SessionID }`，`Child = { id, name?, created: number, running: boolean, lastStep?: number, run?: AgentRun }`。
+- 入参：`{ now, children: Child[], windowStart: number, viewer: SessionID }`，`Child = { id, name?, created: number, running: boolean, lastStep?: number, run?: AgentRun }`。时钟行由调用方用 `renderClock({ now })` 独立生成，不传入自身 run 号与步号。
 - 步骤：
   1. `running = children.filter(c => c.running)`，按 `run?.started_at ?? created` 升序、并列按 id；取前 10；超出记 `omittedRunning`。
   2. `finished = children.filter(c => !c.running && (c.run?.ended_at !== undefined ? c.run.ended_at >= windowStart : c.run !== undefined))`——已关闭的按窗口筛，未关闭的（cut off）不筛；按 `ended_at ?? started_at` 降序、并列按 id；取前 10；超出记 `omittedFinished`。
-  3. 渲染 4.5 的格式：时钟与自身位置；总览行；在跑列表（每行 id、名字、run 号、since、来源、last step；若 `run.previous.ended_at >= windowStart` 附分号句）；已结束列表（已关闭行 / cut off 行）；省略行。
+  3. 渲染 4.5 的子 agent 部分：总览行；在跑列表（每行 id、名字、run 号、since、来源、last step；若 `run.previous.ended_at >= windowStart` 附分号句）；已结束列表（已关闭行 / cut off 行）；省略行。
   4. 两个列表都为空时返回 undefined；否则总览 direct = running.length + finished.length，idle = finished.length，均在截断前计算。时钟行由调用方按"随任一节出现"的规则添加，独立的重复计数不受影响。已结束列表的标题：窗口恰为 10 分钟时写 `Finished in the last 10 minutes, now idle:`，更长时写 `Finished since HH:MM:SS, now idle:`。在跑而记录缺失或已关闭（开始写入未完成、已失败，或续跑窗口）的行写 `running (run record not updated yet)`，与 agent_send 的措辞一致。
   > [已废弃，2026-11-03] 原“两列表都空时只返回总览”会让早已完成的子永久计入 idle；由 `session-fix-tail-window-counts.md` 的统一筛选替代。Session 数据与 agent_list / agent_status 查询范围不变。
 - **正确性论证**：纯函数；行数上界 30；排序有确定的第二键（id）；`finished` 的筛选条件与 4.5 定义逐字对应；cut off 行不受窗口限制故崩溃遗留可见直到被新 run 关闭。
-- 测试（`step-tail.test.ts`）：无子或筛选集合为空返回空；过窗结束项同时退出明细和总览，新运行项不带回旧 idle 计数；在跑按开始时间升序、无记录的按创建时间混排、记录已关闭的写 not updated yet、超 10 截断保留最早的；已结束按结束时间降序、超 10 截断保留最新的；cut off 行出现且不受窗口限制；上一个 run 在窗口内时附带分号句、不在窗口内不带；四种结局；来源三种；名字转义后仍是一行；标题两种；主会话第一行无 run 号；窗口取 10 分钟与上一步开始的较早者。FastCheck 验证筛选计数、过期项加入不影响输出和时间推进后的退出。
+- 测试（`step-tail.test.ts`）：无子或筛选集合为空返回空；过窗结束项同时退出明细和总览，新运行项不带回旧 idle 计数；在跑按开始时间升序、无记录的按创建时间混排、记录已关闭的写 not updated yet、超 10 截断保留最早的；已结束按结束时间降序、超 10 截断保留最新的；cut off 行出现且不受窗口限制；上一个 run 在窗口内时附带分号句、不在窗口内不带；四种结局；来源三种；名字转义后仍是一行；标题两种；主会话与子会话第一行仅当前时间；窗口取 10 分钟与上一步开始的较早者。FastCheck 验证筛选计数、过期项加入不影响输出和时间推进后的退出。
 
 #### 5.3.2 `runLoop` 中的数据采集（`prompt.ts:1434` 组装 tail 处）
 
@@ -549,7 +552,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
   2. **一次 SQL**：`sessions.children(id)`（`session.ts:688-696`，`where parent_id = ?`，一次查询、一次 hydrate）。为空 → 不附带。
   3. 状态投影取一次 `status.list()`（内存，一次拷贝；实施时从逐子 `get` 改为一次 `list`：600 个子时逐次 Effect 调用的开销就占去大半预算），对每行：`running = AgentStatusProjection.project(status) === "running"`（与 `agent_list` 同一映射函数）、`lastStep = at`；`run = metadata.agentRun`；名字 = `metadata.agentName`；`created = time.created`。采集放在 `StepTail.collectSubagents({ sessions, status, parentID })`，服务经参数显式传入（`Pick<Interface, "children">` / `Pick<Interface, "list">`），它能到达存储的路只有 `children` 这一条。
   4. `windowStart = min(now − 10 min, previousStepStart)`。
-  5. 自身位置：子会话取自己的 `agentRun.number`（本步开始时已写），主会话无；步号 = `step`。
+  5. 时钟：主会话与子会话统一调用 `renderClock({ now })`；自身 run 号与内部 `step` 不进入尾部文本。
 - `tail = StepTail.render([renderSubagents(...), renderRepeat(repeat)])`。
 - 同一 commit 删除 `applyAgentRoster` 的注入与调用（`reminders.ts:56-153`、`prompt.ts:1335-1339`），保留 `AGENT_ROSTER_SENTINEL`；相关测试改为断言不再注入。
 - **正确性论证**：
@@ -581,7 +584,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 #### 5.4.3 `agent_send` 的返回（`tool/agent.ts:288-319`）
 
 - 在 `deliver` **之前**取快照：`status = projection.of(target)`、`run = target.metadata.agentRun`、`isChild = target.parentID !== undefined`、名字；目标不存在时快照为空，投递本身会以 `AgentNotFound` 失败并返回失败文本。
-- 按 4.6 六种情况渲染（名字有则写成 `ses_xxx (cw-b333)`，经 `escapeField`）；随后 `agent_status` 提示行；再是既有的 `Accepted for …` 与两句单向说明。
+- 按 4.6 六种情况渲染（名字有则写成 `ses_xxx (cw-b333)`，经 `escapeField`）；随后为既有的 `Accepted for …` 与两句单向说明，不追加状态查询提示。
 - **正确性论证（决策 §6 第 4 点）**：目标在跑且记录未关闭时，消息进入当前 run 或紧接着的 re-arm run，run 号仍是 N（I5），"is in run N" 成立。目标空闲且记录已关闭时下一次开始的 run 必为 N+1（5.2.1 `begin` 对已关闭记录加一）；即使别的消息抢先唤醒，本消息也只是进入 run N+1。空闲且未关闭（遗留）时下一次开始会先关为 lost 再开 N+1，措辞如实写出。在跑且记录已关闭（续跑窗口或写入未完成）时不预告号。投递失败时工具本身返回失败文本，不输出这段话。快照在 deliver 之前取，避免 fork 已启动目标后读到 N+1 与 busy 的混合状态。
 - 测试：六种情况各一例（`tools.test.ts`）；预告的 run 号与下一份报告一致——经注册表里真实的 `agent_send` 投递、父收到的第二份报告带 `run="2"`（`prompt.test.ts` 定值用例）。T3 没有改走工具投递：工具的 `deliverAsync` 会自己 fork 目标的 run，与 T3 用 `prompt.loop` 控制每次 run 的起止冲突，所以 INV-6b 由定值用例承担，T3 承担 INV-6。
 
@@ -632,7 +635,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 2026-10-28/29（第一轮设计审查后，逐点确认）：
 
 7. **记录只存当前 run 加上一个 run 的结束**，不存环。曾提议最近转换的环，随第 8 点的改法一起撤销：快照视图只需要这两样。
-8. **末尾段改为快照视图**：时钟与自身位置、子 agent 总览、在跑列表（开始早的在前）、10 分钟内结束列表（结束晚的在前），各最多 10 行；窗口取 10 分钟与上一步开始以来的较长者。替代原"最近 5 步的变化列表"。写入历史的花名册随之撤销。
+8. **末尾段改为快照视图**：时钟、子 agent 总览、在跑列表（开始早的在前）、10 分钟内结束列表（结束晚的在前），各最多 10 行；窗口取 10 分钟与上一步开始以来的较长者。替代原"最近 5 步的变化列表"。写入历史的花名册随之撤销。
 9. **结局四种**：completed、failed、stopped、lost。lost 只由新 run 开始时关闭遗留的打开记录产生，没有报告。崩溃后不向父补发通知。
 10. **`Session.patch` 按会话加信号量**（方案 1，否决单独建表的方案 2）。HTTP `session.update` 保持整体替换语义，记为已知破坏路径。前提核查 H6c 已通过。
 11. **re-arm 由 work 闭包标志判断**，不由记录判断；到达步数上限那一步不询问钩子。

@@ -216,11 +216,8 @@ function view(children: StepTail.Child[], windowStart = now - StepTail.WINDOW_MS
 }
 
 describe("step tail: clock and window", () => {
-  test("the clock line names the run for a subagent and only the step for a main session", () => {
-    expect(StepTail.renderClock({ now, run: 6, step: 12 })).toBe(
-      `Now: ${AgentRun.formatInstant(now)}. You are in run 6, step 12.`,
-    )
-    expect(StepTail.renderClock({ now, step: 3 })).toBe(`Now: ${AgentRun.formatInstant(now)}. You are at step 3.`)
+  test("the clock line only shows the current time", () => {
+    expect(StepTail.renderClock({ now })).toBe(`Now: ${AgentRun.formatInstant(now)}.`)
   })
 
   test("the window reaches back ten minutes, or to the previous step's start when that is earlier", () => {

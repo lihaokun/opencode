@@ -123,11 +123,9 @@ export function windowStart(now: number, previousStepStart: number) {
   return Math.min(now - WINDOW_MS, previousStepStart)
 }
 
-/** Part 1 of the view: the clock, and where this session is. A main session has no run number. */
-export function renderClock(input: { now: number; run?: number; step: number }) {
-  const where =
-    input.run === undefined ? `You are at step ${input.step}.` : `You are in run ${input.run}, step ${input.step}.`
-  return `Now: ${AgentRun.formatInstant(input.now)}. ${where}`
+/** Part 1 of the view: the current time. */
+export function renderClock(input: { now: number }) {
+  return `Now: ${AgentRun.formatInstant(input.now)}.`
 }
 
 /**

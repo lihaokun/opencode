@@ -12,7 +12,7 @@ import * as Tool from "./tool"
 export const Parameters = Schema.Struct({
   pattern: Schema.String.annotate({ description: "The regex pattern to search for in file contents" }),
   path: Schema.optional(Schema.String).annotate({
-    description: "The directory to search in. Defaults to the current working directory.",
+    description: "The file or directory to search in. Defaults to the current working directory.",
   }),
   include: Schema.optional(Schema.String).annotate({
     description: 'File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")',
@@ -120,13 +120,30 @@ export const GrepTool = Tool.define(
           })
 
           const search = FSUtil.resolve(requested)
-          const info = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
-          const cwd = info?.type === "Directory" ? search : path.dirname(search)
+          // #107 hardened path handling: missing paths reject instead of
+          // silently degrading to a cwd search, non-file/dir shapes are
+          // refused, and a single-file target scopes rg to exactly that file
+          // (a bare "-" basename would mean stdin to rg even after "--").
+          // Our multi-mode branch keeps those semantics; the catch-to-
+          // undefined variant is gone.
+          const info = yield* fs
+            .stat(search)
+            .pipe(
+              Effect.catchReason("PlatformError", "NotFound", () =>
+                Effect.fail(new Error(`Search path not found: ${requested}`)),
+              ),
+            )
+          if (info.type !== "Directory" && info.type !== "File") {
+            throw new Error(`Search path must be a file or directory: ${requested}`)
+          }
+          const cwd = info.type === "Directory" ? search : path.dirname(search)
           // Step P6: dispatch rg args by mode (content --json; files
           // --files-with-matches; count --count-matches; -B/-A, -i, --sort).
           const result = yield* ripgrep.search({
             cwd,
             pattern: params.pattern,
+            // A bare "-" means stdin to ripgrep, even after "--".
+            file: info.type === "File" ? `./${path.basename(search)}` : undefined,
             include: params.include,
             limit: headLimit,
             offset,
@@ -138,8 +155,11 @@ export const GrepTool = Tool.define(
 
           // Step P9: render (absolute paths) + pagination outcome copy.
           // The service returns search-relative paths; render absolute paths
-          // like the legacy projection did, in every mode.
-          const rowBase = requestedInfo?.type === "Directory" ? requested : path.dirname(requested)
+          // like the legacy projection did, in every mode. #107: FSUtil.resolve
+          // follows symlinks, so a File target must render back to the
+          // REQUESTED path, not the realpath rg reported under.
+          const rowBase = requested
+          const requestedFile = info.type === "File" ? requested : undefined
 
           // `matches` counts match entries, not rendered rows: context rows ride
           // along in content mode but are not matches. The service's `total` is
@@ -168,7 +188,11 @@ export const GrepTool = Tool.define(
             }
             const output = [
               `Found ${result.files.length} files`,
-              ...result.files.map((file) => path.resolve(rowBase, file)),
+              // #107: a File target renders back as the requested path even
+              // when rg matched through a symlink (FSUtil.resolve realpaths).
+              ...(requestedFile
+                ? [requestedFile]
+                : result.files.map((file) => path.resolve(rowBase, file))),
               ...tail,
             ]
             return { title: params.pattern, metadata, output: output.join("\n") }
@@ -184,9 +208,9 @@ export const GrepTool = Tool.define(
             const totalMatches = result.counts.reduce((sum: number, item) => sum + item.count, 0)
             const output = [
               `Found ${result.counts.length} files with ${totalMatches} matches`,
-              ...result.counts.map(
-                (item) => `${path.resolve(rowBase, item.path)}: ${item.count} matches`,
-              ),
+              ...(requestedFile
+                ? [`${requestedFile}: ${result.counts[0]?.count ?? 0} matches`]
+                : result.counts.map((item) => `${path.resolve(rowBase, item.path)}: ${item.count} matches`)),
               ...tail,
             ]
             return { title: params.pattern, metadata, output: output.join("\n") }
@@ -203,8 +227,12 @@ export const GrepTool = Tool.define(
           }
 
           // The service returns search-relative paths; render absolute paths
-          // like the legacy projection did.
-          const rows = result.rows.map((row) => ({ ...row, path: path.resolve(rowBase, row.path) }))
+          // like the legacy projection did. A File target renders back as the
+          // requested path (symlink name preserved).
+          const rows = result.rows.map((row) => ({
+            ...row,
+            path: requestedFile ?? path.resolve(rowBase, row.path),
+          }))
 
           const output = [`Found ${result.total} matches`]
           // The shown range counts MATCH rows only — context rows ride along

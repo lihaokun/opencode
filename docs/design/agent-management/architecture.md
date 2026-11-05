@@ -800,8 +800,8 @@ forked fiber 继承 `currentContext`；若 `notify` 走上下文，它会随子�
 工具：agent_send
   target:         string    — session_id，或调用者邻居中某个 Agent 的实例名
   message:        string    — 正文；系统前缀由 M3 添加，调用方不可覆盖
-返回：accepted（已接受/已调度，不保证已送达或将被处理），加目标在投递那一刻的 run 状态与
-  `agent_status` 提示行（子计划 2 §4.6）
+返回：accepted（已接受/已调度，不保证已送达或将被处理），加目标在投递那一刻的 run 状态和
+  单向消息/自动通知说明；不附带状态查询提示（子计划 2 §4.6）
 
 工具：agent_stop
   target:         string    — session_id，或调用者直接子中某个 Agent 的实例名
