@@ -835,20 +835,11 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         slashName: "exit",
         slashAliases: ["quit", "q"],
         run: () => {
-          // Two-press confirmation, same shape as the esc interrupt: one
-          // ctrl+c with an empty input only shows the hint, a second press
-          // inside the window exits.
-          const decision = confirmExit(exitConfirm(), Date.now(), EXIT_CONFIRM_WINDOW_MS)
-          setExitConfirm(decision.next)
-          if (decision.decision === "exit") {
-            exit()
-            return
-          }
-          toast.show({
-            variant: "info",
-            message: "Press ctrl+c again to exit",
-            duration: EXIT_CONFIRM_WINDOW_MS,
-          })
+          // Typing a full slash command is an explicit exit intent — no
+          // mispress to guard against — so it exits immediately. The
+          // two-press guard lives on the keymap binding below, which is the
+          // only place a stray ctrl+c can come from.
+          exit()
         },
         category: "System",
       },
@@ -999,7 +990,26 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
       if (!current?.focused) return true
       return current.current.input === ""
     },
-    bindings: tuiConfig.keybinds.gather("app_exit", ["app.exit"]),
+    // The two-press guard belongs to the key binding only (ctrl+c, ctrl+d,
+    // <leader>q): that is where a mispress can happen. Explicit entry points
+    // — the /exit slash command, dispatching app.exit — call the command
+    // run above, which exits immediately.
+    bindings: tuiConfig.keybinds.gather("app_exit", ["app.exit"]).map((binding) => ({
+      ...binding,
+      cmd: () => {
+        const decision = confirmExit(exitConfirm(), Date.now(), EXIT_CONFIRM_WINDOW_MS)
+        setExitConfirm(decision.next)
+        if (decision.decision === "exit") {
+          exit()
+          return
+        }
+        toast.show({
+          variant: "info",
+          message: "Press ctrl+c again to exit",
+          duration: EXIT_CONFIRM_WINDOW_MS,
+        })
+      },
+    })),
   }))
 
   event.on("tui.command.execute", (evt, { workspace }) => {

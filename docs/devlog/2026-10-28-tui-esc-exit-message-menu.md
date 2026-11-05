@@ -14,6 +14,7 @@
 
 - 根因：`app.exit` 命令单步实现（run 即 `exit()`），空输入时一次按键即销毁 renderer。
 - 修复：抽出 `util/confirm-exit.ts` 纯函数状态机（注入时钟、5 秒窗口、阈值 2，形状与 `session.interrupt` 双击一致）；首按 toast `Press ctrl+c again to exit`，窗口内二按才退出。ctrl+d、`<leader>q`、`/exit` 共享同一 run，keybind 定义零改动。
+- **修订（review 后，见 fix 文档第四部分修订节）**：用户实测反馈 `/exit` 完整输入不存在误触可能，不应要求二次确认。门控从命令 run 移到 keymap binding 层——`gather("app_exit", ["app.exit"])` 逐 binding 覆盖 `cmd` 内联 `confirmExit` 状态机，只对真实按键（ctrl+c/ctrl+d/`<leader>q`）生效；命令入口（`/exit`、`/quit`、`/q`、palette、`tui.command.execute`）直接 `exit()`。新增按键级测试：`mockInput.pressKey` 双击驱动真实 keymap。
 
 ### 3. 消息菜单：左键不弹、右键开菜单、Revert 加确认（#69，commit 56b4866e3b）
 
@@ -43,6 +44,8 @@
 3. **keymap 同键双发**：dialog.replace 发生在命令处理中间时，同一按键事件可能同时命中替换前后的两层 binding（渲染测试里表现为"确认框闪现即完成"）。分步操作（键间隔 >100ms）下行为正确；不是本次改动引入，但写同类"菜单项 → replace 确认框"交互时要把这个时序考虑进去。
 4. **共享机 tmux 纪律**：只用自己创建的会话、`kill-session` 而非 `kill-server`（`kill-server` 会杀掉机器上所有人）。
 5. **验证"没发生"要查持久层**：端测 Cancel 分支时 TUI 界面无变化不能证明没 revert（revert 请求可能已发但被 UI 吞掉）；直接查 SQLite（`session.revert` 字段 / message 计数）才是硬证据。
+6. **按键级测试要喂饱启动语义（修订轮新增）**：用 `mockInput.pressKey` 驱动 base-mode binding 的测试，fixture 必须配置至少一个 provider——空 provider 集会让 app 在 sync complete 后自动弹 connect-provider 对话框（`sync.data.provider.length === 0` effect），对话框把 keymap 推入 `modal` 模式，base-mode binding 从此不匹配任何按键，表象是"按键没反应/测试超时"，真实原因是夹具没有还原真实启动状态。定位手段：`api.keymap.getData("opencode.mode")` 直接读当前模式。
+7. **`@opentui/keymap` 的 binding `cmd` 是一等公民（修订轮新增）**：`Binding.cmd` 原生接受 handler 函数，`gather()` 返回的 binding 数组可以在注册前 `.map()` 覆盖 `cmd` 注入自定义行为，且用户 keybind override 照常生效。这给"同一命令、按键入口与命令入口不同行为"提供了官方挂钩点，不必为门控拆成两个命令。
 
 ## 度量
 

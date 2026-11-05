@@ -74,12 +74,24 @@ test("app.exit prints the session epilogue after scoped cleanup", async () => {
     version: "0.0.0-test",
     time: { created: 0, updated: 0 },
   }
+  // A configured provider keeps the app in base mode: with zero providers the
+  // app force-opens the connect-provider dialog once sync completes, which
+  // pushes the "modal" mode and the base-mode app_exit binding stops
+  // matching — the keystroke guard could never fire.
+  const provider = {
+    id: "test",
+    name: "Test",
+    models: { "test-model": { id: "test-model", name: "Test Model", limit: { context: 200000 } } },
+  }
   const calls = createFetch((url) => {
     if (url.pathname === "/session") return json([demoSession])
     // The app now lives past the first app.exit press, so the session route's
     // own session.get fires; without this it errors and navigates home.
     if (url.pathname === "/session/dummy") return json(demoSession)
     if (url.pathname === "/part") return json([])
+    if (url.pathname === "/config/providers") return json({ providers: [provider], default: { test: "test-model" } })
+    if (url.pathname === "/provider")
+      return json({ all: [provider], default: { test: "test-model" }, connected: ["test"] })
   })
   const originalWrite = process.stdout.write.bind(process.stdout)
   let stdout = ""
@@ -117,15 +129,100 @@ test("app.exit prints the session epilogue after scoped cleanup", async () => {
     await ready
     await setup.renderOnce()
     await setup.renderOnce()
-    // Two-press exit confirmation: the first dispatch only arms the guard.
-    api?.keymap.dispatchCommand("app.exit")
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    expect(setup.renderer.isDestroyed).toBe(false)
+    // app.exit as a command (the /exit slash entry) is an explicit intent —
+    // a single dispatch exits without the two-press guard.
     api?.keymap.dispatchCommand("app.exit")
     await task
 
     expect(stdout).toContain("Demo session")
     expect(stdout).toContain("opencode -s dummy")
+  } finally {
+    process.stdout.write = originalWrite
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    mock.restore()
+  }
+})
+
+test("a single ctrl+c key press only warns; the second inside the window exits", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24, useThread: false })
+  const core = await import("@opentui/core")
+  mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
+  const events = createEventSource()
+  const demoSession = {
+    id: "dummy",
+    title: "Demo session",
+    slug: "dummy",
+    projectID: "project",
+    directory,
+    version: "0.0.0-test",
+    time: { created: 0, updated: 0 },
+  }
+  // A configured provider keeps the app in base mode: with zero providers the
+  // app force-opens the connect-provider dialog once sync completes, which
+  // pushes the "modal" mode and the base-mode app_exit binding stops
+  // matching — the keystroke guard could never fire.
+  const provider = {
+    id: "test",
+    name: "Test",
+    models: { "test-model": { id: "test-model", name: "Test Model", limit: { context: 200000 } } },
+  }
+  const calls = createFetch((url) => {
+    if (url.pathname === "/session") return json([demoSession])
+    // The app now lives past the first app.exit press, so the session route's
+    // own session.get fires; without this it errors and navigates home.
+    if (url.pathname === "/session/dummy") return json(demoSession)
+    if (url.pathname === "/part") return json([])
+    if (url.pathname === "/config/providers") return json({ providers: [provider], default: { test: "test-model" } })
+    if (url.pathname === "/provider")
+      return json({ all: [provider], default: { test: "test-model" }, connected: ["test"] })
+  })
+  const originalWrite = process.stdout.write.bind(process.stdout)
+  let stdout = ""
+  let api: TuiPluginApi | undefined
+  let started!: () => void
+  const ready = new Promise<void>((resolve) => {
+    started = resolve
+  })
+
+  process.stdout.write = ((chunk: string | Uint8Array) => {
+    stdout += String(chunk)
+    return true
+  }) as typeof process.stdout.write
+
+  try {
+    const { run } = await import("../src/app")
+    const task = Effect.runPromise(
+      run({
+        url: "http://test",
+        directory,
+        config: createTuiResolvedConfig({ plugin_enabled: {} }),
+        fetch: calls.fetch,
+        events: events.source,
+        args: { continue: true },
+        pluginHost: {
+          async start(input) {
+            api = input.api
+            started()
+          },
+          async dispose() {},
+        },
+      }).pipe(Effect.provide(AppNodeBuilder.build(Global.node))),
+    )
+
+    await ready
+    await setup.renderOnce()
+    await setup.renderOnce()
+
+    // The two-press guard is on the key binding, so drive it with the real
+    // keymap through the rendered app rather than dispatching the command.
+    // The toast is the observable first-press effect; wait for it so the
+    // second press lands inside the window against a settled keymap.
+    setup.mockInput.pressKey("c", { ctrl: true })
+    await setup.waitForFrame((frame) => frame.includes("Press ctrl+c again to exit"))
+    expect(setup.renderer.isDestroyed).toBe(false)
+
+    setup.mockInput.pressKey("c", { ctrl: true })
+    await task
   } finally {
     process.stdout.write = originalWrite
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()
