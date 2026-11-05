@@ -25,13 +25,13 @@ export const Parameters = Schema.Struct({
   insensitive: Schema.optional(Schema.Boolean).annotate({
     description: "Case-insensitive search",
   }),
-  before: Schema.optional(Schema.Number).annotate({
+  before: Schema.optional(NonNegativeInt).annotate({
     description: "Lines of context before each match, content mode only (max 10)",
   }),
-  after: Schema.optional(Schema.Number).annotate({
+  after: Schema.optional(NonNegativeInt).annotate({
     description: "Lines of context after each match, content mode only (max 10)",
   }),
-  context: Schema.optional(Schema.Number).annotate({
+  context: Schema.optional(NonNegativeInt).annotate({
     description:
       "Lines of context before and after each match, content mode only (max 10). Shorthand for before and after together; an explicit before or after overrides it for that side",
   }),
@@ -200,9 +200,12 @@ export const GrepTool = Tool.define(
           const rows = result.rows.map((row) => ({ ...row, path: path.resolve(rowBase, row.path) }))
 
           const output = [`Found ${result.total} matches`]
+          // The shown range counts MATCH rows only — context rows ride along
+          // but are not results, so rows.length would overstate the window.
+          const matchCount = rows.filter((row) => !row.context).length
           if (offset > 0 || result.hasMore) {
             output.push(
-              `Showing matches ${offset + 1}-${offset + result.rows.length} (offset ${offset}, limit ${headLimit})`,
+              `Showing matches ${offset + 1}-${offset + matchCount} (offset ${offset}, limit ${headLimit})`,
             )
           }
           let current = ""

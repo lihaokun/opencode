@@ -19,6 +19,18 @@ const ERROR_BYTES = 8 * 1024
 const MAX_RECORD_BYTES = 64 * 1024
 const MAX_SUBMATCHES = 100
 
+/**
+ * Oversized JSON records (default JSON limiter, 64 KiB): a MATCH line this
+ * large fails the whole search — an invisible match is worse than an error —
+ * but an oversized CONTEXT line is auxiliary decoration around fine match
+ * lines, so it is dropped and the page keeps its matches instead of failing.
+ */
+const oversizedRecord = (line: string): Effect.Effect<boolean, Error> => {
+  if (Buffer.byteLength(line, "utf8") <= MAX_RECORD_BYTES) return Effect.succeed(false)
+  if (/"type":"context"/.test(line)) return Effect.succeed(true)
+  return Effect.fail(failure(`Ripgrep JSON record exceeded ${MAX_RECORD_BYTES} bytes`))
+}
+
 const RawMatch = Schema.Struct({
   type: Schema.Literals(["match", "context"]),
   data: Schema.Struct({
@@ -263,12 +275,15 @@ const layer = Layer.effect(
             input.file ?? ".",
           ],
           parse: (line) =>
-            (Buffer.byteLength(line, "utf8") > MAX_RECORD_BYTES
-              ? Effect.fail(failure(`Ripgrep JSON record exceeded ${MAX_RECORD_BYTES} bytes`))
-              : Effect.try({
-                  try: () => JSON.parse(line) as unknown,
-                  catch: (cause) => failure("Invalid ripgrep JSON output", cause),
-                })
+            oversizedRecord(line).pipe(
+              Effect.flatMap((dropped) =>
+                dropped
+                  ? Effect.succeed(undefined)
+                  : Effect.try({
+                      try: () => JSON.parse(line) as unknown,
+                      catch: (cause) => failure("Invalid ripgrep JSON output", cause),
+                    }),
+              ),
             ).pipe(
               Effect.flatMap((json) => {
                 if (!json || typeof json !== "object" || !("type" in json) || json.type !== "match")
@@ -323,6 +338,12 @@ const layer = Layer.effect(
               "--no-config",
               "--hidden",
               "--no-messages",
+              // Paginated modes need cross-invocation order stability: rg's
+              // default walk order varies run to run, which duplicates and
+              // drops rows between offset pages. --sort=path forces a
+              // deterministic order (at the cost of the parallel walk — the
+              // row budget already bounds the work).
+              "--sort=path",
               ...(input.include ? [`--glob=${input.include}`] : []),
               "--glob=!**/.git/**",
               ...(input.insensitive ? ["-i"] : []),
@@ -384,6 +405,10 @@ const layer = Layer.effect(
             "--json",
             "--hidden",
             "--no-messages",
+            // Same cross-invocation stability as the non-content modes:
+            // offset windows must traverse an identical sequence on every
+            // page, and rg's default walk order is not stable.
+            "--sort=path",
             ...(input.include ? [`--glob=${input.include}`] : []),
             "--glob=!**/.git/**",
             ...(input.insensitive ? ["-i"] : []),
@@ -394,12 +419,15 @@ const layer = Layer.effect(
             input.file ?? ".",
           ],
           parse: (line) =>
-            (Buffer.byteLength(line, "utf8") > MAX_RECORD_BYTES
-              ? Effect.fail(failure(`Ripgrep JSON record exceeded ${MAX_RECORD_BYTES} bytes`))
-              : Effect.try({
-                  try: () => JSON.parse(line) as unknown,
-                  catch: (cause) => failure("Invalid ripgrep JSON output", cause),
-                })
+            oversizedRecord(line).pipe(
+              Effect.flatMap((dropped) =>
+                dropped
+                  ? Effect.succeed(undefined)
+                  : Effect.try({
+                      try: () => JSON.parse(line) as unknown,
+                      catch: (cause) => failure("Invalid ripgrep JSON output", cause),
+                    }),
+              ),
             ).pipe(
               Effect.flatMap((json) => {
                 if (
@@ -423,52 +451,59 @@ const layer = Layer.effect(
               }),
             ),
         }).pipe(
-          Effect.map((result) => {
-            // Window by MATCH records: leading context records are held until
-            // their match is admitted; the first match beyond the window ends
-            // the walk and its leading context is dropped (rg de-duplicates
-            // shared context lines, so at most one side of the boundary loses
-            // context — matches themselves are never lost).
-            const page: RawRow[] = []
-            let seen = 0
-            let hasMore = false
-            let pending: RawRow[] = []
-            for (const row of result.items) {
-              if (row.context) {
-                pending.push(row)
-                continue
-              }
-              seen += 1
-              if (seen > wanted + input.limit) {
-                hasMore = true
-                break
-              }
-              if (seen > wanted) page.push(...pending, row)
-              pending = []
-            }
-            if (!hasMore) page.push(...pending)
-
-            const rows = page.map((row) => ({
-              path: normalizeEntryPath(row.path.text),
-              line: row.line_number,
-              text:
-                row.lines.text.length > 2_000
-                  ? row.lines.text.slice(0, 2_000).replace(/[\uD800-\uDBFF]$/, "") + "..."
-                  : row.lines.text,
-              context: row.context,
-            }))
-            return { mode: "content" as const, rows, total: seen, hasMore }
-          }),
+          Effect.map((result) => windowContentRows(result.items, wanted, input.limit)),
         )
       }
     })
   }),
 )
 
+/**
+ * Window a content search by MATCH records. Leading context records are held
+ * until their match is admitted; the first match beyond the window ends the
+ * walk and its leading context is dropped (rg de-duplicates shared context
+ * lines, so at most one side of the boundary loses context — matches
+ * themselves are never lost). Trailing context after the last admitted match
+ * only enters the page when that match did: a page beyond the end (offset ≥
+ * total) admits no match, so its leftover context must not surface as a
+ * phantom result row.
+ */
+export function windowContentRows(rows: readonly RawRow[], offset: number, limit: number) {
+  const page: RawRow[] = []
+  let seen = 0
+  let hasMore = false
+  let pending: RawRow[] = []
+  for (const row of rows) {
+    if (row.context) {
+      pending.push(row)
+      continue
+    }
+    seen += 1
+    if (seen > offset + limit) {
+      hasMore = true
+      break
+    }
+    if (seen > offset) page.push(...pending, row)
+    pending = []
+  }
+  if (!hasMore && page.length > 0) page.push(...pending)
+
+  const rendered = page.map((row) => ({
+    path: normalizeEntryPath(row.path.text),
+    line: row.line_number,
+    text:
+      row.lines.text.length > 2_000
+        ? row.lines.text.slice(0, 2_000).replace(/[\uD800-\uDBFF]$/, "") + "..."
+        : row.lines.text,
+    context: row.context,
+  }))
+  return { mode: "content" as const, rows: rendered, total: seen, hasMore }
+}
+
 const normalizeEntryPath = (line: string) =>
   line.replace(/^(?:\.[\\/])+/u, "").replace(/^[\\/]+/u, "").replaceAll("\\", "/")
 
-type RawRow = {
+export type RawRow = {
   path: { text: string }
   line_number: number
   absolute_offset: number

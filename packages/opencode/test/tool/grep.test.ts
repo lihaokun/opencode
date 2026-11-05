@@ -433,3 +433,101 @@ describe("tool.grep", () => {
     }),
   )
 })
+
+// R2: every page is an independent rg invocation, so pagination only works if
+// the traversal order is identical across invocations. Walk a wider tree in
+// pages and demand the union is exactly the file set — no duplicates, no gaps.
+// The oracle keys on dir/file pairs (base names repeat across directories).
+it.instance("pagination across invocations covers every file exactly once", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    for (let dir = 0; dir < 11; dir += 1) {
+      for (let file = 0; file < 15; file += 1) {
+        yield* Effect.promise(() =>
+          Bun.write(path.join(test.directory, `d${dir}`, `f${file}.txt`), "needle\n"),
+        )
+      }
+    }
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+
+    for (const mode of ["files_with_matches", "count", "content"] as const) {
+      const seen: string[] = []
+      for (let offset = 0; offset < 165; offset += 20) {
+        const page = yield* grep.execute(
+          { pattern: "needle", path: test.directory, output_mode: mode, head_limit: 20, offset },
+          ctx,
+        )
+        // The tool renders absolute paths; key the oracle on dir/file pairs so
+        // identical base names in different directories stay distinct.
+        seen.push(...(page.output.match(/d\d+[\\/]f\d+\.txt/g) ?? []))
+      }
+      const unique = new Set(seen)
+      expect(unique.size).toBe(165)
+      expect(seen.length).toBe(unique.size)
+    }
+  }),
+  30_000,
+)
+
+// R7a: an offset past the last match must yield an empty page — the trailing
+// context of the final (skipped) match is not a result.
+it.instance("offset beyond the last match returns no context-only rows", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "r7a.txt"), "hit\nnot-a-match\n"))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+
+    const beyond = yield* grep.execute(
+      { pattern: "^hit$", path: test.directory, include: "r7a.txt", after: 1, offset: 1, head_limit: 1 },
+      ctx,
+    )
+    expect(beyond.metadata).toMatchObject({ matches: 0 })
+    expect(beyond.output).toContain("No matches at offset 1")
+    expect(beyond.output).not.toContain("not-a-match")
+  }),
+)
+
+// R7b: the "Showing matches" range counts matches; context rows ride along
+// without inflating the window.
+it.instance("showing-range counts matches, not context rows", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* Effect.promise(() =>
+      Bun.write(path.join(test.directory, "r7b.txt"), "hit\nafter\nhit\nafter\n"),
+    )
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+
+    const page = yield* grep.execute(
+      { pattern: "hit", path: test.directory, include: "r7b.txt", context: 1, offset: 1, head_limit: 1 },
+      ctx,
+    )
+    // One match admitted (the second "hit"); its before/after context rows
+    // appear in the listing but the range says exactly one match: 2-2.
+    expect(page.output).toContain("Showing matches 2-2 (offset 1, limit 1)")
+  }),
+)
+
+// Negative context values are rejected at the schema layer, not silently
+// treated as zero.
+it.instance("negative context parameters are rejected", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "neg.txt"), "needle\n"))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+
+    for (const params of [
+      { context: -1 },
+      { before: -2 },
+      { after: -3 },
+    ] as const) {
+      const exit = yield* Effect.exit(
+        grep.execute({ pattern: "needle", path: test.directory, ...params }, ctx),
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+    }
+  }),
+)

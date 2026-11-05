@@ -136,3 +136,12 @@ head_limit: PositiveInt（默认 100）
 - [x] callee 契约引用（Ripgrep post/错误通道、permission ask 不变）
 - [x] 循环刻画（流式 + matchesSeen 单调计数 → 终止）
 - [x] 上游事实显式（rg 无 --offset、context 记录形态、单文件裸 count、exit-code 语义——均实证标注）
+
+## 7. 二轮审核修正（2026-11-05，reviewer R2/R7 + 边界三件）
+
+- **跨页顺序稳定（R2）**：三种模式的 rg args 均加 `--sort=path`——rg 默认遍历顺序随调度漂移（实测 11 目录 160 文件、每页 20：多轮去重后 96/104/160 不等），offset 分页要求各次调用遍历相同序列。代价：rg 放弃并行遍历（`--sort` 强制单线程收集）；本工具的 rowLimit 已界定单次工作量，正确性优先，接受该权衡。
+- **越末页纯 context（R7a）**：`windowContentRows` 的尾随 context 仅在「本页确实收下过 match」时入页（`page.length > 0` 才收尾 pending）——offset 跳过全部 match 时，最后被跳过 match 的附属 context 不得当作结果行浮出。
+- **Showing 范围计 match 不计 context（R7b）**：渲染行的范围上限用 `rows.filter(!context).length`。
+- **context 负数（边界①）**：before/after/context 的 schema 从 `Schema.Number` 收紧为 `NonNegativeInt`，负值在参数解码层被拒（原实现静默当 0）。
+- **64KiB 记录上限与 context（边界②）**：保留防御上限（match 行超限仍整体失败——不可见的命中比报错更糟）；但 context 行超限时降级为丢弃该行、页面保留其余结果（`oversizedRecord` helper，按记录内 `"type":"context"` 判别）。原实现让一条超长非命中行拖垮整页。
+- **换行文件名（边界③，已知限制）**：`files_with_matches` 按 rg 文本行解析路径，POSIX 文件名含换行时会被拆成两个虚构路径；count 模式同理（静态分析，未实测）。rg 的 line-delimited 文本输出无法无歧义表达换行文件名，除非换 `--json` 协议——留作后续修订条件：若实际工作负载出现此类文件名，files/count 迁移到 JSON 输出。
