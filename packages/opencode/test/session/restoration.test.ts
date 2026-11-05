@@ -587,3 +587,81 @@ it.effect("renderMaterials collapses the not-restored list beyond the cap", () =
     expect(Token.estimate(text)).toBeLessThan(cfg.budget_tokens + 500)
   }),
 )
+
+// R3 (reviewer 二轮复现链): apply → filterCompactedEffect → toModelMessagesEffect.
+// A read whose stored output was cleared by compaction (time.compacted) but
+// whose disk body matches that cleared output: the model must still receive
+// the file body via the restoration block — the dedup baseline may not count
+// cleared history as visible.
+it.instance("restored body reaches the model when the only prior copy was compacted", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const session = yield* SessionNs.Service.use((ssn) => ssn.create({}))
+    const sessionID = session.id
+    const body = "COMPACTED-ONLY-BODY\n"
+    const spec = path.join(test.directory, "spec.md")
+    yield* seedRestorable(sessionID, spec, body)
+
+    // A real read tool's output IS the file body — make the stored output
+    // match the disk body byte-for-byte (this is what makes the old, buggy
+    // dedup matter: tailText.includes(content) would hit the cleared output).
+    const ssn0 = yield* SessionNs.Service
+    const raw = yield* ssn0.messages({ sessionID })
+    for (const msg of raw) {
+      for (const part of msg.parts) {
+        if (part.type === "tool" && part.tool === "read" && part.state.status === "completed") {
+          yield* ssn0.updatePart({
+            ...part,
+            state: { ...part.state, output: body },
+          })
+        }
+      }
+    }
+
+    // Then mark it compacted like a later prune would: storage keeps the
+    // output, the projection shows the placeholder instead.
+    const ssn = yield* SessionNs.Service
+    const seeded = yield* ssn.messages({ sessionID })
+    for (const msg of seeded) {
+      for (const part of msg.parts) {
+        if (part.type === "tool" && part.tool === "read") {
+          if (part.state.status === "completed") {
+            yield* ssn.updatePart({
+              ...part,
+              state: { ...part.state, time: { ...part.state.time, compacted: Date.now() } },
+            })
+          }
+        }
+      }
+    }
+
+    yield* apply({ sessionID })
+
+    const model = {
+      id: ModelV2.ID.make("test-model"),
+      providerID: ProviderV2.ID.make("test"),
+      api: { id: "test-model", url: "https://example.com", npm: "@ai-sdk/openai" },
+      name: "Test Model",
+      capabilities: {
+        temperature: true,
+        reasoning: false,
+        attachment: false,
+        toolcall: true,
+        input: { text: true, audio: false, image: false, video: false, pdf: false },
+        output: { text: true, audio: false, image: false, video: false, pdf: false },
+        interleaved: false,
+      },
+      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+      limit: { context: 0, input: 0, output: 0 },
+    } as Provider.Model
+
+    const active = yield* MessageV2.filterCompactedEffect(sessionID)
+    const rendered = yield* MessageV2.toModelMessagesEffect(active, model)
+    const wire = JSON.stringify(rendered)
+    // The restoration block carries the current disk body...
+    expect(wire).toContain(RESTORATION_SENTINEL)
+    expect(wire).toContain("COMPACTED-ONLY-BODY")
+    // ...and the cleared read renders as the placeholder, not the raw output.
+    expect(wire).toContain("[Old tool result content cleared]")
+  }),
+)
