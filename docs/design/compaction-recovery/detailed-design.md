@@ -109,6 +109,7 @@ restoration: Schema.optional(Schema.Struct({
   3. `file` 候选 → `stat`：失败 → `missing(reason)`；估算超限 → `reference`；否则读全文 → `tailText.includes(content)`（原始包含判定）→ 命中 `skipped-duplicate`；否则 `inlined`
   4. 顺序执行，单候选失败被 catch → `missing`（错误处理策略 §3）
 - **callee 契约引用**：`FSUtil` read/stat 的错误语义按平台错误处理；`Skill.Service` 解析失败为类型化错误（catch 转 missing）。
+- **提前停止（2026-11-05 R4）**：`spent ≥ budget_tokens` 后不再对剩余候选做 stat/read，直接标记 `reference("restoration budget exhausted")`——候选按最近使用降序，被放弃的尾部是最陈旧的材料。
 - **循环刻画**：候选有限，逐个处理，终止显然。
 - **正确性论证**（non-trivial）：
   - 前置：候选来自 5.2；tailText 语义见 5.1。
@@ -123,7 +124,7 @@ restoration: Schema.optional(Schema.Struct({
 - **实现思路**：
   1. 过滤：`max_files` 对 file 类 `inlined` 候选取前 N（排序已在 collect 保证按最近）
   2. 组装三节：Files（inlined 的 `### file: path` + content 围栏）/ Skills / Todos；reference/missing/skipped-budget 以单行引用形式集中列入 **`## Not restored` 节**（2026-10-20 独立审同步：初稿"列入对应节"，实现为独立降级节——展示形状以实现为准）
-  3. 顺序累加，累计 token 估算超过 `budget_tokens` 时：当前候选降级为 `skipped-budget` 引用行，后续全部同样降级（2026-10-20 独立审口径修订：~~引用行本身计入预算~~ → 仅 inlined content 计入 `used`；引用行约 15-30 token/条，不记账的方向是"多注入"而非"丢失"，G3 实质不受影响，按实现口径修文档）
+  3. 顺序累加，累计 token 估算超过 `budget_tokens` 时：当前候选降级为引用行，后续全部同样降级（2026-11-05 二轮审核 R4 再修订：2026-10-20 的"引用行不计预算"例外使 I2 上界不成立——1,000 条历史引用实测 47,496 token ≈ 预算 5.9 倍。现 Not restored 节条目数封顶 `MAX_REFERENCE_LINES = 20`，超出合并为一条有界汇总行 `- ...and N more`；`budget_tokens ≤ 0` 直接返回 `undefined`（0 预算 = 不恢复，堵住 1-2 字符内容因 round 后估算为 0 而免费注入的角落）。输出上界 = budget + 封顶引用节的固定框架开销）
   4. 整体无任何节有内容 → 返回 `undefined`
   5. 输出 = `RESTORATION_SENTINEL` 行 + 三节 markdown
 - **退出覆盖**：`undefined`（无材料）与文本两种返回。

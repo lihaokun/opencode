@@ -508,3 +508,53 @@ it.instance("apply skips an unsettled compaction marker, accepts a full-summary 
     expect(sentinels[0]!.text).toContain("body text")
   }),
 )
+
+// R3: the dedup baseline must match what the model actually sees. A read part
+// whose output was cleared by compaction (time.compacted set) renders as
+// "[Old tool result content cleared]" in the projection — the file body is NOT
+// model-visible even though it still sits in storage. buildTailText must skip
+// such parts, or a file whose disk body matches only the cleared history would
+// be wrongly deduped away and never restored.
+it.effect("buildTailText excludes compacted tool outputs from the dedup baseline", () =>
+  Effect.gen(function* () {
+    const messages = [
+      { info: { id: "m1" }, parts: [] },
+      {
+        info: { id: "m2" },
+        parts: [
+          {
+            type: "tool",
+            tool: "read",
+            state: { status: "completed", output: "FILE BODY", time: { compacted: 1 } },
+          },
+          {
+            type: "tool",
+            tool: "read",
+            state: { status: "completed", output: "VISIBLE BODY", time: {} },
+          },
+        ],
+      },
+    ] as unknown as SessionV1.WithParts[]
+
+    const tail = buildTailText(messages, "m2")
+    expect(tail).toContain("VISIBLE BODY")
+    expect(tail).not.toContain("FILE BODY")
+  }),
+)
+
+// R4: the omitted list is bounded. A thousand historical candidates must not
+// produce a Not-restored section measured in multiples of the budget.
+it.effect("renderMaterials collapses the not-restored list beyond the cap", () =>
+  Effect.sync(() => {
+    const candidate = (n: number) => ({ kind: "file" as const, ref: `/gone/${n}`, lastUseSeq: 0 })
+    const materials = Array.from({ length: 1_000 }, (_, n) => ({
+      candidate: candidate(n),
+      status: "missing" as const,
+      reason: "file not found on disk",
+    }))
+    const text = renderMaterials(materials, cfg)!
+    expect(text).toContain("...and 980 more (use the read/glob tools if needed)")
+    // The whole block stays inside a small multiple of the budget.
+    expect(Token.estimate(text)).toBeLessThan(cfg.budget_tokens + 500)
+  }),
+)

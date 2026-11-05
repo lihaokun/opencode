@@ -16,49 +16,61 @@ import { Token } from "../../src/util/token"
 describe("PBT renderMaterials", () => {
   const cfg = { ...restorationConfig(undefined), max_files: 3, budget_tokens: 50 }
 
-  const materialArb: fc.Arbitrary<RestorationMaterial> = fc.record({
-    candidate: fc.record({
-      kind: fc.constant("file"),
-      ref: fc.string({ minLength: 1, maxLength: 20 }).map((s) => `/f/${s.replace(/[^\w.-]/g, "x")}`),
-      lastUseSeq: fc.nat(100),
-    }),
-    status: fc.constantFrom("inlined", "reference", "skipped-duplicate", "skipped-budget", "missing"),
-    content: fc.option(fc.string({ minLength: 1, maxLength: 400 }).filter((s) => s.trim().length > 0), {
-      nil: undefined,
-    }),
-  }) as fc.Arbitrary<RestorationMaterial>
+  // Inlined materials always carry content in production (materialize only
+  // stamps inlined on a successful read); tie the generator to that shape so
+  // the property tests render logic, not impossible inputs.
+  const refArb = fc.string({ minLength: 1, maxLength: 20 }).map((s) => `/f/${s.replace(/[^\w.-]/g, "x")}`)
+  const contentArb = fc.string({ minLength: 1, maxLength: 400 }).filter((s) => s.trim().length > 0)
+  const candidateArb = fc.record({
+    kind: fc.constantFrom("file", "skill", "todo"),
+    ref: refArb,
+    lastUseSeq: fc.nat(100),
+  })
+  const materialArb: fc.Arbitrary<RestorationMaterial> = fc
+    .record({
+      candidate: candidateArb,
+      status: fc.constantFrom("inlined", "reference", "skipped-duplicate", "skipped-budget", "missing"),
+      content: fc.option(contentArb, { nil: undefined }),
+    })
+    .map((m) => (m.status === "inlined" ? { ...m, content: m.content ?? "fallback-body" } : m)) as fc.Arbitrary<RestorationMaterial>
 
-  it("inlined file count and total budget stay within limits, and rendering is idempotent", () => {
+  it("the final rendered block honors max_files and budget on the OUTPUT itself", () => {
     fc.assert(
       fc.property(fc.array(materialArb, { maxLength: 20 }), (materials) => {
         const text = renderMaterials(materials, cfg)
         if (!text) return materials.every((m) => m.status !== "inlined")
-        // Count occurrences, not membership: duplicate refs share one heading
-        // string, so a single includes() would over-count them.
-        const countHeadings = (ref: string) => text.split(`### ${ref}\n`).length - 1
-        const inlinedFiles = materials.filter(
-          (m) =>
-            m.status === "inlined" &&
-            m.candidate.kind === "file" &&
-            countHeadings(m.candidate.ref) > 0,
-        )
-        const totalHeadings = new Set(
-          inlinedFiles.map((m) => m.candidate.ref),
-        )
-        for (const ref of totalHeadings) {
-          expect(countHeadings(ref)).toBeLessThanOrEqual(cfg.max_files)
-        }
-        let used = 0
-        for (const m of inlinedFiles) {
-          used += Token.estimate(m.content ?? "")
-        }
-        expect(used).toBeLessThanOrEqual(cfg.budget_tokens)
+        // Oracle over the final text, not the inputs: count FILE headings —
+        // inside the "## Files" section only, so a skill/todo heading that
+        // happens to reuse a /f/ ref is not miscounted — and the total must
+        // obey max_files (the old per-ref oracle could not catch many refs
+        // blowing past it).
+        const filesSection = text.slice(text.indexOf("## Files"), text.indexOf("## Skills") === -1 ? undefined : text.indexOf("## Skills"))
+        const fileHeadings = (filesSection.match(/^### /gm) ?? []).length
+        expect(fileHeadings).toBeLessThanOrEqual(cfg.max_files)
+        // The whole block — headings, fences, reference lines, overflow
+        // summary — stays within budget plus the fixed framing allowance
+        // (sentinel + section titles + the capped not-restored list).
+        expect(Token.estimate(text)).toBeLessThanOrEqual(cfg.budget_tokens + 200)
         expect(text).toContain(RESTORATION_SENTINEL)
         // Idempotent: the same input renders to the same output.
         expect(renderMaterials(materials, cfg)).toBe(text)
         return true
       }),
       { seed: 0x2_026_10_18, numRuns: 300 },
+    )
+  })
+
+  it("zero budget renders no inlined bodies", () => {
+    fc.assert(
+      fc.property(fc.array(materialArb, { maxLength: 20 }), (materials) => {
+        const tight = { ...cfg, budget_tokens: 0 }
+        const text = renderMaterials(materials, tight)
+        if (!text) return true
+        // Nothing is inlined: no fenced content sections at all.
+        expect(text).not.toMatch(/^### \/f\//gm)
+        return true
+      }),
+      { seed: 0x2_026_10_18, numRuns: 100 },
     )
   })
 

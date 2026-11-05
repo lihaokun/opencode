@@ -73,7 +73,13 @@ type ConfigV1Lite = {
   }
 }
 
-/** Text of everything filterCompacted still shows verbatim: the dedup baseline. */
+/**
+ * Text of everything filterCompacted still shows verbatim: the dedup baseline.
+ * Mirrors the model projection (message-v2.ts completed branch): a part with
+ * `time.compacted` renders as "[Old tool result content cleared]", so its
+ * stored output is NOT model-visible and must not enter the baseline —
+ * matching against it would wrongly mark files as still-present (R3).
+ */
 export function buildTailText(messages: SessionV1.WithParts[], tailStartID: string | undefined): string {
   if (!tailStartID) return ""
   const index = messages.findIndex((msg) => msg.info.id === tailStartID)
@@ -82,7 +88,12 @@ export function buildTailText(messages: SessionV1.WithParts[], tailStartID: stri
   for (const msg of messages.slice(index)) {
     for (const part of msg.parts) {
       if (part.type === "text") parts.push(part.text)
-      else if (part.type === "tool" && part.state.status === "completed") parts.push(part.state.output)
+      else if (
+        part.type === "tool" &&
+        part.state.status === "completed" &&
+        !part.state.time?.compacted
+      )
+        parts.push(part.state.output)
     }
   }
   return parts.join("\n\n")
@@ -134,12 +145,23 @@ export function materializeCandidates(
     cfg: RestorationConfig
   },
 ): Effect.Effect<RestorationMaterial[]> {
+  // R4: stop reading once inlined content has consumed the budget — later
+  // candidates can only become reference lines, and stat/read-ing every
+  // historical file just to render "- path (skipped: …)" wastes IO on
+  // thousand-file histories. Candidates are ordered most-recent-first, so the
+  // dropped tail is the stalest material.
+  let spent = 0
   return Effect.forEach(
     candidates,
     (candidate) =>
       Effect.gen(function* () {
+        if (spent >= deps.cfg.budget_tokens) {
+          return { candidate, status: "reference" as const, reason: "restoration budget exhausted" }
+        }
         if (candidate.kind === "todo") {
-          return { candidate, status: "inlined" as const, content: JSON.stringify(deps.todos, null, 2) }
+          const content = JSON.stringify(deps.todos, null, 2)
+          spent += Token.estimate(content)
+          return { candidate, status: "inlined" as const, content }
         }
         if (candidate.kind === "skill") {
           if (Option.isNone(deps.skill)) {
@@ -160,6 +182,7 @@ export function materializeCandidates(
               reason: `skill body is ${Token.estimate(content)} tokens (over the ${deps.cfg.file_max_tokens} cap); reload it with the skill tool if needed`,
             }
           }
+          spent += Token.estimate(content)
           return { candidate, status: "inlined" as const, content }
         }
         const stat = yield* deps.fs.stat(candidate.ref).pipe(Effect.option)
@@ -187,6 +210,7 @@ export function materializeCandidates(
         if (tailText.includes(content)) {
           return { candidate, status: "skipped-duplicate" as const, reason: "already intact in the retained tail" }
         }
+        spent += Token.estimate(content)
         return { candidate, status: "inlined" as const, content }
       }).pipe(
         Effect.catch((error) =>
@@ -200,9 +224,21 @@ export function materializeCandidates(
   )
 }
 
+/**
+ * Cap on the "Not restored" reference lines: the omitted list is explanatory,
+ * not payload, so it collapses to a single bounded summary line beyond this
+ * many entries (R4 — unbounded reference text broke the budget contract).
+ */
+const MAX_REFERENCE_LINES = 20
+
 export function renderMaterials(materials: RestorationMaterial[], cfg: RestorationConfig): string | undefined {
+  // budget_tokens: 0 means "restore nothing" — without this gate, content
+  // whose rounded token estimate is 0 (1–2 chars) would still inline "for
+  // free" past an explicitly zeroed budget.
+  if (cfg.budget_tokens <= 0) return undefined
   const sectionsByKind: Record<"file" | "skill" | "todo", string[]> = { file: [], skill: [], todo: [] }
   const lines: string[] = []
+  let overflowLines = 0
   let used = 0
   let fileCount = 0
   let overBudget = false
@@ -211,18 +247,25 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
     const reason = material.reason ?? material.status
     return `- ${material.candidate.ref} (${reason})`
   }
+  const pushLine = (line: string) => {
+    if (lines.length >= MAX_REFERENCE_LINES) {
+      overflowLines += 1
+      return
+    }
+    lines.push(line)
+  }
 
   for (const material of materials) {
     const kind = material.candidate.kind
     if (material.status === "inlined") {
       if (kind === "file" && fileCount >= cfg.max_files) {
-        lines.push(`- ${material.candidate.ref} (beyond max_files=${cfg.max_files}; read it with the read tool if needed)`)
+        pushLine(`- ${material.candidate.ref} (beyond max_files=${cfg.max_files}; read it with the read tool if needed)`)
         continue
       }
       const cost = Token.estimate(material.content ?? "")
       if (overBudget || used + cost > cfg.budget_tokens) {
         overBudget = true
-        lines.push(
+        pushLine(
           `- ${material.candidate.ref} (skipped: restoration budget exhausted; read it with the read tool if needed)`,
         )
         continue
@@ -233,7 +276,7 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
       continue
     }
     if (material.status === "skipped-duplicate") continue
-    lines.push(referenceLine(material))
+    pushLine(referenceLine(material))
   }
 
   const sections = (["file", "skill", "todo"] as const).flatMap((kind) =>
@@ -241,7 +284,11 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
   )
   if (sections.length === 0 && lines.length === 0) return undefined
 
-  return [RESTORATION_SENTINEL, "Context restored from before the last compaction:", ...sections, ...(lines.length > 0 ? ["## Not restored", ...lines] : [])].join("\n")
+  const notRestored = [
+    ...(lines.length > 0 ? ["## Not restored", ...lines] : []),
+    ...(overflowLines > 0 ? [`- ...and ${overflowLines} more (use the read/glob tools if needed)`] : []),
+  ]
+  return [RESTORATION_SENTINEL, "Context restored from before the last compaction:", ...sections, ...notRestored].join("\n")
 }
 
 export const apply = Effect.fn("SessionRestoration.apply")(function* (input: { sessionID: SessionID }) {
