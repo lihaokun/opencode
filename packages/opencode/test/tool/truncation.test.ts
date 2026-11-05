@@ -192,29 +192,31 @@ describe("Truncate", () => {
       }),
     )
 
-    it.live("suggests delegating when the agent may spawn", () =>
+    it.live("head truncation suggests direct reads without requiring delegation", () =>
       Effect.gen(function* () {
         const svc = yield* Truncate.Service
         const lines = Array.from({ length: 100 }, (_, i) => `line${i}`).join("\n")
-        const agent = { permission: [{ permission: "agent", pattern: "*", action: "allow" as const }] }
-        const result = yield* svc.output(lines, { maxLines: 10 }, agent as any)
+        const result = yield* svc.output(lines, { maxLines: 10 })
 
         expect(result.truncated).toBe(true)
         expect(result.content).toContain("Grep")
-        expect(result.content).toContain("agent tool")
+        expect(result.content).toContain("Read with offset/limit")
+        expect(result.content).not.toContain("agent tool")
+        expect(result.content).not.toContain("Do NOT read")
       }),
     )
 
-    it.live("omits the delegation hint when the agent may not spawn", () =>
+    it.live("tail truncation suggests direct reads without requiring delegation", () =>
       Effect.gen(function* () {
         const svc = yield* Truncate.Service
         const lines = Array.from({ length: 100 }, (_, i) => `line${i}`).join("\n")
-        const agent = { permission: [{ permission: "agent", pattern: "*", action: "deny" as const }] }
-        const result = yield* svc.output(lines, { maxLines: 10 }, agent as any)
+        const result = yield* svc.output(lines, { maxLines: 10, direction: "tail" })
 
         expect(result.truncated).toBe(true)
         expect(result.content).toContain("Grep")
+        expect(result.content).toContain("Read with offset/limit")
         expect(result.content).not.toContain("agent tool")
+        expect(result.content).not.toContain("Do NOT read")
       }),
     )
 

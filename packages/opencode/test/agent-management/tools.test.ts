@@ -7,7 +7,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
@@ -16,6 +16,7 @@ import { Session } from "@/session/session"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { Truncate } from "@/tool/truncate"
+import { Tool } from "@/tool/tool"
 import { AgentLifecycle } from "@/agent-management/lifecycle"
 import { AgentInbox } from "@/agent-management/inbox"
 import { AgentStatusProjection } from "@/agent-management/status"
@@ -462,6 +463,23 @@ describe("tool visibility", () => {
       // stop; offering either would only cost the model a turn to discover.
       const atLimit = yield* visibleAgentTools(current.id)
       expect(atLimit.toSorted()).toEqual(["agent_list", "agent_send", "agent_status"])
+
+      const source = yield* Tool.define(
+        "large-output",
+        Effect.succeed({
+          description: "Return a large test result",
+          parameters: Schema.Struct({}),
+          execute: () =>
+            Effect.succeed({ title: "large output", metadata: {}, output: "x".repeat(Truncate.MAX_BYTES + 1) }),
+        }),
+      )
+      const tool = yield* source.init()
+      const result = yield* tool.execute({}, context(current.id, MessageID.ascending(), stubOps().ops) as never)
+      expect(result.metadata).toMatchObject({ truncated: true, outputPath: expect.any(String) })
+      expect(result.output).toContain("Grep")
+      expect(result.output).toContain("Read with offset/limit")
+      expect(result.output).not.toContain("agent tool")
+      expect(result.output).not.toContain("Do NOT read")
     }),
   )
 })
