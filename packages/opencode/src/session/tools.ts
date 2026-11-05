@@ -532,6 +532,7 @@ function parsesTo(text: string, value: unknown) {
   } catch {
     return false
   }
+}
 
 // The tool table is rebuilt for every provider step, so one detector sees exactly
 // the calls of one model response, in the order they start. A response that
