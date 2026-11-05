@@ -44,6 +44,8 @@ GPT 模板混入了当前宿主不存在的并行接口名称。
 
 状态：四个 grep 回归在旧实现上全部失败；修复后相关工具、截断、Agent、系统提示及 Session 工具测试共 75 pass / 0 fail；Tool.define/插件注册包装 22 pass / 0 fail；真实 agent_send/完成通知回归 1 pass / 0 fail。合计 98 项通过，`bun typecheck` 通过。缺失路径、特殊文件名、文件/目录软链接和显式路径优先于 include 的行为均有覆盖；Windows 效果由 PR CI 验证。
 
+CI 补正：首次完整分片检出 grep 参数说明的 JSON Schema 快照未同步（1048 pass / 1 fail）。已将快照同步为 file or directory，并运行完整 `test/tool/parameters.test.ts`：54 pass / 0 fail，15 个快照通过；保持原快照断言。
+
 ## 7. 代码更新清单
 
 - `tool/grep.ts`、`tool/grep.txt`、grep 回归：目标范围和错误处理。
