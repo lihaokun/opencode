@@ -103,4 +103,42 @@ describe("BackgroundJob", () => {
       expect((yield* jobs.get(job.id))?.status).toBe("running")
     }),
   )
+
+  it.live("cancel records a caller-provided output snapshot", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const latch = yield* Deferred.make<void>()
+      const job = yield* jobs.start({
+        type: "shell",
+        run: Deferred.await(latch).pipe(Effect.as("never recorded")),
+      })
+
+      const cancelled = yield* jobs.cancel(job.id, { output: "stopped\nbuffer-tail" })
+      expect(cancelled?.status).toBe("cancelled")
+      expect(cancelled?.output).toBe("stopped\nbuffer-tail")
+      // The snapshot survives the interruption and is the single source a
+      // post-cancel read (shell_output's settled branch) consults.
+      expect((yield* jobs.get(job.id))).toMatchObject({
+        status: "cancelled",
+        output: "stopped\nbuffer-tail",
+      })
+      yield* Deferred.succeed(latch, undefined)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("cancel without an output leaves output unset", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const latch = yield* Deferred.make<void>()
+      const job = yield* jobs.start({
+        type: "test",
+        run: Deferred.await(latch).pipe(Effect.as("late")),
+      })
+
+      const cancelled = yield* jobs.cancel(job.id)
+      expect(cancelled?.status).toBe("cancelled")
+      expect(cancelled?.output).toBeUndefined()
+      yield* Deferred.succeed(latch, undefined)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
 })

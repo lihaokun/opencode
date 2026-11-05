@@ -2037,6 +2037,12 @@ export type Config = {
     tail_turns?: number
     preserve_recent_tokens?: number
     reserved?: number
+    restoration?: {
+      enabled?: boolean
+      max_files?: number
+      file_max_tokens?: number
+      budget_tokens?: number
+    }
   }
   experimental?: {
     disable_paste_summary?: boolean

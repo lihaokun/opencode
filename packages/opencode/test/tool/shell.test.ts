@@ -12,6 +12,7 @@ import { Filesystem } from "@/util/filesystem"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
 import type { Permission } from "../../src/permission"
 import { Agent } from "../../src/agent/agent"
+import { BackgroundJob } from "../../src/background/job"
 import { Truncate } from "@/tool/truncate"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -32,6 +33,7 @@ const shellLayer = Layer.mergeAll(
       Config.node,
       Agent.node,
       RuntimeFlags.node,
+      BackgroundJob.node,
     ]),
   ),
   testInstanceStoreLayer,

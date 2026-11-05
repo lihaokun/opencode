@@ -161,12 +161,19 @@ function extractUpstreamHeaders(body: unknown): Record<string, unknown> | undefi
   return isRecord(headers) ? headers : undefined
 }
 
-// Mirrors the runtime routing in provider.ts getModel.
+// Mirrors the runtime routing in provider.ts getModel. The upstream base URLs
+// are pinned to the provider defaults: createAnthropic/createOpenAI inherit
+// *_BASE_URL from the environment, and this test's gateway host patterns (see
+// GATEWAY_PROVIDERS) are defined against the canonical api.anthropic.com /
+// api.openai.com hosts — a custom endpoint has no routing entry by design.
 function gatewayModel(apiId: string, gatewayToken = "test") {
   const aigateway = createAiGateway({ accountId: "test", gateway: "test", apiKey: gatewayToken })
-  if (apiId.startsWith("openai/")) return aigateway(createOpenAI()(apiId.slice("openai/".length)))
+  if (apiId.startsWith("openai/"))
+    return aigateway(createOpenAI({ baseURL: "https://api.openai.com/v1" })(apiId.slice("openai/".length)))
   if (apiId.startsWith("anthropic/"))
-    return aigateway(createAnthropic()(apiId.slice("anthropic/".length).replaceAll(".", "-")))
+    return aigateway(
+      createAnthropic({ baseURL: "https://api.anthropic.com" })(apiId.slice("anthropic/".length).replaceAll(".", "-")),
+    )
   const isWorkersAi = apiId.startsWith("workers-ai/") || apiId.startsWith("@cf/")
   const unified = createUnified(isWorkersAi ? { apiKey: gatewayToken } : {})
   return aigateway(unified(apiId))

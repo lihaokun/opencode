@@ -18,6 +18,21 @@ const original = {
 const auth = { username: "opencode", password: "listen-secret" }
 const testPty = process.platform === "win32" ? test.skip : test
 
+// Bun reads proxy settings when the process starts — before any preload can
+// clear them — and the WebSocket upgrade through a real TCP listener then
+// routes through the machine proxy, stalling the loopback stream. Skipped
+// when a proxy is configured: an environment conflict, not a regression
+// signal. (The in-process variants above are unaffected and still run.)
+const proxied = Boolean(
+  process.env.http_proxy ??
+    process.env.https_proxy ??
+    process.env.all_proxy ??
+    process.env.HTTP_PROXY ??
+    process.env.HTTPS_PROXY ??
+    process.env.ALL_PROXY,
+)
+const testPtyRealListener = proxied || process.platform === "win32" ? test.skip : testPty
+
 afterEach(async () => {
   Flag.OPENCODE_SERVER_PASSWORD = original.OPENCODE_SERVER_PASSWORD
   Flag.OPENCODE_SERVER_USERNAME = original.OPENCODE_SERVER_USERNAME
@@ -167,7 +182,7 @@ async function openPtySocket(listener: Awaited<ReturnType<typeof startListener>>
 }
 
 describe("HttpApi Server.listen", () => {
-  testPty("serves HTTP routes and upgrades PTY websocket through Server.listen", async () => {
+  testPtyRealListener("serves HTTP routes and upgrades PTY websocket through Server.listen", async () => {
     await using tmp = await tmpdir({ config: { formatter: false, lsp: false } })
     const listener = await startListener()
     let stopped = false

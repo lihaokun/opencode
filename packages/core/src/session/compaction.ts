@@ -7,11 +7,11 @@ import type { EventV2 } from "../event"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
+import { summarizeToolText } from "./tool-result-projection"
 import { Token } from "../util/token"
 
 const DEFAULT_BUFFER = 20_000
 const DEFAULT_KEEP_TOKENS = 8_000
-const TOOL_OUTPUT_MAX_CHARS = 2_000
 const SUMMARY_OUTPUT_TOKENS = 4_096
 const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
 <template>
@@ -82,9 +82,6 @@ type Input = {
 
 const estimate = (value: unknown) => Token.estimate(JSON.stringify(value))
 
-const truncate = (value: string) =>
-  value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
-
 export const serializeToolContent = (content: SessionMessage.ToolStateCompleted["content"]) =>
   content
     .map((item) =>
@@ -106,7 +103,7 @@ const serialize = (message: SessionMessage.Message) => {
         if (part.state.status === "completed")
           return [
             `[Assistant tool call]: ${part.name}(${input})`,
-            `[Tool result]: ${truncate(serializeToolContent(part.state.content))}`,
+            `[Tool result]: ${summarizeToolText(serializeToolContent(part.state.content))}`,
           ]
         if (part.state.status === "error")
           return [`[Assistant tool call]: ${part.name}(${input})`, `[Tool error]: ${part.state.error.message}`]
@@ -116,7 +113,7 @@ const serialize = (message: SessionMessage.Message) => {
   }
   if (message.type === "system") return `[System update]: ${message.text}`
   if (message.type === "synthetic") return `[Synthetic context]: ${message.text}`
-  if (message.type === "shell") return `[Shell]: ${message.command}\n${truncate(message.output)}`
+  if (message.type === "shell") return `[Shell]: ${message.command}\n${summarizeToolText(message.output)}`
   return ""
 }
 

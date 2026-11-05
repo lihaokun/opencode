@@ -62,7 +62,11 @@ describe("McpOAuthCallback.ensureRunning", () => {
   })
 
   test("starts server with custom redirectUri port and path", async () => {
-    await McpOAuthCallback.ensureRunning("http://127.0.0.1:18000/custom/callback")
+    // Allocate a free loopback port instead of a fixed one: on shared machines
+    // the well-known callback port can be held by another process, which is an
+    // environment conflict rather than a regression of ensureRunning.
+    const port = await getFreeLoopbackPort()
+    await McpOAuthCallback.ensureRunning(`http://127.0.0.1:${port}/custom/callback`)
     expect(McpOAuthCallback.isRunning()).toBe(true)
   })
 

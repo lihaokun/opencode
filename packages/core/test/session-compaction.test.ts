@@ -45,3 +45,42 @@ test("compaction describes tool media without embedding base64", () => {
   expect(serialized).toBe("Image read successfully\n[Attached image/png: pixel.png]")
   expect(serialized).not.toContain(base64)
 })
+
+import { formatExitCodeLine, summarizeToolText } from "@opencode-ai/core/session/tool-result-projection"
+
+test("summarizeToolText keeps results within budget byte-identical", () => {
+  for (const size of [1_999, 2_000]) {
+    const text = "a".repeat(size)
+    expect(summarizeToolText(text)).toBe(text)
+  }
+})
+
+test("summarizeToolText retains head and tail with an omission marker", () => {
+  const head = "h".repeat(1_400)
+  const tail = "t".repeat(600)
+  const middle = "m".repeat(900)
+  const text = head + middle + tail
+  const summarized = summarizeToolText(text)
+
+  expect(summarized.startsWith(head)).toBe(true)
+  expect(summarized.endsWith(tail)).toBe(true)
+  expect(summarized).toContain(`[... ${text.length - 2_000} chars truncated ...]`)
+  expect(summarized).not.toContain(middle.slice(0, 16))
+})
+
+test("summarizeToolText keeps a trailing full-output hint inside the tail window", () => {
+  const text = `${"log line\n".repeat(400)}(Results are truncated...)\nFull output saved to: /tmp/tool_x`
+  const summarized = summarizeToolText(text)
+
+  expect(summarized).toContain("Full output saved to: /tmp/tool_x")
+  expect(summarized.startsWith(text.slice(0, 1_400))).toBe(true)
+})
+
+test("formatExitCodeLine renders only finite non-zero exits", () => {
+  expect(formatExitCodeLine({ exit: 7 })).toBe("[exit code: 7]")
+  expect(formatExitCodeLine({ exit: 0 })).toBeUndefined()
+  expect(formatExitCodeLine({ exit: null })).toBeUndefined()
+  expect(formatExitCodeLine({ exit: "7" })).toBeUndefined()
+  expect(formatExitCodeLine({})).toBeUndefined()
+  expect(formatExitCodeLine(undefined)).toBeUndefined()
+})

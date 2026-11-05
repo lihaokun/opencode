@@ -83,6 +83,22 @@ delete process.env["OTEL_EXPORTER_OTLP_ENDPOINT"]
 delete process.env["OTEL_EXPORTER_OTLP_HEADERS"]
 delete process.env["OTEL_RESOURCE_ATTRIBUTES"]
 
+// Clear machine-level network env: *_BASE_URL changes the baseURL the AI SDK
+// providers bind (breaking gateway/routing tests that pin canonical hosts),
+// and proxy vars intercept the localhost server traffic that server tests
+// depend on. Tests stub the network boundary themselves; anything that needs
+// a proxy to reach the outside cannot reach it in tests anyway.
+delete process.env["ANTHROPIC_BASE_URL"]
+delete process.env["OPENAI_BASE_URL"]
+for (const key of ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]) {
+  delete process.env[key]
+}
+// Bun's fetch may capture proxy settings before the preload runs, so deleting
+// the vars is not always enough. A wildcard no_proxy excludes every target
+// (including loopback server tests) even when the proxy itself was cached.
+process.env["no_proxy"] = "*"
+process.env["NO_PROXY"] = "*"
+
 // Use in-memory sqlite
 process.env["OPENCODE_DB"] = ":memory:"
 

@@ -5,6 +5,8 @@ import type { Agent } from "../../src/agent/agent"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Skill } from "../../src/skill"
 import { Permission } from "../../src/permission"
+import PROMPT_DEFAULT from "../../src/session/prompt/default.txt"
+import PROMPT_TRINITY from "../../src/session/prompt/trinity.txt"
 import type { Provider } from "../../src/provider/provider"
 import { SystemPrompt } from "../../src/session/system"
 import { MCP } from "../../src/mcp"
@@ -12,6 +14,10 @@ import { testEffect } from "../lib/effect"
 import PROMPT_GPT from "../../src/session/prompt/gpt.txt"
 import PROMPT_ASTRA from "../../src/session/prompt/gpt-astra.txt"
 import PROMPT_BEAST from "../../src/session/prompt/beast.txt"
+import PROMPT_GEMINI from "../../src/session/prompt/gemini.txt"
+import PROMPT_ANTHROPIC from "../../src/session/prompt/anthropic.txt"
+import PROMPT_KIMI from "../../src/session/prompt/kimi.txt"
+import PROMPT_META from "../../src/session/prompt/meta.txt"
 
 const skills: Skill.Info[] = [
   {
@@ -89,7 +95,7 @@ const it = testEffect(
 describe("session.system", () => {
   test("selects the Meta prompt for Muse Spark model IDs", () => {
     for (const id of ["meta/muse-spark-preview", "muse-spark-1.1", "muse-spark-1.2"]) {
-      const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)[0]
+      const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)
       expect(prompt).toContain("powered by Muse Spark,")
       expect(prompt).toContain("using Meta Muse Spark.")
       expect(prompt).not.toContain("{{MODEL_NAME}}")
@@ -98,7 +104,7 @@ describe("session.system", () => {
 
   test("selects the Meta prompt for Muse Glimmer model IDs", () => {
     for (const id of ["meta/muse-glimmer", "meta/muse-glimmer-30b", "muse-glimmer-30b"]) {
-      const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)[0]
+      const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)
       expect(prompt).toContain("powered by Muse Glimmer,")
       expect(prompt).toContain("using Meta Muse Glimmer.")
       expect(prompt).not.toContain("{{MODEL_NAME}}")
@@ -107,14 +113,50 @@ describe("session.system", () => {
 
   test("selects the Kimi prompt for official provider model IDs", () => {
     for (const providerID of ["kimi-for-coding", "moonshotai", "moonshotai-cn"]) {
-      const prompt = SystemPrompt.provider({ providerID, api: { id: "k3" } } as Provider.Model)[0]
+      const prompt = SystemPrompt.provider({ providerID, api: { id: "k3" } } as Provider.Model)
       expect(prompt).toContain("# Prompt and Tool Use")
+    }
+  })
+
+  // III.4 (reviewer 二轮): every entry asserts the DISTINCT template it routes
+  // to (the old matrix only checked the shared tail, so a mis-route — k3
+  // without providerID silently falling to DEFAULT — could not be caught).
+  // gpt-5 (bare gpt, not -4/o1/o3/-6/codex) covers the plain PROMPT_GPT route
+  // that no other entry reaches.
+  test("appends the shared working agreement to every distinct model template", () => {
+    const cases = [
+      { model: { api: { id: "meta/muse-spark-preview" } }, template: PROMPT_META.replaceAll("{{MODEL_NAME}}", "Muse Spark") },
+      { model: { api: { id: "gpt-4" } }, template: PROMPT_BEAST },
+      { model: { api: { id: "gpt-6" } }, template: PROMPT_ASTRA },
+      { model: { api: { id: "gpt-5.5" } }, template: PROMPT_GPT },
+      { model: { api: { id: "gemini-2" } }, template: PROMPT_GEMINI },
+      { model: { api: { id: "claude-x" } }, template: PROMPT_ANTHROPIC },
+      { model: { api: { id: "trinity" } }, template: PROMPT_TRINITY },
+      { model: { providerID: "moonshotai", api: { id: "k3" } }, template: PROMPT_KIMI },
+      { model: { api: { id: "anything-else" } }, template: PROMPT_DEFAULT },
+    ] as { model: Provider.Model; template: string }[]
+    for (const { model, template } of cases) {
+      const [routed, shared] = SystemPrompt.systemSections(model)
+      expect(routed).toBe(template)
+      expect(shared.startsWith("# Working agreement")).toBe(true)
+      expect(template).not.toContain("# Working agreement")
+    }
+  })
+
+  test("drops the hard brevity, no-explanation and no-comment rules from default and trinity", () => {
+    for (const prompt of [PROMPT_DEFAULT, PROMPT_TRINITY]) {
+      expect(prompt).not.toContain("fewer than 4 lines")
+      expect(prompt).not.toContain("One word answers are best")
+      expect(prompt).not.toContain("just stop")
+      expect(prompt).not.toContain("DO NOT ADD ***ANY***")
+      expect(prompt).not.toContain("prefer to use the agent tool")
+      expect(prompt).toContain("Do not poll or ask an agent whether it has finished")
     }
   })
 
   test("routes codex-family gpt models to the shared gpt prompt", () => {
     for (const id of ["gpt-5.3-codex", "gpt-5.5-codex-max", "gpt-5.5", "openai/gpt-5.5"]) {
-      const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)[0]
+      const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)
       expect(prompt).toBe(PROMPT_GPT)
       expect(prompt).not.toContain("apply_patch")
       expect(prompt).not.toContain("multi_tool_use.parallel")
@@ -130,11 +172,11 @@ describe("session.system", () => {
     ["o3-mini", PROMPT_BEAST],
     ["gpt-6-o3-codex", PROMPT_BEAST],
   ])("preserves higher-priority routing for %s", (id, expected) => {
-    expect(SystemPrompt.provider({ api: { id } } as Provider.Model)).toEqual([expected])
+    expect(SystemPrompt.provider({ api: { id } } as Provider.Model)).toEqual(expected)
   })
 
   test("the gpt prompt never names apply_patch", () => {
-    const prompt = SystemPrompt.provider({ api: { id: "gpt-5.5" } } as Provider.Model)[0]
+    const prompt = SystemPrompt.provider({ api: { id: "gpt-5.5" } } as Provider.Model)
     expect(prompt).not.toContain("apply_patch")
     expect(prompt).toContain("Edit/Write")
   })

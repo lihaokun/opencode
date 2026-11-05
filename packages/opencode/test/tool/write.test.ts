@@ -181,7 +181,10 @@ describe("tool.write", () => {
 
         if (process.platform !== "win32") {
           const stats = yield* Effect.promise(() => fs.stat(filepath))
-          expect(stats.mode & 0o777).toBe(0o644)
+          // The file must honor the process umask, whatever it is: 0o666 &
+          // ~umask. A hardcoded 0o644 only holds on machines with umask 022.
+          const umask = process.umask()
+          expect(stats.mode & 0o777).toBe(0o666 & ~umask)
         }
       }),
     )
