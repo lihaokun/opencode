@@ -39,10 +39,14 @@ const shellLayer = Layer.mergeAll(
 const it = testEffect(shellLayer)
 
 const sessionID = SessionID.make("ses_bg_shell")
+const otherSessionID = SessionID.make("ses_bg_shell_stranger")
 
-const makeCtx = (extra?: { promptOps?: AgentManagement.AgentPromptOps }): Tool.Context =>
+const makeCtx = (opts?: {
+  session?: SessionID
+  promptOps?: AgentManagement.AgentPromptOps
+}): Tool.Context =>
   ({
-    sessionID,
+    sessionID: opts?.session ?? sessionID,
     messageID: MessageID.make("msg_bg_shell"),
     callID: "call_bg",
     agent: "build",
@@ -50,7 +54,7 @@ const makeCtx = (extra?: { promptOps?: AgentManagement.AgentPromptOps }): Tool.C
     messages: [],
     metadata: () => Effect.void,
     ask: () => Effect.void,
-    extra,
+    extra: opts ? { promptOps: opts.promptOps } : undefined,
   }) as unknown as Tool.Context
 
 const initTools = Effect.gen(function* () {
@@ -109,8 +113,12 @@ it.instance("shell_output reads interim output and final status", () =>
     expect(interim.output).toContain("status: running")
 
     yield* tools.kill.execute({ task_id: taskId }, makeCtx())
+    // R6: the kill path records a `stopped` snapshot with the buffer, so the
+    // post-kill read shows the real stop (not the bare registry-less
+    // "cancelled") plus whatever the task printed before the kill.
     const final = (yield* tools.output.execute({ task_id: taskId }, makeCtx())) as { output: string }
-    expect(final.output).toContain("status: cancelled")
+    expect(final.output).toContain("status: stopped")
+    expect(final.output).toContain("bg-marker")
   }),
 )
 
@@ -333,5 +341,105 @@ it.instance("shell_output reports unknown tasks diagnosably", () =>
     if (Exit.isFailure(exit)) {
       expect(String(Cause.squash(exit.cause))).toContain("unknown task: shell_missing")
     }
+  }),
+)
+
+// R1: ownership is checked on the settled path too. Session A starts a task
+// and lets it finish; session B (a different sessionID, same instance) reads
+// the same task_id — it must be refused on every terminal shape, not just
+// while the entry is live.
+it.instance("shell_output refuses cross-session reads of a settled task", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const owner = makeCtx()
+    const started = yield* tools.shell.execute(
+      { command: `bun -e "console.log('owner-only-marker')"`, run_in_background: true },
+      owner,
+    )
+    const taskId = /shell_[^\s\]]+/.exec(started.output)![0]
+    const bg = yield* BackgroundJob.Service
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const job = yield* bg.get(taskId)
+      if (job && job.status !== "running") break
+      yield* Effect.sleep(50)
+    }
+
+    // Owner still reads fine after settle.
+    const mine = yield* tools.output.execute({ task_id: taskId }, owner)
+    expect(mine.output).toContain("owner-only-marker")
+
+    // The stranger is refused (completed shape).
+    const stranger = makeCtx({ session: otherSessionID })
+    const refused = yield* Effect.exit(tools.output.execute({ task_id: taskId }, stranger))
+    expect(Exit.isFailure(refused)).toBe(true)
+    if (Exit.isFailure(refused)) {
+      expect(String(Cause.squash(refused.cause))).toContain(`unknown task: ${taskId}`)
+    }
+
+    // And the kill tool's settled branch refuses the stranger the same way.
+    const refusedKill = yield* Effect.exit(tools.kill.execute({ task_id: taskId }, stranger))
+    expect(Exit.isFailure(refusedKill)).toBe(true)
+  }),
+)
+
+// R6: cancelling must not lose the tail. The kill response carries it, but a
+// later shell_output must still read it from the cancelled job's snapshot —
+// the interrupted fiber never settles, so the kill path records the buffer.
+it.instance("shell_output keeps the output tail after a kill", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const started = yield* tools.shell.execute(
+      { command: `bun -e "console.log('tail-keeper'); await Bun.sleep(30_000)"`, run_in_background: true },
+      makeCtx(),
+    )
+    const taskId = /shell_[^\s\]]+/.exec(started.output)![0]
+    yield* waitUntilOutput(tools.output, makeCtx(), taskId, "tail-keeper")
+
+    yield* tools.kill.execute({ task_id: taskId }, makeCtx())
+    const bg = yield* BackgroundJob.Service
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const job = yield* bg.get(taskId)
+      if (job && job.status !== "running") break
+      yield* Effect.sleep(50)
+    }
+
+    const after = (yield* tools.output.execute({ task_id: taskId }, makeCtx())) as { output: string }
+    expect(after.output).toContain("tail-keeper")
+    expect(after.output).toContain("status: stopped")
+    // The old copy pointed at a completion message that a cancel never sends.
+    expect(after.output).not.toContain("see the completion message")
+  }),
+)
+
+// R5: the default (no task_id) lookup must see settled tasks — the live
+// registry is empty after settle, but the session's most recent shell job is
+// still the right default target.
+it.instance("shell_output without task_id resolves the most recent settled task", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const ctx = makeCtx()
+    const started = yield* tools.shell.execute(
+      { command: `bun -e "console.log('default-target-marker')"`, run_in_background: true },
+      ctx,
+    )
+    const taskId = /shell_[^\s\]]+/.exec(started.output)![0]
+    const bg = yield* BackgroundJob.Service
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const job = yield* bg.get(taskId)
+      if (job && job.status !== "running") break
+      yield* Effect.sleep(50)
+    }
+
+    const byDefault = (yield* tools.output.execute({}, ctx)) as { output: string }
+    expect(byDefault.output).toContain(taskId)
+    expect(byDefault.output).toContain("default-target-marker")
+
+    // The default never crosses sessions either.
+    const stranger = makeCtx({ session: otherSessionID })
+    const refused = yield* Effect.exit(tools.output.execute({}, stranger))
+    expect(Exit.isFailure(refused)).toBe(true)
   }),
 )

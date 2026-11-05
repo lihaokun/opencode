@@ -814,8 +814,16 @@ export const ShellOutputTool = Tool.define(
         ctx: Tool.Context,
       ) =>
         Effect.gen(function* () {
+          // R5: the default target must include settled tasks — the live
+          // registry is emptied at settle, so a session whose only task has
+          // finished would otherwise answer "no background shell tasks" while
+          // an explicit task_id still works.
           const id =
             params.task_id ??
+            (yield* background.list())
+              .filter((job) => job.type === "shell" && job.metadata?.sessionId === ctx.sessionID)
+              .toSorted((a, b) => b.started_at - a.started_at)
+              .at(0)?.id ??
             [...shellTasks.entries()]
               .filter(([, entry]) => entry.sessionID === ctx.sessionID)
               .toSorted((a, b) => b[1].startedAt - a[1].startedAt)
@@ -823,14 +831,20 @@ export const ShellOutputTool = Tool.define(
           if (!id) throw new Error("no background shell tasks in this session")
           const entry = shellTasks.get(id)
           const job = yield* background.get(id).pipe(Effect.orElseSucceed(() => undefined))
+          // R1: ownership and type are checked on EVERY path, settled or live —
+          // a settled run drops its registry entry, but the job snapshot must
+          // answer only to the session that started it (and only shell jobs:
+          // this tool has no business reading any other job type).
+          if (job && (job.type !== "shell" || job.metadata?.sessionId !== ctx.sessionID)) {
+            throw new Error(`unknown task: ${id}`)
+          }
           // Settled runs drop their registry entry; the job snapshot still has
           // the status, and the output tail lives in the delivered message and
-          // the tool part from then on.
+          // the tool part from then on. For cancelled runs the tail comes from
+          // the snapshot the kill path recorded (same status-line format).
           if (!entry && job) {
-            // Settled runs drop their registry entry; the job snapshot still
-            // has the status, and the settle output leads with the status
-            // line, so the exit code reported here is the real one — never a
-            // guessed exit 0.
+            // The settle output leads with the status line, so the exit code
+            // reported here is the real one — never a guessed exit 0.
             const settled = job.output?.split("\n", 1)[0]
             const status = job.status === "running" ? "running" : (settled ?? job.status)
             const outputTail = job.output ? job.output.slice(job.output.indexOf("\n") + 1) : undefined
@@ -838,7 +852,7 @@ export const ShellOutputTool = Tool.define(
               `[shell task ${id}] ${job.title ?? ""}`.trim(),
               `status: ${status}`,
               ...(outputTail && status !== "running" ? [tailOf(outputTail, params.tail_lines ?? 200)] : []),
-              ...(status === "running" ? [] : job.output ? [] : [`(output tail no longer buffered; see the completion message)`]),
+              ...(status === "running" ? [] : job.output ? [] : [`(no output was captured before the task ended)`]),
             ].join("\n")
             return {
               title: (job.title ?? id).slice(0, 80),
@@ -891,7 +905,7 @@ export const ShellKillTool = Tool.define(
           const entry = shellTasks.get(params.task_id)
           if (!entry) {
             const job = yield* background.get(params.task_id).pipe(Effect.orElseSucceed(() => undefined))
-            if (!job || job.metadata?.sessionId !== ctx.sessionID) {
+            if (!job || job.type !== "shell" || job.metadata?.sessionId !== ctx.sessionID) {
               throw new Error(`unknown task: ${params.task_id}`)
             }
             return {
@@ -901,12 +915,18 @@ export const ShellKillTool = Tool.define(
             }
           }
           if (entry.sessionID !== ctx.sessionID) throw new Error(`unknown task: ${params.task_id}`)
-          const info = yield* background.cancel(params.task_id)
-          const status = info?.status ?? "cancelled"
+          // R6: the interrupted run fiber never reaches settle, so its buffer
+          // would be lost — hand the accumulated output to the cancel snapshot
+          // (same `status\nbuffer` shape the natural settle produces) and the
+          // follow-up shell_output reads it from the job.
+          const info = yield* background.cancel(params.task_id, {
+            output: `stopped\n${entry.buffer}`,
+          })
+          const finalStatus = info?.status ?? "cancelled"
           return {
             title: entry.command.slice(0, 80),
-            metadata: { task_id: params.task_id, status },
-            output: `[shell task ${params.task_id}] stopped (${status})\n${tailOf(entry.buffer, 50)}`,
+            metadata: { task_id: params.task_id, status: finalStatus },
+            output: `[shell task ${params.task_id}] stopped (${finalStatus})\n${tailOf(entry.buffer, 50)}`,
           }
         }).pipe(Effect.orDie),
     }
