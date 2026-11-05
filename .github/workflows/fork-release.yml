@@ -3,9 +3,17 @@
 # Push a tag and the release follows. Which kind depends on where the tagged
 # commit lives:
 #
-#   on main            v1.18.31-fmv3           stable release, marked Latest
+#   on main            v1.18.31-fmv2.1         stable release, marked Latest
 #   on dev, not main   v1.18.31-fmv3-beta.2    pre-release
 #   anywhere else      refused
+#
+# The suffix is fmv<N> or fmv<N>.<M>. N is the fork's feature generation and
+# moves rarely; M numbers the stable releases within a generation (fmv2,
+# fmv2.1, fmv2.2, ...). A beta carries the release it leads to: fmv3-beta.1
+# for the next generation, fmv2.2-beta.1 for the next release within one. M
+# and the beta number are semver numeric identifiers, so they take no leading
+# zero -- 1.18.31-fmv2.01 is not a valid version, and semver already orders
+# fmv2.9 below fmv2.10.
 #
 # The tag name has to match the branch -- a stable-looking tag on dev or a
 # beta-looking tag on main fails here rather than publishing under the wrong
@@ -33,7 +41,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build again (e.g. v1.18.31-fmv3). Rebuilds and replaces that release's assets."
+        description: "Existing tag to build again (e.g. v1.18.31-fmv2.1). Rebuilds and replaces that release's assets."
         required: true
         type: string
 
@@ -70,16 +78,18 @@ jobs:
           TAG="${{ inputs.tag || github.ref_name }}"
           SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
           git fetch -q origin main dev
+          # fmv<N> or fmv<N>.<M>; see the header for what the numbers mean.
+          RELEASE='^v[0-9]+\.[0-9]+\.[0-9]+-fmv[0-9]+(\.(0|[1-9][0-9]*))?'
           if git merge-base --is-ancestor "$SHA" origin/main; then
             CHANNEL=stable
-            if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-fmv[0-9]+$ ]]; then
-              echo "::error::$TAG is on main, so it is a stable release and must be named like v1.18.31-fmv3 (no -beta suffix)"
+            if ! [[ "$TAG" =~ ${RELEASE}$ ]]; then
+              echo "::error::$TAG is on main, so it is a stable release and must be named like v1.18.31-fmv2.1 or v1.18.31-fmv3 (no -beta suffix)"
               exit 1
             fi
           elif git merge-base --is-ancestor "$SHA" origin/dev; then
             CHANNEL=beta
-            if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-fmv[0-9]+-beta\.[0-9]+$ ]]; then
-              echo "::error::$TAG is on dev but not on main, so it is a beta and must be named like v1.18.31-fmv3-beta.1"
+            if ! [[ "$TAG" =~ ${RELEASE}-beta\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::$TAG is on dev but not on main, so it is a beta and must be named like v1.18.31-fmv3-beta.1 or v1.18.31-fmv2.2-beta.1"
               exit 1
             fi
           else

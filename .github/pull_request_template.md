@@ -1,4 +1,4 @@
-> Base branch: `dev`. The default branch `main` only takes promotion PRs from `dev`.
+> Base branch: `dev`. The default branch `main` only takes promotion PRs, from `dev` or a release branch cut from it.
 
 ### Issue for this PR
 

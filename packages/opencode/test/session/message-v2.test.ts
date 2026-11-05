@@ -322,6 +322,59 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
+  test.each(["completed", "error"] as const)(
+    "preserves historical apply_patch %s in model messages",
+    async (status) => {
+      const input = { patchText: "*** Begin Patch\n*** Add File: note.txt\n+hello\n*** End Patch" }
+      const output = "Success. Updated the following files:\nA note.txt"
+      const error = "Failed to find expected lines"
+      const messages: SessionV1.WithParts[] = [
+        {
+          info: assistantInfo("m-patch", "m-user"),
+          parts: [
+            {
+              ...basePart("m-patch", "p-patch"),
+              type: "tool",
+              tool: "apply_patch",
+              callID: "call-patch",
+              state:
+                status === "completed"
+                  ? {
+                      status,
+                      input,
+                      output,
+                      title: "Patched note.txt",
+                      metadata: { files: [{ filePath: "note.txt", type: "add", diff: "+hello\n" }] },
+                      time: { start: 1, end: 2 },
+                    }
+                  : { status, input, error, time: { start: 1, end: 2 } },
+            },
+          ],
+        },
+      ]
+      const converted = await MessageV2.toModelMessages(messages, model)
+      expect(converted).toHaveLength(2)
+      expect(converted[0]).toMatchObject({
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: "call-patch", toolName: "apply_patch", input }],
+      })
+      expect(converted[1]).toMatchObject({
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-patch",
+            toolName: "apply_patch",
+            output: {
+              type: status === "completed" ? "text" : "error-text",
+              value: status === "completed" ? output : error,
+            },
+          },
+        ],
+      })
+    },
+  )
+
   test("converts assistant tool completion into tool-call + tool-result messages with attachments", async () => {
     const userID = "m-user"
     const assistantID = "m-assistant"
@@ -1742,7 +1795,7 @@ describe("session.message-v2.latest", () => {
 
     expect(state.finished?.id).toBe(assistantID)
     expect(state.user?.id).toBe(taskID)
-    expect(state.tasks).toEqual([task])
+    expect(state.tasks).toEqual([{ part: task, message: expect.objectContaining({ id: taskID }) }])
   })
 
   test("filterCompacted preserves latest chronology across the ID rollover", () => {
@@ -1935,7 +1988,8 @@ describe("session.message-v2.latest", () => {
     expect(state.finished?.id).toBe(SUMMARY_ASSISTANT)
     expect(state.user?.id).toBe(NEW_COMPACTION_USER)
     expect(state.tasks).toHaveLength(1)
-    expect(state.tasks[0]).toMatchObject({ type: "compaction", auto: true })
+    expect(state.tasks[0].part).toMatchObject({ type: "compaction", auto: true })
+    expect(state.tasks[0].message.id).toBe(NEW_COMPACTION_USER)
   })
 
   test("selects compaction and subtask work after the finished boundary by creation time", () => {
@@ -1964,6 +2018,7 @@ describe("session.message-v2.latest", () => {
     const state = MessageV2.latest([newTask, { info: finished, parts: [] }, oldTask])
 
     expect(state.tasks).toHaveLength(1)
-    expect(state.tasks[0]).toMatchObject({ type: "subtask", prompt: "inspect" })
+    expect(state.tasks[0].part).toMatchObject({ type: "subtask", prompt: "inspect" })
+    expect(state.tasks[0].message.id).toBe(newTask.info.id)
   })
 })

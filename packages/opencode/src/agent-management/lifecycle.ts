@@ -20,6 +20,8 @@ import { SessionID, MessageID } from "../session/schema"
 import { Truncate } from "../tool/truncate"
 import { AgentDelegation } from "./delegation"
 import { AgentInbox } from "./inbox"
+import { AgentRun } from "./run"
+import { Runner } from "@/effect/runner"
 import { AgentStatusProjection } from "./status"
 import { AgentTree } from "./tree"
 import { AgentWorkdir } from "./workdir"
@@ -422,13 +424,21 @@ const layer = Layer.effect(
 
       const stopped: SessionID[] = []
       const failed: { session_id: SessionID; reason: string }[] = []
+      // Step S19: what the cancel found the target doing, for the notice. The
+      // cancel itself is the only place that can tell; a status read before
+      // or after it would be a race.
+      let before: Runner.StateTag = "Idle"
       for (const level of layers) {
         yield* Effect.forEach(
           level,
           (member) =>
             runState.cancel(member).pipe(
               Effect.matchEffect({
-                onSuccess: () => Effect.sync(() => void stopped.push(member)),
+                onSuccess: (tag) =>
+                  Effect.sync(() => {
+                    stopped.push(member)
+                    if (member === input.target) before = tag
+                  }),
                 onFailure: (error) =>
                   Effect.sync(() => void failed.push({ session_id: member, reason: String(error) })),
               }),
@@ -454,7 +464,11 @@ const layer = Layer.effect(
               sender: input.target,
               sender_name: info.metadata?.[AgentManagement.METADATA_AGENT_NAME],
               sender_agent: info.agent,
-              body: renderTermination(info, stopped.length - 1),
+              body: renderTermination(info, stopped.length - 1, {
+                before,
+                run: AgentRun.read(info.metadata),
+                now: Date.now(),
+              }),
             },
           },
           ops: input.ops,
@@ -474,18 +488,46 @@ const layer = Layer.effect(
 // Name, agent type and title all originate with the model, and all three land
 // in a system-written line, so they go through the same escaping as a message
 // header — see AgentInbox.escapeField.
-function renderTermination(info: Session.Info, descendants: number) {
+function renderTermination(
+  info: Session.Info,
+  descendants: number,
+  state: {
+    before: Runner.StateTag
+    run: AgentManagement.AgentRun | undefined
+    now: number
+  },
+) {
   const raw = info.metadata?.[AgentManagement.METADATA_AGENT_NAME]
   const name = raw === undefined ? undefined : AgentInbox.escapeField(raw)
   const agent = AgentInbox.escapeField(info.agent ?? "agent")
   const who = name ? `${name} (${agent})` : agent
+  const run = runLine(state.run)
   return [
     `Agent cancelled: ${who}`,
     `session_id: ${info.id}`,
     `title: ${AgentInbox.escapeField(info.title)}`,
+    state.before === "Running" || state.before === "ShellThenRun"
+      ? `Stop requested at ${AgentRun.formatInstant(state.now)}.`
+      : "No model run was running when cancellation was applied.",
+    ...(run ? [run] : []),
     ...(descendants > 0 ? [`Its ${descendants} descendant Agent(s) were stopped as well.`] : []),
     "Its session and history are intact; it can be resumed with agent_send.",
   ].join("\n")
+}
+
+/**
+ * Step S20: a record snapshot, not the identity of the cancelled execution.
+ * The target can change runs while descendants are cancelled or the old fiber
+ * winds down. Neither a read before cancel nor this read after it identifies
+ * the fiber cancel captured. Keep the operation and record facts separate.
+ */
+function runLine(run: AgentManagement.AgentRun | undefined) {
+  if (!run) return undefined
+  const ended = AgentRun.ended(run)
+  if (ended) {
+    return `Latest run record after cancellation: ${run.number}, ended at ${AgentRun.formatInstant(ended.ended_at)} (${ended.outcome}).`
+  }
+  return `Latest run record after cancellation: ${run.number}, not closed (started ${AgentRun.formatInstant(run.started_at)}).`
 }
 
 export const node = LayerNode.make({

@@ -3,6 +3,7 @@ import { Effect, Layer, Context } from "effect"
 import { Session } from "../session/session"
 import { SessionID } from "../session/schema"
 import { AgentManagement } from "./schema"
+import { AgentRun } from "./run"
 
 export interface Interface {
   /** The caller's parent, direct children and siblings, plus the caller itself. */
@@ -37,6 +38,7 @@ export function toSkeleton(
   depth: number,
 ): AgentManagement.AgentSkeleton {
   const metadata = session.metadata
+  const run = AgentRun.read(metadata)
   return {
     session_id: session.id,
     parent_id: session.parentID,
@@ -50,6 +52,7 @@ export function toSkeleton(
     // directory, and passing it off as the suggested workdir would imply the
     // runtime cwd had been switched.
     workdir: metadata?.[AgentManagement.METADATA_AGENT_WORKDIR],
+    ...(run ? { run } : {}),
   }
 }
 

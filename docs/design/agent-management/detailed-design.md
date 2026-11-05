@@ -48,6 +48,9 @@
 
 ### 2.3 必须修改的既有代码
 
+> **子计划 2 增补**：`session/session.ts` 的 `patch` 按会话加信号量串行化（读、合并、发布），
+> 见子计划 2 §5.2.0；`session/run-state.ts` 的 `cancel` 返回是否命中在跑的 run，见 §5.4.2。
+
 **A. 深度与权限**
 
 | 位置 | 改动 |
@@ -121,6 +124,9 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   **`WorktreeUnavailable` 只保证不建 Session / 不投 prompt / 不启动 Agent，允许文件系统残留**。
 
 ## 4. 数据结构定义
+
+> **子计划 2（`agentmgmt-2-run-state`）修订**：引入 `AgentRun`、`WakeSource` 与四种 part metadata 约定，
+> 定义见架构 §3 与子计划 §4.1–§4.3；本节其余不变。
 
 本细化不引入新的跨模块类型。架构 §3 已定义 `AgentStatus` / `AgentSkeleton` / `AgentInfo` /
 `WorkdirSource` / `AgentNeighborhood` / `TargetRef` / `AgentMessage` / `Accepted` /
@@ -300,6 +306,10 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
     后者会把合法的 body 判为违规。
 
 #### 5.3.2 `deliver(message: AgentMessage) -> Effect<Accepted, AgentNotFound | SelfDelivery>`
+
+> **子计划 2 修订（#73 服务端）**：步骤 4 的 parts 带发送方标记——agent 路的唯一 text part 带
+> `{ kind: "agent_message", sender, sender_name?, sender_agent? }`，user 路的头行 part 带 `{ kind: "user_message" }`；
+> `render()` 的输出与头行文本逐字不变（子计划 2 §5.2.3，I10）。
 
 - **功能描述**：以目标 Session 自身的身份**fork 进**普通异步消息入口。
 - **调用关系**：callers: M5 `agent_send`、M4 `stop`（一条取消通知）；
@@ -554,6 +564,11 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
 #### 5.4.4 `startDelegation({ session, agent, model, variant, parts, caller, notify = true }) -> Effect<void>`
 
+> **子计划 2 修订**：run-end notice 之前先关闭 run 记录（`agentRun.ended_at` / `outcome`），报告带
+> `run="<n>" ended="<ISO+tz>"` 属性与摘要后缀 ` (run n, ended HH:MM:SS)`，metadata 增发送方三字段；
+> run 记录的开始写在同一个 work 包装的入口（子计划 2 §5.2.2、§5.4.1）。在此之前还有一道插件停止钩子：
+> `runLoop` 正常退出 → `experimental.session.stop` 放行 → 记录关闭 → 报告（子计划 2 §5.1.2）。
+
 - **功能描述**：起初始委托的后台执行。**不再负责结局通知**——通知由 `SessionPrompt.reportRunEnd`
   在子的**每次** run 结束时发出（见本节末"run-end notice"），初始委托那次与 `agent_send` 驱动的
   每一次走同一条路。job 的存在是为了 `agent_list`（状态）、`agent_stop`（取消）与 command-subtask
@@ -641,6 +656,10 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   也是 §5.4.7 不需要排序论证的原因。副作用：只读。
 
 #### 5.4.7 `stop(caller, target) -> Effect<StopOutcome, NotAChild | AgentNotFound>`
+
+> **子计划 2 修订**：`SessionRunState.cancel` 返回取消前状态；步骤 4 的通知正文加一行，三分支——取消前在跑且记录已关为
+> stopped：`run: <n>, stopped at <ISO+tz>`；取消前在跑但记录未关闭或结局不是 stopped：`run: <n>, stop requested at <now>`，
+> 不等待；取消前空闲：`run: <n> had already ended at … (<结局>); nothing was running`（子计划 2 §5.4.2）。
 
 - **功能描述**：自底向上**无条件**取消目标子树；只向 `notify_boundary` 发一条 cancelled 通知。
 - **调用关系**：callers: M5 `agent_stop`；callees: M4 `plan`、`SessionRunState.cancel`、
@@ -796,6 +815,10 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
 #### 5.5.2 `agent_list(ctx) -> Effect<string>`
 
+> **子计划 2 修订**：增 `status` / `relation` / `query` / `limit`（默认 50）参数；每行增 `run` 与 `last`；
+> 在跑在前、其余按最近活动倒序；末尾计数行 `showing <n> of <total> (<r> running, <i> idle)`。
+> 不带参数时默认上限 50 是有意的行为改变（子计划 2 §5.5.3）。
+
 - **功能描述**：渲染调用者的邻居 roster。**AgentInfo 在此组装。**
 - **实现思路**：
   1. `neighborhood(ctx.sessionID)` 得 `AgentSkeleton[]`。失败 → 渲染错误返回。
@@ -812,6 +835,12 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   后置：每行 status 是该次调用瞬间的快照，不保证行间一致（架构 §5 接口已声明）。副作用：无。
 
 #### 5.5.3 `agent_send(params, ctx) -> Effect<string>`
+
+> **子计划 2 修订**：步骤 5 之前取目标状态投影与 `agentRun` 的快照；步骤 6 的 Accepted 渲染按快照分六种：
+> 空闲且记录已关闭 `was idle; this message starts run N+1 (sent …). Its run N ended at … (<outcome>); …`、空闲无记录
+> （省第二句）、空闲且记录未关闭（崩溃遗留，写 cut off 并预告 N+1）、在跑且记录未关闭 `is in run N (started …); it
+> reads this at its next step.`、在跑且记录已关闭或缺失（不预告号）、非子会话（只写 running / idle）；末尾恒加
+> `Current state of one agent: agent_status(target="…").`；既有三句保留。成立性论证见子计划 2 §5.4.3。
 
 - **实现思路**：
   1. caller 取自 `ctx.sessionID`。
@@ -850,6 +879,9 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
 
 #### 5.5.5 `visibleTools(session: Session.Info) -> Effect<ToolName[]>`
 
+> **子计划 2 修订**：两个分支都把 `agent_status` 与 `agent_list` 并列；权限隐藏经 `Permission.disabled` 的
+> 别名表 `agent_status → agent_list`（不是注册表的 `visibleTools`，那只管 code-mode 的 MCP 目录；子计划 2 §5.5.2，I9）。
+
 - **功能描述**：按调用者深度决定向模型暴露哪些 Agent 工具。
 - **调用点**：`session/tools.ts` 的 `SessionTools.resolve`，**不是工具执行期**。
 - **实现思路**：
@@ -872,6 +904,9 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   - 副作用论证：只读 Session。
 
 #### 5.5.6 `rosterReminder(messages, session) -> Effect<void>`  *（面向父）*
+
+> **子计划 2 撤销**：末尾段的进度视图（§5.5.9）每步刷新且不占历史，本函数的注入在子计划 2 的 commit 3 删除，
+> 保留 `AGENT_ROSTER_SENTINEL` 供旧记录识别。以下为撤销前的设计。
 
 - **功能描述**：把当前直接子列表作为**落盘** reminder 注入上下文。
   **边沿触发（状态变化）、回合边界投递**。
@@ -998,9 +1033,34 @@ WorktreeUnavailable { reason, paths?: string[] }       ← paths 给出可能的
   - 不含状态 ⇒ 不会过期成错误信息，只会过期成不完整信息，而不完整由"明写是快照"承担。
   - 副作用：只读；返回值由 `create` 写入初始 prompt。
 
+#### 5.5.8 `agent_status(params, ctx) -> Effect<string>`  *（子计划 2）*
+
+- 见子计划 2 §5.5.1：`resolveTarget(caller, target, "neighbor")` → `agent_list` 权限求值 → 读取会话、状态投影、
+  `agentRun` → 渲染 key: value 行（run 行五种写法：在跑且记录未关闭 / 在跑且记录已关闭或缺失 / 空闲且已关闭 /
+  空闲且未关闭（cut off）/ 从未跑过；非子会话省略；在跑时另有 last step 行）。
+- 正确性论证：解析范围与权限键与 `agent_list` 相同，故不暴露它之外的信息。副作用：无。
+
+#### 5.5.9 末尾段进度视图  *（子计划 2）*
+
+- 见子计划 2 §4.5、§5.3：`runLoop` 组装 tail 时以一次 SQL 取全部直接子的 id / metadata / time_updated，
+  状态来自内存投影；纯函数 `StepTail.renderSubagents` 渲染时钟与自身位置、总览、在跑列表（开始早的在前）、
+  窗口内结束列表（结束晚的在前），各至多 10 行；窗口取 10 分钟与上一步开始以来的较长者。门与被撤销的
+  花名册一样受 `agent_list` deny 控制；总览只计两个列表截断前的集合，过窗结束项与空闲无记录项不计入；
+  无有效项不附带子 Agent 节，运行项与未结算 cut off 项保留。Session 不清理。不写入历史、不进压缩输入、缓存断点跳过。
+
+### 5.6 停止钩子  *（子计划 2，#81）*
+
+- 见子计划 2 §5.1：`runLoop` 的正常退出分支在 `break` 前触发 `experimental.session.stop`；阻止时落库一条
+  合成用户消息（text = reason，metadata `stop_hook`）并继续同一次 run；连续阻止达 `stop_hook_block_cap`
+  （默认 8，0 即不调用钩子）不再询问、直接结束，任一步调用工具或出现钩子之外的新用户消息（run 中途插入的
+  steer、re-arm 消费的输入）即清零（子计划 2 §6 第 17 点）；钩子抛错（defect，
+  `catchAllCause`）或无理由按放行；无超时；多插件后写者胜。出错退出、权限或提问被拒、输出截断、人中断、
+  agent_stop、结构化输出结束、到达步数上限均不触发。主会话与子 agent 同一分支，宿主不区分。
+
 ## 6. 完整性自检 checklist
 
-- [x] 所有函数实现思路推导连续（无跳步）—— 每个非 trivial 函数按编号步骤展开
+- [x] 所有函数实现思路推导连续（无跳步）—— 每个非 trivial 函数按编号步骤展开；子计划 2 新增的
+      §5.5.8 / §5.5.9 / §5.6 的步骤与论证在子计划文档 §5 内展开，本文件只保留指针
 - [x] 所有 if / else / switch 分支已覆盖 —— `neighborhood` 的有无父、`of` 的三支状态、
       `resolveTarget` 的 id/名称与三种基数（**含多匹配这一正常可达分支**）、
       `prepareWorkdir` 的三分支、`classify` 的六分支、`stop` 的成功/失败、

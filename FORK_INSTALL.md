@@ -1,145 +1,97 @@
 # Fork 安装说明
 
-> **分支与版本**：`main`（默认分支）是正式线，`dev` 是测试线；改动先落 `dev`，再以 merge commit 晋升到 `main`。
-> 发版由 tag 驱动（`.github/workflows/fork-release.yml`）：在 `main` 的提交上打 `v1.18.31-fmv3` 这样的 tag 就发正式版；
-> 在 `dev` 的提交上打 `v1.18.31-fmv3-beta.1` 就发 Pre-release 测试版；其他分支上的 tag、或名字与分支不符的 tag 会被拒绝。
-> tag 用 `git tag -a` 加注释，注释就是 release notes。[Releases](https://github.com/lihaokun/opencode/releases) 里不带 Pre-release 标记的就是正式版；
-> 想试最新改动也可以从 `dev` 自己构建。
-> 无论在哪个分支构建，`OPENCODE_CHANNEL` 都保持 `dev`——它决定的是数据目录（`opencode-dev.db`），不是分支；
-> 不设时它会取当前分支名，在 `main` 上裸构建会得到一份空的 `opencode-main.db`。
+使用仓库的 [`script/fm-install.py`](script/fm-install.py)，需要 Python 3.9 或更新版本。默认下载 **lihaokun/opencode 最新正式发布**；也可以选择 beta 或从源码编译。
 
-两种安装方式：**从 [Releases](https://github.com/lihaokun/opencode/releases) 下载预编译包**（推荐），或**从源码构建**（想试 `dev` 上还没发版的改动时）。
-两种都要关掉官方自动更新：官方的 `curl … | bash` 安装脚本和 `npm i -g opencode-ai` 只装官方版，而官方版的自动更新会把自建或下载的 fork 二进制悄悄换回官方 `1.18.x`（实测如此）。
+## 快速安装
 
----
+已有仓库时，在仓库根目录执行：
 
-## 一、从 Releases 安装（推荐）
+```bash
+python3 script/fm-install.py --help          # 查看参数、默认策略与示例
+python3 script/fm-install.py                 # 下载最新正式版（默认）
+python3 script/fm-install.py --channel beta  # 下载最新 beta
+```
 
-选对应平台的包。解压后 `bin/` 里有 `opencode` 和 `rg`（ripgrep），**两个文件放在同一目录并把该目录加入 PATH**：程序按 PATH 找 `rg`，找不到会去 GitHub 下载。
+也可以单独下载脚本，不必 clone 仓库（脚本合入 dev 后可用）：
 
-| 平台 | 资产 |
-|---|---|
-| Windows x64 | `opencode-windows-x64.zip` |
-| macOS Apple Silicon | `opencode-darwin-arm64.tar.gz` |
-| macOS Intel | `opencode-darwin-x64.tar.gz` |
-| Linux x64 | `opencode-linux-x64.tar.gz` |
-| Linux arm64 | `opencode-linux-arm64.tar.gz` |
+```bash
+curl -fL https://raw.githubusercontent.com/lihaokun/opencode/dev/script/fm-install.py -o fm-install.py
+python3 fm-install.py
+```
 
-**Windows**（PowerShell，在下载目录执行）：
+Windows PowerShell：
 
 ```powershell
-Expand-Archive .\opencode-windows-x64.zip -DestinationPath $env:TEMP\opencode -Force
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.opencode\bin" | Out-Null
-Copy-Item "$env:TEMP\opencode\opencode-windows-x64\bin\*" "$env:USERPROFILE\.opencode\bin" -Force
-[Environment]::SetEnvironmentVariable("Path", "$env:USERPROFILE\.opencode\bin;" + [Environment]::GetEnvironmentVariable("Path", "User"), "User")
+Invoke-WebRequest https://raw.githubusercontent.com/lihaokun/opencode/dev/script/fm-install.py -OutFile fm-install.py
+python .\fm-install.py --channel beta
 ```
 
-重开终端后 `opencode --version` 应显示本版本号。二进制未签名，SmartScreen 若拦截选"仍要运行"。
-
-**macOS / Linux**（把 `darwin-arm64` 换成你的包名；bash 用户把 `~/.zshrc` 换成 `~/.bashrc`）：
-
-```bash
-tar -xzf opencode-darwin-arm64.tar.gz
-mkdir -p ~/.opencode/bin && cp opencode-darwin-arm64/bin/* ~/.opencode/bin/
-echo 'export PATH="$HOME/.opencode/bin:$PATH"' >> ~/.zshrc
-```
-
-macOS 若提示"无法打开"（未签名、未公证）：`xattr -dr com.apple.quarantine ~/.opencode/bin`。
-
-**关闭官方自动更新（必须）**：官方更新器会把这个 fork 版本换回官方 1.18.x。在 `~/.config/opencode/opencode.json`（Windows 是 `%USERPROFILE%\.config\opencode\opencode.json`）里加：
+**所有模式都会设置以下全局默认值**：
 
 ```json
-{ "autoupdate": false }
+{
+  "autoupdate": false,
+  "disabled_providers": ["opencode", "opencode-go"]
+}
 ```
 
-校验：`sha256sum -c sha256sums.txt --ignore-missing`；Windows 用 `Get-FileHash .\opencode-windows-x64.zip` 与 `sha256sums.txt` 对照。
+保留自定义 provider、密钥、模型和其他配置；原有 disabled_providers 也保留。安装器仅使用本 fork 的发布和源码，不回退到 OpenCode 官方安装器/npm 程序包。构建依赖仍使用各自原有的依赖源。
 
----
+更新 fork 时重新运行本脚本。不要使用 `opencode upgrade`、官方 `curl … | bash` 或 `npm i -g opencode-ai`，这些仍是上游升级渠道。
 
-## 二、从源码构建
-
-### TL;DR
+## 版本与平台
 
 ```bash
-# 1) 构建(版本号 + channel 都用环境变量)
-bun install                                   # 会应用 patches(如 openai-compatible 修复)
-cd packages/opencode
-OPENCODE_CHANNEL=dev OPENCODE_VERSION=1.18.31-fmv2 bun run script/build.ts --single
-
-# 2) 安装到 PATH 生效位置(官方安装器/更新器用的就是这里)
-install -m 0755 dist/opencode-linux-x64/bin/opencode ~/.opencode/bin/opencode
-
-# 3) 关闭自动更新(二选一,均无需改代码)——见下文
+# 固定版本：省略 channel 时按 tag 推导；显式 channel 与 tag 冲突会报错
+python3 script/fm-install.py --version v1.18.31-fmv3-beta.18
 ```
 
-验证:`opencode --version` 应显示 `1.18.31-fmv2`。
+安装器按数字版本号选择正式/beta 发布，不把 beta.9 误排在 beta.18 后面。下载资产必须通过发布内 `sha256sums.txt` 的校验；归档内 `opencode` 和 `rg` 一起安装。
 
----
+| 平台                | 发布资产                       |
+| ------------------- | ------------------------------ |
+| Windows x64         | `opencode-windows-x64.zip`     |
+| macOS Apple Silicon | `opencode-darwin-arm64.tar.gz` |
+| macOS Intel         | `opencode-darwin-x64.tar.gz`   |
+| Linux x64           | `opencode-linux-x64.tar.gz`    |
+| Linux arm64         | `opencode-linux-arm64.tar.gz`  |
 
-### 1. 版本号:只能用 `OPENCODE_VERSION` 环境变量
+Linux 要求 glibc；x64 发布包要求 AVX2。没有 musl、Windows ARM64 或 baseline 发布资产时，脚本会报不支持或在安装前的可执行文件检查失败；不会换用上游程序。二进制没有系统代码签名，系统若拦截需按本机策略处理。
 
-版本号由 `packages/script/src/index.ts` 决定,优先级:
+## 源码编译
 
-1. **`OPENCODE_VERSION` 环境变量** → 逐字采用(我们就用这个:`1.18.31-fmv2`)；
-2. 否则是 preview 构建 → `0.0.0-<channel>-<时间戳>`（例：`0.0.0-dev-202608161430`）；
-3. 否则(官方发布)→ 从 npm 拉 `opencode-ai/latest` 再 bump。
-
-**注意几个"不行"**:
-
-- ❌ **改 `package.json` 的 `version` 没用** —— 构建逻辑根本不读它(官方 package.json 由上游的 `sync release versions` 提交维护,当前是 `1.18.31`,实际发布版本仍走 npm+bump)。
-- ❌ **加 git tag 也没用** —— 版本逻辑不读任何 tag(`git describe`/`refs/tags` 都没用到)。CI 发版时是 workflow 把 tag 名去掉前缀 `v` 后塞进 `OPENCODE_VERSION`，本地构建仍要自己传。
-- ℹ️ 唯一沾 git 的是**分支名 = channel**（`git branch --show-current`），只影响 preview 版本里的 `<channel>` 段,不是 tag。
-
-所以自定义版本**必须**在构建时传 `OPENCODE_VERSION`。
-
-### 2. Channel:用 `OPENCODE_CHANNEL` 决定数据目录
-
-- `OPENCODE_CHANNEL=dev` → 用 `opencode-dev.db`（与之前的 fork 安装同一份会话/数据）。
-- 不设则默认取当前分支名当 channel。
-- Channel 与版本号**互不干扰**（一个走 `OPENCODE_CHANNEL`，一个走 `OPENCODE_VERSION`）。
-
-### 3. 安装到哪
-
-`~/.opencode/bin/` 通常在 PATH 最前(官方安装器/自动更新器就装在这),所以装这里最稳:
+预先安装 Git、ripgrep (`rg`)、源码 `package.json` 中 `packageManager` 指定的 Bun，以及项目原有原生构建依赖。脚本不自动替换全局 Bun。
 
 ```bash
-# 建议先备份官方二进制再覆盖(可回退)
-[ -f ~/.opencode/bin/opencode ] && mv ~/.opencode/bin/opencode ~/.opencode/bin/opencode.official.bak
-install -m 0755 dist/opencode-linux-x64/bin/opencode ~/.opencode/bin/opencode
+# 临时 clone 本 fork 的 dev、构建、安装，再清理临时源码
+python3 script/fm-install.py --mode build
+
+# 选择 fork 分支/tag
+python3 script/fm-install.py --mode build --ref main
+
+# 使用本地 checkout；保留分支与已有修改，正常写入依赖及 dist
+python3 script/fm-install.py --mode build --source .
 ```
 
-如果 `~/.local/bin` 里也有一份 `opencode`,一并刷新，避免 PATH 顺序服务到旧版本。
+`--source` 和 `--ref` 互斥；`--channel` / `--version` 只用于下载模式。源码构建执行 frozen install，再复用 `packages/opencode/script/build.ts --single --skip-install`，版本标为 `0.0.0-source.g<提交>`（存在本地修改时加 `.dirty`），避免把未发布源码标成正式包。
 
-### 4. 关闭自动更新(无需改代码,二选一)
+无论选 main 还是 dev，构建固定 **`OPENCODE_CHANNEL=dev`**。它决定数据目录与 `opencode-dev.db`，不是发布通道；切正式/beta 不会因此打开另一份空数据库。依赖下载、代码生成和编译仍遵循仓库构建脚本。
 
-自动更新的判定在 `upgrade.ts`：`if (config.autoupdate === false || Flag.OPENCODE_DISABLE_AUTOUPDATE) return`。两条都能关，任选其一:
+## 目录、配置与 PATH
 
-#### 方式 A(推荐):全局 config 设 `autoupdate: false`
+- 默认安装到 `~/.opencode/bin`，可用 `--install-dir /path/to/bin` 更改。
+- 默认全局配置目录是 `$XDG_CONFIG_HOME/opencode`，未设时为 `~/.config/opencode`；Windows 也使用用户主目录的 `.config/opencode`。`--config-dir` 只选择安装器修改的目录，不改变 OpenCode 自身运行时配置路径。
+- 按 OpenCode 的优先级，修改最后一个已存在的 `config.json`、`opencode.json`、`opencode.jsonc`；都不存在则新建 `opencode.json`。支持注释和尾逗号，保留其他字段原文及注释（两个被替换字段值内部的注释除外）。配置无法解析时拒绝安装，避免覆盖。
+- 默认把安装目录加入用户 PATH。Unix 修改当前 shell 的用户配置（bash、zsh、fish，其他使用 `.profile`）；Windows 修改用户 Path。`--no-modify-path` 可禁止，之后自行添加。
+- 重开终端，执行 `opencode --version`，确认 PATH 优先命中了新安装。Windows 长期运行的终端宿主可能也需完全关闭重开。
 
-opencode 会合并加载 `~/.config/opencode/opencode.json` 和 `opencode.jsonc`。把开关写进 **`opencode.json`**(纯 JSON,不碰 `.jsonc` 里的密钥):
+脚本设置全局默认值；显式环境/项目配置仍遵循 OpenCode 原有优先级。若运行时指定其他配置路径，应让 `--config-dir` 对准实际使用的全局目录，并检查更高优先级配置。
+若目录内还有旧式无扩展名 TOML `config`，脚本会要求先迁移到 JSON/JSONC 并备份移走旧文件，再重跑安装；否则 OpenCode 启动时会再次导入旧文件，覆盖刚设置的开关。
 
-```bash
-mkdir -p ~/.config/opencode
-# 有 jq:
-jq '.autoupdate = false' ~/.config/opencode/opencode.json 2>/dev/null > /tmp/oc.json && mv /tmp/oc.json ~/.config/opencode/opencode.json
-# 没有 jq、且文件不存在时:
-printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "autoupdate": false\n}\n' > ~/.config/opencode/opencode.json
-```
+下载、校验、构建失败不会替换既有安装。安装阶段普通文件错误会尝试回滚；不要并行运行安装器，强杀或断电不保证多文件事务。Windows 若旧进程锁定文件，请退出后重试。PATH 修改失败会保留成功安装并提示手动设置。
 
-`autoupdate` 取值:`false`(完全关) / `"notify"`(只提示不装) / `true`(默认,自动装)。
+## 维护者：分支与发版
 
-#### 方式 B:运行时环境变量 `OPENCODE_DISABLE_AUTOUPDATE`
-
-写进 shell profile（`~/.bashrc` / `~/.zshrc`）——这是**运行时** env(`Flag` 运行时读 `process.env`,所以这个有效；注意它**不能在编译期烧进二进制**，因为读的是动态下标 `process.env[key]`）：
-
-```bash
-echo 'export OPENCODE_DISABLE_AUTOUPDATE=1' >> ~/.bashrc
-```
-
----
-
-### 备注
-
-- 每次改了 fork 代码想重装:重跑第 1、2 步即可（`bun install` 会重新应用 patches）。
-- 想换后缀/channel/安装目录,改对应的环境变量即可,无需改脚本。
-- 目标平台产物名形如 `opencode-<os>-<arch>`（如 `opencode-linux-x64`、`opencode-darwin-arm64`）。
+`main` 是正式线，`dev` 是实验线。改动先落 dev，再由 dev 或其发布分支以 merge commit 晋升 main。
+`.github/workflows/fork-release.yml` 按 tag 发版：main 上 `v<upstream>-fmv<N>[.<M>]` 为正式版，dev 上追加 `-beta.<k>` 为预发布；错误分支或不合法名称会被拒绝。
+小版本及 beta 序号不写前导零。注释 tag 的内容作为 release notes；轻量 tag 使用 GitHub 自动生成说明。
