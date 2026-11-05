@@ -24,6 +24,7 @@ import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
 import { BackgroundJob } from "@/background/job"
+import { cancelSnapshot, shellTasks } from "./shell/tasks"
 import type { AgentManagement } from "@/agent-management/schema"
 import { SessionID } from "../session/schema"
 
@@ -48,42 +49,12 @@ const appendCapped = (buffer: string, chunk: string) => {
 }
 
     /**
-     * Live state of background shell tasks, keyed by task id. Process-local and
-     * intentionally non-durable, mirroring the BackgroundJob registry semantics:
-     * a restart loses both the process and its buffer. Entries are removed once
-     * the run settles — output lives with the tool parts from then on, and an
-     * entry left behind would accumulate one per background call for the life
-     * of the process.
+     * Live state of background shell tasks lives in ./shell/tasks.ts (module
+     * cycle avoidance — see that file's header).
      */
-const shellTasks = new Map<
-  string,
-  {
-    command: string
-    sessionID: SessionID
-    buffer: string
-    exit: number | undefined
-    error: string | undefined
-    startedAt: number
-  }
->()
-
 const tailOf = (text: string, lines: number) => {
   const all = text.split("\n")
   return all.length <= lines ? text : all.slice(-lines).join("\n")
-}
-
-/**
- * Cancel snapshot for a live shell task: what BackgroundJob.cancel should
- * persist when the run is interrupted. The interrupted fiber never reaches
- * its settle, so without this snapshot the accumulated buffer is lost. Same
- * `status\nbuffer` shape the natural settle produces, which is what lets
- * shell_output's post-settle read report the real status. Undefined for a
- * task this process no longer owns (settled, foreign, or post-restart).
- */
-export function cancelSnapshot(taskId: string): string | undefined {
-  const entry = shellTasks.get(taskId)
-  if (!entry) return undefined
-  return `stopped\n${entry.buffer}`
 }
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
