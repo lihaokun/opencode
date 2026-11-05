@@ -311,6 +311,8 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
   const cfg = restorationConfig(rawConfig as ConfigV1Lite | undefined)
   if (!cfg.enabled) return
 
+  // Step P2: full message read → locate the compaction part (tail_start_id)
+  // and any existing sentinel.
   const messages = yield* sessions.messages({ sessionID })
 
   let compactionIdx = -1
@@ -340,6 +342,8 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
       if (part.type === "text" && part.text.startsWith(RESTORATION_SENTINEL)) restorationIdx = index
     }
   })
+  // Step P3: trigger decision — no compaction, or a sentinel already newer
+  // than the compaction → leave the transcript alone.
   if (compactionIdx === -1) return
   if (restorationIdx > compactionIdx) return
 
@@ -350,12 +354,20 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
     ? yield* todoOpt.value.get(sessionID).pipe(Effect.orElseSucceed(() => []))
     : []
 
+  // Step P4/P5: collect candidates (B5: read only display.type === "file";
+  // edit via filediff.file; skill via name; most-recent-first; todo appended),
+  // then materialize (stat File-guard → byte/token caps → disk read →
+  // tail-substring skip-duplicate, budget-aware early stop).
   const tailText = buildTailText(messages, tailStartID)
   const candidates = collectCandidates(messages, todos)
   const materials = yield* materializeCandidates(candidates, tailText, { fs, skill: skillOpt, todos, cfg })
+  // Step P6: render within budget (max_files per file, exhaustion degrades to
+  // bounded reference lines) into sentinel + Files/Skills/Todos + Not restored.
   const text = renderMaterials(materials, cfg)
   if (!text) return
 
+  // Step P7: byte-identical comparison against the previous sentinel — only a
+  // changed block is persisted.
   const previous = userMessage.parts.findLast(
     (part): part is SessionV1.TextPart => part.type === "text" && part.text.startsWith(RESTORATION_SENTINEL),
   )

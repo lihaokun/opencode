@@ -192,6 +192,9 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
 export const preparePayload = Effect.fn("LLMRequestPrep.preparePayload")(function* (input: PreparePayloadInput) {
   const system = [
     [
+      // Step P3 (prompt-1): an explicit agent prompt replaces everything
+      // (the opt-out); Step P4: join into one string with SHARED inside the
+      // cache-stable prefix.
       ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.systemSections(input.model)),
       ...input.system,
       ...(input.user.system ? [input.user.system] : []),

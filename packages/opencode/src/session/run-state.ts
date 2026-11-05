@@ -120,6 +120,8 @@ const layer = Layer.effect(
   }),
 )
 
+// Step P9 (bgshell-1): the session-level cancel cascade reaches shell jobs
+// through metadata.sessionId (agent_stop / runState.cancel).
 const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(function* (
   background: BackgroundJob.Interface,
   sessionID: SessionID,

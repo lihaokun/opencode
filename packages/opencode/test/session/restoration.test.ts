@@ -509,6 +509,35 @@ it.instance("apply skips an unsettled compaction marker, accepts a full-summary 
   }),
 )
 
+// III.4 (reviewer 二轮): the full-summary shape — tail_start_id undefined BUT a
+// completed summary present — is a legitimate settled marker. The #77 test
+// above never exercised unset("tail_start_id") (dead helper branch), so this
+// path was untested: restore() must accept it and inject.
+it.instance("apply accepts a full-summary marker (tail_start_id undefined)", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const session = yield* SessionNs.Service.use((ssn) => ssn.create({}))
+    yield* seedRestorable(session.id, path.join(test.directory, "body.txt"), "full summary body\n")
+    const ssn = yield* SessionNs.Service
+    // Strip tail_start_id from the marker: full-summary fallback shape.
+    const msgs = yield* ssn.messages({ sessionID: session.id })
+    for (const msg of msgs) {
+      for (const part of msg.parts) {
+        if (part.type === "compaction") yield* ssn.updatePart({ ...part, tail_start_id: undefined })
+      }
+    }
+    yield* apply({ sessionID: session.id })
+    const parts = yield* SessionNs.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
+      Effect.map((all) => all.flatMap((m) => m.parts)),
+    )
+    const sentinels = parts.filter(
+      (p): p is SessionV1.TextPart => p.type === "text" && p.text.startsWith(RESTORATION_SENTINEL),
+    )
+    expect(sentinels).toHaveLength(1)
+    expect(sentinels[0].text).toContain("full summary body")
+  }),
+)
+
 // R3: the dedup baseline must match what the model actually sees. A read part
 // whose output was cleared by compaction (time.compacted set) renders as
 // "[Old tool result content cleared]" in the projection — the file body is NOT

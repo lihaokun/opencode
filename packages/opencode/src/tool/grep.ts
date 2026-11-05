@@ -8,6 +8,7 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import DESCRIPTION from "./grep.txt"
 import * as Tool from "./tool"
 
+// Step P1: schema — every new parameter optional; absent = legacy behavior.
 export const Parameters = Schema.Struct({
   pattern: Schema.String.annotate({ description: "The regex pattern to search for in file contents" }),
   path: Schema.optional(Schema.String).annotate({
@@ -71,10 +72,11 @@ export const GrepTool = Tool.define(
             throw new Error("pattern is required")
           }
           const mode = params.output_mode ?? "content"
+          // Step P2: validation — context caps and content-mode-only rule.
           const context = params.context ?? 0
-          // `context` is the shorthand for both sides; an explicit before/after
-          // wins over it per side, so {context: 3, after: 1} reads as
-          // before=3, after=1.
+          // Step P4: `context` is the shorthand for both sides; an explicit
+          // before/after wins over it per side, so {context: 3, after: 1} reads
+          // as before=3, after=1.
           const before = params.before ?? context
           const after = params.after ?? context
           if (before > 10 || after > 10 || context > 10) {
@@ -94,6 +96,7 @@ export const GrepTool = Tool.define(
             output: "No files found",
           }
 
+          // Step P3: permission ask (patterns=[pattern], unchanged).
           yield* ctx.ask({
             permission: "grep",
             patterns: [params.pattern],
@@ -105,6 +108,7 @@ export const GrepTool = Tool.define(
             },
           })
 
+          // Step P5: path resolution + external-directory assertion (existing).
           const ins = yield* InstanceState.context
           const requested = path.isAbsolute(params.path ?? ins.directory)
             ? (params.path ?? ins.directory)
@@ -118,6 +122,8 @@ export const GrepTool = Tool.define(
           const search = FSUtil.resolve(requested)
           const info = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
           const cwd = info?.type === "Directory" ? search : path.dirname(search)
+          // Step P6: dispatch rg args by mode (content --json; files
+          // --files-with-matches; count --count-matches; -B/-A, -i, --sort).
           const result = yield* ripgrep.search({
             cwd,
             pattern: params.pattern,
@@ -130,6 +136,7 @@ export const GrepTool = Tool.define(
             after,
           })
 
+          // Step P9: render (absolute paths) + pagination outcome copy.
           // The service returns search-relative paths; render absolute paths
           // like the legacy projection did, in every mode.
           const rowBase = requestedInfo?.type === "Directory" ? requested : path.dirname(requested)

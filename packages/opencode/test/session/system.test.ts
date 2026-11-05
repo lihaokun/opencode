@@ -14,6 +14,10 @@ import { testEffect } from "../lib/effect"
 import PROMPT_GPT from "../../src/session/prompt/gpt.txt"
 import PROMPT_ASTRA from "../../src/session/prompt/gpt-astra.txt"
 import PROMPT_BEAST from "../../src/session/prompt/beast.txt"
+import PROMPT_GEMINI from "../../src/session/prompt/gemini.txt"
+import PROMPT_ANTHROPIC from "../../src/session/prompt/anthropic.txt"
+import PROMPT_KIMI from "../../src/session/prompt/kimi.txt"
+import PROMPT_META from "../../src/session/prompt/meta.txt"
 
 const skills: Skill.Info[] = [
   {
@@ -114,20 +118,26 @@ describe("session.system", () => {
     }
   })
 
-  test("appends the shared working agreement to every model template", () => {
-    const models = [
-      { api: { id: "meta/muse-spark-preview" } },
-      { api: { id: "gpt-4" } },
-      { api: { id: "gpt-6" } },
-      { api: { id: "gpt-5-codex" } },
-      { api: { id: "gemini-2" } },
-      { api: { id: "claude-x" } },
-      { api: { id: "trinity" } },
-      { api: { id: "k3" } },
-      { api: { id: "anything-else" } },
-    ] as Provider.Model[]
-    for (const model of models) {
-      const [template, shared] = SystemPrompt.systemSections(model)
+  // III.4 (reviewer 二轮): every entry asserts the DISTINCT template it routes
+  // to (the old matrix only checked the shared tail, so a mis-route — k3
+  // without providerID silently falling to DEFAULT — could not be caught).
+  // gpt-5 (bare gpt, not -4/o1/o3/-6/codex) covers the plain PROMPT_GPT route
+  // that no other entry reaches.
+  test("appends the shared working agreement to every distinct model template", () => {
+    const cases = [
+      { model: { api: { id: "meta/muse-spark-preview" } }, template: PROMPT_META.replaceAll("{{MODEL_NAME}}", "Muse Spark") },
+      { model: { api: { id: "gpt-4" } }, template: PROMPT_BEAST },
+      { model: { api: { id: "gpt-6" } }, template: PROMPT_ASTRA },
+      { model: { api: { id: "gpt-5.5" } }, template: PROMPT_GPT },
+      { model: { api: { id: "gemini-2" } }, template: PROMPT_GEMINI },
+      { model: { api: { id: "claude-x" } }, template: PROMPT_ANTHROPIC },
+      { model: { api: { id: "trinity" } }, template: PROMPT_TRINITY },
+      { model: { providerID: "moonshotai", api: { id: "k3" } }, template: PROMPT_KIMI },
+      { model: { api: { id: "anything-else" } }, template: PROMPT_DEFAULT },
+    ] as { model: Provider.Model; template: string }[]
+    for (const { model, template } of cases) {
+      const [routed, shared] = SystemPrompt.systemSections(model)
+      expect(routed).toBe(template)
       expect(shared.startsWith("# Working agreement")).toBe(true)
       expect(template).not.toContain("# Working agreement")
     }

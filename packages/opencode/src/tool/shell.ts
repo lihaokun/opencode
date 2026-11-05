@@ -653,6 +653,7 @@ export const ShellTool = Tool.define(
       ctx: Tool.Context,
     ) {
       const ops = (ctx.extra as { promptOps?: AgentManagement.AgentPromptOps } | undefined)?.promptOps
+      // Step P3: registry entry (buffer empty, bounded tail 200k chars).
       const taskId = `shell_${randomUUID()}`
       const entry = {
         command: input.command,
@@ -665,6 +666,7 @@ export const ShellTool = Tool.define(
       shellTasks.set(taskId, entry)
 
       const run = Effect.gen(function* () {
+        // Step P6: spawn → stream accumulation (appendCapped) → exitCode await.
         const exit = yield* Effect.exit(
           Effect.scoped(
             Effect.gen(function* () {
@@ -682,6 +684,7 @@ export const ShellTool = Tool.define(
           ),
         )
         if (Exit.isFailure(exit)) entry.error = String(Cause.squash(exit.cause)).slice(0, 500)
+        // Step P7: completion notice via deliverAsync, failure-isolated.
         // Completion notification, delivered like agent delegation results: the
         // message wakes the session so the model never polls. Delivery failures
         // must not affect the task's own state.
@@ -706,12 +709,14 @@ export const ShellTool = Tool.define(
         // fallback report the REAL exit code instead of guessing.
         return `${status}\n${entry.buffer}`
       }).pipe(
-        // Interrupting the run fiber (shell_kill, session cancel) skips the
-        // body above, so the registry entry would leak one per cancelled task.
-        // ensuring runs on every exit — interruption included.
+        // Step P8: settle — shellTasks.delete on every exit including
+        // interruption (the ❌-3 fix: an in-body delete skipped on cancel and
+        // leaked one entry per killed task).
         Effect.ensuring(Effect.sync(() => shellTasks.delete(taskId))),
       )
 
+      // Step P4: BackgroundJob.start (job-scope fork; metadata carries the
+      // owning session for the cancel cascade, P9).
       const info = yield* background.start({
         id: taskId,
         type: "shell",
@@ -771,6 +776,8 @@ export const ShellTool = Tool.define(
                 }),
               )
 
+              // Step P2: background branch guard (false/absent → the sync
+              // path, byte-identical to the pre-feature behavior).
               if (params.run_in_background === true) {
                 return yield* backgroundRun(
                   { shell, command: params.command, cwd, env: yield* shellEnv(ctx, cwd) },

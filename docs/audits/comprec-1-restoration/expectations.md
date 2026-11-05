@@ -50,7 +50,7 @@
 - 恢复的是**当前磁盘版本**（G1，决议 F① 磁盘重读），与 tail 同版本时去重
 - 预算：回填不把刚压小的上下文重新撑满（G3）——超限降级为可诊断引用行（2026-11-05 R4 修订：Not restored 引用节条目数封顶 20、超出合并为一条汇总行、budget ≤ 0 不恢复、materialize 按预算提前停读——上界为 budget + 固定框架开销，取代"引用行不计预算"旧口径）
 - 幂等（G4）：内容不变不重复写入；多次压缩后不丢不重（GAP-1 三压缩全链）
-- **标记必须已结算**（2026-10-20 审核补充，#77 交互防御）：无 `tail_start_id` 的 compaction part（摘要在途/失败/重试挂错消息）不作为恢复触发——恢复块不叠加在未生效的完整历史上
+- **标记必须已结算**（2026-10-20 审核补充，#77 交互防御；**2026-11-05 口径修正**：settled 判据 = 指向该标记消息的完成摘要 assistant（`summary && finish && !error`，与 filterCompacted 同谓词），**不是** `tail_start_id` 是否存在——全量摘要回退路径的 `tail_start_id` 合法地为 undefined，属 settled 形态之一。回归：`apply accepts a full-summary marker (tail_start_id undefined)`）：无完成摘要指向的 compaction part（摘要在途/失败/重试挂错消息）不作为恢复触发——恢复块不叠加在未生效的完整历史上
 - `enabled: false` → 零注入（GAP-3 矩阵）
 - 注入位置在 filterCompacted 保留区间内（压缩 tail 之后）→ 后续每轮可见
 

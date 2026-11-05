@@ -2635,19 +2635,22 @@ itCompaction.instance(
       // Turns 2-3 + compactions: with the tiny preserve budget every
       // compaction falls back to a full summary — the constraint re-appears in
       // every payload, which is exactly the acceptance target (it survives
-      // three consecutive compactions).
+      // three consecutive compactions). Rounds 2-3 run the REAL
+      // compaction.process (2026-11-05 III.3): the old version only wrote
+      // markers via create() and re-asserted round 1's stale capture — the
+      // stub replies were never consumed.
       stub.push(reply("summary-2", (input) => (captured = JSON.stringify(input.messages))))
       const u2 = yield* createUserMessage(session.id, "continue")
-      yield* createSummaryCompaction(session.id)
-      const c2 = captured
+      const c2 = yield* runCompaction("c2")
       expect(c2).toContain("always use pnpm")
       expect(c2).toContain("continue")
+      expect(c2).not.toBe(c1)
 
       stub.push(reply("summary-3", (input) => (captured = JSON.stringify(input.messages))))
       const u3 = yield* createUserMessage(session.id, "wrap up")
-      yield* createSummaryCompaction(session.id)
-      const c3 = captured
+      const c3 = yield* runCompaction("c3")
       expect(c3).toContain("always use pnpm")
+      expect(c3).not.toBe(c2)
 
       // Restoration after the third compaction: the spec is re-read from disk
       // (current version) and the restoration part is idempotent.

@@ -1514,6 +1514,8 @@ const layer = Layer.effect(
             // it reads the disk as of the compaction moment, once per
             // compaction; it is not re-run per model step.
             if (result === "continue") {
+              // Step P1 (comprec-1): trigger — inject exactly once inside the
+              // compaction task arm after process returns continue (B6).
               yield* SessionRestoration.apply({ sessionID }).pipe(
                 Effect.provideService(Session.Service, sessions),
                 Effect.provideService(FSUtil.Service, fsys),

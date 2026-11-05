@@ -24,6 +24,7 @@ import { Reference } from "@opencode-ai/core/reference"
 import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 
+// Step P1: template routing (early returns, bare template string).
 export function provider(model: Provider.Model) {
   if (model.api.id.includes("muse")) {
     const name = model.api.id.includes("muse-glimmer") ? "Muse Glimmer" : "Muse Spark"
@@ -55,6 +56,8 @@ export function provider(model: Provider.Model) {
  * wins any residual per-template conflict and stays inside the cache-stable
  * prefix.
  */
+// Step P2: assemble [template, PROMPT_SHARED] — SHARED always last (the
+// single-source invariant).
 export function systemSections(model: Provider.Model) {
   return [provider(model), PROMPT_SHARED]
 }
