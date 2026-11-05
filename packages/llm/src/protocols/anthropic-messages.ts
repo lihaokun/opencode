@@ -507,7 +507,17 @@ const fromRequest = Effect.fn("AnthropicMessages.fromRequest")(function* (reques
   const toolChoice = request.toolChoice ? yield* lowerToolChoice(request.toolChoice) : undefined
   const generation = request.generation
   const toolSchemaCompatibility = request.model.compatibility?.toolSchema
+  // max_tokens is mandatory on Anthropic Messages. Callers pass limit.output
+  // straight through, where 0 is the "unknown" shape — `?? 4096` does not fire
+  // for it (0 is not nullish), so guard it explicitly and declare the
+  // adapter-level fallback instead of writing a fabricated 0 onto the wire.
   const outputLimit = request.model.defaults?.limits?.output ?? request.model.route.defaults.limits?.output ?? 4096
+  const resolvedMaxTokens = generation?.maxTokens ?? (outputLimit > 0 ? outputLimit : 4096)
+  if (generation?.maxTokens === undefined && outputLimit === 0) {
+    yield* Effect.logWarning(
+      `Anthropic Messages: unknown output limit for "${request.model.id}"; using the adapter default max_tokens 4096.`,
+    )
+  }
   // Allocate the 4-breakpoint budget in invalidation order: tools → system →
   // messages. Tools live highest in the cache hierarchy, so when callers
   // over-mark we keep their tool hints and shed the message-tail ones first.
@@ -543,7 +553,7 @@ const fromRequest = Effect.fn("AnthropicMessages.fromRequest")(function* (reques
     tools,
     tool_choice: toolChoice,
     stream: true as const,
-    max_tokens: generation?.maxTokens ?? outputLimit,
+    max_tokens: resolvedMaxTokens,
     temperature: generation?.temperature,
     top_p: generation?.topP,
     top_k: generation?.topK,

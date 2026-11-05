@@ -393,6 +393,18 @@ describe("session.compaction.usable", () => {
 
     expect(usable({ cfg: config, model, outputTokenMax: 64_000 })).toBe(336_000)
   })
+
+  test("falls back to the compaction buffer when the output limit is unknown (#98)", () => {
+    // Unknown output: no fabricated envelope — the bounded local buffer is the
+    // preflight reserve on both branches.
+    const noInput = createModel({ context: 400_000, output: 0 })
+    noInput.capabilities.reasoning = true
+    expect(usable({ cfg: config, model: noInput })).toBe(380_000)
+
+    const withInput = createModel({ context: 400_000, input: 272_000, output: 0 })
+    withInput.capabilities.reasoning = true
+    expect(usable({ cfg: config, model: withInput })).toBe(252_000)
+  })
 })
 
 function compactionContext(context: string) {
