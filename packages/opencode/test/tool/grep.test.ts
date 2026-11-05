@@ -228,6 +228,24 @@ describe("tool.grep", () => {
     }),
   )
 
+  it.instance("an exact file named dash is not treated as stdin", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const file = path.join(test.directory, "-")
+      yield* Effect.promise(() => Bun.write(file, "needle\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "sibling.txt"), "needle\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      for (const target of [file, "./-"]) {
+        const result = yield* grep.execute({ pattern: "needle", path: target }, ctx)
+        expect(result.metadata.matches).toBe(1)
+        expect(result.output).toContain(`${file}:`)
+        expect(result.output).toContain("Line 1: needle")
+        expect(result.output).not.toContain("sibling.txt")
+      }
+    }),
+  )
+
   it.instance("does not ask for external_directory when alias path is allowed", () =>
     Effect.gen(function* () {
       if (process.platform === "win32") return

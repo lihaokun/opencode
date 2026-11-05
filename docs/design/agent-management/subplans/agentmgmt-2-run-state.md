@@ -584,7 +584,7 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
 #### 5.4.3 `agent_send` 的返回（`tool/agent.ts:288-319`）
 
 - 在 `deliver` **之前**取快照：`status = projection.of(target)`、`run = target.metadata.agentRun`、`isChild = target.parentID !== undefined`、名字；目标不存在时快照为空，投递本身会以 `AgentNotFound` 失败并返回失败文本。
-- 按 4.6 六种情况渲染（名字有则写成 `ses_xxx (cw-b333)`，经 `escapeField`）；随后 `agent_status` 提示行；再是既有的 `Accepted for …` 与两句单向说明。
+- 按 4.6 六种情况渲染（名字有则写成 `ses_xxx (cw-b333)`，经 `escapeField`）；随后为既有的 `Accepted for …` 与两句单向说明，不追加状态查询提示。
 - **正确性论证（决策 §6 第 4 点）**：目标在跑且记录未关闭时，消息进入当前 run 或紧接着的 re-arm run，run 号仍是 N（I5），"is in run N" 成立。目标空闲且记录已关闭时下一次开始的 run 必为 N+1（5.2.1 `begin` 对已关闭记录加一）；即使别的消息抢先唤醒，本消息也只是进入 run N+1。空闲且未关闭（遗留）时下一次开始会先关为 lost 再开 N+1，措辞如实写出。在跑且记录已关闭（续跑窗口或写入未完成）时不预告号。投递失败时工具本身返回失败文本，不输出这段话。快照在 deliver 之前取，避免 fork 已启动目标后读到 N+1 与 busy 的混合状态。
 - 测试：六种情况各一例（`tools.test.ts`）；预告的 run 号与下一份报告一致——经注册表里真实的 `agent_send` 投递、父收到的第二份报告带 `run="2"`（`prompt.test.ts` 定值用例）。T3 没有改走工具投递：工具的 `deliverAsync` 会自己 fork 目标的 run，与 T3 用 `prompt.loop` 控制每次 run 的起止冲突，所以 INV-6b 由定值用例承担，T3 承担 INV-6。
 

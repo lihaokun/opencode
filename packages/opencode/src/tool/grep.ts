@@ -72,7 +72,8 @@ export const GrepTool = Tool.define(
           const result = yield* ripgrep.grep({
             cwd,
             pattern: params.pattern,
-            file: info.type === "File" ? path.basename(search) : undefined,
+            // A bare "-" means stdin to ripgrep, even after "--".
+            file: info.type === "File" ? `./${path.basename(search)}` : undefined,
             include: params.include,
             limit: 100,
           })
