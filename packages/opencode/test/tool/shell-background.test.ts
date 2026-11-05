@@ -195,7 +195,11 @@ it.instance("session cancel stops the background process and suppresses the comp
     yield* Effect.sleep(500)
     expect(delivered).toHaveLength(0)
     const final = (yield* tools.output.execute({ task_id: taskId }, makeCtx())) as { output: string }
-    expect(final.output).toContain("status: cancelled")
+    // R6 parity: the cascade now carries the same snapshot the direct kill
+    // path records — the settled read reports "stopped" plus the tail, not a
+    // bare "cancelled" with the buffer gone.
+    expect(final.output).toContain("status: stopped")
+    expect(final.output).toContain("cancel-marker")
   }),
 )
 

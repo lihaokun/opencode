@@ -71,6 +71,20 @@ const tailOf = (text: string, lines: number) => {
   const all = text.split("\n")
   return all.length <= lines ? text : all.slice(-lines).join("\n")
 }
+
+/**
+ * Cancel snapshot for a live shell task: what BackgroundJob.cancel should
+ * persist when the run is interrupted. The interrupted fiber never reaches
+ * its settle, so without this snapshot the accumulated buffer is lost. Same
+ * `status\nbuffer` shape the natural settle produces, which is what lets
+ * shell_output's post-settle read report the real status. Undefined for a
+ * task this process no longer owns (settled, foreign, or post-restart).
+ */
+export function cancelSnapshot(taskId: string): string | undefined {
+  const entry = shellTasks.get(taskId)
+  if (!entry) return undefined
+  return `stopped\n${entry.buffer}`
+}
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
   ...CWD,
@@ -927,7 +941,7 @@ export const ShellKillTool = Tool.define(
           // (same `status\nbuffer` shape the natural settle produces) and the
           // follow-up shell_output reads it from the job.
           const info = yield* background.cancel(params.task_id, {
-            output: `stopped\n${entry.buffer}`,
+            output: cancelSnapshot(params.task_id),
           })
           const finalStatus = info?.status ?? "cancelled"
           return {

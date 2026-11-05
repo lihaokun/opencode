@@ -5,6 +5,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import path from "path"
 import { BackgroundJob } from "@/background/job"
+import { cancelSnapshot } from "@/tool/shell"
 import { Decimal } from "decimal.js"
 import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
@@ -1126,7 +1127,9 @@ const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function*
       if (job.metadata?.sessionId === sessionID) return true
       return job.metadata?.parentSessionId === sessionID
     }),
-    (job) => background.cancel(job.id),
+    // R6 parity: session removal interrupts the run fiber before settle —
+    // pass the shell buffer snapshot so the tail survives in the job output.
+    (job) => background.cancel(job.id, { output: cancelSnapshot(job.id) }),
     { concurrency: "unbounded", discard: true },
   )
 })

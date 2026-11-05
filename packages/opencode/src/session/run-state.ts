@@ -3,6 +3,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
+import { cancelSnapshot } from "@/tool/shell"
 import { Effect, Latch, Layer, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
@@ -141,7 +142,12 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
     yield* Effect.forEach(
       batch,
       (job) =>
-        background.cancel(job.id).pipe(
+        // R6 parity: the cascade interrupts the run fiber, which never
+        // reaches its settle — pass the shell buffer snapshot so the tail
+        // survives in the job's output (same channel the direct kill path
+        // uses). Non-shell jobs have no snapshot; undefined output cancels
+        // without one.
+        background.cancel(job.id, { output: cancelSnapshot(job.id) }).pipe(
           Effect.tap(() =>
             Effect.sync(() => {
               cancelled.add(job.id)
