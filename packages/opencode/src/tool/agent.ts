@@ -240,7 +240,6 @@ export const AgentTool = Tool.define(
           // Not "running": the job may not have started yet, and claiming a
           // status here would contradict agent_list a moment later.
           "It is running in the background. Its result will arrive as a message when it finishes.",
-          "Use agent_list for its current status.",
         ].join("\n"),
       }
     })
@@ -531,7 +530,6 @@ export const AgentSendTool = Tool.define(
         metadata: sendMeta,
         output: [
           ...(snapshot ? [describeTarget(accepted.target, { ...snapshot, status, now })] : []),
-          `Current state of one agent: agent_status(target="${accepted.target}").`,
           `Accepted for ${accepted.target}.`,
           // Spelled out because a model that reads this as a call will spend its
           // next turn asking where the answer is.

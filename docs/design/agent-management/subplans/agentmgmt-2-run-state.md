@@ -356,10 +356,13 @@ agent_send 的返回（在 deliver 之前取目标的状态投影与 agentRun �
   目标在跑，记录已关闭或缺失（开始写入尚未完成、已失败，或 §5.2.2 的续跑窗口）：
     `ses_xxx (cw-b333) is running (its run record is not updated yet); it reads this at its next step.`
   目标不是子会话（如主会话）：只写 `is running` / `is idle`，不写 run 号
-  末尾恒加一行：`Current state of one agent: agent_status(target="ses_xxx").`
+  不附带 agent_status 查询调用提示；工具用法仅在工具描述中说明
   既有的三句"单向消息"说明保留在上述内容之后
   投递失败时工具返回失败文本，不输出以上任何一句
 ```
+
+2026-11-05 修订：创建 Agent 的成功返回也不再附带 `Use agent_list for its current status.`。
+两处仅移除重复的查询引导；状态事实、自动通知说明、工具描述与查询能力不变。
 
 ### 4.7 工具 schema（commit 5）
 
