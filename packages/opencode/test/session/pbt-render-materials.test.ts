@@ -93,4 +93,50 @@ describe("PBT renderMaterials", () => {
     expect(text).toContain(RESTORATION_SENTINEL)
     expect(text).toContain("/f/b (skipped: restoration budget exhausted")
   })
+
+  // Self-audit P3-a: MAX_REFERENCE_LINES caps line COUNT only; refs are raw
+  // absolute paths (PATH_MAX 4096) and reasons carry guidance prose, so the
+  // count cap alone admits ~21k tokens against the default 8000 budget. The
+  // generator must therefore NOT assume short refs — pathological paths are
+  // exactly the input this property exists for.
+  it("pathological refs cannot blow the budget through reference lines", () => {
+    const pathological = restorationConfig(undefined) // budget 8000
+    fc.assert(
+      fc.property(
+        fc.array(
+          fc.record({
+            candidate: fc.record({
+              kind: fc.constantFrom("file", "skill", "todo"),
+              // PATH_MAX-scale refs, not the friendly /f/x shapes.
+              ref: fc.string({ minLength: 1, maxLength: 4096 }).map((s) => `/${s.replace(/\n/g, "x")}`),
+              lastUseSeq: fc.nat(100),
+            }),
+            status: fc.constantFrom("reference", "missing"),
+            reason: fc.option(fc.string({ maxLength: 200 }), { nil: undefined }),
+          }),
+          { maxLength: 60 },
+        ),
+        (materials) => {
+          const text = renderMaterials(materials as RestorationMaterial[], pathological)
+          if (!text) return true
+          // 20 reference lines × (clipped ref + reason) + framing stays a small
+          // multiple of the budget — unclipped PATH_MAX refs would blow past it.
+          expect(Token.estimate(text)).toBeLessThan(pathological.budget_tokens + 2_000)
+          return true
+        },
+      ),
+      { seed: 0x2_026_10_18, numRuns: 200 },
+    )
+    // Deterministic worst case — the PBT generator can under-sample long
+    // strings, so anchor the exact adversarial shape: a full set of
+    // PATH_MAX-length refs at the line cap. Unclipped: 20 × 4 KiB ≈ 21k
+    // tokens against the 8000 budget.
+    const worstCase = Array.from({ length: 40 }, (_, n) => ({
+      candidate: { kind: "file" as const, ref: `/deep/${"d".repeat(4090)}${n}`, lastUseSeq: n },
+      status: "missing" as const,
+      reason: "file not found on disk",
+    }))
+    const text = renderMaterials(worstCase, pathological)!
+    expect(Token.estimate(text)).toBeLessThan(pathological.budget_tokens + 2_000)
+  })
 })

@@ -228,8 +228,12 @@ export function materializeCandidates(
  * Cap on the "Not restored" reference lines: the omitted list is explanatory,
  * not payload, so it collapses to a single bounded summary line beyond this
  * many entries (R4 — unbounded reference text broke the budget contract).
+ * MAX_REF_CHARS additionally caps each line's ref segment: refs are raw
+ * absolute paths (Linux PATH_MAX 4096), so a count cap alone still admits
+ * ~20 × 4 KiB ≈ 21k tokens against the default 8000 budget.
  */
 const MAX_REFERENCE_LINES = 20
+const MAX_REF_CHARS = 160
 
 export function renderMaterials(materials: RestorationMaterial[], cfg: RestorationConfig): string | undefined {
   // budget_tokens: 0 means "restore nothing" — without this gate, content
@@ -245,7 +249,7 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
 
   const referenceLine = (material: RestorationMaterial) => {
     const reason = material.reason ?? material.status
-    return `- ${material.candidate.ref} (${reason})`
+    return `- ${clipRef(material.candidate.ref)} (${reason})`
   }
   const pushLine = (line: string) => {
     if (lines.length >= MAX_REFERENCE_LINES) {
@@ -255,24 +259,29 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
     lines.push(line)
   }
 
+  // Both ends of every reference line are attacker-sized (paths up to
+  // PATH_MAX, reasons with guidance prose): clip the ref so 20 lines can
+  // never blow the budget on their own.
+  const clipRef = (ref: string) => (ref.length > MAX_REF_CHARS ? ref.slice(0, MAX_REF_CHARS) + "…" : ref)
+
   for (const material of materials) {
     const kind = material.candidate.kind
     if (material.status === "inlined") {
       if (kind === "file" && fileCount >= cfg.max_files) {
-        pushLine(`- ${material.candidate.ref} (beyond max_files=${cfg.max_files}; read it with the read tool if needed)`)
+        pushLine(`- ${clipRef(material.candidate.ref)} (beyond max_files=${cfg.max_files}; read it with the read tool if needed)`)
         continue
       }
       const cost = Token.estimate(material.content ?? "")
       if (overBudget || used + cost > cfg.budget_tokens) {
         overBudget = true
         pushLine(
-          `- ${material.candidate.ref} (skipped: restoration budget exhausted; read it with the read tool if needed)`,
+          `- ${clipRef(material.candidate.ref)} (skipped: restoration budget exhausted; read it with the read tool if needed)`,
         )
         continue
       }
       used += cost
       if (kind === "file") fileCount += 1
-      sectionsByKind[kind].push(`### ${material.candidate.ref}\n\`\`\`\n${material.content}\n\`\`\``)
+      sectionsByKind[kind].push(`### ${clipRef(material.candidate.ref)}\n\`\`\`\n${material.content}\n\`\`\``)
       continue
     }
     if (material.status === "skipped-duplicate") continue
