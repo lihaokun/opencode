@@ -1,16 +1,68 @@
 // Bun Snapshot v1, https://bun.sh/docs/test/snapshots
 
-exports[`tool parameters JSON Schema (wire shape) apply_patch 1`] = `
+exports[`tool parameters JSON Schema (wire shape) grep 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
-    "patchText": {
-      "description": "The full patch text that describes all changes to be made",
+    "after": {
+      "description": "Lines of context after each match, content mode only (max 10)",
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": "integer",
+    },
+    "before": {
+      "description": "Lines of context before each match, content mode only (max 10)",
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": "integer",
+    },
+    "context": {
+      "description": "Lines of context before and after each match, content mode only (max 10). Shorthand for before and after together; an explicit before or after overrides it for that side",
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": "integer",
+    },
+    "head_limit": {
+      "description": "Maximum number of results to return (default 100)",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991,
+      "minimum": -9007199254740991,
+      "type": "integer",
+    },
+    "include": {
+      "description": "File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")",
+      "type": "string",
+    },
+    "insensitive": {
+      "description": "Case-insensitive search",
+      "type": "boolean",
+    },
+    "offset": {
+      "description": "Skip the first N results (for pagination)",
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": "integer",
+    },
+    "output_mode": {
+      "description": "Output format: 'content' shows matching lines (default), 'files_with_matches' lists matching file paths, 'count' shows match counts per file",
+      "enum": [
+        "content",
+        "files_with_matches",
+        "count",
+      ],
+      "type": "string",
+    },
+    "path": {
+      "description": "The directory to search in. Defaults to the current working directory.",
+      "type": "string",
+    },
+    "pattern": {
+      "description": "The regex pattern to search for in file contents",
       "type": "string",
     },
   },
   "required": [
-    "patchText",
+    "pattern",
   ],
   "type": "object",
 }
@@ -87,68 +139,6 @@ exports[`tool parameters JSON Schema (wire shape) glob 1`] = `
     },
     "pattern": {
       "description": "The glob pattern to match files against",
-      "type": "string",
-    },
-  },
-  "required": [
-    "pattern",
-  ],
-  "type": "object",
-}
-`;
-
-exports[`tool parameters JSON Schema (wire shape) grep 1`] = `
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "properties": {
-    "after": {
-      "description": "Lines of context after each match, content mode only (max 10)",
-      "type": "number",
-    },
-    "before": {
-      "description": "Lines of context before each match, content mode only (max 10)",
-      "type": "number",
-    },
-    "context": {
-      "description": "Lines of context before and after each match, content mode only (max 10). Shorthand for before and after together; an explicit before or after overrides it for that side",
-      "type": "number",
-    },
-    "head_limit": {
-      "description": "Maximum number of results to return (default 100)",
-      "exclusiveMinimum": 0,
-      "maximum": 9007199254740991,
-      "minimum": -9007199254740991,
-      "type": "integer",
-    },
-    "include": {
-      "description": "File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")",
-      "type": "string",
-    },
-    "insensitive": {
-      "description": "Case-insensitive search",
-      "type": "boolean",
-    },
-    "offset": {
-      "description": "Skip the first N results (for pagination)",
-      "maximum": 9007199254740991,
-      "minimum": 0,
-      "type": "integer",
-    },
-    "output_mode": {
-      "description": "Output format: 'content' shows matching lines (default), 'files_with_matches' lists matching file paths, 'count' shows match counts per file",
-      "enum": [
-        "content",
-        "files_with_matches",
-        "count",
-      ],
-      "type": "string",
-    },
-    "path": {
-      "description": "The directory to search in. Defaults to the current working directory.",
-      "type": "string",
-    },
-    "pattern": {
-      "description": "The regex pattern to search for in file contents",
       "type": "string",
     },
   },
