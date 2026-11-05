@@ -60,6 +60,12 @@
 - 全套回归与 CI：见 PR #60 提交后 CI（本轮 HEAD `725e9cb2ba`）
 - reviewer 复现场景逐条回放：R1 跨会话（stranger 四态拒绝）、R2 七页 165 全唯一、R3 compacted-read 基线排除、R4 千文件封顶、R5 结算后默认查询、R6 kill 后尾部保留、R7a/R7b
 
+## 追加：R3 端测补链（2026-11-05 晚）
+
+端测盘点（用户问"端测做了吗"）后的补齐：R3 修复初版只有单元级（buildTailText 排除 compacted）+ apply 级测试，**没有 reviewer 复现的那条完整链**（apply → filterCompactedEffect → toModelMessagesEffect）。补了 `restored body reaches the model when the only prior copy was compacted`。
+
+**第一版是假回归保护**：fixture 里 read 的 output 是 `read <path>` 而非文件正文——`tailText.includes(content)` 永远不命中，把 R3 修复回滚测试照样绿。falsification 检查（回滚修复→跑测试）当场揭穿。修正：output 必须与磁盘正文逐字节相同（真实 read 工具的形状），回滚即红、修复即绿。教训追加：**"复现 reviewer 的链"要复现到能红的形状，断言链路通了但 oracle 不可证伪 = 装饰**。R1/R5/R6（shell-background 直测真实进程）与 R2/R7（grep 真树 + PBT 生产函数）本轮已是端测级；B6 overflow wire 测试复核仍绿。
+
 ## 度量
 
 | 指标           | 数值                                          |
