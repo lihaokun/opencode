@@ -216,12 +216,15 @@ test("a single ctrl+c key press only warns; the second inside the window exits",
     // The two-press guard is on the key binding, so drive it with the real
     // keymap through the rendered app rather than dispatching the command.
     // The toast is the observable first-press effect; wait for it so the
-    // second press lands inside the window against a settled keymap.
-    setup.mockInput.pressKey("c", { ctrl: true })
-    await setup.waitForFrame((frame) => frame.includes("Press ctrl+c again to exit"))
+    // second press lands inside the window against a settled keymap. Drive
+    // ctrl+d (not ctrl+c) so the assertion proves the toast names the key
+    // that was actually pressed — the same command is bound to both.
+    setup.mockInput.pressKey("d", { ctrl: true })
+    await setup.waitForFrame((frame) => frame.includes("Press ctrl+d again to exit"))
     expect(setup.renderer.isDestroyed).toBe(false)
+    expect(setup.captureCharFrame()).not.toContain("Press ctrl+c again")
 
-    setup.mockInput.pressKey("c", { ctrl: true })
+    setup.mockInput.pressKey("d", { ctrl: true })
     await task
   } finally {
     process.stdout.write = originalWrite

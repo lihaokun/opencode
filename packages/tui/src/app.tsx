@@ -1,6 +1,7 @@
 import { render, TimeToFirstDraw, useRenderer, useTerminalDimensions } from "@opentui/solid"
 import { registerOpencodeSpinner } from "./component/register-spinner"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
+import { stringifyKeyStroke, type CommandContext } from "@opentui/keymap"
 import { Deferred, Effect } from "effect"
 import { Global } from "@opencode-ai/core/global"
 import { Flag } from "@opencode-ai/core/flag/flag"
@@ -996,7 +997,7 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     // run above, which exits immediately.
     bindings: tuiConfig.keybinds.gather("app_exit", ["app.exit"]).map((binding) => ({
       ...binding,
-      cmd: () => {
+      cmd: (ctx: CommandContext) => {
         const decision = confirmExit(exitConfirm(), Date.now(), EXIT_CONFIRM_WINDOW_MS)
         setExitConfirm(decision.next)
         if (decision.decision === "exit") {
@@ -1005,7 +1006,9 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         }
         toast.show({
           variant: "info",
-          message: "Press ctrl+c again to exit",
+          // Name the key that was actually pressed — the same command is
+          // bound to ctrl+c, ctrl+d and <leader>q.
+          message: `Press ${stringifyKeyStroke(ctx.event)} again to exit`,
           duration: EXIT_CONFIRM_WINDOW_MS,
         })
       },
