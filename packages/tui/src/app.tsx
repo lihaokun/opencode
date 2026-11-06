@@ -1,6 +1,7 @@
 import { render, TimeToFirstDraw, useRenderer, useTerminalDimensions } from "@opentui/solid"
 import { registerOpencodeSpinner } from "./component/register-spinner"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
+import { stringifyKeyStroke, type CommandContext } from "@opentui/keymap"
 import { Deferred, Effect } from "effect"
 import { Global } from "@opencode-ai/core/global"
 import { Flag } from "@opencode-ai/core/flag/flag"
@@ -86,6 +87,7 @@ import * as TuiAudio from "./audio"
 import { win32DisableProcessedInput, win32FlushInputBuffer } from "./terminal-win32"
 import { destroyRenderer } from "./util/renderer"
 import { cliErrorMessage, errorFormat } from "./util/error"
+import { confirmExit, EXIT_CONFIRM_WINDOW_MS, type ExitConfirmState } from "./util/confirm-exit"
 
 registerOpencodeSpinner()
 
@@ -407,6 +409,8 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     }),
   )
   const [ready, setReady] = createSignal(false)
+  const [exitConfirm, setExitConfirm] = createSignal<ExitConfirmState>({ count: 0, firstAt: undefined })
+  onCleanup(() => setExitConfirm({ count: 0, firstAt: undefined }))
   props.pluginHost
     .start({
       api,
@@ -831,7 +835,13 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         title: "Exit the app",
         slashName: "exit",
         slashAliases: ["quit", "q"],
-        run: () => exit(),
+        run: () => {
+          // Typing a full slash command is an explicit exit intent — no
+          // mispress to guard against — so it exits immediately. The
+          // two-press guard lives on the keymap binding below, which is the
+          // only place a stray ctrl+c can come from.
+          exit()
+        },
         category: "System",
       },
       {
@@ -981,7 +991,28 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
       if (!current?.focused) return true
       return current.current.input === ""
     },
-    bindings: tuiConfig.keybinds.gather("app_exit", ["app.exit"]),
+    // The two-press guard belongs to the key binding only (ctrl+c, ctrl+d,
+    // <leader>q): that is where a mispress can happen. Explicit entry points
+    // — the /exit slash command, dispatching app.exit — call the command
+    // run above, which exits immediately.
+    bindings: tuiConfig.keybinds.gather("app_exit", ["app.exit"]).map((binding) => ({
+      ...binding,
+      cmd: (ctx: CommandContext) => {
+        const decision = confirmExit(exitConfirm(), Date.now(), EXIT_CONFIRM_WINDOW_MS)
+        setExitConfirm(decision.next)
+        if (decision.decision === "exit") {
+          exit()
+          return
+        }
+        toast.show({
+          variant: "info",
+          // Name the key that was actually pressed — the same command is
+          // bound to ctrl+c, ctrl+d and <leader>q.
+          message: `Press ${stringifyKeyStroke(ctx.event)} again to exit`,
+          duration: EXIT_CONFIRM_WINDOW_MS,
+        })
+      },
+    })),
   }))
 
   event.on("tui.command.execute", (evt, { workspace }) => {
