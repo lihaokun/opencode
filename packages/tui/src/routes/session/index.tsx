@@ -203,8 +203,8 @@ export function Session() {
     setEpilogue(sessionEpilogue({ title, sessionID: session()?.id }))
   })
   onCleanup(() => setEpilogue())
-  // Set on a right-button down whose copy-on-select already consumed the
-  // press; the matching up clears it instead of opening the message menu.
+  // Set on a right-button down that copied the selection; the matching up
+  // clears it instead of opening the message menu.
   let rightPressCopied = false
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const descendants = createMemo(() => {
@@ -1222,11 +1222,14 @@ export function Session() {
                         <UserMessage
                           index={index()}
                           onMouseDown={(event) => {
-                            // With copy-on-select enabled (Windows default),
-                            // the global right-button down copies and clears
-                            // the selection. If it did, this press is spent:
-                            // remember it so the matching up does not also
-                            // open the menu (review of PR #88).
+                            // The renderer clears the current selection after
+                            // any button-down that is not preventDefaulted
+                            // (opentui CliRenderer.processSingleMouseEvent),
+                            // so by the time the matching up arrives there is
+                            // never a selection to copy. The copy must happen
+                            // here, on the down — and if it did copy, the
+                            // press is spent: remember it so the up does not
+                            // also open the menu (review of PR #88).
                             rightPressCopied =
                               event.button === MouseButton.RIGHT &&
                               Boolean(renderer.getSelection()?.getSelectedText()) &&
@@ -1234,8 +1237,10 @@ export function Session() {
                           }}
                           onMouseUp={(event) => {
                             // Issue #69: left click is for focus and selection
-                            // only; right click copies a selection or opens the
-                            // message menu when nothing is selected.
+                            // only; right click opens the message menu — the
+                            // selection-copy happened on the matching down
+                            // (see onMouseDown above), which also tells this
+                            // handler whether the press was already spent.
                             const action = messageMouseAction({
                               button: event.button,
                               selectionText: renderer.getSelection()?.getSelectedText(),

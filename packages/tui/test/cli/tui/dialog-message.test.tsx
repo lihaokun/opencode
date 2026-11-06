@@ -39,6 +39,12 @@ const userMessage = (overrides: Partial<Message> = {}): Message =>
     ...overrides,
   }) as Message
 
+// The deletion set spans roles — the server's cleanup removes boundary and
+// everything after regardless of role — so the fixture must be able to build
+// assistant rows too, or "assistants are counted" cannot be asserted.
+const assistantMessage = (overrides: Partial<Message> = {}): Message =>
+  ({ ...userMessage(), role: "assistant", ...overrides }) as Message
+
 async function mountDialogMessage(input: { messages: Message[]; openMessageID?: string }) {
   const revertCalls: string[] = []
   const tmp = await tmpdir()
@@ -225,13 +231,15 @@ test("single-message session counts the message itself, not zero", async () => {
 
 test("interleaved turns count assistants from the selected message on", async () => {
   // Review of PR #88: the deletion set includes assistants after the
-  // boundary, so user/assistant/user/assistant from the selection = 4.
+  // boundary. Real interleaved history (user, assistant, user*, assistant):
+  // selecting the second user message removes it plus its answer — and the
+  // assistant rows are what a user-only-count regression would drop.
   const mounted = await mountDialogMessage({
     messages: [
       userMessage(),
-      userMessage({ id: "msg_2" }),
-      userMessage({ id: "msg_3" }),
-      userMessage({ id: "msg_4" }),
+      assistantMessage({ id: "msg_1a" }),
+      userMessage({ id: "msg_2", time: { created: Date.now() + 2 } }),
+      assistantMessage({ id: "msg_2a", time: { created: Date.now() + 3 } }),
     ],
     openMessageID: "msg_2",
   })
@@ -240,9 +248,10 @@ test("interleaved turns count assistants from the selected message on", async ()
   try {
     await chooseRevert(app)
     await wait(app, () => app.captureCharFrame().includes("Confirm Revert"))
-    // Selected msg_2 (index 1 of 4): msgs 2..4 are removed.
+    // Selected msg_2 (index 2 of 4): msg_2, msg_2a are removed — 2 messages,
+    // not 1, because the assistant answer counts too.
     const frame = app.captureCharFrame()
-    expect(frame).toContain("3 messages (starting with this one)")
+    expect(frame).toContain("2 messages (starting with this one)")
   } finally {
     app.renderer.destroy()
   }

@@ -137,3 +137,12 @@ Review 提出三条，逐条核实后全部成立，修复如下：
 3. **测试放宽分支** — `if (revertCalls.length === 0)` 是调试"同键双发"疑虑的遗留；事后证明双发是早期 harness 未注入 fetch stub 造成的假象（真实断言：第一次 Enter 后必须见 Confirm 且 calls=0，二次确认后才 =1）。删除两个放宽分支，连跑 3 轮全绿。
 
 复查教训：fix 文档第四部分的交互推理（"down 的 stopPropagation 足以…"）当时没有用两事件链验证支撑；对事件对（down/up）的行为声明，测试必须覆盖完整事件序列，单事件单测发现不了这类缺口。
+
+### 自审修订（PR #88 二次自审，2026-11-06）
+
+按 reviewer 标准复扫 review 响应 commit，发现两处残留，修复如下：
+
+1. **"interleaved" 用例的 fixture 没有真正的 interleaved** — 测试名声称 "count assistants from the selected message on"，fixture 却全是 `userMessage()`（helper 只能造 user）。它能抓 off-by-one，但抓不住"只数 user"的角色过滤回归——恰是计数 bug 的另一半形态；reviewer 点名的 "user/assistant 交错" 实质未交付。修复：新增 `assistantMessage` helper，用例改为 `[user, assistant, user(选中), assistant]`，断言 "2 messages"（选中 user + 其 assistant 回答），若计数退化成只数 user 会得到 "1" 而失败。
+2. **down 阶段复制 handler 的注释机制失实** — 注释称这是 "copy-on-select enabled (Windows default)" 的补丁。实际机制更广：opentui renderer 在**任何**未 preventDefault 的 button-down 之后清空当前选区（`CliRenderer.processSingleMouseEvent`），所以 right **up** 到达时选区在所有平台都已不存在——(a) 决策器的 `selectionText` copy 分支在生产中不可达，标为防御性保留；(b) down 阶段复制在 Linux/macOS 上同样承重，若将来有人按旧注释"纠正"为加 flag 门控，非 Windows 的右键复制会退化成弹菜单。重写 `onMouseDown`/`onMouseUp` 注释与 `message-mouse.ts` docstring 说明真实机制。
+
+教训补充：上一条教训（"交互声明要完整事件链验证"）同样适用于**注释与 docstring**——对机制的解释性文字（何时触发、哪个平台承重、哪个分支可达）也是行为声明，写之前同样要核到源码；否则注释会引导后来的维护者做出错误"修复"。

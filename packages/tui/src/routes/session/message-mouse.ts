@@ -2,11 +2,20 @@ import { MouseButton } from "@opentui/core"
 
 /** What a mouse-up on a user message should do. Left click never opens the
  * menu — clicks are for focus and text selection (issue #69). Right click
- * copies when there is a selection and opens the message menu otherwise;
- * any other button does nothing. `consumedByCopy` suppresses the menu when
- * this press was already spent on a copy: with copy-on-select enabled, the
- * right-button down copies and clears the selection, so the later up sees no
- * selection and must not also open the menu. */
+ * opens the message menu; any other button does nothing.
+ *
+ * Two notes on the remaining branches, both consequences of the renderer
+ * clearing the selection after any button-down that is not preventDefaulted
+ * (opentui CliRenderer.processSingleMouseEvent):
+ *
+ * - `consumedByCopy`: the selection-copy happens on the right-button *down*
+ *   (the message row's onMouseDown), because that is the last moment the
+ *   selection still exists. When the down copied, the press is spent and the
+ *   matching up must not also open the menu.
+ * - the `selectionText` copy branch is defensive only: on the up there is
+ *   normally no selection left to see. Keep it so a renderer that stops
+ *   clearing on down degrades to copy-instead-of-menu rather than opening a
+ *   menu over a selection the user meant to copy. */
 export type MessageMouseAction = "copy" | "menu" | "none"
 
 export function messageMouseAction(input: {
