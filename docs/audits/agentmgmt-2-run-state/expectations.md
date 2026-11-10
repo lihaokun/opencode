@@ -101,9 +101,9 @@
 
 **进度视图（commit 3）**
 
-- S14 门：无直接子或 `agent_list` deny → 不附带；筛选后无有效项同样不附带子 Agent 节
+- S14 门：无直接子或 `agent_list` deny → 不附带；已有直接子但筛选后无有效项则保留零运行行
 - S15 采集：一次 children SQL 和一次 status.list；窗口下界取 `min(now − 10min, previousStepStart)`。状态由 work 持有，首步初始化，同号 re-arm 保留（含根），新号或新 loop 重置；收到带 finish 的响应即推进，先于各提前退出分支；预检撤回/provider 拒绝不推进。
-- S16 渲染：在跑升序（`started_at ?? created`）、已结束降序（`ended_at ?? started_at`）、cut off 行不受窗口限制、各 10 行、省略行、上一个 run 的分号句；总览计数为两个列表截断前的集合，过窗结束/空闲无记录项不计数；两列表空时整节省略，重复计数独立保留；节序在重复计数之前
+- S16 渲染：在跑升序（`started_at ?? created`）、已结束降序（`ended_at ?? started_at`）、cut off 行不受窗口限制、各 10 行、省略行、上一个 run 的分号句；总览计数为两个列表截断前的集合，过窗结束/空闲无记录项不计数；已有直接子但两列表空时输出 `Your subagents: 0 running.`，时钟随之保留；重复计数独立保留；节序在重复计数之前
 - S17 删除花名册注入（`applyAgentRoster` 调用与实现），保留 sentinel 常量
 
 **报告与 agent_send（commit 4）**
@@ -156,7 +156,7 @@
 - **INV-7（= I7）** 对任意步序列（工具步、询问钩子的最终回答、带中途插入新消息的最终回答）与任意 cap（1–8），钩子连续阻止长度不限：父收到的报告恰一份，其创建时间不早于最后一次询问；每次询问的 `continuations` 等于按定义推进的参照值；每个请求的最后一条用户消息文本等于当时最新的 reason 或插入消息；每次询问之前子会话的 `SessionStatus` 事件序列中没有 idle。—— T8
 - **INV-7b** 每段连续无工具、无新输入的退出尝试中询问与阻止次数 ≤ cap；一步含工具调用或钩子之外的新用户消息后计数从 0 重新累积。—— T8（steer、超 cap 的阻止）；定值用例（新 run 再次询问）
 - **INV-8（= I8）** 相邻两步请求的历史部分逐字相同（R1 扩展到带进度视图的会话）；视图文本不出现在会话历史与压缩输入中。
-- **INV-8b** 随机生成子集合（状态、记录、创建时间、最后一步时间）与窗口：在跑列表恰等于投影 running 的子按 `started_at ?? created` 升序取前 10；已结束列表恰等于空闲且有 run 记录且（已关闭且 `ended_at ≥ windowStart`，或未关闭）的子按 `ended_at ?? started_at` 降序取前 10；总览 direct/running/idle 为这两个集合截断前的大小，总数等于两分项之和；过窗结束项/空闲无记录项加入输入不影响输出；集合空返回 undefined。省略计数等于被截去的数量；非空视图行数恰为标题、各行与省略行之和（名字与唤醒来源名含换行、制表符、`]` 时也不多出一行）；同一输入两次渲染文本相同。—— T7 与 FastCheck 退窗性质
+- **INV-8b** 随机生成子集合（状态、记录、创建时间、最后一步时间）与窗口：在跑列表恰等于投影 running 的子按 `started_at ?? created` 升序取前 10；已结束列表恰等于空闲且有 run 记录且（已关闭且 `ended_at ≥ windowStart`，或未关闭）的子按 `ended_at ?? started_at` 降序取前 10；总览 direct/running/idle 为这两个集合截断前的大小，总数等于两分项之和。无子输入返回 undefined；已有子但两集合空时只返回 `Your subagents: 0 running.`。过窗结束项/空闲无记录项加入已有子集合不影响输出，加入空输入则产生零运行行。省略计数等于被截去的数量；非空视图行数恰为标题、各行与省略行之和（名字与唤醒来源名含换行、制表符、`]` 时也不多出一行），零运行视图恰为一行；同一输入两次渲染文本相同。—— T7 与 FastCheck 退窗性质
 - **INV-9（= I9）** 对权限规则形态 {无规则、`agent_list: deny` 通配、`agent_list` 具体 pattern 的 deny（`Permission.disabled` 只认 `pattern === "*"`，故不隐藏）、`agent_status: deny`} × 深度 {< limit, ≥ limit} 的全部组合，工具表中 `agent_status ∈ tools ⇔ agent_list ∈ tools`；`agent_list` 通配 deny 时 `agent_status` 执行被拒。—— 枚举
 - **INV-10（= I10）** 对任意发送方字段，`render()` 的输出与基线逐字相同；四条路径的 metadata 形状固定。—— 枚举
 - **INV-11（= I11）** 对同一会话的任意并发 patch 序列（随机的 setTitle / setMetadata / touch / setAgentModel；另 `updateMetadata` 并发自增 N 次恰得 N，每次写入的值各不相同），锁内按序发布的 `session.updated` 行序列中，title / metadata.note / agent / model.id 四个字段都不会回到出现过的值（丢失的更新就是回退），每次写入的值都在某一行出现过，最终行等于最后一个事件的行。这蕴含"每个字段等于最后一次写该字段的值"。—— T9

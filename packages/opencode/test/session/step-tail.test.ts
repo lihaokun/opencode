@@ -231,10 +231,11 @@ describe("step tail: subagent view", () => {
     expect(view([])).toBeUndefined()
   })
 
-  test("expired children leave the overview as well as the finished list", () => {
+  test("expired children leave the counts and finished list but preserve zero running", () => {
     const expired = Array.from({ length: 4 }, (_, i) => child(i, { run: closed(1, 120 * 60_000) }))
-    expect(view(expired)).toBeUndefined()
-    expect(view([...expired, child(4, {})])).toBeUndefined()
+    expect(view(expired)).toBe("Your subagents: 0 running.")
+    expect(view([...expired, child(4, {})])).toBe("Your subagents: 0 running.")
+    expect(view([child(4, {})])).toBe("Your subagents: 0 running.")
     const active = child(5, { running: true, run: open(2, 1_000) })
     expect(view([...expired, active])).toBe(view([active]))
     expect(view([...expired, active])).toStartWith("Your subagents: 1 direct, 1 running, 0 idle.")
@@ -248,7 +249,7 @@ describe("step tail: subagent view", () => {
     expect(text).toContain(id(1))
     expect(text).not.toContain(id(2))
     expect(view(rows, now - StepTail.WINDOW_MS + 1)).toStartWith("Your subagents: 1 direct, 0 running, 1 idle.")
-    expect(view(rows, now - StepTail.WINDOW_MS + 2)).toBeUndefined()
+    expect(view(rows, now - StepTail.WINDOW_MS + 2)).toBe("Your subagents: 0 running.")
   })
 
   test("running rows: longest-running first, with the source, the last step and the previous run inside the window", () => {
@@ -418,7 +419,7 @@ describe("step tail: subagent view", () => {
         .toSorted((a, b) => end(b) - end(a) || byId(a, b))
 
       if (running.length + finished.length === 0) {
-        expect(text, label).toBeUndefined()
+        expect(text, label).toBe(children.length === 0 ? undefined : "Your subagents: 0 running.")
         continue
       }
 
@@ -466,7 +467,7 @@ describe("step tail: subagent view", () => {
     }
   })
 
-  test("PBT: overview counts follow visibility classes and ignore expired history", () => {
+  test("PBT: overview counts ignore expired history while known children preserve zero running", () => {
     FastCheck.assert(
       FastCheck.property(
         FastCheck.integer({ min: 0, max: 50 * 60_000 }),
@@ -507,14 +508,18 @@ describe("step tail: subagent view", () => {
           const text = view(children, now - width)
           expect(text?.split("\n")[0]).toBe(
             running + idle === 0
-              ? undefined
+              ? children.length === 0
+                ? undefined
+                : "Your subagents: 0 running."
               : `Your subagents: ${running + idle} direct, ${running} running, ${idle} idle.`,
           )
           const history = ages.flatMap((age, i) => [
             child(1000 + i, { run: closed(1, width + age) }),
             child(2000 + i, {}),
           ])
-          expect(view([...history, ...children], now - width)).toBe(text)
+          expect(view([...history, ...children], now - width)).toBe(
+            children.length === 0 && history.length > 0 ? "Your subagents: 0 running." : text,
+          )
           expect(children).toEqual(before)
         },
       ),
@@ -539,7 +544,7 @@ describe("step tail: subagent view", () => {
           expect(render(at, [ended, ...persistent])).toStartWith("Your subagents: 3 direct, 1 running, 2 idle.")
           expect(render(at + 1, [ended, ...persistent])).toBe(render(at + 1, persistent))
           expect(render(at + 1, persistent)).toStartWith("Your subagents: 2 direct, 1 running, 1 idle.")
-          expect(render(at + 1, [ended])).toBeUndefined()
+          expect(render(at + 1, [ended])).toBe("Your subagents: 0 running.")
         },
       ),
       { numRuns: 100, seed: 97104 },
