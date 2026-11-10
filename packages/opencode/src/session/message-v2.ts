@@ -508,6 +508,29 @@ export function parts(messageID: MessageID) {
   })
 }
 
+// The role of the chronologically latest message, or undefined for an empty
+// session. Generated IDs use the same order in SQLite and compareChronology,
+// so this needs one indexed row and no parts. A custom ID can contain non-BMP
+// characters: SQLite orders UTF-8, while JS orders UTF-16 code units. Only a
+// SQL winner containing a surrogate can lose under JS's order. For that rare
+// case reuse the old filtered-history predicate, including compaction bounds.
+export const latestRole = Effect.fn("MessageV2.latestRole")(function* (sessionID: SessionID) {
+  const { db } = yield* Database.Service
+  const row = yield* db
+    .select({ id: MessageTable.id, data: MessageTable.data })
+    .from(MessageTable)
+    .where(eq(MessageTable.session_id, sessionID))
+    .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+    .limit(1)
+    .get()
+    .pipe(Effect.orDie)
+  if (!row) return undefined
+  if (!/[\uD800-\uDFFF]/.test(row.id)) return (row.data as Info).role
+  const result = latest(yield* filterCompactedEffect(sessionID))
+  if (!result.user) return result.assistant?.role
+  return !result.assistant || compareChronology(result.user, result.assistant) > 0 ? "user" : "assistant"
+})
+
 export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: SessionID; messageID: MessageID }) {
   const { db } = yield* Database.Service
   const row = yield* db
@@ -527,7 +550,10 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
   const result = [] as WithParts[]
   const completed = new Set<string>()
   let retain: MessageID | undefined
+  let boundary: WithParts | undefined
   for (const msg of msgs) {
+    // Keep even hidden summary attempts until the durable boundary has been
+    // interpreted: old tail_start_id values can point at those messages.
     result.push(msg)
     if (retain) {
       if (msg.info.id === retain) break
@@ -536,44 +562,43 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
     if (msg.info.role === "user" && completed.has(msg.info.id)) {
       const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
       if (!part) continue
+      boundary = msg
       if (!part.tail_start_id) break
       retain = part.tail_start_id
       if (msg.info.id === retain) break
       continue
     }
-    if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((part) => part.type === "compaction"))
-      break
     if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
       completed.add(msg.info.parentID)
   }
   result.reverse()
-  const compactionIndex = result.findLastIndex(
-    (msg) =>
-      msg.info.role === "user" &&
-      msg.parts.some((item): item is CompactionPart => item.type === "compaction" && item.tail_start_id !== undefined),
-  )
-  const compaction = result[compactionIndex]
-  const part = compaction?.parts.find(
-    (item): item is CompactionPart => item.type === "compaction" && item.tail_start_id !== undefined,
-  )
-  const summaryIndex = compaction
+  const compactionIndex = boundary ? result.indexOf(boundary) : -1
+  const summaryIndex = boundary
     ? result.findIndex(
         (msg, index) =>
           index > compactionIndex &&
           msg.info.role === "assistant" &&
           msg.info.summary &&
-          msg.info.parentID === compaction.info.id,
+          msg.info.finish &&
+          !msg.info.error &&
+          msg.info.parentID === boundary.info.id,
       )
     : -1
-  const tailIndex = part?.tail_start_id ? result.findIndex((msg) => msg.info.id === part.tail_start_id) : -1
-  if (tailIndex >= 0 && tailIndex < compactionIndex && summaryIndex > compactionIndex) {
-    return [
-      ...result.slice(compactionIndex, summaryIndex + 1),
-      ...result.slice(tailIndex, compactionIndex),
-      ...result.slice(summaryIndex + 1),
-    ]
-  }
-  return result
+  // Only the settled boundary controls the layout. Inputs arriving between
+  // its marker and summary follow the retained tail, in their original order.
+  const ordered =
+    boundary && summaryIndex > compactionIndex
+      ? [
+          boundary,
+          result[summaryIndex]!,
+          ...result.slice(0, compactionIndex),
+          ...result.slice(compactionIndex + 1, summaryIndex),
+          ...result.slice(summaryIndex + 1),
+        ]
+      : result
+  return ordered.filter(
+    (msg) => msg.info.role !== "assistant" || !msg.info.summary || (msg.info.finish && !msg.info.error),
+  )
 }
 
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -600,7 +625,9 @@ export function latest(msgs: WithParts[]) {
   const tasks = msgs.flatMap((m) =>
     finished && compareChronology(m.info, finished) <= 0
       ? []
-      : m.parts.filter((p): p is CompactionPart | SubtaskPart => p.type === "compaction" || p.type === "subtask"),
+      : m.parts
+          .filter((p): p is CompactionPart | SubtaskPart => p.type === "compaction" || p.type === "subtask")
+          .map((p) => ({ part: p, message: m.info })),
   )
   return { user, assistant, finished, tasks }
 }

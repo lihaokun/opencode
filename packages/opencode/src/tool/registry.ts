@@ -3,6 +3,7 @@ import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { PlanExitTool } from "./plan"
 import { Session } from "@/session/session"
+import { SessionStatus } from "@/session/status"
 import { QuestionTool } from "./question"
 import { ShellTool } from "./shell"
 import { EditTool } from "./edit"
@@ -12,6 +13,7 @@ import { ReadTool } from "./read"
 import {
   AgentTool,
   AgentListTool,
+  AgentStatusTool,
   AgentSendTool,
   AgentStopTool,
   AGENT_TOOL_ID,
@@ -41,7 +43,6 @@ import { Provider } from "@/provider/provider"
 import { WebSearchTool } from "./websearch"
 import { LspTool } from "./lsp"
 import * as Truncate from "./truncate"
-import { ApplyPatchTool } from "./apply_patch"
 import { Glob } from "@opencode-ai/core/util/glob"
 import path from "path"
 import { pathToFileURL } from "url"
@@ -121,6 +122,7 @@ const layer = Layer.effect(
     const invalid = yield* InvalidTool
     const agentTool = yield* AgentTool
     const agentListTool = yield* AgentListTool
+    const agentStatusTool = yield* AgentStatusTool
     const agentSendTool = yield* AgentSendTool
     const agentStopTool = yield* AgentStopTool
     const agentTree = yield* AgentTree.Service
@@ -136,7 +138,6 @@ const layer = Layer.effect(
     const writetool = yield* WriteTool
     const edit = yield* EditTool
     const greptool = yield* GrepTool
-    const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
     const agent = yield* Agent.Service
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
@@ -179,8 +180,7 @@ const layer = Layer.effect(
                 const output = typeof result === "string" ? result : result.output
                 const metadata = typeof result === "string" ? {} : (result.metadata ?? {})
                 const attachments = typeof result === "string" ? undefined : result.attachments
-                const info = yield* agent.get(toolCtx.agent)
-                const out = yield* truncate.output(output, {}, info)
+                const out = yield* truncate.output(output)
                 return {
                   title: typeof result === "string" ? "" : (result.title ?? ""),
                   output: out.truncated ? out.content : output,
@@ -240,13 +240,13 @@ const layer = Layer.effect(
           write: Tool.init(writetool),
           agent: Tool.init(agentTool),
           agentList: Tool.init(agentListTool),
+          agentStatus: Tool.init(agentStatusTool),
           agentSend: Tool.init(agentSendTool),
           agentStop: Tool.init(agentStopTool),
           fetch: Tool.init(webfetch),
           todo: Tool.init(todo),
           search: Tool.init(websearch),
           skill: Tool.init(skilltool),
-          patch: Tool.init(patchtool),
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
@@ -266,13 +266,13 @@ const layer = Layer.effect(
             tool.write,
             tool.agent,
             tool.agentList,
+            tool.agentStatus,
             tool.agentSend,
             tool.agentStop,
             tool.fetch,
             tool.todo,
             tool.search,
             tool.skill,
-            tool.patch,
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
@@ -332,11 +332,6 @@ const layer = Layer.effect(
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
         }
-
-        const usePatch =
-          input.modelID.includes("gpt-") && !input.modelID.includes("oss") && !input.modelID.includes("gpt-4")
-        if (tool.id === ApplyPatchTool.id) return usePatch
-        if (tool.id === EditTool.id || tool.id === WriteTool.id) return !usePatch
 
         // Depth decides which Agent tools exist at all. Withdrawing them beats
         // letting the call fail: a model that has to try, hit the wall and
@@ -499,6 +494,7 @@ export const node = LayerNode.make({
     AgentLifecycle.node,
     AgentInbox.node,
     AgentStatusProjection.node,
+    SessionStatus.node,
   ],
 })
 

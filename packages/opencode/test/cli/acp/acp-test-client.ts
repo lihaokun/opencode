@@ -3,6 +3,11 @@ import type { SessionConfigOption, SessionConfigSelectOption } from "@agentclien
 import { Duration, Effect } from "effect"
 import type { AcpHandle } from "../../lib/cli-process"
 
+// Initialization includes cold CLI startup. Leave room in the outer test
+// for subsequent protocol requests and process cleanup on Windows CI.
+export const ACP_STARTUP_TIMEOUT_MS = process.platform === "win32" ? 60_000 : 30_000
+export const ACP_TEST_TIMEOUT_MS = ACP_STARTUP_TIMEOUT_MS * 2
+
 type JsonRpcRequest = {
   readonly jsonrpc: "2.0"
   readonly id: number
@@ -23,7 +28,7 @@ type JsonRpcNotification<T = unknown> = {
   readonly params?: T
 }
 
-export type AcpClient = {
+export type AcpClient = Pick<AcpHandle, "close" | "exited"> & {
   readonly request: <T>(method: string, params?: unknown) => Effect.Effect<JsonRpcResponse<T>, unknown>
   readonly receive: Effect.Effect<unknown>
   readonly waitForNotification: <T>(
@@ -39,12 +44,21 @@ export function createAcpClient(acp: AcpHandle): AcpClient {
   const request = <T>(method: string, params?: unknown) =>
     Effect.gen(function* () {
       const id = state.nextId++
+      const timeoutMs = method === "initialize" ? ACP_STARTUP_TIMEOUT_MS : 30_000
       const message: JsonRpcRequest =
         params === undefined ? { jsonrpc: "2.0", id, method } : { jsonrpc: "2.0", id, method, params }
       yield* acp.send(message)
 
       while (true) {
-        const received = yield* acp.receive.pipe(Effect.timeout(Duration.seconds(15)))
+        const received = yield* acp.receive.pipe(
+          Effect.timeoutOrElse({
+            duration: Duration.millis(timeoutMs),
+            orElse: () =>
+              Effect.fail(
+                new Error(`Timed out waiting for ACP ${method} response (id ${id}) after ${timeoutMs / 1000}s`),
+              ),
+          }),
+        )
         if (isJsonRpcResponse<T>(received) && received.id === id) return received
       }
     })
@@ -59,6 +73,8 @@ export function createAcpClient(acp: AcpHandle): AcpClient {
     })
 
   return {
+    close: acp.close,
+    exited: acp.exited,
     request,
     receive: acp.receive,
     waitForNotification,
