@@ -6668,7 +6668,7 @@ it.instance("each step ends with the clock and the subagent view, and the histor
   }),
 )
 
-it.instance("expired subagent counts disappear from requests without deleting sessions or hiding repeat facts", () =>
+it.instance("expired subagent details disappear but zero running survives expiry and a later resume", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -6719,18 +6719,50 @@ it.instance("expired subagent counts disappear from requests without deleting se
     const inputs = yield* llm.inputs
     expect(inputs).toHaveLength(4)
     expect(lastUserContent(inputs[0]!)).toContain("Your subagents: 4 direct, 0 running, 4 idle.")
-    expect(JSON.stringify(inputs[1]!.messages)).not.toContain("Your subagents:")
-    expect(JSON.stringify(inputs[1]!.messages)).not.toContain("Now: ")
+    expect(lastUserContent(inputs[1]!)).toBe(
+      `Now: ${AgentRun.formatInstant(t0 + 11 * 60_000)}.\n\nYour subagents: 0 running.`,
+    )
     expect(lastUserContent(inputs[2]!)).toContain("Your last step repeated the tool calls")
-    expect(lastUserContent(inputs[2]!)).not.toContain("Your subagents:")
+    expect(lastUserContent(inputs[2]!)).toContain("Your subagents: 0 running.")
     expect(lastUserContent(inputs[2]!)).toStartWith("Now: ")
+    for (const child of children) {
+      expect(lastUserContent(inputs[1]!)).not.toContain(child.id)
+      expect(lastUserContent(inputs[2]!)).not.toContain(child.id)
+    }
     expect(lastUserContent(inputs[3]!)).toContain("Your subagents: 1 direct, 1 running, 0 idle.")
     for (const child of children.slice(1)) expect(lastUserContent(inputs[3]!)).not.toContain(child.id)
     expect(yield* sessions.children(parent.id)).toHaveLength(4)
     for (const child of children.slice(1)) {
       expect(AgentRun.read((yield* sessions.get(child.id)).metadata)?.ended_at).toBe(t0 - 60_000)
     }
-    expect(JSON.stringify(yield* sessions.messages({ sessionID: parent.id }))).not.toContain("Your subagents:")
+
+    // Resume hours later, after the last running child has also ended. This
+    // starts a fresh loop, so no earlier step can keep a finished row visible.
+    yield* status.set(children[0]!.id, { type: "idle" })
+    yield* sessions.setMetadata({
+      sessionID: children[0]!.id,
+      metadata: {
+        agentRun: {
+          number: 2,
+          started_at: Date.now(),
+          ended_at: Date.now(),
+          outcome: "completed",
+          woken_by: { kind: "system" },
+        },
+      },
+    })
+    setSystemTime(t0 + 3 * 60 * 60_000)
+    yield* user(parent.id, "resume working")
+    yield* llm.text("resumed")
+    yield* prompt.loop({ sessionID: parent.id })
+    const resumed = yield* llm.inputs
+    expect(resumed).toHaveLength(5)
+    expect(lastUserContent(resumed[4]!)).toBe(
+      `Now: ${AgentRun.formatInstant(t0 + 3 * 60 * 60_000)}.\n\nYour subagents: 0 running.`,
+    )
+    const stored = JSON.stringify(yield* sessions.messages({ sessionID: parent.id }))
+    expect(stored).not.toContain("Your subagents:")
+    expect(stored).not.toContain("Now: ")
   }),
 )
 

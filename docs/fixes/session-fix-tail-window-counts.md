@@ -1,5 +1,7 @@
 # Step tail：总览与完成明细共同退出窗口
 
+> 2026-11-10：本文保留本次修复的历史方案和验证。下文“空列表整节省略/返回 undefined”已由 [零运行补丁](session-fix-tail-zero-running.md) 取代：已有直接子时保留 `0 running` 与时钟；过期条目仍不进入总数、idle 计数或明细。
+
 用户确认的修复口径：已结束且退出窗口的子 Agent 不再计入尾巴；按 workflow 构建补丁。仅修改视图，不清理 Session、不改变 agent_list / agent_status 的查询范围。
 
 ## 第一部分：现象与复现
