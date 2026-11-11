@@ -18,16 +18,16 @@ import { Archive } from "@/util/archive"
 import { Process } from "@/util/process"
 import { compareVersion, parseVersion } from "./version-compare"
 
-// The fork ships exclusively via GitHub release downloads (fmcode-1-visible-rename):
-// "curl" marks an install under ~/.fmcode/bin or ~/.local/bin. Every package
+// The fork ships exclusively via GitHub release downloads (fcode-1-visible-rename):
+// "curl" marks an install under ~/.fcode/bin or ~/.local/bin. Every package
 // manager path was removed — an unknown method (local dev build, npm install
 // of the upstream package, etc.) cannot self-upgrade.
 export type Method = "curl" | "unknown"
 
 // Test/E2E seam: point the GitHub API and asset host at a local fake so the
 // upgrade flow can run against constructed releases without leaving localhost.
-const GITHUB_API = process.env["FMCODE_GITHUB_API"] ?? "https://api.github.com"
-const GITHUB_DOWNLOAD = process.env["FMCODE_GITHUB_DOWNLOAD"] ?? "https://github.com"
+const GITHUB_API = process.env["FCODE_GITHUB_API"] ?? "https://api.github.com"
+const GITHUB_DOWNLOAD = process.env["FCODE_GITHUB_DOWNLOAD"] ?? "https://github.com"
 
 export type ReleaseType = "patch" | "minor" | "major"
 
@@ -95,7 +95,7 @@ const fail = (message: string) => new UpgradeFailedError({ stderr: message })
 const assetName = () => {
   const platform = process.platform === "darwin" ? "darwin" : process.platform === "win32" ? "windows" : "linux"
   const extension = process.platform === "win32" ? ".zip" : ".tar.gz"
-  return `fmcode-${platform}-${process.arch}${extension}`
+  return `fcode-${platform}-${process.arch}${extension}`
 }
 
 const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Service> = Layer.effect(
@@ -178,7 +178,7 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
         }
       }),
       method: Effect.fn("Installation.method")(function* () {
-        if (process.execPath.includes(path.join(".fmcode", "bin"))) return "curl" as Method
+        if (process.execPath.includes(path.join(".fcode", "bin"))) return "curl" as Method
         if (process.execPath.includes(path.join(".local", "bin"))) return "curl" as Method
         return "unknown" as Method
       }),
@@ -276,13 +276,13 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
         const topDir = path.join(stagingDir, entries.find((entry) => entry.isDirectory())?.name ?? "")
         const binDirStaged = path.join(topDir, "bin")
         const stagedBin = yield* Effect.promise(() => fs.readdir(binDirStaged).catch(() => [] as string[]))
-        const executable = process.platform === "win32" ? "fmcode.exe" : "fmcode"
+        const executable = process.platform === "win32" ? "fcode.exe" : "fcode"
         if (!stagedBin.includes(executable) || !stagedBin.includes("rg")) {
           yield* cleanup
-          return yield* fail("extracted release is missing the fmcode binary or rg")
+          return yield* fail("extracted release is missing the fcode binary or rg")
         }
 
-        // Replace: fmcode first (the binary users run), then the rest. On
+        // Replace: fcode first (the binary users run), then the rest. On
         // Windows the running exe cannot be overwritten — park it as .old and
         // drop the new file in; the next run cleans the .old up.
         const moves: Array<[string, string]> = [
@@ -299,7 +299,7 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
         if (process.platform === "win32") {
           const live = moves[0][1]
           yield* Effect.promise(() => fs.rename(live, `${live}.old`)).pipe(
-            Effect.mapError(() => fail("cannot park the running executable (is another fmcode running?)")),
+            Effect.mapError(() => fail("cannot park the running executable (is another fcode running?)")),
           )
         }
         for (const [index, [from, to]] of moves.entries()) {
@@ -316,7 +316,7 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
         // Non-critical cleanup: leftovers must not fail the upgrade.
         yield* cleanup
         yield* Effect.promise(async () => {
-          await fs.rm(path.join(binDir, "fmcode.exe.old"), { force: true })
+          await fs.rm(path.join(binDir, "fcode.exe.old"), { force: true })
         }).pipe(Effect.orDie)
       }),
     }

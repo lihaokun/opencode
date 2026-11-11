@@ -1,6 +1,6 @@
 # 调研报告 — 自动更新绑定本 fork 的 release（#65）
 
-> feature：`fork-autoupdate`；子计划：`fork-1-release-autoupdate`；issue #65。本文产出早于 #66 步骤 1 的实现与 fmcode 命名裁决（commit `6ed4929afe`，2026-10-25）；文中 `oc-fm` 一律按 `fmcode` 理解，`opencode` 二进制/资产名按 `fmcode` 理解。#66 步骤 1 已实现（upgrade stub、`curl|unknown` 方法、`.fmcode/bin` 识别），本调研的现状节保留为历史证据，方案节仍然有效，待用户逐条裁决后修订进架构。
+> feature：`fork-autoupdate`；子计划：`fork-1-release-autoupdate`；issue #65。本文产出早于 #66 步骤 1 的实现与 fmcode 命名裁决（commit `6ed4929afe`，2026-10-25）；文中 `oc-fm` 一律按 `fmcode` 理解，`opencode` 二进制/资产名按 `fmcode` 理解。（2026-11-11 注：名字最终裁决为 `fcode`，`fmcode` 按 `fcode` 理解，见 fcode-rename 调研 §1.3a。）#66 步骤 1 已实现（upgrade stub、`curl|unknown` 方法、`.fmcode/bin` 识别），本调研的现状节保留为历史证据，方案节仍然有效，待用户逐条裁决后修订进架构。
 
 ## 1. 现状梳理（`dev@f9ed5e63ed` 实测；fmcode-1 落地后链路已收缩为 curl-only + stub，本节描述的是实现前的历史形态，保留作危害证据）
 

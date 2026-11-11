@@ -13,9 +13,9 @@ const run = (env: Record<string, string>, code: string) => {
 }
 
 describe("env-alias (import-time side effect)", () => {
-  it("copies set FMCODE_X to unset OPENCODE_X", () => {
+  it("copies set FCODE_X to unset OPENCODE_X", () => {
     const out = run(
-      { FMCODE_LOG_LEVEL: "DEBUG", OPENCODE_LOG_LEVEL: undefined as unknown as string },
+      { FCODE_LOG_LEVEL: "DEBUG", OPENCODE_LOG_LEVEL: undefined as unknown as string },
       `import "./src/env-alias"; console.log(process.env.OPENCODE_LOG_LEVEL)`,
     ).trim()
     expect(out).toBe("DEBUG")
@@ -23,13 +23,13 @@ describe("env-alias (import-time side effect)", () => {
 
   it("explicit OPENCODE_X wins, alias skipped", () => {
     const out = run(
-      { FMCODE_LOG_LEVEL: "DEBUG", OPENCODE_LOG_LEVEL: "INFO" },
+      { FCODE_LOG_LEVEL: "DEBUG", OPENCODE_LOG_LEVEL: "INFO" },
       `import "./src/env-alias"; console.log(process.env.OPENCODE_LOG_LEVEL)`,
     ).trim()
     expect(out).toBe("INFO")
   })
 
-  it("unset FMCODE leaves OPENCODE untouched", () => {
+  it("unset FCODE leaves OPENCODE untouched", () => {
     const out = run(
       { OPENCODE_LOG_LEVEL: "WARN" },
       `import "./src/env-alias"; console.log(process.env.OPENCODE_LOG_LEVEL)`,
@@ -39,7 +39,7 @@ describe("env-alias (import-time side effect)", () => {
 
   it("keys outside the alias list are not copied", () => {
     const out = run(
-      { FMCODE_VERSION: "9.9.9" },
+      { FCODE_VERSION: "9.9.9" },
       `import "./src/env-alias"; console.log(process.env.OPENCODE_VERSION ?? "unset")`,
     ).trim()
     expect(out).toBe("unset")

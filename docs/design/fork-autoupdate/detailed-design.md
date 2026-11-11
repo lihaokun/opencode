@@ -1,6 +1,6 @@
 # 细化设计 — fork 自动更新 / fork-1-release-autoupdate
 
-> feature：`fork-autoupdate`；子计划：`fork-1-release-autoupdate`（issue #65）。上游：`docs/research/fork-autoupdate-research.md`（六决策已裁决）、`docs/design/fork-autoupdate/architecture.md`（复核通过，commit `5d0a028b4a`）。本细化不改架构确定的模块划分与接口。
+> feature：`fork-autoupdate`；子计划：`fork-1-release-autoupdate`（issue #65）。上游：`docs/research/fork-autoupdate-research.md`（六决策已裁决）、`docs/design/fork-autoupdate/architecture.md`（复核通过，commit `5d0a028b4a`）。本细化不改架构确定的模块划分与接口。（2026-11-11 注：改名子计划最终定名 `fcode`，文中 `fmcode` 字样按 `fcode` 理解，见 fcode-rename 调研 §1.3a。）
 
 ## 1. 范围
 

@@ -7,7 +7,7 @@ import { compareVersion, parseVersion } from "../../installation/version-compare
 
 export const UpgradeCommand = {
   command: "upgrade [target]",
-  describe: "upgrade fmcode to the latest or a specific release",
+  describe: "upgrade fcode to the latest or a specific release",
   builder: (yargs: Argv) => {
     return yargs.positional("target", {
       describe: "version to upgrade to, for ex '1.18.31-fmv2.1' or 'v1.18.31-fmv2.1'",
@@ -21,7 +21,7 @@ export const UpgradeCommand = {
     prompts.intro("Upgrade")
     const method = await Installation.method()
     if (method === "unknown") {
-      prompts.log.warn("fmcode was not installed from a release; self-upgrade is unavailable")
+      prompts.log.warn("fcode was not installed from a release; self-upgrade is unavailable")
       prompts.outro("Done")
       return
     }
@@ -41,7 +41,7 @@ export const UpgradeCommand = {
     // and cross-channel moves are allowed. Only the exact re-install of the
     // running version is skipped.
     if (!args.target && compareVersion(parsed, parseVersion(InstallationVersion) ?? parsed) <= 0) {
-      prompts.log.warn(`fmcode upgrade skipped: ${target} is already installed`)
+      prompts.log.warn(`fcode upgrade skipped: ${target} is already installed`)
       prompts.outro("Done")
       return
     }
@@ -57,7 +57,7 @@ export const UpgradeCommand = {
       prompts.outro("Done")
       return
     }
-    spinner.stop("Upgrade complete — restart fmcode to run the new version")
+    spinner.stop("Upgrade complete — restart fcode to run the new version")
     prompts.outro("Done")
   },
 }

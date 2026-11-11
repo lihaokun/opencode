@@ -1,6 +1,6 @@
 # 架构 — fmcode 自动更新绑定本 fork 的 release
 
-> feature：`fork-autoupdate`；子计划：`fork-1-release-autoupdate`。issue #65。上游调研见 `docs/research/fork-autoupdate-research.md`（六项决策 2026-10-26 经用户裁决：GitHub 单源、自写比较器、进程内替换、**不做 TTL 缓存**、beta 取比较器最大、手动允许降级）。实现前置 `fmcode-1-visible-rename` 已落地（`curl|unknown` 方法、`.fmcode/bin` 识别、`upgrade()` stub、`UpgradeNotSupportedError`）——本子计划用进程内替换替换掉那个 stub。
+> feature：`fork-autoupdate`；子计划：`fork-1-release-autoupdate`。issue #65。上游调研见 `docs/research/fork-autoupdate-research.md`（六项决策 2026-10-26 经用户裁决：GitHub 单源、自写比较器、进程内替换、**不做 TTL 缓存**、beta 取比较器最大、手动允许降级）。实现前置 `fmcode-1-visible-rename` 已落地（`curl|unknown` 方法、`.fmcode/bin` 识别、`upgrade()` stub、`UpgradeNotSupportedError`）——本子计划用进程内替换替换掉那个 stub。（2026-11-11 注：改名子计划后经二次裁决定名 `fcode`，原 `fmcode-1-visible-rename` 即 `fcode-1-visible-rename`，`.fmcode/bin` 即 `.fcode/bin`，见 fcode-rename 调研 §1.3a。）
 
 ## 1. 范围
 

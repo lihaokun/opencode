@@ -65,9 +65,9 @@ function jsonResponse(body: unknown) {
 function fakeReleaseHandler(options: { corrupt?: boolean }) {
   const platform = process.platform === "win32" ? "windows" : "linux"
   const extension = process.platform === "win32" ? ".zip" : ".tar.gz"
-  const name = `fmcode-${platform}-${process.arch}${extension}`
+  const name = `fcode-${platform}-${process.arch}${extension}`
   const entries: Array<{ name: string; content: Buffer; mode: number }> = [
-    { name: `${name.replace(extension, "")}/bin/fmcode`, content: Buffer.from("#!/bin/sh\n"), mode: 0o755 },
+    { name: `${name.replace(extension, "")}/bin/fcode`, content: Buffer.from("#!/bin/sh\n"), mode: 0o755 },
     { name: `${name.replace(extension, "")}/bin/rg`, content: Buffer.from("#!/bin/sh\n"), mode: 0o755 },
     { name: `${name.replace(extension, "")}/package.json`, content: Buffer.from("{}"), mode: 0o644 },
   ]
@@ -237,8 +237,8 @@ describe("installation", () => {
       testLayer(fakeReleaseHandler({ corrupt: true })),
     ).effect("leaves the live binary untouched on checksum mismatch", () =>
       Effect.gen(function* () {
-        const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "fmcode-live-"))
-        const live = path.join(binDir, "fmcode")
+        const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "fcode-live-"))
+        const live = path.join(binDir, "fcode")
         fs.writeFileSync(live, "#!/bin/sh\necho old\n", { mode: 0o755 })
         const original = process.execPath
         try {
@@ -257,7 +257,7 @@ describe("installation", () => {
 
   describe("method", () => {
     testEffect(testLayer(() => jsonResponse({ tag_name: "v1.0.0-fmv1" }))).effect(
-      "reports curl for .fmcode/bin installs",
+      "reports curl for .fcode/bin installs",
       () =>
         Effect.gen(function* () {
           const original = process.execPath
@@ -266,7 +266,7 @@ describe("installation", () => {
             // follow the runner's platform (backslashes on win32); keep the
             // fixture in the same form instead of forcing POSIX slashes.
             Object.defineProperty(process, "execPath", {
-              value: path.resolve(path.sep, path.join(".fmcode", "bin", "fmcode")),
+              value: path.resolve(path.sep, path.join(".fcode", "bin", "fcode")),
               configurable: true,
             })
             expect(yield* Installation.use.method()).toBe("curl")
@@ -282,7 +282,7 @@ describe("installation", () => {
         Effect.gen(function* () {
           const original = process.execPath
           try {
-            Object.defineProperty(process, "execPath", { value: "/home/u/workspace/fmcode/build/fmcode", configurable: true })
+            Object.defineProperty(process, "execPath", { value: "/home/u/workspace/fcode/build/fcode", configurable: true })
             expect(yield* Installation.use.method()).toBe("unknown")
           } finally {
             Object.defineProperty(process, "execPath", { value: original, configurable: true })

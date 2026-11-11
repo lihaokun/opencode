@@ -1,6 +1,6 @@
-# 细化设计 — fmcode 改名 / fmcode-1-visible-rename
+# 细化设计 — fcode 改名 / fcode-1-visible-rename
 
-> feature：`fmcode-rename`；子计划：`fmcode-1-visible-rename`（issue #66 步骤 1）。上游：`docs/research/fmcode-rename-research.md`、`docs/design/fmcode-rename/architecture.md`（2026-10-26 全部决策闭合后重写）。本细化不改架构确定的模块划分与接口。
+> feature：`fcode-rename`；子计划：`fcode-1-visible-rename`（issue #66 步骤 1）。上游：`docs/research/fcode-rename-research.md`、`docs/design/fcode-rename/architecture.md`（2026-10-26 全部决策闭合后重写）。2026-11-11 二次更名 fmcode → fcode（调研 §1.3a），文中 `fmcode` 字样按 `fcode` 口径理解。本细化不改架构确定的模块划分与接口。
 
 ## 1. 范围
 

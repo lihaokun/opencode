@@ -23,7 +23,7 @@ interface RemovalTargets {
 
 export const UninstallCommand = {
   command: "uninstall",
-  describe: "uninstall fmcode and remove all related files",
+  describe: "uninstall fcode and remove all related files",
   builder: (yargs: Argv) =>
     yargs
       .option("keep-config", {
@@ -54,7 +54,7 @@ export const UninstallCommand = {
     UI.empty()
     UI.println(UI.logo("  "))
     UI.empty()
-    prompts.intro("Uninstall fmcode")
+    prompts.intro("Uninstall fcode")
 
     const method = await Installation.method()
     prompts.log.info(`Installation method: ${method}`)
@@ -171,7 +171,7 @@ async function executeUninstall(method: Installation.Method, targets: RemovalTar
     prompts.log.info(`  rm "${targets.binary}"`)
 
     const binDir = path.dirname(targets.binary)
-    if (binDir.includes(".fmcode")) {
+    if (binDir.includes(".fcode")) {
       prompts.log.info(`  rmdir "${binDir}" 2>/dev/null`)
     }
   }
@@ -185,7 +185,7 @@ async function executeUninstall(method: Installation.Method, targets: RemovalTar
   }
 
   UI.empty()
-  prompts.log.success("Thank you for using fmcode!")
+  prompts.log.success("Thank you for using fcode!")
 }
 
 async function getShellConfigFile(): Promise<string | null> {
@@ -222,9 +222,9 @@ async function getShellConfigFile(): Promise<string | null> {
     if (!exists) continue
 
     const content = await Filesystem.readText(file).catch(() => "")
-    // Both marker forms: fmcode's own PATH lines, and the legacy opencode
+    // Both marker forms: fcode's own PATH lines, and the legacy opencode
     // lines a user may have inherited when reusing an old shell config.
-    if (content.includes("# fmcode") || content.includes(".fmcode/bin") || content.includes("# opencode") || content.includes(".opencode/bin")) {
+    if (content.includes("# fcode") || content.includes(".fcode/bin") || content.includes("# opencode") || content.includes(".opencode/bin")) {
       return file
     }
   }
@@ -242,7 +242,7 @@ async function cleanShellConfig(file: string) {
   for (const line of lines) {
     const trimmed = line.trim()
 
-    if (trimmed === "# fmcode" || trimmed === "# opencode") {
+    if (trimmed === "# fcode" || trimmed === "# opencode") {
       skip = true
       continue
     }
@@ -250,7 +250,7 @@ async function cleanShellConfig(file: string) {
     if (skip) {
       skip = false
       if (
-        trimmed.includes(".fmcode/bin") ||
+        trimmed.includes(".fcode/bin") ||
         trimmed.includes(".opencode/bin") ||
         trimmed.includes("fish_add_path")
       ) {
@@ -259,9 +259,9 @@ async function cleanShellConfig(file: string) {
     }
 
     if (
-      (trimmed.startsWith("export PATH=") && (trimmed.includes(".fmcode/bin") || trimmed.includes(".opencode/bin"))) ||
+      (trimmed.startsWith("export PATH=") && (trimmed.includes(".fcode/bin") || trimmed.includes(".opencode/bin"))) ||
       ((trimmed.startsWith("fish_add_path") || trimmed.startsWith("export PATH=")) &&
-        (trimmed.includes(".fmcode") || trimmed.includes(".opencode")))
+        (trimmed.includes(".fcode") || trimmed.includes(".opencode")))
     ) {
       continue
     }

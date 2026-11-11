@@ -176,7 +176,7 @@ for (const item of targets) {
       autoloadTsconfig: true,
       autoloadPackageJson: true,
       target: name.replace(pkg.name, "bun") as any,
-      outfile: `dist/${name}/bin/fmcode`,
+      outfile: `dist/${name}/bin/fcode`,
       execArgv: [`--user-agent=opencode/${Script.version}`, "--use-system-ca", "--"],
       windows: {},
     },
@@ -205,7 +205,7 @@ for (const item of targets) {
 
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {
-    const binaryPath = `dist/${name}/bin/fmcode`
+    const binaryPath = `dist/${name}/bin/fcode`
     console.log(`Running smoke test: ${binaryPath} --version`)
     try {
       const versionOutput = await $`${binaryPath} --version`.text()

@@ -10,9 +10,9 @@
 > 想试最新改动也可以从 `dev` 自己构建。
 > release 构建固定 `OPENCODE_CHANNEL=latest`（决定数据库名 `opencode.db`）；本地从源码构建时不设该变量——它会取当前分支名（dev 分支得到 `opencode-dev.db`，`main` 上得到 `opencode-main.db`），与 release 库互不干扰。
 
-## ⚠️ 安装器与 fmcode 改名的适配状态
+## ⚠️ 安装器与 fcode 改名的适配状态
 
-`script/fm-install.py`（#102）在改名（#66）合入 dev 之前编写，当前仍按**改名前**的约定工作：下载 `opencode-*` 资产、安装名为 `opencode` 的二进制到 `~/.opencode/bin`、写配置到 `~/.config/opencode`。已发布的全部 release（截至 `v1.18.31-fmv3-beta.21`）资产确实是 `opencode-*` 命名，安装器对这些存量 release 有效；改名后的首个 `fmcode-*` release 产出前需要先把安装器移植到新命名。
+`script/fm-install.py`（#102）在改名（#66）合入 dev 之前编写，当前仍按**改名前**的约定工作：下载 `opencode-*` 资产、安装名为 `opencode` 的二进制到 `~/.opencode/bin`、写配置到 `~/.config/opencode`。已发布的全部 release（截至 `v1.18.31-fmv3-beta.21`）资产确实是 `opencode-*` 命名，安装器对这些存量 release 有效；改名后的首个 `fcode-*` release 产出前需要先把安装器移植到新命名。
 
 ## 一、安装器（当前仅适用于存量 `opencode-*` release）
 
@@ -53,9 +53,9 @@ python .\fm-install.py --channel beta
 
 保留自定义 provider、密钥、模型和其他配置；原有 disabled_providers 也保留。安装器仅使用本 fork 的发布和源码，不回退到 OpenCode 官方安装器/npm 程序包。构建依赖仍使用各自原有的依赖源。
 
-说明：#65 之后 `fmcode` 自身的自动更新已限定只从本 fork 的 release 取版本（正式版跟正式版、beta 跟 beta，从不降级、不跨渠道），关闭并非安全必需；安装器默认关闭属保守选择，可自行改回 `"autoupdate": true`。
+说明：#65 之后 `fcode` 自身的自动更新已限定只从本 fork 的 release 取版本（正式版跟正式版、beta 跟 beta，从不降级、不跨渠道），关闭并非安全必需；安装器默认关闭属保守选择，可自行改回 `"autoupdate": true`。
 
-更新 fork 时重新运行本脚本。不要对官方 `opencode` 二进制使用 `opencode upgrade`、官方 `curl … | bash` 或 `npm i -g opencode-ai`，这些仍是上游升级渠道（fmcode 与官方版目录分离，互不覆盖）。
+更新 fork 时重新运行本脚本。不要对官方 `opencode` 二进制使用 `opencode upgrade`、官方 `curl … | bash` 或 `npm i -g opencode-ai`，这些仍是上游升级渠道（fcode 与官方版目录分离，互不覆盖）。
 
 ### 安装器：版本与平台
 
@@ -110,44 +110,44 @@ python3 script/fm-install.py --mode build --source .
 
 ---
 
-## 二、手动：从 Releases 安装（fmcode 改名后的约定）
+## 二、手动：从 Releases 安装（fcode 改名后的约定）
 
 > 现有存量 release 资产仍是 `opencode-*` 命名（见上方适配状态）；下表是改名后的发布工作流产出的命名。
 
-选对应平台的包。解压后 `bin/` 里有 `fmcode` 和 `rg`（ripgrep），**两个文件放在同一目录并把该目录加入 PATH**：程序按 PATH 找 `rg`，找不到会去 GitHub 下载。
+选对应平台的包。解压后 `bin/` 里有 `fcode` 和 `rg`（ripgrep），**两个文件放在同一目录并把该目录加入 PATH**：程序按 PATH 找 `rg`，找不到会去 GitHub 下载。
 
 | 平台 | 资产 |
 |---|---|
-| Windows x64 | `fmcode-windows-x64.zip` |
-| macOS Apple Silicon | `fmcode-darwin-arm64.tar.gz` |
-| macOS Intel | `fmcode-darwin-x64.tar.gz` |
-| Linux x64 | `fmcode-linux-x64.tar.gz` |
-| Linux arm64 | `fmcode-linux-arm64.tar.gz` |
+| Windows x64 | `fcode-windows-x64.zip` |
+| macOS Apple Silicon | `fcode-darwin-arm64.tar.gz` |
+| macOS Intel | `fcode-darwin-x64.tar.gz` |
+| Linux x64 | `fcode-linux-x64.tar.gz` |
+| Linux arm64 | `fcode-linux-arm64.tar.gz` |
 
 **Windows**（PowerShell，在下载目录执行）：
 
 ```powershell
-Expand-Archive .\fmcode-windows-x64.zip -DestinationPath $env:TEMP\fmcode -Force
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.fmcode\bin" | Out-Null
-Copy-Item "$env:TEMP\fmcode\fmcode-windows-x64\bin\*" "$env:USERPROFILE\.fmcode\bin" -Force
-[Environment]::SetEnvironmentVariable("Path", "$env:USERPROFILE\.fmcode\bin;" + [Environment]::GetEnvironmentVariable("Path", "User"), "User")
+Expand-Archive .\fcode-windows-x64.zip -DestinationPath $env:TEMP\fcode -Force
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.fcode\bin" | Out-Null
+Copy-Item "$env:TEMP\fcode\fcode-windows-x64\bin\*" "$env:USERPROFILE\.fcode\bin" -Force
+[Environment]::SetEnvironmentVariable("Path", "$env:USERPROFILE\.fcode\bin;" + [Environment]::GetEnvironmentVariable("Path", "User"), "User")
 ```
 
-重开终端后 `fmcode --version` 应显示本版本号。二进制未签名，SmartScreen 若拦截选"仍要运行"。
+重开终端后 `fcode --version` 应显示本版本号。二进制未签名，SmartScreen 若拦截选"仍要运行"。
 
 **macOS / Linux**（把 `darwin-arm64` 换成你的包名；bash 用户把 `~/.zshrc` 换成 `~/.bashrc`）：
 
 ```bash
-tar -xzf fmcode-darwin-arm64.tar.gz
-mkdir -p ~/.fmcode/bin && cp fmcode-darwin-arm64/bin/* ~/.fmcode/bin/
-echo 'export PATH="$HOME/.fmcode/bin:$PATH"' >> ~/.zshrc
+tar -xzf fcode-darwin-arm64.tar.gz
+mkdir -p ~/.fcode/bin && cp fcode-darwin-arm64/bin/* ~/.fcode/bin/
+echo 'export PATH="$HOME/.fcode/bin:$PATH"' >> ~/.zshrc
 ```
 
-macOS 若提示"无法打开"（未签名、未公证）：`xattr -dr com.apple.quarantine ~/.fmcode/bin`。
+macOS 若提示"无法打开"（未签名、未公证）：`xattr -dr com.apple.quarantine ~/.fcode/bin`。
 
-装了官方版（`curl … | bash` 或 `npm i -g opencode-ai`）的话，官方版与 fmcode 目录分离（`~/.opencode/bin` vs `~/.fmcode/bin`），互不覆盖，两份各自升级。fmcode 自身的自动更新只从本 fork 的 release 取版本，无需关闭（想关仍然支持，见下文）。
+装了官方版（`curl … | bash` 或 `npm i -g opencode-ai`）的话，官方版与 fcode 目录分离（`~/.opencode/bin` vs `~/.fcode/bin`），互不覆盖，两份各自升级。fcode 自身的自动更新只从本 fork 的 release 取版本，无需关闭（想关仍然支持，见下文）。
 
-校验：`sha256sum -c sha256sums.txt --ignore-missing`；Windows 用 `Get-FileHash .\fmcode-windows-x64.zip` 与 `sha256sums.txt` 对照。
+校验：`sha256sum -c sha256sums.txt --ignore-missing`；Windows 用 `Get-FileHash .\fcode-windows-x64.zip` 与 `sha256sums.txt` 对照。
 
 ---
 
@@ -162,10 +162,10 @@ cd packages/opencode
 OPENCODE_CHANNEL=dev OPENCODE_VERSION=1.18.31-fmv2.1 bun run script/build.ts --single
 
 # 2) 安装到 PATH 生效位置
-install -m 0755 dist/opencode-linux-x64/bin/fmcode ~/.fmcode/bin/fmcode
+install -m 0755 dist/opencode-linux-x64/bin/fcode ~/.fcode/bin/fcode
 ```
 
-验证:`fmcode --version` 应显示 `1.18.31-fmv2.1`。
+验证:`fcode --version` 应显示 `1.18.31-fmv2.1`。
 
 ### 1. 版本号:只能用 `OPENCODE_VERSION` 环境变量
 
@@ -191,15 +191,15 @@ install -m 0755 dist/opencode-linux-x64/bin/fmcode ~/.fmcode/bin/fmcode
 
 ### 3. 安装到哪
 
-release 包解压出的 `bin/` 里有 `fmcode` 和 `rg` 两个文件，把所在目录加入 PATH 即可（推荐 `~/.fmcode/bin`）：
+release 包解压出的 `bin/` 里有 `fcode` 和 `rg` 两个文件，把所在目录加入 PATH 即可（推荐 `~/.fcode/bin`）：
 
 ```bash
-mkdir -p ~/.fmcode/bin
-install -m 0755 dist/opencode-linux-x64/bin/* ~/.fmcode/bin/
-echo 'export PATH="$HOME/.fmcode/bin:$PATH"' >> ~/.zshrc
+mkdir -p ~/.fcode/bin
+install -m 0755 dist/opencode-linux-x64/bin/* ~/.fcode/bin/
+echo 'export PATH="$HOME/.fcode/bin:$PATH"' >> ~/.zshrc
 ```
 
-若 `~/.local/bin` 里还留着旧的 `opencode`/`fmcode`，一并清理，避免 PATH 顺序命中旧版本。
+若 `~/.local/bin` 里还留着旧的 `opencode`/`fcode`，一并清理，避免 PATH 顺序命中旧版本。
 
 ### 4. 自动更新（可选关闭）
 
@@ -208,7 +208,7 @@ echo 'export PATH="$HOME/.fmcode/bin:$PATH"' >> ~/.zshrc
 想关（二选一）：
 
 - config 里 `autoupdate: false`（`false` 完全关 / `"notify"` 只提示 / `true` 自动装，默认 `true`）
-- 环境变量 `OPENCODE_DISABLE_AUTOUPDATE=1`（或新前缀 `FMCODE_DISABLE_AUTOUPDATE`，旧前缀仍可用）
+- 环境变量 `OPENCODE_DISABLE_AUTOUPDATE=1`（或新前缀 `FCODE_DISABLE_AUTOUPDATE`，旧前缀仍可用）
 
 ---
 
@@ -216,7 +216,7 @@ echo 'export PATH="$HOME/.fmcode/bin:$PATH"' >> ~/.zshrc
 
 - 每次改了 fork 代码想重装:重跑第 1、2 步即可（`bun install` 会重新应用 patches）。
 - 想换后缀/channel/安装目录,改对应的环境变量即可,无需改脚本。
-- 源码构建产物目录名仍以包名为前缀（如 `dist/opencode-linux-x64/`），其中的二进制是 `bin/fmcode`。
+- 源码构建产物目录名仍以包名为前缀（如 `dist/opencode-linux-x64/`），其中的二进制是 `bin/fcode`。
 
 ## 维护者：分支与发版
 

@@ -1,6 +1,8 @@
-# 调研报告 — fmcode 改名（与官方 opencode 分离用户可见层）
+# 调研报告 — fcode 改名（与官方 opencode 分离用户可见层）
 
-> feature：`fmcode-rename`；issue：#66（原文名 `oc-fm`，2026-10-26 经用户裁决更名 `fmcode`，见 §1.3）。本文覆盖步骤 1（二进制名、安装目录、数据/缓存/状态目录、数据库名、环境变量前缀、配置与凭据二选一读取）；项目级 `.fmcode/` 二选一（步骤 2）、TUI 标志与上游托管服务（步骤 3）不在本文档内，另行扩充。
+> feature：`fcode-rename`；issue：#66（原文名 `oc-fm`，2026-10-26 经用户裁决更名 `fmcode`，2026-11-11 再次裁决更名 **`fcode`**，见 §1.3a）。本文覆盖步骤 1（二进制名、安装目录、数据/缓存/状态目录、数据库名、环境变量前缀、配置与凭据二选一读取）；项目级 `.fcode/` 二选一（步骤 2）、TUI 标志与上游托管服务（步骤 3）不在本文档内，另行扩充。
+>
+> **命名口径**：除 §1.3a 裁决记录外，本文所有 `fmcode`/`FMCODE_`/`.fmcode` 均按 `fcode` 口径理解（fmcode 是从未发布的中间名，无存量用户，文档不逐处改写）。
 
 ## 1. 基线与裁决
 
@@ -34,7 +36,11 @@
 | mDNS 服务名 | `opencode-<port>` / `opencode.local` | `fmcode-<port>` / `fmcode.local` |
 | release 资产名 | `opencode-<os>-<arch>` | `fmcode-<os>-<arch>` |
 
-不沿用 `oc-fm` 的中间形态（文档中残留的 `oc-fm`、`OC_FM_`、`.oc-fm/` 一律按 `fmcode` 理解）。
+不沿用 `oc-fm` 的中间形态（文档中残留的 `oc-fm`、`OC_FM_`、`.oc-fm/` 一律按最终名 `fcode` 理解）。
+
+### 1.3a 二次更名 fmcode → fcode（2026-11-11 用户裁决）
+
+在 fmcode 命名未随任何 release 发布前（已发布资产全部仍是 `opencode-*`，`fmcode-*` 从未产出），名字再次裁决为 **`fcode`**。可用性实测（2026-11-11）：本机 PATH / apt 无冲突；npm `fcode` 已注册但为休眠占位库（1.0.0，2022 年后未更新，无 bin）；PyPI 无；GitHub 无 CLI/agent 同名（唯一的语义邻接是 OpenFirmware IEEE 1275 字节码 FCODE——冷门固件领域，与 coding agent 无实际混淆面）。裁决理由：5 字符更短、`f` 身份锚点保留、冲突面比 foc（Filecoin 邻接）/fbot（Facebook bot 生态联想）干净。代码与发布面（`global.ts`、`env-alias.ts`、`build.ts`、`fork-release.yml`、FORK_INSTALL.md 等）已全量改为 fcode；本文其余各节的 `fmcode` 字样按上文命名口径理解。
 
 ### 1.4 数据库名（2026-10-26 用户裁决）
 
