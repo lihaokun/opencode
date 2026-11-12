@@ -278,8 +278,15 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
         const stagedBin = yield* Effect.promise(() => fs.readdir(binDirStaged).catch(() => [] as string[]))
         const executable = process.platform === "win32" ? "fcode.exe" : "fcode"
         if (!stagedBin.includes(executable) || !stagedBin.includes("rg")) {
+          const tree = yield* Effect.promise(() =>
+            fs
+              .readdir(stagingDir, { recursive: true })
+              .catch(() => fs.readdir(stagingDir).catch(() => [] as string[])),
+          )
           yield* cleanup
-          return yield* fail("extracted release is missing the fcode binary or rg")
+          return yield* fail(
+            `extracted release is missing the ${executable} binary or rg (staging: ${JSON.stringify(tree)})`,
+          )
         }
 
         // Replace: fcode first (the binary users run), then the rest. On
