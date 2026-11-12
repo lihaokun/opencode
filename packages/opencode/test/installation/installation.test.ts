@@ -279,9 +279,14 @@ describe("installation", () => {
           expect(fs.readFileSync(newBin).toString()).toContain("#!/bin/sh")
           expect(fs.readFileSync(path.join(binDir, rgName)).toString()).toContain("#!/bin/sh")
           expect(JSON.parse(fs.readFileSync(path.join(binDir, "package.json"), "utf8"))).toEqual({})
-          // Defensive chmod ran on the two binaries.
-          expect(fs.statSync(newBin).mode & 0o777).toBe(0o755)
-          expect(fs.statSync(path.join(binDir, rgName)).mode & 0o777).toBe(0o755)
+          // Defensive chmod ran on the two binaries. On win32 the mode
+          // carries no execute bits (438 = 0o666) — Expand-Archive drops
+          // them — so the chmod assert only has teeth on unix; what matters
+          // cross-platform is that the files exist with the staged bytes.
+          if (process.platform !== "win32") {
+            expect(fs.statSync(newBin).mode & 0o777).toBe(0o755)
+            expect(fs.statSync(path.join(binDir, rgName)).mode & 0o777).toBe(0o755)
+          }
           // Staging cleaned up; no .old residue on unix (win32 may leave
           // none too — the running exe here is not locked in the test env).
           expect(fs.readdirSync(binDir).some((entry) => entry.startsWith(".staging-"))).toBe(false)
