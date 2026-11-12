@@ -100,6 +100,40 @@ jobs:
         working-directory: packages/client
         run: bun run check:generated
 
+      # The binary installs @opencode-ai/plugin@<version> from npm while the
+      # host runs the repo's packages/plugin sources; they must stay identical
+      # (issue #67). A source edit without a version bump fails here.
+      - name: Check plugin SDK drift
+        if: runner.os == 'Linux' && matrix.shard == 1
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          # The checkout is shallow, so the base commit is usually absent.
+          # Fetch it; if that fails (new branch / force push / all-zero sha),
+          # fall back to RUNNING the check — a plugin change must never slip
+          # through for lack of a comparable base. (The previous wording said
+          # "skip" here, which made the diff's bad-object failure skip the
+          # check on every PR.)
+          comparable=0
+          if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ]; then
+            if git cat-file -e "$base" 2>/dev/null || git fetch --no-tags origin "$base" >/dev/null 2>&1; then
+              comparable=1
+            fi
+          fi
+          if [ "$comparable" = "1" ] && ! git diff --name-only "$base" HEAD -- packages/plugin | grep -q .; then
+            echo "packages/plugin unchanged since $base — skipping drift check"
+            exit 0
+          fi
+          if [ "$comparable" = "1" ]; then
+            echo "packages/plugin changed since $base — running drift check"
+          else
+            echo "base $base not fetchable — running drift check (fail-closed)"
+          fi
+          bun script/check-plugin-drift.ts
+
       - name: Run HttpApi exerciser gates
         if: runner.os == 'Linux' && matrix.shard == 1
         timeout-minutes: 20

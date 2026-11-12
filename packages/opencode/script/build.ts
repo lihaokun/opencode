@@ -15,6 +15,7 @@ const generated = await import("./generate.ts")
 
 import { Script } from "@opencode-ai/script"
 import pkg from "../package.json"
+import pluginPkg from "../../plugin/package.json"
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
@@ -143,16 +144,18 @@ if (!skipInstall) {
   await $`bun install --os="*" --cpu="*" @ff-labs/fff-bun@${pkg.dependencies["@ff-labs/fff-bun"]}`
 }
 for (const item of targets) {
-  const name = [
-    pkg.name,
-    // changing to win32 flags npm for some reason
-    item.os === "win32" ? "windows" : item.os,
-    item.arch,
-    item.avx2 === false ? "baseline" : undefined,
-    item.abi === undefined ? undefined : item.abi,
-  ]
+  // Two different names come out of this loop:
+  // - `name` is the dist directory and asset name: fcode-<os>-<arch>. The
+  //   fork-release workflow's ASSETS keys must match it exactly (it installs
+  // rg into dist/$key/bin and archives the whole $key/ directory).
+  // - the Bun compile target is derived separately from the os/arch parts;
+  //   deriving it from `name` breaks the moment the asset prefix diverges
+  //   from the package name (it used to be name.replace(pkg.name, "bun")).
+  const osName = item.os === "win32" ? "windows" : item.os
+  const name = ["fcode", osName, item.arch, item.avx2 === false ? "baseline" : undefined, item.abi === undefined ? undefined : item.abi]
     .filter(Boolean)
     .join("-")
+  const bunTarget = ["bun", osName, item.arch].join("-")
   console.log(`building ${name}`)
   await $`mkdir -p dist/${name}/bin`
 
@@ -174,8 +177,8 @@ for (const item of targets) {
       autoloadDotenv: false,
       autoloadTsconfig: true,
       autoloadPackageJson: true,
-      target: name.replace(pkg.name, "bun") as any,
-      outfile: `dist/${name}/bin/opencode`,
+      target: bunTarget as any,
+      outfile: `dist/${name}/bin/fcode`,
       execArgv: [`--user-agent=opencode/${Script.version}`, "--use-system-ca", "--"],
       windows: {},
     },
@@ -193,6 +196,7 @@ for (const item of targets) {
       FFF_LIBC: JSON.stringify(item.abi === "musl" ? "musl" : "gnu"),
       OPENCODE_VERSION: `'${Script.version}'`,
       OPENCODE_MODELS_DEV: generated.modelsData,
+      OPENCODE_PLUGIN_SDK_VERSION: `'${pluginPkg.version}'`,
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + treeSitterWorkerPath,
       OPENCODE_WORKER_PATH: workerPath,
       OPENCODE_CHANNEL: `'${Script.channel}'`,
@@ -203,7 +207,7 @@ for (const item of targets) {
 
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {
-    const binaryPath = `dist/${name}/bin/opencode`
+    const binaryPath = `dist/${name}/bin/fcode`
     console.log(`Running smoke test: ${binaryPath} --version`)
     try {
       const versionOutput = await $`${binaryPath} --version`.text()
