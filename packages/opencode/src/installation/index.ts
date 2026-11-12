@@ -277,7 +277,8 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
         const binDirStaged = path.join(topDir, "bin")
         const stagedBin = yield* Effect.promise(() => fs.readdir(binDirStaged).catch(() => [] as string[]))
         const executable = process.platform === "win32" ? "fcode.exe" : "fcode"
-        if (!stagedBin.includes(executable) || !stagedBin.includes("rg")) {
+        const rgExecutable = process.platform === "win32" ? "rg.exe" : "rg"
+        if (!stagedBin.includes(executable) || !stagedBin.includes(rgExecutable)) {
           const tree = yield* Effect.promise(() =>
             fs
               .readdir(stagingDir, { recursive: true })
@@ -285,7 +286,7 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
           )
           yield* cleanup
           return yield* fail(
-            `extracted release is missing the ${executable} binary or rg (staging: ${JSON.stringify(tree)})`,
+            `extracted release is missing the ${executable} binary or ${rgExecutable} (staging: ${JSON.stringify(tree)})`,
           )
         }
 
