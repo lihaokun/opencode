@@ -66,9 +66,10 @@ function fakeReleaseHandler(options: { corrupt?: boolean }) {
   const platform = process.platform === "win32" ? "windows" : "linux"
   const extension = process.platform === "win32" ? ".zip" : ".tar.gz"
   const name = `fcode-${platform}-${process.arch}${extension}`
+  const exe = process.platform === "win32" ? ".exe" : ""
   const entries: Array<{ name: string; content: Buffer; mode: number }> = [
-    { name: `${name.replace(extension, "")}/bin/fcode`, content: Buffer.from("#!/bin/sh\n"), mode: 0o755 },
-    { name: `${name.replace(extension, "")}/bin/rg`, content: Buffer.from("#!/bin/sh\n"), mode: 0o755 },
+    { name: `${name.replace(extension, "")}/bin/fcode${exe}`, content: Buffer.from("#!/bin/sh\n"), mode: 0o755 },
+    { name: `${name.replace(extension, "")}/bin/rg${exe}`, content: Buffer.from("#!/bin/sh\n"), mode: 0o755 },
     { name: `${name.replace(extension, "")}/package.json`, content: Buffer.from("{}"), mode: 0o644 },
   ]
   const bytes =
@@ -264,16 +265,15 @@ describe("installation", () => {
     testEffect(testLayer(fakeReleaseHandler({}))).effect("replaces the live binary through the full upgrade flow", () =>
       Effect.gen(function* () {
         const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "fcode-upgrade-"))
-        const live = path.join(binDir, "fcode")
+        const executable = process.platform === "win32" ? "fcode.exe" : "fcode"
+        const rgName = process.platform === "win32" ? "rg.exe" : "rg"
+        const live = path.join(binDir, executable)
         fs.writeFileSync(live, "#!/bin/sh\necho old\n", { mode: 0o755 })
-        const oldRg = path.join(binDir, "rg")
-        fs.writeFileSync(oldRg, "#!/bin/sh\necho old-rg\n", { mode: 0o755 })
+        fs.writeFileSync(path.join(binDir, rgName), "#!/bin/sh\necho old-rg\n", { mode: 0o755 })
         const original = process.execPath
         try {
           Object.defineProperty(process, "execPath", { value: live, configurable: true })
           yield* Installation.use.upgrade("curl", "1.18.31-fmv2.1")
-          const executable = process.platform === "win32" ? "fcode.exe" : "fcode"
-          const rgName = process.platform === "win32" ? "rg.exe" : "rg"
           // All three shipped files present with the staged contents.
           const newBin = path.join(binDir, executable)
           expect(fs.readFileSync(newBin).toString()).toContain("#!/bin/sh")
