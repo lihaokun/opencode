@@ -110,7 +110,7 @@ ALIASES 清单构成（§调研 5.3 讨论 B 的落地口径）：
   - 不收：构建 define（OPENCODE_VERSION/CHANNEL/MODELS_DEV/PLUGIN_SDK_VERSION/WORKER_PATH/LIBC）、测试隔离（OPENCODE_TEST_*）、server 握手（OPENCODE_SERVER_PASSWORD/USERNAME/CONSOLE_TOKEN）、内部标记（OPENCODE_PID/CALLER/ROUTE/PLUGIN_META_FILE 等进程间契约）
 正确性论证：
   - 前置: 执行时点早于一切读点（模块顺序保证）
-  - 论证: 拷贝后下游读 OPENCODE_X 得 FMCODE_X 值；显式 OPENCODE_X 存在时不拷 ⇒ 不变式成立；清单完整性由 CI grep 对齐检查机械保证
+  - 论证: 拷贝后下游读 OPENCODE_X 得 FCODE_X 值；显式 OPENCODE_X 存在时不拷 ⇒ 不变式成立；清单完整性由 `test/cli/env-alias.test.ts` 的对齐测试机械保证（flag.ts 全键 ⊆ 别名表，排除项显式列举；2026-11-12 评审补——原稿承诺的 "CI grep 对齐检查" 当时并未存在，清单已漂移 4 键）
   - 副作用论证: 仅 process.env 写
 ```
 
@@ -179,7 +179,7 @@ G3：凭据路径恒 fmcode 侧（§4.1 后置条件）⇒ opencode 凭据文件
 - H1: xdg-basedir 未设 XDG 变量时全平台回退 `$HOME/.local/{share,state}`、`$HOME/.config`、`$HOME/.cache`（源码核实）
 - H2: 官方版与 fmcode 可能同时运行——data/cache/state/tmp/config 全目录分离 + 凭据隔离后，两版间无任何共享读写面（各自 `<os.tmpdir>/fmcode` 与 `<os.tmpdir>/opencode` 亦分离）
 - H3: 凭据文件的全部消费者都在 fmcode 侧路径上（实测两处：`auth/index.ts:10`、`mcp/auth.ts:37`，均为 `path.join(Global.Path.data, ...)`，app 改名后自动跟随；grep 复核作例行评审项）
-- H4: `OPENCODE_` 92 名单当前完整；新增变量须同步别名表或显式标"不收"（CI grep 对齐强制）
+- H4: `OPENCODE_` 92 名单当前完整；新增变量须同步别名表或显式标"不收"（env-alias 对齐测试强制：排除项为 OPENCODE_CLIENT / OPENCODE_PLUGIN_META_FILE / OPENCODE_PURE / OPENCODE_WORKSPACE_ID，均为进程内机器标识而非用户配置）
 
 ### 模块级 invariant
 

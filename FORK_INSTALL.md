@@ -162,7 +162,7 @@ cd packages/opencode
 OPENCODE_CHANNEL=dev OPENCODE_VERSION=1.18.31-fmv2.1 bun run script/build.ts --single
 
 # 2) 安装到 PATH 生效位置
-install -m 0755 dist/opencode-linux-x64/bin/fcode ~/.fcode/bin/fcode
+install -m 0755 dist/fcode-linux-x64/bin/fcode ~/.fcode/bin/fcode
 ```
 
 验证:`fcode --version` 应显示 `1.18.31-fmv2.1`。
@@ -195,7 +195,7 @@ release 包解压出的 `bin/` 里有 `fcode` 和 `rg` 两个文件，把所在�
 
 ```bash
 mkdir -p ~/.fcode/bin
-install -m 0755 dist/opencode-linux-x64/bin/* ~/.fcode/bin/
+install -m 0755 dist/fcode-linux-x64/bin/* ~/.fcode/bin/
 echo 'export PATH="$HOME/.fcode/bin:$PATH"' >> ~/.zshrc
 ```
 
@@ -216,7 +216,7 @@ echo 'export PATH="$HOME/.fcode/bin:$PATH"' >> ~/.zshrc
 
 - 每次改了 fork 代码想重装:重跑第 1、2 步即可（`bun install` 会重新应用 patches）。
 - 想换后缀/channel/安装目录,改对应的环境变量即可,无需改脚本。
-- 源码构建产物目录名仍以包名为前缀（如 `dist/opencode-linux-x64/`），其中的二进制是 `bin/fcode`。
+- 源码构建产物目录名形如 `dist/fcode-linux-x64/`（与 release 资产同名），其中的二进制是 `bin/fcode`。
 
 ## 维护者：分支与发版
 

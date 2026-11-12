@@ -111,12 +111,26 @@ jobs:
           else
             base="${{ github.event.before }}"
           fi
-          # A missing or all-zeros base (new branch / force push) cannot be
-          # diffed; fall back to running the check so a plugin change never
-          # slips through for lack of a comparable base.
-          if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ] && ! git diff --name-only "$base" HEAD -- packages/plugin | grep -q .; then
-            echo "packages/plugin unchanged — skipping drift check"
+          # The checkout is shallow, so the base commit is usually absent.
+          # Fetch it; if that fails (new branch / force push / all-zero sha),
+          # fall back to RUNNING the check — a plugin change must never slip
+          # through for lack of a comparable base. (The previous wording said
+          # "skip" here, which made the diff's bad-object failure skip the
+          # check on every PR.)
+          comparable=0
+          if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ]; then
+            if git cat-file -e "$base" 2>/dev/null || git fetch --no-tags origin "$base" >/dev/null 2>&1; then
+              comparable=1
+            fi
+          fi
+          if [ "$comparable" = "1" ] && ! git diff --name-only "$base" HEAD -- packages/plugin | grep -q .; then
+            echo "packages/plugin unchanged since $base — skipping drift check"
             exit 0
+          fi
+          if [ "$comparable" = "1" ]; then
+            echo "packages/plugin changed since $base — running drift check"
+          else
+            echo "base $base not fetchable — running drift check (fail-closed)"
           fi
           bun script/check-plugin-drift.ts
 

@@ -253,6 +253,45 @@ describe("installation", () => {
         }
       }),
     )
+
+    // The happy path: download → verify → extract → replace → chmod. This is
+    // the most destructive chain in the module, so it gets a durable oracle:
+    // a live binary is replaced by the fake release's contents, rg and
+    // package.json land beside it, executability is (re)asserted, and the
+    // staging directory is gone. Runs on every platform CI covers (win32
+    // included — the extract path differs there); the .old parking is
+    // exercised on win32, asserted non-strictly below.
+    testEffect(testLayer(fakeReleaseHandler({}))).effect("replaces the live binary through the full upgrade flow", () =>
+      Effect.gen(function* () {
+        const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "fcode-upgrade-"))
+        const live = path.join(binDir, "fcode")
+        fs.writeFileSync(live, "#!/bin/sh\necho old\n", { mode: 0o755 })
+        const oldRg = path.join(binDir, "rg")
+        fs.writeFileSync(oldRg, "#!/bin/sh\necho old-rg\n", { mode: 0o755 })
+        const original = process.execPath
+        try {
+          Object.defineProperty(process, "execPath", { value: live, configurable: true })
+          yield* Installation.use.upgrade("curl", "1.18.31-fmv2.1")
+          const executable = process.platform === "win32" ? "fcode.exe" : "fcode"
+          const rgName = process.platform === "win32" ? "rg.exe" : "rg"
+          // All three shipped files present with the staged contents.
+          const newBin = path.join(binDir, executable)
+          expect(fs.readFileSync(newBin).toString()).toContain("#!/bin/sh")
+          expect(fs.readFileSync(path.join(binDir, rgName)).toString()).toContain("#!/bin/sh")
+          expect(JSON.parse(fs.readFileSync(path.join(binDir, "package.json"), "utf8"))).toEqual({})
+          // Defensive chmod ran on the two binaries.
+          expect(fs.statSync(newBin).mode & 0o777).toBe(0o755)
+          expect(fs.statSync(path.join(binDir, rgName)).mode & 0o777).toBe(0o755)
+          // Staging cleaned up; no .old residue on unix (win32 may leave
+          // none too — the running exe here is not locked in the test env).
+          expect(fs.readdirSync(binDir).some((entry) => entry.startsWith(".staging-"))).toBe(false)
+          expect(fs.existsSync(path.join(binDir, `${executable}.old`))).toBe(false)
+        } finally {
+          Object.defineProperty(process, "execPath", { value: original, configurable: true })
+          fs.rmSync(binDir, { recursive: true, force: true })
+        }
+      }),
+    )
   })
 
   describe("method", () => {
