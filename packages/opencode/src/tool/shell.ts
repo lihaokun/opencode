@@ -54,7 +54,20 @@ const appendCapped = (buffer: string, chunk: string) => {
      */
 const tailOf = (text: string, lines: number) => {
   const all = text.split("\n")
-  return all.length <= lines ? text : all.slice(-lines).join("\n")
+  if (all.at(-1) === "") all.pop()
+  return all.slice(-lines).join("\n")
+}
+// Preserve the task/status header and return a bounded UTF-8 tail without creating an artifact.
+function backgroundPreview(output: string, limits: { maxBytes: number; maxLines: number }, headerLines = 2) {
+  const rows = output.split("\n")
+  const header = rows.slice(0, headerLines).join("\n")
+  if (rows.length <= limits.maxLines && Buffer.byteLength(output) <= limits.maxBytes)
+    return { output, truncated: false }
+  const bytes = limits.maxBytes - Buffer.byteLength(header) - 1
+  if (bytes <= 0 || limits.maxLines <= headerLines)
+    return { output: tail(header, limits.maxLines, limits.maxBytes).text, truncated: true }
+  const body = tail(rows.slice(headerLines).join("\n"), limits.maxLines - headerLines, bytes)
+  return { output: header + "\n" + body.text, truncated: true }
 }
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
@@ -321,7 +334,8 @@ const ask = Effect.fn("ShellTool.ask")(function* (ctx: Tool.Context, scan: Scan,
   })
 })
 
-function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv) {
+function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv, background = false) {
+  const stop = background ? { forceKillAfter: "3 seconds" as const } : {}
   if (process.platform === "win32" && Shell.ps(shell)) {
     return ChildProcess.make(
       shell,
@@ -329,6 +343,7 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
       {
         cwd,
         env,
+        ...stop,
         stdin: "ignore",
         detached: false,
       },
@@ -337,6 +352,7 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
 
   return ChildProcess.make(command, [], {
     shell,
+    ...stop,
     cwd,
     env,
     stdin: "ignore",
@@ -655,9 +671,7 @@ export const ShellTool = Tool.define(
         const exit = yield* Effect.exit(
           Effect.scoped(
             Effect.gen(function* () {
-              const handle = yield* spawner.spawn(
-                cmd(input.shell, input.command, input.cwd, input.env),
-              )
+              const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env, true))
               yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
                 Effect.sync(() => {
                   entry.buffer = appendCapped(entry.buffer, chunk)
@@ -678,15 +692,22 @@ export const ShellTool = Tool.define(
           : entry.exit !== undefined
             ? `exit ${entry.exit}`
             : "terminated"
-        const body = `[shell task finished] ${taskId} ${input.command} · ${status}\n${tailOf(entry.buffer, 200)}`
+        const body = `[shell task finished] ${taskId} ${input.command.slice(0, 160).replace(/[\r\n]+/g, " ")} · ${status}\n${tailOf(entry.buffer, 200)}`
         if (ops) {
           yield* ops
-            .deliverAsync({
-              sessionID: ctx.sessionID,
-              agent: ctx.agent,
-              parts: [{ type: "text", text: body }],
-            })
-            .pipe(Effect.ignore)
+            .deliverAsync(
+              {
+                sessionID: ctx.sessionID,
+                parts: [{ type: "text", text: backgroundPreview(body, yield* trunc.limits(), 1).output }],
+              },
+              "current",
+            )
+            .pipe(
+              Effect.catchCauseIf(
+                (cause) => !Cause.hasInterrupts(cause),
+                (cause) => Effect.logWarning("shell completion notification failed", { taskId, cause }),
+              ),
+            )
         }
         if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause)
         // The settle output leads with the status line: BackgroundJob.Info has
@@ -705,7 +726,7 @@ export const ShellTool = Tool.define(
       const info = yield* background.start({
         id: taskId,
         type: "shell",
-        title: input.command.slice(0, 80),
+        title: input.command.slice(0, 80).replace(/[\r\n]+/g, " "),
         // Same shape agent delegation uses: cancelBackgroundJobs walks the
         // session graph through this, so agent_stop and interrupt reach the
         // process, and a stopped session is never woken by the completion
@@ -714,7 +735,7 @@ export const ShellTool = Tool.define(
         run,
       })
       return {
-        title: input.command.slice(0, 80),
+        title: input.command.slice(0, 80).replace(/[\r\n]+/g, " "),
         // task_id/status ride the metadata too (detailed-design §5.1): the
         // text is for the model, the metadata is the programmable surface —
         // UI/SDK consumers read it from the tool part without parsing prose.
@@ -790,6 +811,7 @@ export const ShellOutputTool = Tool.define(
   "shell_output",
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
+    const trunc = yield* Truncate.Service
     return {
       description:
         "Read the status and recent output of a background shell task started with run_in_background. Defaults to the most recent background shell task in this session.",
@@ -813,10 +835,12 @@ export const ShellOutputTool = Tool.define(
           const id =
             params.task_id ??
             (yield* background.list())
+              .toReversed()
               .filter((job) => job.type === "shell" && job.metadata?.sessionId === ctx.sessionID)
               .toSorted((a, b) => b.started_at - a.started_at)
               .at(0)?.id ??
             [...shellTasks.entries()]
+              .reverse()
               .filter(([, entry]) => entry.sessionID === ctx.sessionID)
               .toSorted((a, b) => b[1].startedAt - a[1].startedAt)
               .at(0)?.[0]
@@ -838,7 +862,10 @@ export const ShellOutputTool = Tool.define(
             // The settle output leads with the status line, so the exit code
             // reported here is the real one — never a guessed exit 0.
             const settled = job.output?.split("\n", 1)[0]
-            const status = job.status === "running" ? "running" : (settled ?? job.status)
+            const status =
+              job.status === "running"
+                ? "running"
+                : (settled ?? (job.error ? `error: ${job.error.slice(0, 500)}` : job.status))
             const outputTail = job.output ? job.output.slice(job.output.indexOf("\n") + 1) : undefined
             const output = [
               `[shell task ${id}] ${job.title ?? ""}`.trim(),
@@ -846,10 +873,11 @@ export const ShellOutputTool = Tool.define(
               ...(outputTail && status !== "running" ? [tailOf(outputTail, params.tail_lines ?? 200)] : []),
               ...(status === "running" ? [] : job.output ? [] : [`(no output was captured before the task ended)`]),
             ].join("\n")
+            const view = backgroundPreview(output, yield* trunc.limits())
             return {
               title: (job.title ?? id).slice(0, 80),
-              metadata: { task_id: id, status: job.status },
-              output,
+              metadata: { truncated: view.truncated, task_id: id, status: job.status },
+              output: view.output,
             }
           }
           if (!entry || entry.sessionID !== ctx.sessionID) throw new Error(`unknown task: ${id}`)
@@ -864,16 +892,17 @@ export const ShellOutputTool = Tool.define(
                   : entry.exit !== undefined
                     ? `exit ${entry.exit}`
                     : "finished"
-          const tail = tailOf(entry.buffer, params.tail_lines ?? 200)
+          const lines = tailOf(entry.buffer, params.tail_lines ?? 200)
           const output = [
-            `[shell task ${id}] ${entry.command}`,
+            `[shell task ${id}] ${entry.command.slice(0, 160).replace(/[\r\n]+/g, " ")}`,
             `status: ${status}`,
-            ...(tail.length > 0 ? [tail] : []),
+            ...(lines.length > 0 ? [lines] : []),
           ].join("\n")
+          const view = backgroundPreview(output, yield* trunc.limits())
           return {
             title: entry.command.slice(0, 80),
-            metadata: { task_id: id, status: job?.status },
-            output,
+            metadata: { truncated: view.truncated, task_id: id, status: job?.status },
+            output: view.output,
           }
         }).pipe(Effect.orDie),
     }
@@ -884,8 +913,10 @@ export const ShellKillTool = Tool.define(
   "shell_kill",
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
+    const trunc = yield* Truncate.Service
     return {
-      description: "Stop a background shell task started with run_in_background. The task's session and output are kept; use shell_output to read what it produced.",
+      description:
+        "Stop a background shell task started with run_in_background. The task's session and output are kept; use shell_output to read what it produced.",
       parameters: Schema.Struct({
         task_id: Schema.String.annotate({ description: "Background shell task id" }),
       }),
@@ -900,10 +931,15 @@ export const ShellKillTool = Tool.define(
             if (!job || job.type !== "shell" || job.metadata?.sessionId !== ctx.sessionID) {
               throw new Error(`unknown task: ${params.task_id}`)
             }
+            const view = backgroundPreview(
+              `[shell task ${params.task_id}] already settled (${job.status})${job.output ? `\n${tailOf(job.output, 50)}` : ""}`,
+              yield* trunc.limits(),
+              1,
+            )
             return {
               title: (job.title ?? params.task_id).slice(0, 80),
-              metadata: { task_id: params.task_id, status: job.status },
-              output: `[shell task ${params.task_id}] already settled (${job.status})${job.output ? `\n${tailOf(job.output, 50)}` : ""}`,
+              metadata: { truncated: view.truncated, task_id: params.task_id, status: job.status },
+              output: view.output,
             }
           }
           if (entry.sessionID !== ctx.sessionID) throw new Error(`unknown task: ${params.task_id}`)
@@ -915,10 +951,15 @@ export const ShellKillTool = Tool.define(
             output: cancelSnapshot(params.task_id),
           })
           const finalStatus = info?.status ?? "cancelled"
+          const view = backgroundPreview(
+            `[shell task ${params.task_id}] stopped (${finalStatus})\n${tailOf(entry.buffer, 50)}`,
+            yield* trunc.limits(),
+            1,
+          )
           return {
             title: entry.command.slice(0, 80),
-            metadata: { task_id: params.task_id, status: finalStatus },
-            output: `[shell task ${params.task_id}] stopped (${finalStatus})\n${tailOf(entry.buffer, 50)}`,
+            metadata: { truncated: view.truncated, task_id: params.task_id, status: finalStatus },
+            output: view.output,
           }
         }).pipe(Effect.orDie),
     }

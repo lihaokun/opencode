@@ -1155,7 +1155,7 @@ withMcpTool.instance("loop replays an MCP structuredContent into the next model 
 
 it.instance("loop delivers background shell completion as a message on the wire", () =>
   Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
+    const { llm, dir } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
     const chat = yield* sessions.create({
@@ -1169,13 +1169,23 @@ it.instance("loop delivers background shell completion as a message on the wire"
       parts: [{ type: "text", text: "start the server" }],
     })
     yield* llm.tool("bash", {
-      command: `bun -e "console.log('bg-done-marker'); process.exit(0)"`,
+      command: `bun -e "const end = Date.now() + 15000; while (!(await Bun.file('finish-shell').exists()) && Date.now() < end) await Bun.sleep(20); console.log('bg-done-marker')"`,
       run_in_background: true,
     })
     yield* llm.text("started")
     yield* llm.text("ack")
 
     yield* prompt.loop({ sessionID: chat.id })
+
+    // The shell waits on the file, so the user can switch after its tool
+    // call has returned and before the completion notice is delivered.
+    yield* sessions.setAgentModel({
+      sessionID: chat.id,
+      agent: "plan",
+      model: { providerID: ref.providerID, id: ref.modelID, variant: "turbo" },
+      time: Date.now(),
+    })
+    yield* writeText(path.join(dir, "finish-shell"), "ready")
 
     // The background process exits, the completion notification is delivered
     // through the real deliverAsync path, and that message wakes a new model
@@ -1195,6 +1205,9 @@ it.instance("loop delivers background shell completion as a message on the wire"
     const wire = JSON.stringify(notification)
     expect(wire).toContain("bg-done-marker")
     expect(wire).toContain("exit 0")
+    const session = yield* sessions.get(chat.id)
+    expect(session.agent).toBe("plan")
+    expect(session.model?.variant).toBe("turbo")
   }),
 )
 

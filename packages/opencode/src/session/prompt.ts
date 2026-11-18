@@ -169,7 +169,7 @@ const layer = Layer.effect(
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
-        deliverAsync: (input: PromptInput) => deliverAsync(input),
+        deliverAsync: (input: PromptInput, identity?: "current") => deliverAsync(input, identity),
       } satisfies AgentManagement.AgentPromptOps
     })
 
@@ -178,8 +178,17 @@ const layer = Layer.effect(
       yield* state.cancel(sessionID)
     })
 
-    const deliverAsync = Effect.fn("SessionPrompt.deliverAsync")(function* (input: PromptInput) {
+    const deliverAsync = Effect.fn("SessionPrompt.deliverAsync")(function* (input: PromptInput, identity?: "current") {
       const target = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      const message =
+        identity === "current"
+          ? {
+              ...input,
+              agent: target.agent ?? (yield* agents.defaultInfo()).name,
+              model: target.model ? { providerID: target.model.providerID, modelID: target.model.id } : undefined,
+              variant: target.model?.variant === "default" ? undefined : target.model?.variant,
+            }
+          : input
       const here = yield* InstanceState.context
 
       // Everything the fork does is reported this way, or the failure escapes
@@ -205,7 +214,7 @@ const layer = Layer.effect(
       // Same directory means this instance already is the target's, and loading
       // it again would be a detour to the same place.
       if (target.directory === here.directory) {
-        yield* report(prompt(input))
+        yield* report(prompt(message))
         return
       }
 
@@ -225,7 +234,7 @@ const layer = Layer.effect(
           ),
         )
       }
-      yield* report(store.value.provide({ directory: target.directory }, prompt(input)))
+      yield* report(store.value.provide({ directory: target.directory }, prompt(message)))
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {

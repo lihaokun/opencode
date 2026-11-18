@@ -116,3 +116,5 @@ shell_kill: { task_id: string }
 - [x] callee 契约引用（BackgroundJob start/cancel post、deliverAsync 语义、promptOps 通道均已标注）
 - [x] 循环刻画（无新增循环；流累积既有）
 - [x] 上游事实显式（inbox deliverAsync 形状、promptOps 通道、settle 一次保证、注册表非持久化——均标注出处）
+
+2026-11-19 修订：完成通知采用目标 Session 当下的 agent、model、variant；投递异常不改写进程结局。取消向进程组发送 TERM，并有界升级，含 shell 先退出且子进程仍存活的情况。shell_output / shell_kill 在内存内按有效行数、UTF-8 字节预算保留尾部。终端换行不占用一个额外的输出行；同毫秒启动时选后启动的任务。

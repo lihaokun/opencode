@@ -1,6 +1,7 @@
 import { expect } from "bun:test"
 import path from "path"
 import { Cause, Effect, Exit, Layer } from "effect"
+import { FastCheck, TestClock } from "effect/testing"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -16,8 +17,8 @@ import { ShellOutputTool, ShellKillTool, ShellTool } from "../../src/tool/shell"
 import { MessageID, SessionID } from "../../src/session/schema"
 import type { Tool } from "../../src/tool/tool"
 import type { AgentManagement } from "../../src/agent-management/schema"
-import { testInstanceStoreLayer } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { TestInstance, testInstanceStoreLayer } from "../fixture/fixture"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 
 const shellLayer = Layer.mergeAll(
   LayerNode.compile(
@@ -64,6 +65,11 @@ const initTools = Effect.gen(function* () {
   return { shell, output, kill }
 })
 
+function startedTaskID(result: { metadata: object }) {
+  if ("task_id" in result.metadata && typeof result.metadata.task_id === "string") return result.metadata.task_id
+  throw new Error("background start did not return a task_id")
+}
+
 const waitUntilOutput = (
   output: { execute: (args: { task_id: string }, ctx: Tool.Context) => Effect.Effect<{ output: string }> },
   ctx: Tool.Context,
@@ -74,7 +80,7 @@ const waitUntilOutput = (
     const deadline = Date.now() + 10_000
     while (Date.now() < deadline) {
       const result = yield* output.execute({ task_id: taskId }, ctx)
-      if (result.output.includes(needle)) return
+      if (result.output.split("\n").slice(2).includes(needle)) return
       yield* Effect.sleep(50)
     }
     throw new Error(`timed out waiting for output containing: ${needle}`)
@@ -118,7 +124,7 @@ it.instance("shell_output reads interim output and final status", () =>
     // "cancelled") plus whatever the task printed before the kill.
     const final = (yield* tools.output.execute({ task_id: taskId }, makeCtx())) as { output: string }
     expect(final.output).toContain("status: stopped")
-    expect(final.output).toContain("bg-marker")
+    expect(final.output.split("\n").slice(2)).toContain("bg-marker")
   }),
 )
 
@@ -186,6 +192,7 @@ it.instance("session cancel stops the background process and suppresses the comp
     const before = yield* bg.get(taskId)
     expect(before?.metadata?.sessionId).toBe(sessionID)
 
+    yield* waitUntilOutput(tools.output, makeCtx(), taskId, "cancel-marker")
     yield* runState.cancel(sessionID)
     const job = yield* bg.get(taskId)
     expect(job?.status).toBe("cancelled")
@@ -199,7 +206,7 @@ it.instance("session cancel stops the background process and suppresses the comp
     // path records — the settled read reports "stopped" plus the tail, not a
     // bare "cancelled" with the buffer gone.
     expect(final.output).toContain("status: stopped")
-    expect(final.output).toContain("cancel-marker")
+    expect(final.output.split("\n").slice(2)).toContain("cancel-marker")
   }),
 )
 
@@ -248,7 +255,7 @@ it.instance("buffer is capped and the task entry is cleaned up after the run set
 
     const final = (yield* tools.output.execute({ task_id: taskId }, makeCtx())) as { output: string }
     expect(final.output).toContain("status: exit 0")
-    expect(final.output.length).toBeLessThan(line.length * 400)
+    expect(job?.output?.slice("exit 0\n".length)).toBe(line.repeat(400).slice(-200_000))
 
     // Settled runs remove their registry entry; shell_output then falls back
     // to the BackgroundJob snapshot for status and reports the missing tail.
@@ -410,7 +417,7 @@ it.instance("shell_output keeps the output tail after a kill", () =>
     }
 
     const after = (yield* tools.output.execute({ task_id: taskId }, makeCtx())) as { output: string }
-    expect(after.output).toContain("tail-keeper")
+    expect(after.output.split("\n").slice(2)).toContain("tail-keeper")
     expect(after.output).toContain("status: stopped")
     // The old copy pointed at a completion message that a cancel never sends.
     expect(after.output).not.toContain("see the completion message")
@@ -446,4 +453,309 @@ it.instance("shell_output without task_id resolves the most recent settled task"
     const refused = yield* Effect.exit(tools.output.execute({}, stranger))
     expect(Exit.isFailure(refused)).toBe(true)
   }),
+)
+// Generate output independently of its representation in the command title.
+// The marker only appears as a complete line after a child actually writes it.
+it.instance("tail_lines counts a final newline as the end of the last line", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const jobs = yield* BackgroundJob.Service
+    const ctx = makeCtx()
+    const started = yield* tools.shell.execute(
+      {
+        command: `bun -e "console.log(22); console.log(33)"`,
+        run_in_background: true,
+      },
+      ctx,
+    )
+    const id = startedTaskID(started)
+    yield* jobs.wait({ id })
+    const result = yield* tools.output.execute({ task_id: id, tail_lines: 1 }, ctx)
+    expect(result.output.split("\n").slice(2).filter(Boolean)).toEqual(["33"])
+  }),
+)
+
+it.instance("a failed shell spawn remains diagnosable after settlement", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const jobs = yield* BackgroundJob.Service
+    const ctx = makeCtx()
+    const started = yield* tools.shell.execute(
+      {
+        command: "echo hello",
+        workdir: "does-not-exist",
+        run_in_background: true,
+      },
+      ctx,
+    )
+    const id = startedTaskID(started)
+    const { info } = yield* jobs.wait({ id })
+    expect(info?.status).toBe("error")
+    const result = yield* tools.output.execute({ task_id: id }, ctx)
+    expect(result.output).toContain("does-not-exist")
+  }),
+)
+
+it.instance("failed completion delivery preserves the process exit and captured output", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const jobs = yield* BackgroundJob.Service
+    let attempts = 0
+    const ctx = makeCtx({
+      promptOps: {
+        deliverAsync: () =>
+          Effect.sync(() => {
+            attempts++
+            throw new Error("target unavailable during delivery")
+          }),
+      } as unknown as AgentManagement.AgentPromptOps,
+    })
+    const started = yield* tools.shell.execute(
+      {
+        command: `bun -e "console.log(42); process.exit(7)"`,
+        run_in_background: true,
+      },
+      ctx,
+    )
+    const id = startedTaskID(started)
+    const { info } = yield* jobs.wait({ id })
+    expect(attempts).toBe(1)
+    expect(info?.status).toBe("completed")
+    const result = yield* tools.output.execute({ task_id: id }, ctx)
+    expect(result.output.split("\n")).toEqual(expect.arrayContaining(["status: exit 7", "42"]))
+  }),
+)
+
+it.instance("the most recently admitted shell wins a same-millisecond tie", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const jobs = yield* BackgroundJob.Service
+    const starts = yield* Effect.forEach(["shell_first", "shell_second"], (id) =>
+      jobs.start({ id, type: "shell", metadata: { sessionId: sessionID }, run: Effect.succeed("exit 0\n") }),
+    ).pipe(Effect.provide(TestClock.layer()))
+    expect(starts[0]!.started_at).toBe(starts[1]!.started_at)
+    const result = yield* tools.output.execute({}, makeCtx())
+    expect(result.metadata.task_id).toBe("shell_second")
+  }),
+)
+
+it.instance("large background reads and stops keep the latest output in memory", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const fs = yield* FSUtil.Service
+    yield* fs.ensureDir(Truncate.DIR)
+    const before = yield* fs.readDirectory(Truncate.DIR)
+    const ctx = makeCtx()
+    const started = yield* tools.shell.execute(
+      {
+        command: `bun -e "console.log('q'.repeat(120000)); console.log(12345); await Bun.sleep(20000)"`,
+        run_in_background: true,
+      },
+      ctx,
+    )
+    const id = startedTaskID(started)
+    // Probe the small line window first; default windows would already trigger
+    // the very disk write that this check is intended to detect.
+    yield* pollWithTimeout(
+      tools.output
+        .execute({ task_id: id, tail_lines: 2 }, ctx)
+        .pipe(Effect.map((r) => r.output.split("\n").includes("12345") || undefined)),
+      "the final output marker never arrived",
+    )
+    const live = yield* tools.output.execute({ task_id: id }, ctx)
+    const stopped = yield* tools.kill.execute({ task_id: id }, ctx)
+    const terminal = yield* tools.output.execute({ task_id: id }, ctx)
+    const repeated = yield* tools.kill.execute({ task_id: id }, ctx)
+    expect((yield* fs.readDirectory(Truncate.DIR)).toSorted()).toEqual(before.toSorted())
+    for (const result of [live, stopped, terminal, repeated]) {
+      expect(result.metadata).not.toHaveProperty("outputPath")
+      expect(result.output.split("\n")).toContain("12345")
+    }
+  }),
+)
+
+const unix = process.platform === "win32" ? it.instance.skip : it.instance
+unix(
+  "shell_kill terminates a TERM-resistant process before its natural exit",
+  () =>
+    Effect.gen(function* () {
+      const tools = yield* initTools
+      const ctx = makeCtx()
+      const { directory } = yield* TestInstance
+      // The sentinel is written only if the process runs to its natural exit.
+      // The finite timer also cleans up an unmodified implementation after the red test.
+      const started = yield* tools.shell.execute(
+        {
+          command: `exec bun -e "process.on('SIGTERM', () => {}); console.log(4321); await Bun.sleep(8000); await Bun.write('natural-exit', 'finished')"`,
+          run_in_background: true,
+        },
+        ctx,
+      )
+      const id = startedTaskID(started)
+      yield* waitUntilOutput(tools.output, ctx, id, "4321")
+      const result = yield* tools.kill.execute({ task_id: id }, ctx)
+      expect(result.metadata.status).toBe("cancelled")
+      expect(yield* Effect.promise(() => Bun.file(path.join(directory, "natural-exit")).exists())).toBe(false)
+    }),
+  20_000,
+)
+
+unix(
+  "shell_kill also stops TERM-resistant workers that redirect output",
+  () =>
+    Effect.gen(function* () {
+      const tools = yield* initTools
+      const ctx = makeCtx()
+      const { directory } = yield* TestInstance
+      // A trailing command keeps the shell as process group leader. Redirected
+      // stdio allows the shell's close event while its worker is still alive.
+      const started = yield* tools.shell.execute(
+        {
+          command: `bun -e "process.on('SIGTERM', () => {}); await Bun.write('worker-ready', 'yes'); await Bun.sleep(6000); await Bun.write('survived-stop', 'yes')" > worker.log 2>&1; true`,
+          run_in_background: true,
+        },
+        ctx,
+      )
+      const file = (name: string) => Effect.promise(() => Bun.file(path.join(directory, name)).exists())
+      yield* pollWithTimeout(
+        file("worker-ready").pipe(Effect.map((ready) => ready || undefined)),
+        "worker never started",
+      )
+      const until = Date.now() + 6500
+      yield* tools.kill.execute({ task_id: startedTaskID(started) }, ctx)
+      // Wait through the worker's finite lifetime on both a green and a red
+      // implementation. An orphan cannot write after the test's fixture closes.
+      yield* Effect.sleep(Math.max(0, until - Date.now()))
+      expect(yield* file("survived-stop")).toBe(false)
+    }),
+  15_000,
+)
+
+it.instance(
+  "generated shell lifecycles retain the owner's output and terminal result",
+  () =>
+    Effect.gen(function* () {
+      const tools = yield* initTools
+      const jobs = yield* BackgroundJob.Service
+      const state = yield* SessionRunState.Service
+      const run = Effect.runPromiseWith(yield* Effect.context())
+      const sequences = FastCheck.record({
+        finish: FastCheck.constantFrom("natural", "kill", "session-cancel"),
+        value: FastCheck.nat(99),
+        live: FastCheck.array(FastCheck.constantFrom("owner-read", "stranger-read", "stranger-kill"), { maxLength: 5 }),
+        terminal: FastCheck.array(
+          FastCheck.constantFrom("owner-read", "owner-kill", "stranger-read", "stranger-kill"),
+          { maxLength: 5 },
+        ),
+      })
+      yield* Effect.promise(() =>
+        FastCheck.assert(
+          FastCheck.asyncProperty(sequences, (actions) =>
+            run(
+              Effect.gen(function* () {
+                let notices = 0
+                const ctx = makeCtx({
+                  promptOps: {
+                    deliverAsync: () =>
+                      Effect.sync(() => {
+                        notices++
+                      }),
+                  } as unknown as AgentManagement.AgentPromptOps,
+                })
+                const stranger = makeCtx({ session: otherSessionID })
+                const delay = actions.finish === "natural" ? "" : "await Bun.sleep(20000);"
+                const started = yield* tools.shell.execute(
+                  {
+                    command: `bun -e "console.log(1000 + ${actions.value}); ${delay} process.exit(7)"`,
+                    run_in_background: true,
+                  },
+                  ctx,
+                )
+                const id = startedTaskID(started)
+                const marker = String(1000 + actions.value)
+                yield* waitUntilOutput(tools.output, ctx, id, marker)
+                const check = (operation: string) =>
+                  Effect.gen(function* () {
+                    const owner = operation.startsWith("owner")
+                    const result = yield* Effect.exit(
+                      (operation.endsWith("read") ? tools.output : tools.kill).execute(
+                        { task_id: id },
+                        owner ? ctx : stranger,
+                      ),
+                    )
+                    if (!owner) {
+                      expect(Exit.isFailure(result)).toBe(true)
+                      if (Exit.isFailure(result)) expect(String(Cause.squash(result.cause))).toContain("unknown task")
+                      return
+                    }
+                    if (Exit.isFailure(result)) throw new Error(Cause.pretty(result.cause))
+                    if (operation === "owner-read") expect(result.value.output.split("\n")).toContain(marker)
+                  })
+                yield* Effect.forEach(actions.live, check)
+                if (actions.finish === "kill") yield* tools.kill.execute({ task_id: id }, ctx)
+                if (actions.finish === "session-cancel") yield* state.cancel(ctx.sessionID)
+                const { info } = yield* jobs.wait({ id })
+                yield* Effect.forEach(actions.terminal, check)
+                const result = yield* tools.output.execute({ task_id: id }, ctx)
+                expect(result.output.split("\n")).toEqual(
+                  expect.arrayContaining([actions.finish === "natural" ? "status: exit 7" : "status: stopped", marker]),
+                )
+                expect(info?.status).toBe(actions.finish === "natural" ? "completed" : "cancelled")
+                expect(yield* jobs.get(id)).toEqual(info)
+                expect(notices).toBe(actions.finish === "natural" ? 1 : 0)
+              }),
+            ),
+          ),
+          { seed: 60004, numRuns: 30 },
+        ),
+      )
+    }),
+  30_000,
+)
+
+it.instance(
+  "shell output respects the configured byte budget and preserves UTF-8",
+  () =>
+    Effect.gen(function* () {
+      const tools = yield* initTools
+      const jobs = yield* BackgroundJob.Service
+      const started = yield* tools.shell.execute(
+        { command: `bun -e "console.log('界'.repeat(30000) + 777)"`, run_in_background: true },
+        makeCtx(),
+      )
+      const id = startedTaskID(started)
+      yield* jobs.wait({ id })
+      const result = yield* tools.output.execute({ task_id: id }, makeCtx())
+      const tail = result.output.split("\n").slice(2).join("\n")
+      expect(tail).not.toContain("\uFFFD")
+      expect(tail.trimEnd().endsWith("777")).toBe(true)
+      // Permit a small human-readable truncation note regardless of formatting.
+      expect(Buffer.byteLength(tail)).toBeLessThanOrEqual(1024 + 128)
+      expect(result.metadata).toMatchObject({ truncated: true })
+      expect(result.metadata).not.toHaveProperty("outputPath")
+    }),
+  { config: { tool_output: { max_bytes: 1024, max_lines: 10 } } },
+)
+
+it.instance(
+  "shell output applies the configured line budget to the tail",
+  () =>
+    Effect.gen(function* () {
+      const tools = yield* initTools
+      const jobs = yield* BackgroundJob.Service
+      const started = yield* tools.shell.execute(
+        { command: `bun -e "for (let i = 1000; i < 1020; i++) console.log(i)"`, run_in_background: true },
+        makeCtx(),
+      )
+      const id = startedTaskID(started)
+      yield* jobs.wait({ id })
+      const result = yield* tools.output.execute({ task_id: id, tail_lines: 100 }, makeCtx())
+      const numeric = result.output.split("\n").filter((line) => /^\d+$/.test(line))
+      expect(numeric.at(-1)).toBe("1019")
+      expect(numeric.length).toBeLessThanOrEqual(8)
+      expect(numeric.length).toBeGreaterThan(0)
+      expect(result.metadata).toMatchObject({ truncated: true })
+      expect(result.metadata).not.toHaveProperty("outputPath")
+    }),
+  { config: { tool_output: { max_bytes: 8192, max_lines: 8 } } },
 )
