@@ -185,3 +185,7 @@ msgs = yield* SessionRestoration.apply({ sessionID: chat.id }).pipe(
 - [x] 所有 callee 调用显式引用 pre/post（FSUtil/Skill/Todo/Token/Session 的契约在 §3/§5.3 标注）
 - [x] 所有循环有终止性论证（各函数线性扫描，计数单调）
 - [x] 所有上游事实显式列出（H1-H5 已核实并标注出处行号；`resource.text` 真值语义等实现层事实在实现思路内注明）
+
+### 摘要输入超限后的保留边界
+
+当摘要请求因上下文超限失败，SessionCompaction 可以把更多近期消息留作原文，使用缩短的旧前缀重试一次。成功后，SessionRestoration 基于本次成功的 `tail_start_id` 去重；晚到输入排在保留原文之后。适用条件和预算见[修复说明](../../fixes/session-fix-summary-overflow-tail.md)。

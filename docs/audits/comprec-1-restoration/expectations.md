@@ -85,3 +85,5 @@ budget_tokens；渲染幂等（同输入同输出）。collect/materialize/build
 
 - core V2 runner 无对应实现（已确认零 V2 消费者；`compaction.ts` V2 孪生文件的摘要输入共享 `summarizeToolText`/exit 行 helper，但 restoration 注入为 V1-only——CLAUDE.md 双运行时条目）
 - 注入位置与 roster 同构（synthetic part + 哨兵前缀 + findLast 去重先例）
+
+**摘要超限恢复用例**：第一次摘要输入被拒后，用严格更短的输入成功，则最终投影按顺序包含成功摘要、每条保留原文和晚到输入，各一次。若恢复尝试仍被拒，marker 保持未结算，发一次终止错误。见 `compaction.test.ts` 的 `summary overflow retries only with a shorter head`。

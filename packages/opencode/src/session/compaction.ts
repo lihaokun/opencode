@@ -244,12 +244,13 @@ const layer = Layer.effect(
 
     const select = Effect.fn("SessionCompaction.select")(function* (input: {
       messages: SessionV1.WithParts[]
+      recoveryBudget?: number
       cfg: ConfigV1.Info
       model: Provider.Model
     }) {
       const limit = input.cfg.compaction?.tail_turns
       if (limit !== undefined && limit <= 0) return { head: input.messages, tail_start_id: undefined }
-      const budget = preserveRecentBudget({ cfg: input.cfg, model: input.model })
+      const budget = input.recoveryBudget ?? preserveRecentBudget({ cfg: input.cfg, model: input.model })
       const all = turns(input.messages)
       if (!all.length) return { head: input.messages, tail_start_id: undefined }
       const recent = limit === undefined ? all : all.slice(-limit)
@@ -263,7 +264,9 @@ const layer = Layer.effect(
           messages: input.messages.slice(turn.start, turn.end),
           model: input.model,
         })
-        if (total + size <= budget) {
+        // A recovery summary needs a nonempty older prefix. For a single long
+        // turn splitTurn may still preserve its later assistant messages.
+        if (total + size <= budget && !(input.recoveryBudget !== undefined && turn.start === 0)) {
           total += size
           keep = { start: turn.start, id: turn.id }
           continue
@@ -399,99 +402,111 @@ const layer = Layer.effect(
       const prior = completedCompactions(messages)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
       const previousSummary = prior.at(-1)?.summary
-      const selected = yield* select({
-        messages: messages.filter((_, index) => !hidden.has(index)),
-        cfg,
-        model,
-      })
+      const historyForSummary = messages.filter((_, index) => !hidden.has(index))
+      let selected = yield* select({ messages: historyForSummary, cfg, model })
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
         "experimental.session.compacting",
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
-      const msgs = structuredClone(selected.head)
-      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-      const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
-      const nextPrompt =
-        compacting.prompt ??
-        [
-          buildPrompt({
-            previousSummary,
-            context: [conversation],
-          }),
-          ...compacting.context,
-        ]
-          .filter(Boolean)
-          .join("\n\n")
+      const summaryPrompt = Effect.fnUntraced(function* (head: SessionV1.WithParts[]) {
+        const msgs = structuredClone(head)
+        yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+        const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
+        const prompt =
+          compacting.prompt ??
+          [buildPrompt({ previousSummary, context: [conversation] }), ...compacting.context]
+            .filter(Boolean)
+            .join("\n\n")
+        return compacting.prompt
+          ? [prompt, "The following is the conversation history:", conversation].filter(Boolean).join("\n\n")
+          : prompt
+      })
       const ctx = yield* InstanceState.context
-      const msg: SessionV1.Assistant = {
-        id: MessageID.ascending(),
-        role: "assistant",
-        parentID: input.parentID,
-        sessionID: input.sessionID,
-        mode: "compaction",
-        agent: "compaction",
-        variant: userMessage.model.variant,
-        summary: true,
-        path: {
-          cwd: ctx.directory,
-          root: ctx.worktree,
-        },
-        cost: 0,
-        tokens: {
-          output: 0,
-          input: 0,
-          reasoning: 0,
-          cache: { read: 0, write: 0 },
-        },
-        modelID: model.id,
-        providerID: model.providerID,
-        time: {
-          created: Date.now(),
-        },
-      }
-      yield* session.updateMessage(msg)
-      const processor = yield* processors.create({
-        assistantMessage: msg,
-        sessionID: input.sessionID,
-        model,
-      })
-      const result = yield* processor.process({
-        user: userMessage,
-        agent,
-        sessionID: input.sessionID,
-        tools: {},
-        system: [],
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: [
-                  nextPrompt,
-                  ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
-                ]
-                  .filter(Boolean)
-                  .join("\n\n"),
-              },
-            ],
+      const summarize = Effect.fnUntraced(function* (text: string) {
+        const msg: SessionV1.Assistant = {
+          id: MessageID.ascending(),
+          role: "assistant",
+          parentID: input.parentID,
+          sessionID: input.sessionID,
+          mode: "compaction",
+          agent: "compaction",
+          variant: userMessage.model.variant,
+          summary: true,
+          path: {
+            cwd: ctx.directory,
+            root: ctx.worktree,
           },
-        ],
-        model,
-      })
+          cost: 0,
+          tokens: {
+            output: 0,
+            input: 0,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+          modelID: model.id,
+          providerID: model.providerID,
+          time: {
+            created: Date.now(),
+          },
+        }
+        yield* session.updateMessage(msg)
+        const processor = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: input.sessionID,
+          model,
+        })
+        const result = yield* processor.process({
+          user: userMessage,
+          agent,
+          sessionID: input.sessionID,
+          tools: {},
+          system: [],
+          messages: [{ role: "user", content: [{ type: "text", text }] }],
+          model,
+        })
 
-      if (result === "compact") {
-        processor.message.error = new SessionV1.ContextOverflowError({
-          message: replay
-            ? "Conversation history too large to compact - exceeds model context limit"
-            : "Session too large to compact - context exceeds model limit even after stripping media",
-        }).toObject()
-        processor.message.finish = "error"
-        yield* session.updateMessage(processor.message)
+        if (result === "compact") {
+          processor.message.error = new SessionV1.ContextOverflowError({
+            message: replay
+              ? "Conversation history too large to compact - exceeds model context limit"
+              : "Session too large to compact - context exceeds model limit even after stripping media",
+          }).toObject()
+          processor.message.finish = "error"
+          yield* session.updateMessage(processor.message)
+        }
+        return { result, message: processor.message }
+      })
+      const original = yield* summaryPrompt(selected.head)
+      let attempt = yield* summarize(original)
+      // The marker is what makes the suffix visible after a successful summary.
+      // The separate overflow-replay path already reissues the rejected user turn.
+      if (attempt.result === "compact" && compactionPart && !replay && selected.head.length > 1) {
+        const primary = agent.model
+          ? yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+          : model
+        const budget = Math.floor(usable({ cfg, model: primary, outputTokenMax: flags.outputTokenMax }) / 4)
+        const candidate = yield* select({
+          messages: historyForSummary,
+          cfg,
+          model: primary,
+          recoveryBudget: Math.min(budget, cfg.compaction?.preserve_recent_tokens ?? budget),
+        })
+        if (candidate.head.length > 0 && candidate.head.length < selected.head.length) {
+          const shorter = yield* summaryPrompt(candidate.head)
+          if (shorter.length < original.length) {
+            selected = candidate
+            attempt = yield* summarize(shorter)
+          }
+        }
+      }
+      if (attempt.result === "compact") {
+        if (attempt.message.error)
+          yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: attempt.message.error })
         return "stop"
       }
+      if (attempt.result !== "continue" || attempt.message.error) return "stop"
 
       if (compactionPart && compactionPart.tail_start_id !== selected.tail_start_id) {
         yield* session.updatePart({
@@ -500,7 +515,7 @@ const layer = Layer.effect(
         })
       }
 
-      if (result === "continue" && input.auto) {
+      if (input.auto) {
         // A user can change configuration while the summary is streaming.
         const current = (yield* latestUser(input.sessionID)) ?? userMessage
         if (replay) {
@@ -599,11 +614,8 @@ const layer = Layer.effect(
         }
       }
 
-      if (processor.message.error) return "stop"
-      if (result === "continue") {
-        yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
-      }
-      return result
+      yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
+      return "continue"
     })
 
     const create = Effect.fn("SessionCompaction.create")(function* (input: {

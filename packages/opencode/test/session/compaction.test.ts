@@ -968,6 +968,83 @@ describe("session.compaction.prune", () => {
 })
 
 describe("session.compaction.process", () => {
+  for (const mode of ["recover", "reject-again", "retention-disabled"] as const) {
+    itCompaction.instance(`summary overflow retries only with a shorter head (${mode})`, () => {
+      const stub = llm()
+      const requests: string[] = []
+      const reject = (input: LLM.StreamInput) => {
+        requests.push(JSON.stringify(input.messages))
+        return Stream.fail(
+          new APICallError({
+            message: "Prompt exceeds max length",
+            url: "https://example.test",
+            requestBodyValues: {},
+            statusCode: 400,
+            isRetryable: false,
+          }),
+        )
+      }
+      stub.push(reject)
+      stub.push(
+        mode === "recover"
+          ? reply("recovered-summary", (input) => requests.push(JSON.stringify(input.messages)))
+          : reject,
+      )
+      return Effect.gen(function* () {
+        const sessions = yield* SessionNs.Service
+        const events = yield* EventV2Bridge.Service
+        const chat = yield* sessions.create({})
+        yield* createUserMessage(chat.id, "older-prefix:" + "a".repeat(12_000))
+        const extra = yield* createUserMessage(chat.id, "recent-original:" + "b".repeat(62_000))
+        const last = yield* createUserMessage(chat.id, "latest-original")
+        yield* createSummaryCompaction(chat.id)
+        const marker = (yield* sessions.messages({ sessionID: chat.id })).at(-1)!
+        const late = yield* createUserMessage(chat.id, "late-worker-report")
+        const seen: string[] = []
+        const off = yield* events.listen((event) =>
+          Effect.sync(() => {
+            seen.push(event.type)
+          }),
+        )
+        const result = yield* SessionCompaction.use.process({
+          sessionID: chat.id,
+          parentID: marker.info.id,
+          messages: yield* MessageV2.filterCompactedEffect(chat.id),
+          auto: false,
+        })
+        yield* off
+        expect(requests).toHaveLength(mode === "retention-disabled" ? 1 : 2)
+        expect(requests[0]).toContain("recent-original:")
+        for (const request of requests) {
+          expect(request).toContain("older-prefix:")
+          expect(request).not.toContain("late-worker-report")
+        }
+        if (requests.length === 2) {
+          expect(requests[1]).not.toContain("recent-original:")
+          expect(requests[1]).not.toContain("latest-original")
+          expect(requests[1]!.length).toBeLessThan(requests[0]!.length)
+        }
+        const projected = yield* MessageV2.filterCompactedEffect(chat.id)
+        const part = projected
+          .find((item) => item.info.id === marker.info.id)
+          ?.parts.find((part) => part.type === "compaction")
+        expect(seen.filter((type) => type === SessionNs.Event.Error.type)).toHaveLength(mode === "recover" ? 0 : 1)
+        if (mode === "recover") {
+          expect(result).toBe("continue")
+          expect(part?.tail_start_id).toBe(extra.id)
+          expect(projected[1]?.info).toMatchObject({ summary: true, parentID: marker.info.id, finish: "stop" })
+          expect(projected.slice(2).map((item) => item.info.id)).toEqual([extra.id, last.id, late.id])
+        } else {
+          expect(result).toBe("stop")
+          expect(part?.tail_start_id).toBeUndefined()
+          expect(seen).not.toContain(SessionCompaction.Event.Compacted.type)
+        }
+      }).pipe(
+        withCompaction({ llm: stub.llmLayer, config: cfg(mode === "retention-disabled" ? { tail_turns: 0 } : {}) }),
+      )
+    })
+  }
+
   for (const auto of [false, true]) {
     itCompaction.instance(`ordinary retry keeps late inputs outside its marker boundary (auto=${auto})`, () => {
       const stub = llm()
