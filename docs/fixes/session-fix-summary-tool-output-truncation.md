@@ -44,7 +44,7 @@ ZCode 摘要输入**无字符截断**（完整 provider messages 直接进摘要
    `text.length <= 2_000` 原样返回；否则 `头 1,400 + \n[... N chars truncated ...]\n + 尾 600`（N = 原长 − 2,000）。纯截断，无 metadata 参数——exit 与 compacted 是 V1 schema 概念，留在 V1 调用点。
 2. **opencode serialize（`compaction.ts:66-83`）**：completed 分支改为 `summarizeToolText([output, ...attachments].join("\n"))`，其后追加 `formatExitCodeLine(part.state.metadata)`（非零时，换行拼接）；`time.compacted` 分支维持 `[Old tool result content cleared]` 不变。本地的 `truncate` 常量/函数随使用点清理（`grep` 确认无其他消费后删除）。
 3. **core serialize（工具分支）**：`truncate(serializeToolContent(...))` → `summarizeToolText(serializeToolContent(...))`；`[Shell]:` 行的 `truncate` 同步替换（同一问题域）；core 本地 2,000 常量与 `truncate` 删除（grep 确认无其他消费）。
-4. **error 分支两侧均不变**（现状不截断，维持）。
+4. **error 分支**（2026-11-19 修订）：V1/V2 的长错误也经头尾摘要；工具截断器生成的全文入口按原路径保留。
 
 **修复后复现走查。**
 

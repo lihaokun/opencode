@@ -7,7 +7,7 @@ import type { EventV2 } from "../event"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
-import { summarizeToolText } from "./tool-result-projection"
+import { summarizeToolText, summarizeToolError } from "./tool-result-projection"
 import { Token } from "../util/token"
 
 const DEFAULT_BUFFER = 20_000
@@ -106,7 +106,10 @@ const serialize = (message: SessionMessage.Message) => {
             `[Tool result]: ${summarizeToolText(serializeToolContent(part.state.content))}`,
           ]
         if (part.state.status === "error")
-          return [`[Assistant tool call]: ${part.name}(${input})`, `[Tool error]: ${part.state.error.message}`]
+          return [
+            `[Assistant tool call]: ${part.name}(${input})`,
+            `[Tool error]: ${summarizeToolError(part.state.error.message)}`,
+          ]
         return [`[Assistant tool call]: ${part.name}(${input})`]
       })
       .join("\n")

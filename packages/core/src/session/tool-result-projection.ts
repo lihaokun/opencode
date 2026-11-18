@@ -37,6 +37,18 @@ const TOOL_RESULT_SUMMARY_TAIL_CHARS = 600
 export function summarizeToolText(text: string): string {
   if (text.length <= TOOL_RESULT_SUMMARY_MAX_CHARS) return text
   const head = TOOL_RESULT_SUMMARY_MAX_CHARS - TOOL_RESULT_SUMMARY_TAIL_CHARS
-  const omitted = text.length - TOOL_RESULT_SUMMARY_MAX_CHARS
-  return `${text.slice(0, head)}\n[... ${omitted} chars truncated ...]\n${text.slice(-TOOL_RESULT_SUMMARY_TAIL_CHARS)}`
+  const prefix = text.slice(0, head).replace(/[\uD800-\uDBFF]$/, "")
+  const suffix = text.slice(-TOOL_RESULT_SUMMARY_TAIL_CHARS).replace(/^[\uDC00-\uDFFF]/, "")
+  return `${prefix}\n[... ${text.length - prefix.length - suffix.length} chars truncated ...]\n${suffix}`
+}
+
+/** Errors store the truncator's continuation as text rather than tool metadata. */
+export function summarizeToolError(text: string) {
+  const preview = summarizeToolText(text)
+  if (preview === text) return preview
+  const saved =
+    /(?:^|\n)The tool call failed; error output was truncated\. Full output saved to: ([^\r\n]{1,32767})\nUse Grep to search the full content or Read with offset\/limit to view specific sections\.$/.exec(
+      text,
+    )?.[1]
+  return saved && !preview.includes(saved) ? preview + "\nFull output saved to: " + saved : preview
 }

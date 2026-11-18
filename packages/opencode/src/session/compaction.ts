@@ -24,7 +24,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
-import { formatExitCodeLine, summarizeToolText } from "@opencode-ai/core/session/tool-result-projection"
+import { formatExitCodeLine, summarizeToolText, summarizeToolError } from "@opencode-ai/core/session/tool-result-projection"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 
 export const Event = SessionCompactionEvent
@@ -73,13 +73,18 @@ const serialize = (message: SessionV1.WithParts) => {
         const attachments = (part.state.attachments ?? []).map(
           (item) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`,
         )
-        const text = part.state.time.compacted
+        const preview = part.state.time.compacted
           ? "[Old tool result content cleared]"
           : summarizeToolText([part.state.output, ...attachments].join("\n"))
+        const saved = part.state.metadata.outputPath
+        const text =
+          !part.state.time.compacted && typeof saved === "string" && saved && !preview.includes(saved)
+            ? preview + "\nFull output saved to: " + saved
+            : preview
         const exit = part.state.time.compacted ? undefined : formatExitCodeLine(part.state.metadata)
         return [call, `[Tool result]: ${exit ? `${text}\n${exit}` : text}`]
       }
-      if (part.state.status === "error") return [call, `[Tool error]: ${part.state.error}`]
+      if (part.state.status === "error") return [call, `[Tool error]: ${summarizeToolError(part.state.error)}`]
       return [call]
     })
     .join("\n")

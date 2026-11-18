@@ -420,11 +420,19 @@ const withMcpTool = testEffect(
           inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
         },
         client: {
-          callTool: async () => ({
-            content: [{ type: "text", text: "查询完成" }],
-            structuredContent: { matches: [{ path: "src/a.ts", line: 42 }] },
-            isError: false,
-          }),
+          callTool: async (request: { arguments?: { q?: string } }) => {
+            if (request.arguments?.q === "large diagnostics")
+              return {
+                content: [{ type: "text", text: "lookup failed for test query" }],
+                structuredContent: { detail: "界".repeat(65_536) },
+                isError: true,
+              }
+            return {
+              content: [{ type: "text", text: "查询完成" }],
+              structuredContent: { matches: [{ path: "src/a.ts", line: 42 }] },
+              isError: false,
+            }
+          },
         } as unknown as MCPClient,
       },
     },
@@ -1111,6 +1119,34 @@ it.instance("loop replays grep output_mode results into the next model request",
     expect(wire).toContain("Found 2 files")
     expect(wire).toContain("needle-a.txt")
     expect(wire).toContain("needle-b.txt")
+  }),
+)
+
+withMcpTool.instance("a long structured MCP error is bounded on the next model request", () =>
+  Effect.gen(function* () {
+    const llm = yield* TestLLMServer
+    const dir = (yield* TestInstance).directory
+    yield* writeConfig(dir, providerCfg(llm.url))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "look it up" }],
+    })
+    yield* llm.tool("guide-server", { q: "large diagnostics" })
+    yield* llm.text("done")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const replay = (yield* llm.inputs).at(-1)!
+    const message = (replay.messages as { role: string; content: unknown }[]).find((m) => m.role === "tool")
+    expect(message).toBeDefined()
+    const wire = JSON.stringify(message)
+    expect(wire).toContain("lookup failed for test query")
+    expect(wire).not.toContain("tool call succeeded")
+    expect(Buffer.byteLength(wire)).toBeLessThan(Truncate.MAX_BYTES + 2_048)
   }),
 )
 

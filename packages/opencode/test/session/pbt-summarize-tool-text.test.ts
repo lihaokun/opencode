@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test"
 import {
   TOOL_RESULT_SUMMARY_MAX_CHARS,
   summarizeToolText,
+  summarizeToolError,
 } from "@opencode-ai/core/session/tool-result-projection"
 
 // Tail size is module-private; derive it from the output shape. The output is
@@ -28,8 +29,7 @@ describe("PBT summarizeToolText", () => {
       fc.property(textArb, (text) => {
         const out = summarizeToolText(text)
         // ≤ MAX passes through byte-identical; over MAX it is head + marker + tail.
-        const bound = Math.max(text.length, TOOL_RESULT_SUMMARY_MAX_CHARS + 80)
-        return out.length <= bound
+        return out.length <= TOOL_RESULT_SUMMARY_MAX_CHARS + 80
       }),
     )
   })
@@ -58,6 +58,25 @@ describe("PBT summarizeToolText", () => {
     )
   })
 
+  it("preserves Unicode scalars and reports the number of omitted UTF-16 units", () => {
+    const supplementary = fc.integer({ min: 0x10000, max: 0x10ffff }).map((cp) => String.fromCodePoint(cp))
+    fc.assert(
+      fc.property(supplementary, supplementary, fc.integer({ min: 1, max: 2_000 }), (left, right, middle) => {
+        const text = "h".repeat(1_399) + left + "m".repeat(middle) + right + "t".repeat(599)
+        const out = summarizeToolText(text)
+        expect(out.isWellFormed()).toBe(true)
+        const parts = /^(.*?)\n\[\.\.\. (\d+) chars truncated \.\.\.\]\n(.*?)$/s.exec(out)
+        expect(parts).not.toBeNull()
+        if (!parts) return
+        expect(text.startsWith(parts[1])).toBe(true)
+        expect(text.endsWith(parts[3])).toBe(true)
+        expect(+parts[2]).toBe(text.length - parts[1].length - parts[3].length)
+        expect(out.length).toBeLessThanOrEqual(TOOL_RESULT_SUMMARY_MAX_CHARS + 80)
+      }),
+      { seed: 4619, numRuns: 100 },
+    )
+  })
+
   // Plain sanity anchor so a broken import fails loudly rather than as three
   // vacuous pre-condition skips.
   it("anchors: short input identity and long input shape", () => {
@@ -65,4 +84,18 @@ describe("PBT summarizeToolText", () => {
     const long = "a".repeat(TOOL_RESULT_SUMMARY_MAX_CHARS + 10)
     expect(summarizeToolText(long)).toContain("chars truncated")
   })
+})
+
+it("keeps the full error artifact path even if the path exceeds the text tail", () => {
+  const path = "/tmp/" + "long-path/".repeat(100) + "tool-result"
+  const error =
+    "lookup failed\n" +
+    "x".repeat(4000) +
+    "\nThe tool call failed; error output was truncated. Full output saved to: " +
+    path +
+    "\nUse Grep to search the full content or Read with offset/limit to view specific sections."
+  const preview = summarizeToolError(error)
+  expect(preview).toContain("lookup failed")
+  expect(preview).toContain(path)
+  expect(preview.length).toBeLessThan(error.length)
 })

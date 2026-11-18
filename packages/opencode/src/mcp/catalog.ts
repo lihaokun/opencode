@@ -26,9 +26,19 @@ export function callToolErrorMessage(result: CallToolResult): string {
     .flatMap((item) => (item.type === "text" ? [item.text] : []))
     .filter((text) => text.trim())
   if (result.structuredContent !== undefined && result.structuredContent !== null) {
-    parts.push(JSON.stringify(result.structuredContent))
+    const structured = result.structuredContent
+    const serialized = JSON.stringify(structured)
+    if (!parts.some((part) => part === serialized || parsesTo(part, structured))) parts.push(serialized)
   }
   return parts.join("\n\n") || "MCP tool returned an error"
+}
+
+export function parsesTo(text: string, value: unknown) {
+  try {
+    return Bun.deepEquals(JSON.parse(text), value)
+  } catch {
+    return false
+  }
 }
 
 export async function paginate<T, R extends { nextCursor?: string }>(
@@ -55,7 +65,12 @@ export function defs(client: Client, timeout?: number) {
   return listTools(client, timeout ?? DEFAULT_TIMEOUT).pipe(Effect.catch(() => Effect.void))
 }
 
-export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: number): Tool {
+export function convertTool(
+  mcpTool: MCPToolDef,
+  client: Client,
+  timeout: number | undefined,
+  truncateError: (text: string) => Promise<string>,
+): Tool {
   const inputSchema: JSONSchema7 = {
     ...(mcpTool.inputSchema as JSONSchema7),
     type: "object",
@@ -81,7 +96,7 @@ export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: numbe
           onprogress: () => {},
         },
       )
-      if (result.isError) throw new Error(callToolErrorMessage(result))
+      if (result.isError) throw new Error(await truncateError(callToolErrorMessage(result)))
       if (result.content.length > 0 || result.structuredContent === undefined || result.structuredContent === null)
         return result
       return {

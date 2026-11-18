@@ -1,3 +1,4 @@
+import { Truncate } from "./truncate"
 import * as Tool from "./tool"
 import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { Cause, Effect, Schema } from "effect"
@@ -132,6 +133,7 @@ function toolTree(catalog: readonly CatalogEntry[], run: (entry: CatalogEntry) =
 }
 
 const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: {
+  truncate: Truncate.Interface
   plugin: Plugin.Interface
   entry: CatalogEntry
   args: Record<string, unknown>
@@ -146,8 +148,8 @@ const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: 
   const result: CallToolResult = yield* Effect.gen(function* () {
     yield* input.ctx.ask({ permission: input.entry.key, metadata: {}, patterns: ["*"], always: ["*"] })
     // Deliberately mirrors McpCatalog.convertTool's transport call so the MCP service stays free of tool-loop concerns.
-    return yield* Effect.promise(async () => {
-      const raw = await input.entry.tool.client.callTool(
+    const raw = yield* Effect.promise(() =>
+      input.entry.tool.client.callTool(
         { name: input.entry.tool.def.name, arguments: input.args },
         CallToolResultSchema,
         {
@@ -157,10 +159,14 @@ const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: 
           // The MCP SDK only sends a progress token when this hook is present, enabling timeout resets.
           onprogress: () => {},
         },
+      ),
+    )
+    if (raw.isError) {
+      return yield* Effect.die(
+        new Error((yield* input.truncate.output(McpCatalog.callToolErrorMessage(raw), { error: true })).content),
       )
-      if (raw.isError) throw new Error(McpCatalog.callToolErrorMessage(raw))
-      return raw
-    })
+    }
+    return raw
   }).pipe(
     Effect.withSpan("Tool.execute", {
       attributes: {
@@ -182,6 +188,7 @@ const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: 
 export const CodeModeTool = Tool.define(
   CODE_MODE_TOOL,
   Effect.gen(function* () {
+    const truncate = yield* Truncate.Service
     const mcp = yield* MCP.Service
     const agents = yield* Agent.Service
     const sessions = yield* Session.Service
@@ -215,6 +222,7 @@ export const CodeModeTool = Tool.define(
           Effect.gen(function* () {
             childCalls += 1
             const result = yield* invokeChildTool({
+              truncate,
               plugin,
               entry,
               args: (input ?? {}) as Record<string, unknown>,

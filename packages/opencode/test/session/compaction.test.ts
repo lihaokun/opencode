@@ -1620,6 +1620,55 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
+    "attachment descriptions keep the saved tool output reachable in the summary request",
+    () => {
+      const stub = llm()
+      let captured = ""
+      stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const user = yield* createUserMessage(session.id, "Inspect the returned shots")
+        const assistant = yield* createAssistantMessage(session.id, user.id, "/tmp")
+        const outputPath = "/tmp/" + "camera-results/".repeat(50) + "tool-output-photos"
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "tool",
+          tool: "camera",
+          callID: "camera-shots",
+          state: {
+            status: "completed",
+            input: {},
+            title: "shots",
+            output: `captured shots\n${"log\n".repeat(900)}Full output saved to: ${outputPath}`,
+            metadata: { truncated: true, outputPath },
+            time: { start: 0, end: 1 },
+            attachments: Array.from({ length: 40 }, (_, i) => ({
+              type: "file",
+              id: PartID.ascending(),
+              messageID: assistant.id,
+              sessionID: session.id,
+              mime: "image/png",
+              filename: `camera-${i}.png`,
+              url: "data:image/png;base64,aW1hZ2U=",
+            })),
+          },
+        })
+        yield* createSummaryCompaction(session.id)
+        const messages = yield* ssn.messages({ sessionID: session.id })
+        const parentID = messages.at(-1)!.info.id
+        yield* SessionCompaction.use.process({ parentID, messages, sessionID: session.id, auto: false })
+        expect(captured).toContain("captured shots")
+        expect(captured).toContain(outputPath)
+        expect(captured).not.toContain("aW1hZ2U=")
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 20 }) }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
     "falls back to full summary when retained tail media exceeds preserve token budget",
     () => {
       const stub = llm()

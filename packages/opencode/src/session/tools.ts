@@ -393,7 +393,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   if (flags.experimentalCodeMode) return tools
 
   for (const [key, entry] of Object.entries(yield* mcp.tools())) {
-    const item = McpCatalog.convertTool(entry.def, entry.client, entry.timeout)
+    const item = McpCatalog.convertTool(entry.def, entry.client, entry.timeout, (text) =>
+      run.promise(truncate.output(text, { error: true }).pipe(Effect.map((out) => out.content))),
+    )
     const execute = item.execute
     if (!execute) continue
 
@@ -520,19 +522,11 @@ export function projectMcpToolResult(result: CallToolResult): {
   const structured = result.structuredContent
   if (structured !== undefined && structured !== null) {
     const serialized = JSON.stringify(structured)
-    if (!textParts.some((item) => item === serialized || parsesTo(item, structured))) {
+    if (!textParts.some((item) => item === serialized || McpCatalog.parsesTo(item, structured))) {
       textParts.push(serialized)
     }
   }
   return { text: textParts.join("\n\n"), attachments }
-}
-
-function parsesTo(text: string, value: unknown) {
-  try {
-    return Bun.deepEquals(JSON.parse(text), value)
-  } catch {
-    return false
-  }
 }
 
 // The tool table is rebuilt for every provider step, so one detector sees exactly

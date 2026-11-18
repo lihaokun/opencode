@@ -10,42 +10,24 @@ import { projectMcpToolResult } from "../../src/session/tools"
  * 断言按项（\n\n 分割）做全等/语义判等，不做子串计数——短序列化值
  * （"false"、"null"）可以是无关项的子串。
  */
-const jsonValue: fc.Arbitrary<unknown> = fc.jsonValue()
-
-const parses = (text: string, value: unknown) => {
-  try {
-    return Bun.deepEquals(JSON.parse(text), value)
-  } catch {
-    return false
-  }
-}
-
 const project = (content: unknown[], structuredContent?: unknown) =>
   projectMcpToolResult({ content, structuredContent } as unknown as CallToolResult)
 
 describe("PBT projectMcpToolResult", () => {
   it("structured data appears exactly once as its own item, or zero times when a text item already carries it", () => {
     fc.assert(
-      fc.property(
-        fc.array(jsonValue, { maxLength: 4 }),
-        fc.option(jsonValue, { nil: undefined }),
-        (items, structured) => {
-          const content = items.map((value) => ({ type: "text" as const, text: JSON.stringify(value) }))
-          const out = project(content, structured)
-          const outItems = out.text.split("\n\n")
-          if (structured === undefined || structured === null) {
-            // Nothing appended: the projection is exactly the input items joined.
-            return out.text === content.map((item) => item.text).join("\n\n")
-          }
-          const serialized = JSON.stringify(structured)
-          const carries = content.filter((item) => item.text === serialized || parses(item.text, structured))
-          const outCarries = outItems.filter((item) => item === serialized || parses(item, structured))
-          // With no carrier in, the appended serialized item is itself the one
-          // carrier; with a carrier in, dedup keeps the count unchanged.
-          const expectedCarriers = carries.length > 0 ? carries.length : 1
-          return outCarries.length === expectedCarriers
-        },
-      ),
+      fc.property(fc.jsonValue(), fc.string(), fc.constantFrom("absent", "append", "echo"), (value, key, kind) => {
+        const structured = { first: value, key }
+        const prose = "tool result: " + key
+        const echo = JSON.stringify({ key, first: value }, null, 2)
+        const texts = kind === "echo" ? [prose, echo] : [prose]
+        const output = project(
+          texts.map((text) => ({ type: "text", text })),
+          kind === "absent" ? undefined : structured,
+        )
+        const expected = kind === "append" ? [...texts, JSON.stringify(structured)] : texts
+        expect(output.text).toBe(expected.join("\n\n"))
+      }),
       { seed: 0x2_026_10_18, numRuns: 200 },
     )
   })
