@@ -348,3 +348,14 @@ describe("PublicApi OpenAPI v2 errors", () => {
     )
   })
 })
+
+test("published OpenAPI accepts the runtime compaction restoration options", async () => {
+  const runtime = OpenApi.fromApi(PublicApi) as OpenApiSpec
+  const published: OpenApiSpec = await Bun.file(new URL("../../../sdk/openapi.json", import.meta.url)).json()
+  const options = (spec: OpenApiSpec) =>
+    spec.components.schemas.Config?.properties?.compaction?.properties?.restoration?.properties
+  expect(options(runtime)).toBeDefined()
+  expect(Object.keys(options(published) ?? {}).sort()).toEqual(Object.keys(options(runtime)!).sort())
+  for (const [name, value] of Object.entries(options(runtime)!))
+    expect(options(published)?.[name]?.type).toBe(value.type)
+})

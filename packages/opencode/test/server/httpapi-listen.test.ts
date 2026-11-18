@@ -23,14 +23,7 @@ const testPty = process.platform === "win32" ? test.skip : test
 // routes through the machine proxy, stalling the loopback stream. Skipped
 // when a proxy is configured: an environment conflict, not a regression
 // signal. (The in-process variants above are unaffected and still run.)
-const proxied = Boolean(
-  process.env.http_proxy ??
-    process.env.https_proxy ??
-    process.env.all_proxy ??
-    process.env.HTTP_PROXY ??
-    process.env.HTTPS_PROXY ??
-    process.env.ALL_PROXY,
-)
+const proxied = process.env.OPENCODE_TEST_STARTED_WITH_PROXY === "1"
 const testPtyRealListener = proxied || process.platform === "win32" ? test.skip : testPty
 
 afterEach(async () => {

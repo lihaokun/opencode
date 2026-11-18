@@ -90,6 +90,16 @@ delete process.env["OTEL_RESOURCE_ATTRIBUTES"]
 // a proxy to reach the outside cannot reach it in tests anyway.
 delete process.env["ANTHROPIC_BASE_URL"]
 delete process.env["OPENAI_BASE_URL"]
+process.env.OPENCODE_TEST_STARTED_WITH_PROXY = [
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+].some((key) => !!process.env[key])
+  ? "1"
+  : "0"
 for (const key of ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]) {
   delete process.env[key]
 }
