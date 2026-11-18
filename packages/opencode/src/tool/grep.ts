@@ -5,6 +5,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { assertExternalDirectoryEffect } from "./external-directory"
+import { Truncate } from "./truncate"
 import DESCRIPTION from "./grep.txt"
 import * as Tool from "./tool"
 
@@ -40,7 +41,7 @@ export const Parameters = Schema.Struct({
     description: "Skip the first N results (for pagination)",
   }),
   head_limit: Schema.optional(PositiveInt).annotate({
-    description: "Maximum number of results to return (default 100)",
+    description: "Maximum number of results to return (default 100; bounded by the tool output line limit)",
   }),
 })
 
@@ -48,6 +49,7 @@ export const GrepTool = Tool.define(
   "grep",
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
+    const trunc = yield* Truncate.Service
     const ripgrep = yield* Ripgrep.Service
     return {
       description: DESCRIPTION,
@@ -85,7 +87,7 @@ export const GrepTool = Tool.define(
           if (mode !== "content" && (before > 0 || after > 0 || context > 0)) {
             throw new Error("context lines only apply to output_mode=content")
           }
-          const headLimit = params.head_limit ?? 100
+          const headLimit = Math.min(params.head_limit ?? 100, (yield* trunc.limits()).maxLines)
           const offset = params.offset ?? 0
           // Empty-result metadata reflects THIS request (mode/offset/limit),
           // not hardcoded defaults — a caller reading metadata after a
@@ -146,6 +148,7 @@ export const GrepTool = Tool.define(
             file: info.type === "File" ? `./${path.basename(search)}` : undefined,
             include: params.include,
             limit: headLimit,
+            signal: ctx.abort,
             offset,
             mode,
             insensitive: params.insensitive ?? false,
@@ -171,9 +174,19 @@ export const GrepTool = Tool.define(
             offset,
             head_limit: headLimit,
           }
-          const tail = result.hasMore
-            ? [``, `(more results available; increase offset to ${offset + headLimit})`]
-            : []
+          const render = Effect.fnUntraced(function* (output: string) {
+            const page = yield* trunc.output(output)
+            return {
+              title: params.pattern,
+              metadata: {
+                ...metadata,
+                truncated: result.hasMore || page.truncated,
+                ...(page.truncated ? { outputPath: page.outputPath } : {}),
+              },
+              output: page.content,
+            }
+          })
+          const tail = result.hasMore ? [``, `(more results available; increase offset to ${offset + headLimit})`] : []
 
           if (result.mode === "files_with_matches") {
             if (result.files.length === 0) {
@@ -195,14 +208,14 @@ export const GrepTool = Tool.define(
                 : result.files.map((file) => path.resolve(rowBase, file))),
               ...tail,
             ]
-            return { title: params.pattern, metadata, output: output.join("\n") }
+            return yield* render(output.join("\n"))
           }
 
           if (result.mode === "count") {
             if (result.counts.length === 0) {
               return {
                 ...empty,
-                output: offset > 0 ? `No matches at offset ${offset} (total matches: ${result.total})` : "No files found",
+                output: offset > 0 ? `No matches at offset ${offset} (total files: ${result.total})` : "No files found",
               }
             }
             const totalMatches = result.counts.reduce((sum: number, item) => sum + item.count, 0)
@@ -213,7 +226,7 @@ export const GrepTool = Tool.define(
                 : result.counts.map((item) => `${path.resolve(rowBase, item.path)}: ${item.count} matches`)),
               ...tail,
             ]
-            return { title: params.pattern, metadata, output: output.join("\n") }
+            return yield* render(output.join("\n"))
           }
 
           if (result.rows.length === 0) {
@@ -254,7 +267,7 @@ export const GrepTool = Tool.define(
           }
           output.push(...tail)
 
-          return { title: params.pattern, metadata, output: output.join("\n") }
+          return yield* render(output.join("\n"))
         }).pipe(Effect.orDie),
     }
   }),

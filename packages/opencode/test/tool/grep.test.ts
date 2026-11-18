@@ -1,5 +1,6 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { describe, expect } from "bun:test"
+import fc from "fast-check"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
@@ -531,6 +532,125 @@ describe("tool.grep", () => {
     }),
   )
 })
+
+it.instance(
+  "each page keeps the complete context of its own isolated matches",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const rg = yield* Ripgrep.Service
+      const groups = Array.from({ length: 6 }, (_, i) => ({
+        file: `group-${Math.floor(i / 2)}.txt`,
+        before: `before-${i}`,
+        match: `hit-${i}`,
+        after: `after-${i}`,
+      }))
+      for (const file of new Set(groups.map((group) => group.file))) {
+        const lines = groups
+          .filter((group) => group.file === file)
+          .flatMap((group) => [group.before, group.match, group.after, "gap", "gap"])
+        yield* Effect.promise(() => Bun.write(path.join(test.directory, file), lines.join("\n") + "\n"))
+      }
+      yield* Effect.promise(() =>
+        fc.assert(
+          fc.asyncProperty(
+            fc.integer({ min: 0, max: groups.length }),
+            fc.integer({ min: 1, max: 3 }),
+            fc.boolean(),
+            fc.boolean(),
+            async (offset, limit, before, after) => {
+              const page = await Effect.runPromise(
+                rg.search({
+                  cwd: test.directory,
+                  pattern: "^hit-",
+                  offset,
+                  limit,
+                  before: Number(before),
+                  after: Number(after),
+                }),
+              )
+              if (page.mode !== "content") throw new Error("Expected a content page")
+              expect(page.rows.map((row) => [row.path, row.text.trimEnd()])).toEqual(
+                groups
+                  .slice(offset, offset + limit)
+                  .flatMap((group) =>
+                    [...(before ? [group.before] : []), group.match, ...(after ? [group.after] : [])].map((text) => [
+                      group.file,
+                      text,
+                    ]),
+                  ),
+              )
+              expect(page.hasMore).toBe(offset + limit < groups.length)
+            },
+          ),
+          {
+            seed: 4619,
+            numRuns: 24,
+            examples: [
+              [1, 1, true, true],
+              [2, 1, false, true],
+            ],
+          },
+        ),
+      )
+    }),
+  30_000,
+)
+
+it.instance("a skipped adjacent match preserves shared leading context for the admitted match", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const file = path.join(test.directory, "adjacent.txt")
+    yield* Effect.promise(() => Bun.write(file, "prefix\nhit-first\nhit-second\n"))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const result = yield* grep.execute({ path: file, pattern: "^hit-", before: 2, offset: 1, head_limit: 1 }, ctx)
+    expect(result.output).toContain("Line 1- prefix")
+    expect(result.output).toContain("Line 3: hit-second")
+    expect(result.output).not.toContain("hit-first")
+  }),
+)
+
+it.instance("a non-UTF-8 context row preserves its neighboring ASCII match", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const file = path.join(test.directory, "mixed.txt")
+    yield* Effect.promise(() => Bun.write(file, Uint8Array.of(104, 105, 116, 10, 255, 10)))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const result = yield* grep.execute({ path: file, pattern: "hit", after: 1 }, ctx)
+    expect(result.output).toContain("Line 1: hit")
+    expect(result.metadata.matches).toBe(1)
+  }),
+)
+
+it.instance("a context-heavy grep page bounds its bytes and keeps a continuation", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const file = path.join(test.directory, "contexts.txt")
+    const groups = Array.from({ length: 80 }, (_, index) => `hit-${index}\n${"界".repeat(500)}\n`)
+    yield* Effect.promise(() => Bun.write(file, groups.join("")))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const result = yield* grep.execute({ path: file, pattern: "^hit-", head_limit: 100, after: 1 }, ctx)
+    expect(result.output).toContain("hit-0")
+    expect(Buffer.byteLength(result.output)).toBeLessThan(Truncate.MAX_BYTES + 2_048)
+    expect(result.output).toMatch(/offset|saved to/i)
+  }),
+)
+
+it.instance("a deep grep offset still returns the final matches exactly once", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const file = path.join(test.directory, "deep.txt")
+    yield* Effect.promise(() => Bun.write(file, Array.from({ length: 10_002 }, (_, i) => `hit-${i}\n`).join("")))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const result = yield* grep.execute({ path: file, pattern: "^hit-", offset: 10_000, head_limit: 2 }, ctx)
+    expect(result.output.match(/hit-\d+/g)).toEqual(["hit-10000", "hit-10001"])
+    expect(result.metadata.truncated).toBe(false)
+  }),
+)
 
 // R2: every page is an independent rg invocation, so pagination only works if
 // the traversal order is identical across invocations. Walk a wider tree in

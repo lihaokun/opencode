@@ -145,3 +145,5 @@ head_limit: PositiveInt（默认 100）
 - **context 负数（边界①）**：before/after/context 的 schema 从 `Schema.Number` 收紧为 `NonNegativeInt`，负值在参数解码层被拒（原实现静默当 0）。
 - **64KiB 记录上限与 context（边界②）**：保留防御上限（match 行超限仍整体失败——不可见的命中比报错更糟）；但 context 行超限时降级为丢弃该行、页面保留其余结果（`oversizedRecord` helper，按记录内 `"type":"context"` 判别）。原实现让一条超长非命中行拖垮整页。
 - **换行文件名（边界③，已知限制）**：`files_with_matches` 按 rg 文本行解析路径，POSIX 文件名含换行时会被拆成两个虚构路径；count 模式同理（静态分析，未实测）。rg 的 line-delimited 文本输出无法无歧义表达换行文件名，除非换 `--json` 协议——留作后续修订条件：若实际工作负载出现此类文件名，files/count 迁移到 JSON 输出。
+
+2026-11-19 全量复核修订：P7/P8 在消费 rg 流时计数并跳过 offset。页面按文件及真实行号收集所选命中前后的上下文，跨页共享的上下文可在各自页面出现。非法 UTF-8 的辅助行可省略；真实匹配仍可用。有效 head_limit 至多为配置的工具行上限，渲染后的页面也经工具输出预算保护，超长页面返回预览和该页的全文路径。

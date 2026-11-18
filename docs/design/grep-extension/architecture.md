@@ -74,7 +74,7 @@ schema 扩展 + 校验（context 上限 10、mode 与 context 互斥说明）+ �
 
 ### M3 测试
 
-- 单元：渲染三分支 + 越界 + hasMore + 默认参数兼容（不传新参数 → args 与渲染结构与改前一致；**截断尾行文案例外，见 G5 修订**）
+- 单元：渲染三分支 + 越界 + hasMore + 默认参数兼容（不传新参数 → content 的结果结构兼容；rg 按路径稳定排序；**截断尾行文案例外，见 G5 修订**）
 - 集成：临时目录真文件上跑 rg（content/context/files/count/insensitive/offset 各一 + 非法表达式 + 分页越界）
 - 既有 grep 测试不破坏（若有）
 
@@ -88,9 +88,9 @@ schema 扩展 + 校验（context 上限 10、mode 与 context 互斥说明）+ �
 
 ## 6. 关键设计决策
 
-1. **默认模式 = content 且兼容**（**2026-10-20 独立审修订**：*"逐字节一致"收窄为"结构兼容"*）：不传新参数时 rg args 与渲染结构与现状一致；例外是 **≥limit 截断时的尾行文案被分页状态行取代**（旧 `Found N matches (more matches available)` + `(Results truncated…)` 的尾缀组合 → `(more results available; increase offset to N)`）——旧行文在 exactly-100 条时会误报截断，新状态行顺带修复该缺陷；存量会话中该文案只出现在截断场景，摘要投影不受影响（I1 以"默认路径零新 args + 渲染结构不变"为准，文案字面除外）。
+1. **默认模式 = content 且兼容**（**2026-10-20 独立审修订**：*"逐字节一致"收窄为"结构兼容"*）：不传新参数时 content 渲染结构兼容；所有模式通过 `--sort=path` 固定分页顺序；例外是 **≥limit 截断时的尾行文案被分页状态行取代**（旧 `Found N matches (more matches available)` + `(Results truncated…)` 的尾缀组合 → `(more results available; increase offset to N)`）——旧行文在 exactly-100 条时会误报截断，新状态行顺带修复该缺陷；存量会话中该文案只出现在截断场景，摘要投影不受影响（I1 以"默认路径稳定排序 + 渲染结构兼容"为准，文案字面除外）。
 2. **分页做在条目级**（匹配行/文件），`head_limit` 缺省 100 与现状一致；"仍有余量"用取数 `limit+offset+1` 探测。
-3. **files/count 不走 --json**：rg 原生文本行更简单，且服务层注释明确自己是行适配器——保持一致。**offset 无 rg 原生支持**（已实证 rg 15.1.0 无 `--offset` flag），由服务层 `take(limit+offset+1)` + slice 实现，语义不变。
+3. **files/count 不走 --json**：rg 原生文本行更简单，且服务层注释明确自己是行适配器——保持一致。**offset 无 rg 原生支持**（已实证 rg 15.1.0 无 `--offset` flag），由服务层流式跳过 offset，最多读到下一条匹配及当前页必要后文，语义不变。
 4. **context 参数名用 before/after/context 而非 `-A/-B/-C`**：schema 键避免 dash 开头；ZCode 的 dash 风格是 CC 兼容面，fork 无此包袱。
 5. **不新增工具**：扩展现有 grep（issue："可以扩展现有工具或提供等效能力，不必仅为名字一致重命名"）。
 
@@ -104,14 +104,14 @@ schema 扩展 + 校验（context 上限 10、mode 与 context 互斥说明）+ �
 
 - H1：rg 二进制版本支持 `-A/-B/-C`（~~含 `--offset`~~ **2026-10-20 清扫**：rg 无 `--offset`，offset 走服务层切片——细化 §0 实证；bundle 的 ripgrep 由 `RipgrepBinary` 管理）
 - H2：`--json` 与文本行模式在 `run` 骨架内可共存（run 的 parse 是行级函数，与输出格式无关——事实）
-- H3：content 模式默认路径（无新参数）不触发任何新 args ⇒ 兼容由构造审查 + 单元测试保证（截断尾行文案例外，决策 1 修订）
+- H3：content 模式默认路径使用 `--sort=path`，其余可选搜索参数按输入展开 ⇒ 兼容由构造审查 + 单元测试保证（截断尾行文案例外，决策 1 修订）
 
 **模块级不变量**
 
-- I1：无新参数时，rg args 与渲染输出**结构**和现状一致（截断尾行文案例外——决策 1 修订）；空结果 metadata 反映本次请求的 mode/offset/limit — 维护方：M2 默认参数路径 + 单元测试
+- I1：无新参数时，rg 使用稳定排序，渲染输出**结构**保持兼容（截断尾行文案例外——决策 1 修订）；空结果 metadata 反映本次请求的 mode/offset/limit — 维护方：M2 默认参数路径 + 单元测试
 - I2：`before/after/context ≤ 10` 与 mode-context 互斥在工具层强制 — 维护方：M2 schema 校验（超限拒绝并说明，非静默截断）
 
-**preservation 论证**：I1 的破坏途径是新参数缺省时混入新 args——M1 的 args 追加全部以参数存在为条件（展开式守卫）；I2 由工具层入口单点校验。
+**preservation 论证**：I1 的破坏途径是新参数缺省时混入新 args——M1 除固定排序外按参数存在追加 flag；I2 由工具层入口单点校验。
 
 ## 8. 细化阶段待核实清单
 

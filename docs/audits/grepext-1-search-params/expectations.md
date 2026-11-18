@@ -77,3 +77,7 @@ context）。模型与 `ripgrep.ts` content 窗口逐行对应。
 
 - `legacy grep` 工具（filesystem/search.ts 消费者）零改动——双消费者不串扰（回归背书）
 - ZCode grep 契约为参照：mode/head_limit/offset 对齐，`-o`/`type`/`multiline`/行级分页为已记录非目标（架构 §1）
+
+## 2026-11-19 分页的文件及上下文归属
+
+真实 rg 小目录测试生成多个文件、相隔命中、before/after 和分页；额外验证相邻命中共享前文、非 UTF-8 辅助行、深 offset、结果字节预算及下一页或全文入口。已复核 61,200 个窗口。实现 P7、P8 对应流式计数和上下文选择；固定路径排序适用于全部模式。

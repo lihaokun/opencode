@@ -23,7 +23,7 @@ exports[`tool parameters JSON Schema (wire shape) grep 1`] = `
       "type": "integer",
     },
     "head_limit": {
-      "description": "Maximum number of results to return (default 100)",
+      "description": "Maximum number of results to return (default 100; bounded by the tool output line limit)",
       "exclusiveMinimum": 0,
       "maximum": 9007199254740991,
       "minimum": -9007199254740991,

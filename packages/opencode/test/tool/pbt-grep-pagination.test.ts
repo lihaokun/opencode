@@ -95,10 +95,10 @@ describe("PBT grep pagination window (production windowContentRows)", () => {
 
   it("anchors: leading context is held with its match, boundary match keeps one side", () => {
     const rows = [row(true, 1), row(false, 2), row(true, 3), row(false, 4)]
-    const first = windowContentRows(rows, 0, 1)
+    const first = windowContentRows(rows, 0, 1, 1, 0)
     expect(first.rows.map((r) => r.line)).toStrictEqual([1, 2])
     expect(first.hasMore).toBe(true)
-    const second = windowContentRows(rows, 1, 1)
+    const second = windowContentRows(rows, 1, 1, 1, 0)
     expect(second.rows.map((r) => r.line)).toStrictEqual([3, 4])
   })
 })

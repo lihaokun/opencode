@@ -142,6 +142,7 @@ const layer = Layer.effect(
       readonly parse: (line: string) => Effect.Effect<A | undefined, Error>
       readonly pattern?: string
       readonly onItem?: (item: A) => Effect.Effect<void>
+      readonly consume?: (item: A) => boolean
     }) => {
       const program = Effect.scoped(
         Effect.gen(function* () {
@@ -154,26 +155,32 @@ const layer = Layer.effect(
           )
           let observed = 0
           const offset = input.offset ?? 0
-          const rows = yield* Stream.decodeText(handle.stdout).pipe(
+          // Step P7: count the skipped prefix without storing its rows.
+          const rows: A[] = []
+          let truncated = false
+          yield* Stream.decodeText(handle.stdout).pipe(
             Stream.splitLines,
             Stream.filter((line) => line.length > 0),
             Stream.mapEffect(input.parse),
             Stream.filter((row): row is A => row !== undefined),
             Stream.tap((row) => {
-              if (!input.onItem || observed++ >= input.limit + offset) return Effect.void
-              return input.onItem(row)
+              observed++
+              if (input.consume) {
+                truncated = input.consume(row)
+                return Effect.void
+              }
+              if (observed > offset + input.limit) {
+                truncated = true
+                return Effect.void
+              }
+              if (observed > offset) rows.push(row)
+              return input.onItem?.(row) ?? Effect.void
             }),
-            Stream.take(input.limit + offset + 1),
-            Stream.runCollect,
-            Effect.map((chunk) => [...chunk]),
+            Stream.takeUntil(() => truncated),
+            Stream.runDrain,
           )
-          // `total` is the FULL entry count, not the page slice: the tool layer
-          // renders "total" in beyond-window messages, and a page-length number
-          // there would read as "0 results exist". One past the window when the
-          // stream was cut at limit+offset+1, else the whole list.
-          const truncated = rows.length > input.limit + offset
-          const total = truncated ? input.limit + offset + 1 : rows.length
-          if (truncated) return { items: rows.slice(offset, offset + input.limit), total, truncated, partial: false }
+          const total = observed
+          if (truncated) return { items: rows, total, truncated, partial: false }
 
           const code = yield* handle.exitCode
           const stderr = yield* Fiber.join(stderrFiber)
@@ -183,7 +190,7 @@ const layer = Layer.effect(
           if (code !== 0 && code !== 1 && code !== 2) {
             return yield* failure(stderr.trim() || `ripgrep failed with code ${code}`)
           }
-          return { items: rows.slice(offset, offset + input.limit), total, truncated: false, partial: code === 2 }
+          return { items: rows, total, truncated: false, partial: code === 2 }
         }),
       )
       const abortable = input.signal ? program.pipe(Effect.raceFirst(waitForAbort(input.signal))) : program
@@ -388,16 +395,12 @@ const layer = Layer.effect(
         // rows are never counted or split across the window boundary.
         const before = input.before ?? 0
         const after = input.after ?? 0
-        const contextLines = before + after
-        const wanted = input.offset ?? 0
-        // Row budget: each match emits itself plus at most `contextLines`
-        // context records; the margin absorbs rg's cross-group context
-        // de-duplication so the bound never cuts inside the match window.
-        const rowLimit = contextLines > 0 ? (wanted + input.limit) * (2 + contextLines) + 64 : wanted + input.limit + 1
-
+        // Step P8: select context by file and line relative to admitted matches.
+        const page = contentPage(input.offset ?? 0, input.limit, before, after)
         return run<RawRow>({
           cwd: input.cwd,
-          limit: rowLimit,
+          limit: input.limit,
+          consume: page.add,
           signal: input.signal,
           pattern: input.pattern,
           args: [
@@ -446,58 +449,69 @@ const layer = Layer.effect(
                     submatches: match.data.submatches.slice(0, MAX_SUBMATCHES),
                     context: match.type === "context",
                   })),
-                  Effect.mapError((cause) => failure("Invalid ripgrep match output", cause)),
+                  Effect.catch((cause) => json.type === "context" ? Effect.succeed(undefined) : Effect.fail(failure("Invalid ripgrep match output", cause))),
                 )
               }),
             ),
         }).pipe(
-          Effect.map((result) => windowContentRows(result.items, wanted, input.limit)),
+          Effect.map(() => page.result()),
         )
       }
     })
   }),
 )
 
-/**
- * Window a content search by MATCH records. Leading context records are held
- * until their match is admitted; the first match beyond the window ends the
- * walk and its leading context is dropped (rg de-duplicates shared context
- * lines, so at most one side of the boundary loses context — matches
- * themselves are never lost). Trailing context after the last admitted match
- * only enters the page when that match did: a page beyond the end (offset ≥
- * total) admits no match, so its leftover context must not surface as a
- * phantom result row.
- */
-export function windowContentRows(rows: readonly RawRow[], offset: number, limit: number) {
-  const page: RawRow[] = []
+// Keep only the requested page, plus at most "before" rows of lookbehind.
+function contentPage(offset: number, limit: number, before: number, after: number) {
+  const rows: GrepRow[] = []
+  let pending: GrepRow[] = []
+  let last: GrepRow | undefined
   let seen = 0
   let hasMore = false
-  let pending: RawRow[] = []
-  for (const row of rows) {
-    if (row.context) {
-      pending.push(row)
-      continue
-    }
-    seen += 1
-    if (seen > offset + limit) {
-      hasMore = true
-      break
-    }
-    if (seen > offset) page.push(...pending, row)
-    pending = []
+  return {
+    add(raw: RawRow) {
+      const row = {
+        path: normalizeEntryPath(raw.path.text),
+        line: raw.line_number,
+        text:
+          raw.lines.text.length > 2000
+            ? raw.lines.text.slice(0, 2000).replace(/[\uD800-\uDBFF]$/, "") + "..."
+            : raw.lines.text,
+        context: raw.context,
+      }
+      const following = last?.path === row.path && row.line <= last.line + after
+      if (hasMore && !following) return true
+      if (row.context) {
+        if (following) rows.push(row)
+        else if (before > 0 && !hasMore) {
+          if (pending.at(-1)?.path !== row.path) pending = []
+          pending.push(row)
+          if (pending.length > before) pending.shift()
+        }
+        return false
+      }
+      if (!hasMore) seen++
+      if (seen > offset + limit) {
+        hasMore = true
+        return !following || row.line === last!.line + after
+      }
+      if (seen > offset) {
+        for (const previous of pending)
+          if (previous.path === row.path && previous.line >= row.line - before) rows.push(previous)
+        rows.push(row)
+        last = row
+      }
+      if (seen > offset) pending = []
+      return false
+    },
+    result: () => ({ mode: "content" as const, rows, total: seen, hasMore }),
   }
-  if (!hasMore && page.length > 0) page.push(...pending)
+}
 
-  const rendered = page.map((row) => ({
-    path: normalizeEntryPath(row.path.text),
-    line: row.line_number,
-    text:
-      row.lines.text.length > 2_000
-        ? row.lines.text.slice(0, 2_000).replace(/[\uD800-\uDBFF]$/, "") + "..."
-        : row.lines.text,
-    context: row.context,
-  }))
-  return { mode: "content" as const, rows: rendered, total: seen, hasMore }
+export function windowContentRows(rows: readonly RawRow[], offset: number, limit: number, before = 10, after = 0) {
+  const page = contentPage(offset, limit, before, after)
+  for (const row of rows) if (page.add(row)) break
+  return page.result()
 }
 
 const normalizeEntryPath = (line: string) =>
