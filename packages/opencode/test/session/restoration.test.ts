@@ -1,3 +1,5 @@
+import { Skill } from "@/skill"
+import { Agent } from "@/agent/agent"
 import path from "path"
 import { expect } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
@@ -25,6 +27,7 @@ import { TestInstance } from "../fixture/fixture"
 import {
   RESTORATION_SENTINEL,
   apply,
+  isRestoration,
   buildTailText,
   collectCandidates,
   materializeCandidates,
@@ -34,6 +37,8 @@ import {
 
 const env = AppNodeBuilder.build(
   LayerNode.group([
+    Agent.node,
+    Skill.node,
     SessionNs.node,
     SessionProjector.node,
     Database.node,
@@ -840,5 +845,36 @@ it.instance("a second compaction retires the previous restoration block", () =>
     )
     expect(visible).toHaveLength(1)
     expect(visible[0].text).toContain("SECOND RESTORE BODY")
+  }),
+)
+
+it.instance("the built-in skill can be restored without a backing file", () =>
+  Effect.gen(function* () {
+    const skill = yield* Skill.Service
+    const fs = yield* FSUtil.Service
+    const info = yield* skill.get("customize-opencode")
+    expect(info?.location).toBe("<built-in>")
+    const materials = yield* materializeCandidates([{ kind: "skill", ref: "customize-opencode", lastUseSeq: 1 }], "", {
+      skill: Option.some(skill),
+      fs,
+      todos: [],
+      cfg: { ...cfg, file_max_tokens: 1_000_000, budget_tokens: 1_000_000 },
+    })
+    expect(materials[0]?.content).toBe(info?.content)
+    expect(materials[0]?.status).toBe("inlined")
+  }),
+)
+
+it.effect("ordinary user text bearing a restoration header remains user-owned", () =>
+  Effect.sync(() => {
+    const text = {
+      type: "text" as const,
+      id: PartID.ascending(),
+      sessionID: SessionID.make("ses_test_restoration"),
+      messageID: MessageID.ascending(),
+      text: RESTORATION_SENTINEL + " copied from a transcript",
+    }
+    expect(isRestoration(text)).toBe(false)
+    expect(isRestoration({ ...text, synthetic: true })).toBe(true)
   }),
 )

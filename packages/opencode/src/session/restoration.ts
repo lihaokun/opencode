@@ -1,3 +1,9 @@
+import path from "node:path"
+import { Agent } from "@/agent/agent"
+import { Permission } from "@/permission"
+import { InstanceState } from "@/effect/instance-state"
+import { containsPath } from "@/project/instance-context"
+import { MessageV2 } from "./message-v2"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect, Exit, Option } from "effect"
@@ -20,6 +26,14 @@ import { Session } from "./session"
  */
 
 export const RESTORATION_SENTINEL = "<!-- opencode:restoration -->"
+
+export function isRestoration(part: SessionV1.Part): boolean {
+  return (
+    part.type === "text" &&
+    part.synthetic === true &&
+    (part.metadata?.kind === "compaction_restoration" || part.text.startsWith(RESTORATION_SENTINEL))
+  )
+}
 
 export type RestorationCandidate = {
   kind: "file" | "skill" | "todo"
@@ -86,14 +100,25 @@ export function buildTailText(messages: SessionV1.WithParts[], tailStartID: stri
   if (index === -1) return ""
   const parts: string[] = []
   for (const msg of messages.slice(index)) {
+    if (!MessageV2.assistantVisible(msg)) continue
     for (const part of msg.parts) {
-      if (part.type === "text") parts.push(part.text)
-      else if (
-        part.type === "tool" &&
-        part.state.status === "completed" &&
-        !part.state.time?.compacted
-      )
+      if (part.type === "text" && !part.ignored && !isRestoration(part)) parts.push(part.text)
+      else if (part.type === "tool" && part.state.status === "completed" && !part.state.time?.compacted) {
         parts.push(part.state.output)
+        const display = part.state.metadata?.display
+        if (
+          part.tool === "read" &&
+          display?.type === "file" &&
+          !display.truncated &&
+          !part.state.metadata.truncated &&
+          display.lineStart === 1 &&
+          display.lineEnd === display.totalLines &&
+          typeof display.text === "string"
+        ) {
+          // read renders line numbers; the full raw lines are the same model-visible content.
+          parts.push(display.text + "\n")
+        }
+      }
     }
   }
   return parts.join("\n\n")
@@ -145,6 +170,7 @@ export function materializeCandidates(
   tailText: string,
   deps: {
     fs: FSUtil.Interface
+    readable?: (path: string) => boolean
     skill: Option.Option<Skill.Interface>
     todos: Todo.Info[]
     cfg: RestorationConfig
@@ -156,86 +182,104 @@ export function materializeCandidates(
   // thousand-file histories. Candidates are ordered most-recent-first, so the
   // dropped tail is the stalest material.
   let spent = 0
-  return Effect.forEach(
-    candidates,
-    (candidate) =>
-      Effect.gen(function* () {
-        if (spent >= deps.cfg.budget_tokens) {
-          // Kind-specific honest guidance: skills and files are reloadable
-          // with their tools, but there is no todo-reading tool — pointing
-          // the model at "the read tool" for a todo list is a dead end.
-          return {
-            candidate,
-            status: "reference" as const,
-            reason:
-              candidate.kind === "todo"
-                ? "restoration budget exhausted; the todo list was not re-inlined"
-                : "restoration budget exhausted",
-          }
+  let files = 0
+  const include = (candidate: RestorationCandidate, content: string): RestorationMaterial => {
+    const cost = Token.estimate(content)
+    if (spent + cost > deps.cfg.budget_tokens)
+      return { candidate, status: "reference", reason: "restoration budget exhausted" }
+    spent += cost
+    if (candidate.kind === "file") files++
+    return { candidate, status: "inlined", content }
+  }
+  return Effect.forEach(candidates, (candidate) =>
+    Effect.gen(function* () {
+      if (spent >= deps.cfg.budget_tokens) {
+        // Kind-specific honest guidance: skills and files are reloadable
+        // with their tools, but there is no todo-reading tool — pointing
+        // the model at "the read tool" for a todo list is a dead end.
+        return {
+          candidate,
+          status: "reference" as const,
+          reason:
+            candidate.kind === "todo"
+              ? "restoration budget exhausted; the todo list was not re-inlined"
+              : "restoration budget exhausted",
         }
-        if (candidate.kind === "todo") {
-          const content = JSON.stringify(deps.todos, null, 2)
-          spent += Token.estimate(content)
-          return { candidate, status: "inlined" as const, content }
+      }
+      if (candidate.kind === "todo") {
+        const content = JSON.stringify(deps.todos, null, 2)
+        return include(candidate, content)
+      }
+      if (candidate.kind === "skill") {
+        if (Option.isNone(deps.skill)) {
+          return { candidate, status: "missing" as const, reason: "skill service unavailable" }
         }
-        if (candidate.kind === "skill") {
-          if (Option.isNone(deps.skill)) {
-            return { candidate, status: "missing" as const, reason: "skill service unavailable" }
-          }
-          const info = yield* deps.skill.value.get(candidate.ref).pipe(Effect.option)
-          if (Option.isNone(info) || info.value === undefined) {
-            return { candidate, status: "missing" as const, reason: `skill "${candidate.ref}" not found` }
-          }
-          const content = yield* deps.fs.readFileStringSafe(info.value.location)
-          if (content === undefined) {
-            return { candidate, status: "missing" as const, reason: `skill file missing: ${info.value.location}` }
-          }
-          if (Token.estimate(content) > deps.cfg.file_max_tokens) {
-            return {
-              candidate,
-              status: "reference" as const,
-              reason: `skill body is ${Token.estimate(content)} tokens (over the ${deps.cfg.file_max_tokens} cap); reload it with the skill tool if needed`,
-            }
-          }
-          spent += Token.estimate(content)
-          return { candidate, status: "inlined" as const, content }
+        const info = yield* deps.skill.value.get(candidate.ref).pipe(Effect.option)
+        if (Option.isNone(info) || info.value === undefined) {
+          return { candidate, status: "missing" as const, reason: `skill "${candidate.ref}" not found` }
         }
-        const stat = yield* deps.fs.stat(candidate.ref).pipe(Effect.option)
-        if (Option.isNone(stat) || stat.value.type !== "File") {
-          return { candidate, status: "missing" as const, reason: `file not found on disk: ${candidate.ref}` }
-        }
-        if (stat.value.size > deps.cfg.file_max_tokens * TOKEN_BYTES) {
-          return {
-            candidate,
-            status: "reference" as const,
-            reason: `file is ${stat.value.size} bytes (over the ${deps.cfg.file_max_tokens} token cap); read it with the read tool if needed`,
-          }
-        }
-        const content = yield* deps.fs.readFileStringSafe(candidate.ref)
+        const content =
+          info.value.location === "<built-in>"
+            ? info.value.content
+            : yield* deps.fs.readFileStringSafe(info.value.location)
         if (content === undefined) {
-          return { candidate, status: "missing" as const, reason: `file unreadable: ${candidate.ref}` }
+          return { candidate, status: "missing" as const, reason: `skill file missing: ${info.value.location}` }
         }
         if (Token.estimate(content) > deps.cfg.file_max_tokens) {
           return {
             candidate,
             status: "reference" as const,
-            reason: `file is ~${Token.estimate(content)} tokens (over the ${deps.cfg.file_max_tokens} cap); read it with the read tool if needed`,
+            reason: `skill body is ${Token.estimate(content)} tokens (over the ${deps.cfg.file_max_tokens} cap); reload it with the skill tool if needed`,
           }
         }
-        if (tailText.includes(content)) {
-          return { candidate, status: "skipped-duplicate" as const, reason: "already intact in the retained tail" }
+        return include(candidate, content)
+      }
+      if (files >= deps.cfg.max_files)
+        return { candidate, status: "reference" as const, reason: `beyond max_files=${deps.cfg.max_files}` }
+      if (deps.readable && !deps.readable(candidate.ref))
+        return { candidate, status: "reference" as const, reason: "read permission required" }
+      const resolved = yield* Effect.try({
+        try: () => FSUtil.resolve(candidate.ref),
+        catch: () => new Error("path unavailable"),
+      }).pipe(Effect.option)
+      if (Option.isNone(resolved)) return { candidate, status: "missing" as const, reason: "path unavailable" }
+      if (deps.readable && !deps.readable(resolved.value))
+        return { candidate, status: "reference" as const, reason: "read permission required" }
+      const stat = yield* deps.fs.stat(resolved.value).pipe(Effect.option)
+      if (Option.isNone(stat) || stat.value.type !== "File") {
+        return { candidate, status: "missing" as const, reason: `file not found on disk: ${candidate.ref}` }
+      }
+      if (stat.value.size > deps.cfg.file_max_tokens * TOKEN_BYTES) {
+        return {
+          candidate,
+          status: "reference" as const,
+          reason: `file is ${stat.value.size} bytes (over the ${deps.cfg.file_max_tokens} token cap); read it with the read tool if needed`,
         }
-        spent += Token.estimate(content)
-        return { candidate, status: "inlined" as const, content }
-      }).pipe(
-        Effect.catch((error) =>
-          Effect.succeed({
-            candidate,
-            status: "missing" as const,
-            reason: `restoration read failed: ${String(error)}`,
-          }),
-        ),
+      }
+      const content = yield* deps.fs.readFileStringSafe(resolved.value)
+      if (content === undefined) {
+        return { candidate, status: "missing" as const, reason: `file unreadable: ${candidate.ref}` }
+      }
+      if (Token.estimate(content) > deps.cfg.file_max_tokens) {
+        return {
+          candidate,
+          status: "reference" as const,
+          reason: `file is ~${Token.estimate(content)} tokens (over the ${deps.cfg.file_max_tokens} cap); read it with the read tool if needed`,
+        }
+      }
+      if (tailText.includes(content)) {
+        return { candidate, status: "skipped-duplicate" as const, reason: "already intact in the retained tail" }
+      }
+      return include(candidate, content)
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.succeed({
+          candidate,
+          status: "missing" as const,
+          reason: `restoration read failed: ${String(error)}`,
+        }),
       ),
+    ),
   )
 }
 
@@ -264,7 +308,7 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
 
   const referenceLine = (material: RestorationMaterial) => {
     const reason = material.reason ?? material.status
-    return `- ${clipRef(material.candidate.ref)} (${reason})`
+    return `- ${clipRef(material.candidate.ref)} (${clipRef(reason)})`
   }
   const pushLine = (line: string) => {
     if (lines.length >= MAX_REFERENCE_LINES) {
@@ -348,6 +392,7 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
   let compactionIdx = -1
   let tailStartID: string | undefined
   let restorationIdx = -1
+  let restoredMarker: unknown
   // A marker counts as settled only when a completed summary points at it
   // (#77): summary && finish && !error, parentID = the marker's message —
   // the same predicate filterCompacted uses. This covers both settled shapes:
@@ -371,43 +416,60 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
       }
       // Retired (ignored) blocks do not count as "already restored" — a
       // transcript whose only sentinels are ignored must re-fire.
-      if (part.type === "text" && !part.ignored && part.text.startsWith(RESTORATION_SENTINEL))
+      if (part.type === "text" && isRestoration(part) && !part.ignored) {
         restorationIdx = index
+        restoredMarker = part.metadata?.markerID
+      }
     }
   })
   // Step P3: trigger decision — no compaction, or a sentinel already newer
   // than the compaction → leave the transcript alone.
   if (compactionIdx === -1) return
-  if (restorationIdx > compactionIdx) return
+  if (restoredMarker ? restoredMarker === messages[compactionIdx]!.info.id : restorationIdx > compactionIdx) return
 
   const userMessage = messages.findLast((msg) => msg.info.role === "user")
-  if (!userMessage) return
+  if (userMessage?.info.role !== "user") return
 
-  const todos = Option.isSome(todoOpt)
-    ? yield* todoOpt.value.get(sessionID).pipe(Effect.orElseSucceed(() => []))
-    : []
+  const todos = Option.isSome(todoOpt) ? yield* todoOpt.value.get(sessionID).pipe(Effect.orElseSucceed(() => [])) : []
 
   // Step P4/P5: collect candidates (B5: read only display.type === "file";
   // edit via filediff.file; skill via name; most-recent-first; todo appended),
   // then materialize (stat File-guard → byte/token caps → disk read →
   // tail-substring skip-duplicate, budget-aware early stop).
-  const tailText = buildTailText(messages, tailStartID)
-  const candidates = collectCandidates(messages, todos)
-  const materials = yield* materializeCandidates(candidates, tailText, { fs, skill: skillOpt, todos, cfg })
+  const current = yield* sessions.get(sessionID)
+  const agents = yield* Agent.Service
+  const agent = yield* agents.get(userMessage.info.agent)
+  const selectedAgent =
+    current.agent && current.agent !== userMessage.info.agent ? yield* agents.get(current.agent) : agent
+  const instance = yield* InstanceState.context
+  const rules = Permission.merge(agent?.permission ?? [], current.permission ?? [])
+  const selectedRules = Permission.merge(selectedAgent?.permission ?? [], current.permission ?? [])
+  const tools = userMessage.info.tools
+  const allowed = (permission: string, pattern: string) =>
+    !!agent &&
+    !!selectedAgent &&
+    tools?.[permission] !== false &&
+    Permission.evaluate(permission, pattern, rules).action === "allow" &&
+    Permission.evaluate(permission, pattern, selectedRules).action === "allow"
+  const readable = (file: string) =>
+    allowed("read", path.relative(instance.worktree, file)) &&
+    (containsPath(file, instance) ||
+      allowed("external_directory", FSUtil.normalizePathPattern(path.join(path.dirname(file), "*"))))
+  const candidates = collectCandidates(messages, todos).filter((c) => c.kind !== "skill" || allowed("skill", c.ref))
+  const tailText = buildTailText(MessageV2.filterCompacted(messages.toReversed()), tailStartID)
+  const materials = yield* materializeCandidates(candidates, tailText, { fs, skill: skillOpt, todos, cfg, readable })
   // Step P6: render within budget (max_files per file, exhaustion degrades to
   // bounded reference lines) into sentinel + Files/Skills/Todos + Not restored.
   const text = renderMaterials(materials, cfg)
-  if (!text) return
 
   // Step P7: byte-identical comparison against the previous sentinel — only a
   // changed block is persisted. An ignored sentinel is not "the previous
   // block"; it is retired history (see G4 retirement below), so a re-fire
   // after retirement still writes.
   const previous = userMessage.parts.findLast(
-    (part): part is SessionV1.TextPart =>
-      part.type === "text" && !part.ignored && part.text.startsWith(RESTORATION_SENTINEL),
+    (part): part is SessionV1.TextPart => part.type === "text" && isRestoration(part) && !part.ignored,
   )
-  if (previous?.text === text) return
+  if (text && previous?.text === text && previous.metadata?.markerID === messages[compactionIdx]!.info.id) return
 
   // G4 ("at most one restoration block per context"): every prior sentinel —
   // on any message — is retired the moment a fresh one is written. Without
@@ -421,18 +483,19 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
   // ignored text parts.
   for (const msg of messages) {
     for (const part of msg.parts) {
-      if (part.type !== "text" || part.ignored || !part.text.startsWith(RESTORATION_SENTINEL)) continue
-      if (previous?.id === part.id) continue
+      if (part.type !== "text" || part.ignored || !isRestoration(part)) continue
       yield* sessions.updatePart({ ...part, ignored: true })
     }
   }
 
+  if (!text) return
   const part = yield* sessions.updatePart({
     id: PartID.ascending(),
     messageID: userMessage.info.id,
     sessionID: userMessage.info.sessionID,
     type: "text",
     text,
+    metadata: { kind: "compaction_restoration", markerID: messages[compactionIdx]!.info.id },
     synthetic: true,
   })
   userMessage.parts.push(part)

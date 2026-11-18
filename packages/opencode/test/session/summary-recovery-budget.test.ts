@@ -89,3 +89,42 @@ test("payload estimate includes system, reasoning, tool name/input, and effectiv
   })
   expect(size).toBe(1 + amount(3 + 6 + JSON.stringify(input).length) + amount(6 + 4 + JSON.stringify(schema).length))
 })
+
+test("PBT: transformed payloads reach increasing targets or skip the provider call", () => {
+  FastCheck.assert(
+    FastCheck.property(
+      FastCheck.array(FastCheck.tuple(FastCheck.integer({ min: 1, max: 4 }), FastCheck.integer({ min: -8, max: 8 })), {
+        minLength: 1,
+        maxLength: 24,
+      }),
+      (data) => {
+        let estimated = 0
+        const groups = data.map(([weight, delta], i) => ({
+          start: data.length - i,
+          reduction: (estimated += weight),
+          actual: estimated + delta,
+        }))
+        const plan = recoveryBoundaries(100, 0, groups)
+        let cursor = plan.next()
+        let last = 0
+        const calls: number[] = []
+        while (!cursor.done) {
+          const { start, target } = cursor.value
+          const actual = groups[data.length - start]!.actual
+          expect(target).toBe(5 * (Math.floor(last / 5) + 1))
+          if (actual < target) {
+            cursor = plan.next(undefined)
+            continue
+          }
+          expect(actual).toBeGreaterThan(last)
+          calls.push(start)
+          last = actual
+          cursor = plan.next(actual)
+        }
+        expect(calls.length).toBeLessThanOrEqual(5)
+        expect(calls).toEqual([...new Set(calls)].toSorted((a, b) => b - a))
+      },
+    ),
+    { numRuns: 250 },
+  )
+})

@@ -1,11 +1,14 @@
+import { Agent } from "@/agent/agent"
 import { afterEach, describe, expect, mock, test } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { FastCheck } from "effect/testing"
 import { APICallError } from "ai"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import * as Stream from "effect/Stream"
+import { Skill } from "@/skill"
 import { Config } from "@/config/config"
 import { LLM } from "../../src/session/llm"
 import { SessionCompaction } from "../../src/session/compaction"
@@ -244,7 +247,15 @@ const env = AppNodeBuilder.build(compactionTestNode, [
 const it = testEffect(env)
 
 const compactionEnv = AppNodeBuilder.build(
-  LayerNode.group([SessionNs.node, SessionProjector.node, Database.node, EventV2Bridge.node, CrossSpawnSpawner.node, FSUtil.node]),
+  LayerNode.group([
+    Agent.node,
+    SessionNs.node,
+    SessionProjector.node,
+    Database.node,
+    EventV2Bridge.node,
+    CrossSpawnSpawner.node,
+    FSUtil.node,
+  ]),
 )
 const itCompaction = testEffect(compactionEnv)
 
@@ -2836,3 +2847,284 @@ itCompaction.instance(
   },
   { git: true },
 )
+
+// The summary stub never echoes file or skill contents. An occurrence in the
+// final model request must come from the retained tail or the new restoration.
+describe("model context after restoration", () => {
+  const projection = AppNodeBuilder.build(LayerNode.group([Agent.node, Skill.node, Config.node]))
+  const wire = Effect.fnUntraced(function* (sessionID: SessionID) {
+    const active = yield* MessageV2.filterCompactedEffect(sessionID)
+    return JSON.stringify(yield* MessageV2.toModelMessagesEffect(active, defaultProvider.model))
+  })
+
+  const recordRead = Effect.fnUntraced(function* (assistant: SessionV1.Assistant, file: string) {
+    const sessions = yield* SessionNs.Service
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      sessionID: assistant.sessionID,
+      messageID: assistant.id,
+      type: "tool",
+      tool: "read",
+      callID: PartID.ascending(),
+      state: {
+        status: "completed",
+        input: { filePath: file },
+        title: file,
+        output: "Previous version",
+        metadata: { display: { type: "file", path: file } },
+        time: { start: 0, end: 1 },
+      },
+    })
+  })
+
+  const recordSkill = Effect.fnUntraced(function* (assistant: SessionV1.Assistant, dir: string) {
+    const fs = yield* FSUtil.Service
+    const sessions = yield* SessionNs.Service
+    yield* fs.writeWithDirs(
+      path.join(dir, ".opencode", "skills", "fixture-skill", "SKILL.md"),
+      "---\nname: fixture-skill\ndescription: Test fixture\n---\nloaded-fixture-skill-body",
+    )
+    const skills = yield* Skill.Service
+    expect((yield* skills.get("fixture-skill"))?.content).toContain("loaded-fixture-skill-body")
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      sessionID: assistant.sessionID,
+      messageID: assistant.id,
+      type: "tool",
+      tool: "skill",
+      callID: PartID.ascending(),
+      state: {
+        status: "completed",
+        input: { name: "fixture-skill" },
+        title: "fixture-skill",
+        output: "Earlier skill revision",
+        metadata: { name: "fixture-skill" },
+        time: { start: 0, end: 1 },
+      },
+    })
+  })
+
+  const compact = Effect.fnUntraced(function* (sessionID: SessionID, overflow: boolean) {
+    yield* SessionCompaction.use.create({ sessionID, agent: "build", model: ref, auto: true, overflow })
+    const messages = yield* MessageV2.filterCompactedEffect(sessionID)
+    const result = yield* SessionCompaction.use.process({
+      sessionID,
+      messages,
+      parentID: messages.at(-1)!.info.id,
+      auto: true,
+      overflow,
+    })
+    expect(result).toBe("continue")
+    yield* SessionRestoration.apply({ sessionID })
+  })
+
+  itCompaction.instance("a missing path below a replaced directory does not hide other recovered files", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const fs = yield* FSUtil.Service
+      const dir = (yield* TestInstance).directory
+      const session = yield* sessions.create({ permission: [{ permission: "read", pattern: "*", action: "allow" }] })
+      const user = yield* createUserMessage(session.id, "inspect the two documents")
+      const assistant = yield* createAssistantMessage(session.id, user.id, dir)
+      const surviving = path.join(dir, "surviving.md")
+      yield* fs.writeWithDirs(surviving, "still-present-after-rename")
+      yield* recordRead(assistant, surviving)
+      yield* recordRead(assistant, path.join(dir, "replaced", "child.md"))
+      yield* fs.writeWithDirs(path.join(dir, "replaced"), "this name is now a regular file")
+      yield* createCompactionMarker(session.id)
+      const marker = (yield* sessions.messages({ sessionID: session.id })).at(-1)!
+      yield* createSummaryAssistantMessage(session.id, marker.info.id, dir, "summary")
+      yield* SessionRestoration.apply({ sessionID: session.id })
+      expect(yield* wire(session.id)).toContain("still-present-after-rename")
+    }).pipe(Effect.provide(projection)),
+  )
+
+  itCompaction.instance("an omitted errored assistant cannot supply a recovered file body", () => {
+    const stub = llm()
+    stub.push(reply("summary"))
+    return Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const fs = yield* FSUtil.Service
+      const dir = (yield* TestInstance).directory
+      const session = yield* sessions.create({ permission: [{ permission: "read", pattern: "*", action: "allow" }] })
+      const first = yield* createUserMessage(session.id, "inspect the document")
+      const assistant = yield* createAssistantMessage(session.id, first.id, dir)
+      const file = path.join(dir, "retained.md")
+      yield* fs.writeWithDirs(file, "file-body-with-only-a-hidden-copy")
+      yield* recordRead(assistant, file)
+      const recent = yield* createUserMessage(session.id, "continue the review")
+      const failed = yield* createAssistantMessage(session.id, recent.id, dir)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        sessionID: session.id,
+        messageID: failed.id,
+        type: "text",
+        text: "file-body-with-only-a-hidden-copy",
+      })
+      yield* sessions.updateMessage({
+        ...failed,
+        finish: "error",
+        error: MessageV2.fromError(new Error("fixture stream failed"), { providerID: ref.providerID }),
+      })
+      yield* compact(session.id, false)
+      expect(yield* wire(session.id)).toContain("file-body-with-only-a-hidden-copy")
+    }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1 }) }), Effect.provide(projection))
+  })
+
+  for (const overflow of [false, true]) {
+    itCompaction.instance(`two compactions preserve current file bodies (overflow replay=${overflow})`, () => {
+      const stub = llm()
+      stub.push(reply("first summary"))
+      stub.push(reply("second summary"))
+      return Effect.gen(function* () {
+        const sessions = yield* SessionNs.Service
+        const fs = yield* FSUtil.Service
+        const dir = (yield* TestInstance).directory
+        const session = yield* sessions.create({ permission: [{ permission: "read", pattern: "*", action: "allow" }] })
+        const first = yield* createUserMessage(session.id, "review the first file")
+        const assistant = yield* createAssistantMessage(session.id, first.id, dir)
+        const one = path.join(dir, "one.md")
+        const two = path.join(dir, "two.md")
+        yield* fs.writeWithDirs(one, "first-file-version-one")
+        yield* recordRead(assistant, one)
+        yield* createUserMessage(session.id, "continue the review")
+        yield* compact(session.id, false)
+        expect(yield* wire(session.id)).toContain("first-file-version-one")
+
+        const continuation = MessageV2.latest(yield* sessions.messages({ sessionID: session.id })).user!
+        const second = yield* createAssistantMessage(session.id, continuation.id, dir)
+        if (overflow) yield* fs.writeWithDirs(one, "first-file-version-two")
+        yield* fs.writeWithDirs(two, "second-file-current-version")
+        yield* recordRead(second, two)
+        yield* compact(session.id, overflow)
+
+        const final = yield* wire(session.id)
+        expect(final.match(/second-file-current-version/g) ?? []).toHaveLength(1)
+        expect(final.match(overflow ? /first-file-version-two/g : /first-file-version-one/g) ?? []).toHaveLength(1)
+        if (overflow) expect(final).not.toContain("first-file-version-one")
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1 }) }), Effect.provide(projection))
+    })
+  }
+
+  itCompaction.instance(
+    "files excluded by max_files leave their budget available to skills",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* SessionNs.Service
+        const fs = yield* FSUtil.Service
+        const dir = (yield* TestInstance).directory
+        const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+        const user = yield* createUserMessage(session.id, "review the notes and skill")
+        const assistant = yield* createAssistantMessage(session.id, user.id, dir)
+        yield* recordSkill(assistant, dir)
+        const file = path.join(dir, "recent.txt")
+        yield* fs.writeWithDirs(file, "q".repeat(1024))
+        yield* recordRead(assistant, file)
+        yield* createCompactionMarker(session.id)
+        const marker = (yield* sessions.messages({ sessionID: session.id })).at(-1)!
+        yield* createSummaryAssistantMessage(session.id, marker.info.id, dir, "summary")
+        yield* SessionRestoration.apply({ sessionID: session.id })
+        const final = yield* wire(session.id)
+        expect(final).toContain("loaded-fixture-skill-body")
+        expect(final).not.toContain("q".repeat(1024))
+      }).pipe(Effect.provide(projection)),
+    { config: { compaction: { restoration: { max_files: 0, budget_tokens: 256 } } } },
+  )
+
+  for (const action of ["ask", "deny"] as const) {
+    itCompaction.instance(`restoration honors current read and skill permissions (${action})`, () =>
+      Effect.gen(function* () {
+        const sessions = yield* SessionNs.Service
+        const fs = yield* FSUtil.Service
+        const dir = (yield* TestInstance).directory
+        const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+        const user = yield* createUserMessage(session.id, "review the fixture notes")
+        const assistant = yield* createAssistantMessage(session.id, user.id, dir)
+        const allowed = path.join(dir, "allowed.txt")
+        const limited = path.join(dir, "limited.txt")
+        yield* fs.writeWithDirs(allowed, "permitted-update")
+        yield* fs.writeWithDirs(limited, "limited-update")
+        yield* recordRead(assistant, allowed)
+        yield* recordRead(assistant, limited)
+        yield* recordSkill(assistant, dir)
+        yield* sessions.setPermission({
+          sessionID: session.id,
+          permission: [
+            { permission: "read", pattern: "*", action: "allow" },
+            { permission: "read", pattern: "*limited.txt", action },
+            { permission: "skill", pattern: "fixture-skill", action },
+          ],
+        })
+        yield* createCompactionMarker(session.id)
+        const marker = (yield* sessions.messages({ sessionID: session.id })).at(-1)!
+        yield* createSummaryAssistantMessage(session.id, marker.info.id, dir, "summary of the fixture notes")
+        yield* SessionRestoration.apply({ sessionID: session.id })
+        const final = yield* wire(session.id)
+        expect(final).toContain("permitted-update")
+        expect(final).not.toContain("limited-update")
+        expect(final).not.toContain("loaded-fixture-skill-body")
+      }).pipe(Effect.provide(projection)),
+    )
+  }
+
+  itCompaction.instance(
+    "PBT: every transition shows exactly one current revision of each tracked file",
+    () => {
+      const stub = llm()
+      return Effect.gen(function* () {
+        const sessions = yield* SessionNs.Service
+        const fs = yield* FSUtil.Service
+        const dir = (yield* TestInstance).directory
+        const run = Effect.runPromiseWith(
+          yield* Effect.context<
+            SessionNs.Service | SessionCompaction.Service | Agent.Service | Database.Service | FSUtil.Service
+          >(),
+        )
+        const transition = FastCheck.record({
+          overflow: FastCheck.boolean(),
+          edits: FastCheck.subarray([0, 1]),
+        })
+        yield* Effect.promise(() =>
+          FastCheck.assert(
+            FastCheck.asyncProperty(FastCheck.array(transition, { minLength: 2, maxLength: 4 }), (steps) =>
+              run(
+                Effect.gen(function* () {
+                  const session = yield* sessions.create({
+                    permission: [{ permission: "read", pattern: "*", action: "allow" }],
+                  })
+                  const user = yield* createUserMessage(session.id, "inspect both files")
+                  const assistant = yield* createAssistantMessage(session.id, user.id, dir)
+                  const revisions = [0, 0]
+                  const paths = [path.join(dir, "tracked-left.md"), path.join(dir, "tracked-right.md")]
+                  for (const [i, file] of paths.entries()) {
+                    yield* fs.writeWithDirs(file, `tracked-${i}-revision-0.`)
+                    yield* recordRead(assistant, file)
+                  }
+                  yield* createUserMessage(session.id, "continue the review")
+                  for (const step of [{ overflow: false, edits: [] }, ...steps]) {
+                    for (const i of step.edits) {
+                      revisions[i]++
+                      yield* fs.writeWithDirs(paths[i]!, `tracked-${i}-revision-${revisions[i]}.`)
+                    }
+                    stub.push(reply("short fixture summary"))
+                    yield* compact(session.id, step.overflow)
+                    const visible = yield* wire(session.id)
+                    for (const [i, latest] of revisions.entries()) {
+                      const versions = Array.from(
+                        visible.matchAll(new RegExp(`tracked-${i}-revision-(\\d+)\\.`, "g")),
+                        (m) => Number(m[1]),
+                      )
+                      expect(versions).toEqual([latest])
+                    }
+                  }
+                }),
+              ),
+            ),
+            { seed: 0x5561, numRuns: 12 },
+          ),
+        )
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1 }) }), Effect.provide(projection))
+    },
+    30_000,
+  )
+})

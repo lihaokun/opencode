@@ -1518,6 +1518,7 @@ const layer = Layer.effect(
               // compaction task arm after process returns continue (B6).
               yield* SessionRestoration.apply({ sessionID }).pipe(
                 Effect.provideService(Session.Service, sessions),
+                Effect.provideService(Agent.Service, agents),
                 Effect.provideService(FSUtil.Service, fsys),
               )
             }

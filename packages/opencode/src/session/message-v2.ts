@@ -134,6 +134,15 @@ function providerMeta(metadata: Record<string, any> | undefined) {
   return Object.keys(rest).length > 0 ? rest : undefined
 }
 
+export function assistantVisible(msg: WithParts) {
+  return (
+    msg.info.role !== "assistant" ||
+    !msg.info.error ||
+    (AbortedError.isInstance(msg.info.error) &&
+      msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning"))
+  )
+}
+
 export const toModelMessagesEffect = Effect.fnUntraced(function* (
   input: WithParts[],
   model: Provider.Model,
@@ -251,15 +260,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
       const differentModel = `${model.providerID}/${model.id}` !== `${msg.info.providerID}/${msg.info.modelID}`
       const media: Array<{ mime: string; url: string; filename?: string }> = []
 
-      if (
-        msg.info.error &&
-        !(
-          AbortedError.isInstance(msg.info.error) &&
-          msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")
-        )
-      ) {
-        continue
-      }
+      if (!assistantVisible(msg)) continue
       const assistantMessage: UIMessage = {
         id: msg.info.id,
         role: "assistant",

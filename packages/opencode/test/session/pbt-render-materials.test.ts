@@ -140,3 +140,25 @@ describe("PBT renderMaterials", () => {
     expect(Token.estimate(text)).toBeLessThan(pathological.budget_tokens + 2_000)
   })
 })
+
+it("bounds the complete diagnostic when both its reference and its reason name a missing file", () => {
+  const cfg = restorationConfig(undefined)
+  fc.assert(
+    fc.property(fc.integer({ min: 2600, max: 3960 }), fc.integer({ min: 20, max: 40 }), (pathChars, count) => {
+      const materials = Array.from({ length: count }, (_, index) => {
+        const ref = `/missing/${"segment/".repeat(Math.ceil(pathChars / 8))}${index}.md`
+        return {
+          candidate: { kind: "file" as const, ref, lastUseSeq: count - index },
+          status: "missing" as const,
+          reason: `file not found on disk: ${ref}`,
+        }
+      })
+      const text = renderMaterials(materials, cfg)
+      expect(text).toContain("## Not restored")
+      // The existing PATH_MAX invariant allows at most 2,000 tokens of framing
+      // beyond the configured payload budget for the default configuration.
+      expect(Token.estimate(text!)).toBeLessThan(cfg.budget_tokens + 2_000)
+    }),
+    { seed: 0x5560, numRuns: 50 },
+  )
+})
