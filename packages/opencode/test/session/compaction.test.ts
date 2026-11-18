@@ -968,15 +968,30 @@ describe("session.compaction.prune", () => {
 })
 
 describe("session.compaction.process", () => {
-  for (const mode of ["recover", "reject-again", "retention-disabled"] as const) {
-    itCompaction.instance(`summary overflow retries only with a shorter head (${mode})`, () => {
+  for (const mode of [
+    "recover",
+    "reject-again",
+    "retention-disabled",
+    "sample",
+    "foreign-sample",
+    "no-sample",
+    "cap-below-target",
+  ] as const) {
+    itCompaction.instance(`summary overflow advances by five-percent stages (${mode})`, () => {
       const stub = llm()
-      const requests: string[] = []
+      const generic = mode === "sample" || mode === "foreign-sample" || mode === "no-sample"
+      const succeeds = mode === "recover" || generic
+      const requests: number[][] = []
+      const capture = (input: LLM.StreamInput) => {
+        requests.push(
+          Array.from(JSON.stringify(input.messages).matchAll(/turn-(\d+)-body/g), (match) => Number(match[1])),
+        )
+      }
       const reject = (input: LLM.StreamInput) => {
-        requests.push(JSON.stringify(input.messages))
+        capture(input)
         return Stream.fail(
           new APICallError({
-            message: "Prompt exceeds max length",
+            message: generic ? "Prompt exceeds max length" : "Prompt exceeds max length: 214000 tokens > 200000",
             url: "https://example.test",
             requestBodyValues: {},
             statusCode: 400,
@@ -984,22 +999,31 @@ describe("session.compaction.process", () => {
           }),
         )
       }
-      stub.push(reject)
-      stub.push(
-        mode === "recover"
-          ? reply("recovered-summary", (input) => requests.push(JSON.stringify(input.messages)))
-          : reject,
-      )
+      for (let i = 0; i < 6; i++)
+        stub.push(succeeds && i === (generic ? 1 : 2) ? reply("recovered-summary", capture) : reject)
       return Effect.gen(function* () {
         const sessions = yield* SessionNs.Service
         const events = yield* EventV2Bridge.Service
         const chat = yield* sessions.create({})
-        yield* createUserMessage(chat.id, "older-prefix:" + "a".repeat(12_000))
-        const extra = yield* createUserMessage(chat.id, "recent-original:" + "b".repeat(62_000))
-        const last = yield* createUserMessage(chat.id, "latest-original")
+        const users = yield* Effect.forEach(
+          Array.from({ length: 16 }, (_, i) => i),
+          (i) => createUserMessage(chat.id, `turn-${i}-body` + "b".repeat(29_999)),
+        )
+        if (mode === "sample" || mode === "foreign-sample") {
+          const anchor = yield* createAssistantMessage(chat.id, users.at(-1)!.id, "/tmp")
+          yield* sessions.updateMessage({
+            ...anchor,
+            modelID: mode === "sample" ? ref.modelID : ModelV2.ID.make("other"),
+            tokens: { input: 2000, output: 200_000, reasoning: 90_000, cache: { read: 69_000, write: 1000 } },
+          })
+          yield* sessions.updateMetadata({
+            sessionID: chat.id,
+            update: () => ({ summaryBudgetSample: { messageID: anchor.id, estimate: 10000 } }),
+          })
+        }
         yield* createSummaryCompaction(chat.id)
         const marker = (yield* sessions.messages({ sessionID: chat.id })).at(-1)!
-        const late = yield* createUserMessage(chat.id, "late-worker-report")
+        const late = yield* createUserMessage(chat.id, "late worker report")
         const seen: string[] = []
         const off = yield* events.listen((event) =>
           Effect.sync(() => {
@@ -1013,37 +1037,100 @@ describe("session.compaction.process", () => {
           auto: false,
         })
         yield* off
-        expect(requests).toHaveLength(mode === "retention-disabled" ? 1 : 2)
-        expect(requests[0]).toContain("recent-original:")
-        for (const request of requests) {
-          expect(request).toContain("older-prefix:")
-          expect(request).not.toContain("late-worker-report")
-        }
-        if (requests.length === 2) {
-          expect(requests[1]).not.toContain("recent-original:")
-          expect(requests[1]).not.toContain("latest-original")
-          expect(requests[1]!.length).toBeLessThan(requests[0]!.length)
-        }
-        const projected = yield* MessageV2.filterCompactedEffect(chat.id)
-        const part = projected
-          .find((item) => item.info.id === marker.info.id)
-          ?.parts.find((part) => part.type === "compaction")
-        expect(seen.filter((type) => type === SessionNs.Event.Error.type)).toHaveLength(mode === "recover" ? 0 : 1)
-        if (mode === "recover") {
-          expect(result).toBe("continue")
-          expect(part?.tail_start_id).toBe(extra.id)
+        const lengths = requests.map((r) => r.length)
+        // Base head holds 15 groups. A 7% gap rounds to 10%, moving 2 groups.
+        // The next 15% stage moves 3 cumulatively. Five groups would exceed the
+        // 50k total retained-token cap after wire framing.
+        const nextHead = mode === "sample" ? 13 : 14
+        expect(lengths).toEqual(
+          mode === "retention-disabled"
+            ? [16]
+            : mode === "cap-below-target"
+              ? [15]
+              : generic
+                ? [15, nextHead]
+                : [15, 13, 12],
+        )
+        expect(result).toBe(succeeds ? "continue" : "stop")
+        expect(seen.filter((t) => t === SessionNs.Event.Error.type)).toHaveLength(succeeds ? 0 : 1)
+        const stored = yield* sessions.messages({ sessionID: chat.id })
+        expect(stored.filter((m) => m.info.role === "assistant" && m.info.summary)).toHaveLength(1)
+        if (succeeds) {
+          const projected = yield* MessageV2.filterCompactedEffect(chat.id)
           expect(projected[1]?.info).toMatchObject({ summary: true, parentID: marker.info.id, finish: "stop" })
-          expect(projected.slice(2).map((item) => item.info.id)).toEqual([extra.id, last.id, late.id])
+          expect(
+            projected
+              .slice(2)
+              .filter((m) => m.info.role === "user")
+              .map((m) => m.info.id),
+          ).toEqual([...users.slice(generic ? nextHead : 12).map((u) => u.id), late.id])
         } else {
-          expect(result).toBe("stop")
-          expect(part?.tail_start_id).toBeUndefined()
           expect(seen).not.toContain(SessionCompaction.Event.Compacted.type)
+          expect(
+            stored.find((m) => m.info.id === marker.info.id)?.parts.find((p) => p.type === "compaction")?.tail_start_id,
+          ).toBeUndefined()
         }
       }).pipe(
-        withCompaction({ llm: stub.llmLayer, config: cfg(mode === "retention-disabled" ? { tail_turns: 0 } : {}) }),
+        withCompaction({
+          llm: stub.llmLayer,
+          provider: ProviderTest.fake({ model: createModel({ context: 220_000, output: 20_000 }) }),
+          config: cfg(
+            mode === "retention-disabled" ? { tail_turns: 0 } : mode === "cap-below-target" ? { tail_turns: 2 } : {},
+          ),
+        }),
       )
     })
   }
+
+  itCompaction.instance("cancelling preparation between rejected summary attempts settles the pending summary", () =>
+    Effect.gen(function* () {
+      const gate = yield* Deferred.make<void>()
+      const stub = llm()
+      stub.push(
+        Stream.fail(
+          new APICallError({
+            message: "Prompt exceeds max length",
+            url: "https://example.test",
+            requestBodyValues: {},
+            statusCode: 400,
+            isRetryable: false,
+          }),
+        ),
+      )
+      let transforms = 0
+      const hooks = Layer.mock(Plugin.Service)({
+        trigger: (name, _input, out) =>
+          name === "experimental.chat.messages.transform" && ++transforms === 2
+            ? Deferred.succeed(gate, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.succeed(out),
+        list: () => Effect.succeed([]),
+        init: () => Effect.void,
+      })
+      yield* Effect.gen(function* () {
+        const sessions = yield* SessionNs.Service
+        const chat = yield* sessions.create({})
+        for (let i = 0; i < 16; i++) yield* createUserMessage(chat.id, "g".repeat(30000))
+        yield* createSummaryCompaction(chat.id)
+        const history = yield* sessions.messages({ sessionID: chat.id })
+        const job = yield* SessionCompaction.use
+          .process({ sessionID: chat.id, parentID: history.at(-1)!.info.id, messages: history, auto: false })
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(gate).pipe(Effect.timeout("5 seconds"))
+        yield* Fiber.interrupt(job)
+        const assistants = (yield* sessions.messages({ sessionID: chat.id })).filter(
+          (m) => m.info.role === "assistant" && m.info.summary,
+        )
+        expect(assistants).toHaveLength(1)
+        expect(assistants[0]?.info).toMatchObject({ finish: "error", error: { name: "MessageAbortedError" } })
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          plugin: hooks,
+          provider: ProviderTest.fake({ model: createModel({ context: 220000, output: 20000 }) }),
+        }),
+      )
+    }),
+  )
 
   for (const auto of [false, true]) {
     itCompaction.instance(`ordinary retry keeps late inputs outside its marker boundary (auto=${auto})`, () => {

@@ -971,6 +971,24 @@ it.instance("loop calls LLM and returns assistant message", () =>
   }),
 )
 
+it.instance("a successful provider request pairs its input usage with a durable local estimate", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Budget sample", permission: allowAll })
+    yield* user(chat.id, "estimate this request")
+    yield* llm.push(reply().text("done").usage({ input: 91, output: 13 }).stop())
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    expect(result.info.role === "assistant" && result.info.tokens.input).toBe(91)
+    expect((yield* sessions.get(chat.id)).metadata?.summaryBudgetSample).toEqual({
+      messageID: result.info.id,
+      estimate: expect.any(Number),
+    })
+    expect((yield* sessions.get(chat.id)).metadata?.summaryBudgetSample.estimate).toBeGreaterThan(0)
+  }),
+)
+
 it.instance("loop delivers the shared working agreement on the wire", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

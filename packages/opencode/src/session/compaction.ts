@@ -5,6 +5,8 @@ import { Session } from "./session"
 import { SessionID, MessageID, PartID } from "./schema"
 import { Provider } from "@/provider/provider"
 import { MessageV2 } from "./message-v2"
+import { LLM } from "./llm"
+import { estimatePayload, estimateMessages, calibratedInput, recoveryBoundaries, providerGap } from "./summary-budget"
 import { Token } from "@/util/token"
 import { SessionProcessor } from "./processor"
 import { Agent } from "@/agent/agent"
@@ -12,7 +14,7 @@ import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
 
-import { Effect, Layer, Context, Option } from "effect"
+import { Effect, Layer, Context, Option, Cause, Exit } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -195,6 +197,7 @@ export const use = serviceUse(Service)
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
+    const llm = yield* LLM.Service
     const config = yield* Config.Service
     const session = yield* Session.Service
     const agents = yield* Agent.Service
@@ -244,13 +247,12 @@ const layer = Layer.effect(
 
     const select = Effect.fn("SessionCompaction.select")(function* (input: {
       messages: SessionV1.WithParts[]
-      recoveryBudget?: number
       cfg: ConfigV1.Info
       model: Provider.Model
     }) {
       const limit = input.cfg.compaction?.tail_turns
       if (limit !== undefined && limit <= 0) return { head: input.messages, tail_start_id: undefined }
-      const budget = input.recoveryBudget ?? preserveRecentBudget({ cfg: input.cfg, model: input.model })
+      const budget = preserveRecentBudget({ cfg: input.cfg, model: input.model })
       const all = turns(input.messages)
       if (!all.length) return { head: input.messages, tail_start_id: undefined }
       const recent = limit === undefined ? all : all.slice(-limit)
@@ -264,9 +266,7 @@ const layer = Layer.effect(
           messages: input.messages.slice(turn.start, turn.end),
           model: input.model,
         })
-        // A recovery summary needs a nonempty older prefix. For a single long
-        // turn splitTurn may still preserve its later assistant messages.
-        if (total + size <= budget && !(input.recoveryBudget !== undefined && turn.start === 0)) {
+        if (total + size <= budget) {
           total += size
           keep = { start: turn.start, id: turn.id }
           continue
@@ -424,40 +424,35 @@ const layer = Layer.effect(
           : prompt
       })
       const ctx = yield* InstanceState.context
-      const summarize = Effect.fnUntraced(function* (text: string) {
-        const msg: SessionV1.Assistant = {
-          id: MessageID.ascending(),
-          role: "assistant",
-          parentID: input.parentID,
-          sessionID: input.sessionID,
-          mode: "compaction",
-          agent: "compaction",
-          variant: userMessage.model.variant,
-          summary: true,
-          path: {
-            cwd: ctx.directory,
-            root: ctx.worktree,
-          },
-          cost: 0,
-          tokens: {
-            output: 0,
-            input: 0,
-            reasoning: 0,
-            cache: { read: 0, write: 0 },
-          },
-          modelID: model.id,
-          providerID: model.providerID,
-          time: {
-            created: Date.now(),
-          },
-        }
-        yield* session.updateMessage(msg)
-        const processor = yield* processors.create({
-          assistantMessage: msg,
-          sessionID: input.sessionID,
-          model,
-        })
-        const result = yield* processor.process({
+      const msg: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: input.parentID,
+        sessionID: input.sessionID,
+        mode: "compaction",
+        agent: "compaction",
+        variant: userMessage.model.variant,
+        summary: true,
+        path: {
+          cwd: ctx.directory,
+          root: ctx.worktree,
+        },
+        cost: 0,
+        tokens: {
+          output: 0,
+          input: 0,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+        modelID: model.id,
+        providerID: model.providerID,
+        time: {
+          created: Date.now(),
+        },
+      }
+      const prepare = Effect.fnUntraced(function* (head: SessionV1.WithParts[]) {
+        const text = yield* summaryPrompt(head)
+        const stream: LLM.StreamInput = {
           user: userMessage,
           agent,
           sessionID: input.sessionID,
@@ -465,48 +460,132 @@ const layer = Layer.effect(
           system: [],
           messages: [{ role: "user", content: [{ type: "text", text }] }],
           model,
-        })
-
-        if (result === "compact") {
-          processor.message.error = new SessionV1.ContextOverflowError({
-            message: replay
-              ? "Conversation history too large to compact - exceeds model context limit"
-              : "Session too large to compact - context exceeds model limit even after stripping media",
-          }).toObject()
-          processor.message.finish = "error"
-          yield* session.updateMessage(processor.message)
         }
-        return { result, message: processor.message }
+        const preparedPayload = yield* llm.preparePayload(stream)
+        return { ...stream, preparedPayload }
       })
-      const original = yield* summaryPrompt(selected.head)
-      let attempt = yield* summarize(original)
-      // The marker is what makes the suffix visible after a successful summary.
-      // The separate overflow-replay path already reissues the rejected user turn.
-      if (attempt.result === "compact" && compactionPart && !replay && selected.head.length > 1) {
-        const primary = agent.model
-          ? yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
-          : model
-        const budget = Math.floor(usable({ cfg, model: primary, outputTokenMax: flags.outputTokenMax }) / 4)
-        const candidate = yield* select({
-          messages: historyForSummary,
-          cfg,
-          model: primary,
-          recoveryBudget: Math.min(budget, cfg.compaction?.preserve_recent_tokens ?? budget),
-        })
-        if (candidate.head.length > 0 && candidate.head.length < selected.head.length) {
-          const shorter = yield* summaryPrompt(candidate.head)
-          if (shorter.length < original.length) {
-            selected = candidate
-            attempt = yield* summarize(shorter)
+      const summarize = Effect.fnUntraced(function* (stream: LLM.StreamInput) {
+        const processor = yield* processors.create({ assistantMessage: msg, sessionID: input.sessionID, model })
+        const result = yield* processor.process(stream)
+        return { result, error: processor.summaryOverflow }
+      })
+      const original = yield* prepare(selected.head)
+      const attempt = yield* Effect.gen(function* () {
+        yield* session.updateMessage(msg)
+        let attempt = yield* summarize(original)
+        if (
+          attempt.result === "compact" &&
+          compactionPart &&
+          !replay &&
+          selected.head.length > 1 &&
+          cfg.compaction?.tail_turns !== 0
+        ) {
+          const primary = agent.model
+            ? yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+            : model
+          const budget = usable({ cfg, model, outputTokenMax: flags.outputTokenMax })
+          const cap = Math.min(
+            Math.floor(usable({ cfg, model: primary, outputTokenMax: flags.outputTokenMax }) / 4),
+            cfg.compaction?.preserve_recent_tokens ?? Infinity,
+          )
+          if (budget > 0 && cap > 0) {
+            const originalSize = yield* Effect.promise(() => estimatePayload(original.preparedPayload))
+            const sample = (yield* session.get(input.sessionID).pipe(Effect.orDie)).metadata?.summaryBudgetSample
+            const anchor = history.findLast((m) => m.info.id === sample?.messageID)?.info
+            const baseline =
+              anchor?.role === "assistant" &&
+              anchor.finish &&
+              !anchor.error &&
+              anchor.providerID === model.providerID &&
+              anchor.modelID === model.id &&
+              Number.isSafeInteger(sample?.estimate) &&
+              sample.estimate > 0
+                ? {
+                    actual: anchor.tokens.input + anchor.tokens.cache.read + anchor.tokens.cache.write,
+                    estimate: sample.estimate,
+                  }
+                : undefined
+            const gap =
+              providerGap(attempt.error?.message ?? "") ??
+              providerGap(attempt.error?.responseBody ?? "") ??
+              calibratedInput(originalSize, baseline) - budget
+            const groups = turns(historyForSummary)
+            const minGroup = Math.max(0, groups.length - (cfg.compaction?.tail_turns ?? Infinity))
+            // Work backwards once. Estimate the amount removed in summary form
+            // separately from the cost of replaying that group as model messages.
+            const candidates: { start: number; reduction: number }[] = []
+            let end = selected.head.length
+            const replayCost = Effect.fnUntraced(function* (slice: SessionV1.WithParts[]) {
+              return estimateMessages(yield* MessageV2.toModelMessagesEffect(slice, primary))
+            })
+            let retained = yield* replayCost(historyForSummary.slice(end))
+            let removedChars = 0
+            for (let i = groups.length - 1; i >= minGroup; i--) {
+              const start = groups[i]!.start
+              if (start >= end) continue
+              if (start === 0) break
+              const group = historyForSummary.slice(start, end)
+              retained += yield* replayCost(group)
+              if (retained > cap) break
+              for (const message of group) {
+                const text = serialize(message)
+                if (text) removedChars += text.length + 2
+              }
+              candidates.push({ start, reduction: Math.ceil(removedChars / 3) })
+              end = start
+            }
+            const plan = recoveryBoundaries(budget, gap, candidates)
+            let cursor = plan.next()
+            while (!cursor.done && attempt.result === "compact") {
+              const { start, target } = cursor.value
+              const head = historyForSummary.slice(0, start)
+              const stream = yield* prepare(head)
+              const reduction = originalSize - (yield* Effect.promise(() => estimatePayload(stream.preparedPayload)))
+              if (reduction < target) {
+                cursor = plan.next(undefined)
+                continue
+              }
+              if ((yield* replayCost(historyForSummary.slice(start))) > cap) break
+              selected = { head, tail_start_id: historyForSummary[start]!.info.id }
+              attempt = yield* summarize(stream)
+              cursor = plan.next(reduction)
+            }
           }
         }
-      }
+        return attempt
+      }).pipe(
+        Effect.onExit((exit) => {
+          if (Exit.isSuccess(exit) || msg.error || msg.finish) return Effect.void
+          // Preparing a shorter candidate is interruptible too, between calls to
+          // SessionProcessor. Settle the one pending row on cancellation/defect.
+          const interrupted = Cause.hasInterruptsOnly(exit.cause)
+          msg.error = MessageV2.fromError(
+            interrupted ? new DOMException("Compaction interrupted", "AbortError") : Cause.squash(exit.cause),
+            { providerID: model.providerID, aborted: interrupted },
+          )
+          msg.finish = "error"
+          msg.time.completed = Date.now()
+          return session
+            .updateMessage(msg)
+            .pipe(
+              Effect.andThen(events.publish(Session.Event.Error, { sessionID: input.sessionID, error: msg.error })),
+              Effect.asVoid,
+            )
+        }),
+      )
       if (attempt.result === "compact") {
-        if (attempt.message.error)
-          yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: attempt.message.error })
+        msg.error = new SessionV1.ContextOverflowError({
+          message: replay
+            ? "Conversation history too large to compact - exceeds model context limit"
+            : "Session too large to compact - context exceeds model limit even after stripping media",
+        }).toObject()
+        msg.finish = "error"
+        msg.time.completed = Date.now()
+        yield* session.updateMessage(msg)
+        yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: msg.error })
         return "stop"
       }
-      if (attempt.result !== "continue" || attempt.message.error) return "stop"
+      if (attempt.result !== "continue" || msg.error) return "stop"
 
       if (compactionPart && compactionPart.tail_start_id !== selected.tail_start_id) {
         yield* session.updatePart({
@@ -658,6 +737,7 @@ export const node = LayerNode.make({
   layer: layer,
   deps: [
     Config.node,
+    LLM.node,
     Session.node,
     Agent.node,
     Plugin.node,

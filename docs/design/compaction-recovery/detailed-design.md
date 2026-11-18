@@ -188,4 +188,4 @@ msgs = yield* SessionRestoration.apply({ sessionID: chat.id }).pipe(
 
 ### 摘要输入超限后的保留边界
 
-当摘要请求因上下文超限失败，SessionCompaction 可以把更多近期消息留作原文，使用缩短的旧前缀重试一次。成功后，SessionRestoration 基于本次成功的 `tail_start_id` 去重；晚到输入排在保留原文之后。适用条件和预算见[修复说明](../../fixes/session-fix-summary-overflow-tail.md)。
+摘要请求被拒后，以确切缺口或同模型成功请求的实际输入加估值差选择起始档，按可用预算的 5% 逐档增加到 25%。每个更短的候选最多发一次；保留区另受主模型预算和配置约束。成功时使用选定边界进行 restoration；仅最终用尽才报告溢出。见[修复说明](../../fixes/session-fix-summary-overflow-tail.md)。
