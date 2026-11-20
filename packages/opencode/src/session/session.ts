@@ -827,6 +827,14 @@ const layer: Layer.Layer<
             messageID: cloned.id,
             sessionID: session.id,
           }
+          if (
+            p.type === "text" &&
+            p.synthetic &&
+            p.metadata?.compaction_continue &&
+            typeof p.metadata.protected_from === "string"
+          )
+            p.metadata = { ...p.metadata, protected_from: idMap.get(MessageID.make(p.metadata.protected_from)) }
+          if (p.type === "compaction" && p.protected_from) p.protected_from = idMap.get(p.protected_from)
           if (p.type === "compaction" && p.tail_start_id) {
             p.tail_start_id = idMap.get(p.tail_start_id)
           }

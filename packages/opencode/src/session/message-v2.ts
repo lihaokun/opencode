@@ -552,59 +552,92 @@ export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: Ses
   }
 })
 
+export function isOriginal(message: WithParts) {
+  return message.info.role === "assistant" ? !message.info.summary : !message.parts.some((p) => p.type === "compaction")
+}
+
+const visibleSummary = (m: WithParts) =>
+  m.info.role !== "assistant" || !m.info.summary || (!!m.info.finish && !m.info.error)
+
+// The DB stream is newest first. Only the newest settled marker determines the
+// window. Old ID boundaries are interpreted here, including hidden/missing
+// anchors, before normalizing the successful summary in memory.
 export function filterCompacted(msgs: Iterable<WithParts>) {
-  const result = [] as WithParts[]
-  const completed = new Set<string>()
-  let retain: MessageID | undefined
-  let boundary: WithParts | undefined
-  for (const msg of msgs) {
-    // Keep even hidden summary attempts until the durable boundary has been
-    // interpreted: old tail_start_id values can point at those messages.
-    result.push(msg)
-    if (retain) {
-      if (msg.info.id === retain) break
-      continue
+  const later: WithParts[] = []
+  const completed = new Map<MessageID, WithParts>()
+  const iterator = msgs[Symbol.iterator]()
+  for (let item = iterator.next(); !item.done; item = iterator.next()) {
+    const m = item.value
+    const summary = completed.get(m.info.id)
+    const marker = summary && m.parts.find((part): part is CompactionPart => part.type === "compaction")
+    if (marker && summary?.info.role === "assistant") {
+      const stored = summary.info.n
+      const tail: WithParts[] = []
+      const stripped = new Set<MessageID>()
+      let stripPreviousUser = false
+      const rememberMedia = (part: CompactionPart) => {
+        if (!part.overflow) return
+        if (part.protected_from) stripped.add(part.protected_from)
+        else stripPreviousUser = true // completed a pending marker from an older build
+      }
+      if (stored !== undefined) rememberMedia(marker)
+      // New summaries count original rows. Legacy anchors are matched against
+      // every raw ID (even a hidden summary); only original rows enter n.
+      const oldStart = stored === undefined ? marker.tail_start_id : undefined
+      if (stored !== undefined || (oldStart && oldStart !== m.info.id)) {
+        while (stored === undefined || tail.length < stored) {
+          const next = iterator.next()
+          if (next.done) break
+          const row = next.value
+          if (isOriginal(row)) {
+            if (stripPreviousUser && row.info.role === "user") {
+              stripped.add(row.info.id)
+              stripPreviousUser = false
+            }
+            tail.push(stripped.has(row.info.id) ? withoutUserMedia(row) : row)
+          } else if (row.info.role === "assistant" && row.info.summary && row.info.finish && !row.info.error) {
+            completed.set(row.info.parentID, row)
+          } else if (row.info.role === "user") {
+            const previous = completed.get(row.info.id)
+            const part = row.parts.find((p): p is CompactionPart => p.type === "compaction")
+            if (part && previous?.info.role === "assistant" && previous.info.n !== undefined) rememberMedia(part)
+          }
+          if (row.info.id === oldStart) break
+        }
+      }
+      const normalized = stored !== undefined ? summary : { ...summary, info: { ...summary.info, n: tail.length } }
+      return [
+        m,
+        normalized,
+        ...tail.reverse(),
+        ...later.reverse().filter((row) => row !== summary && visibleSummary(row)),
+      ]
     }
-    if (msg.info.role === "user" && completed.has(msg.info.id)) {
-      const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
-      if (!part) continue
-      boundary = msg
-      if (!part.tail_start_id) break
-      retain = part.tail_start_id
-      if (msg.info.id === retain) break
-      continue
-    }
-    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
-      completed.add(msg.info.parentID)
+    if (m.info.role === "assistant" && m.info.summary && m.info.finish && !m.info.error)
+      completed.set(m.info.parentID, m)
+    later.push(m)
   }
-  result.reverse()
-  const compactionIndex = boundary ? result.indexOf(boundary) : -1
-  const summaryIndex = boundary
-    ? result.findIndex(
-        (msg, index) =>
-          index > compactionIndex &&
-          msg.info.role === "assistant" &&
-          msg.info.summary &&
-          msg.info.finish &&
-          !msg.info.error &&
-          msg.info.parentID === boundary.info.id,
-      )
-    : -1
-  // Only the settled boundary controls the layout. Inputs arriving between
-  // its marker and summary follow the retained tail, in their original order.
-  const ordered =
-    boundary && summaryIndex > compactionIndex
-      ? [
-          boundary,
-          result[summaryIndex]!,
-          ...result.slice(0, compactionIndex),
-          ...result.slice(compactionIndex + 1, summaryIndex),
-          ...result.slice(summaryIndex + 1),
-        ]
-      : result
-  return ordered.filter(
-    (msg) => msg.info.role !== "assistant" || !msg.info.summary || (msg.info.finish && !msg.info.error),
-  )
+  return later.reverse().filter(visibleSummary)
+}
+
+// The input itself remains in storage; only the outgoing representation loses
+// the oversized attachment on the overflow recovery path.
+export function withoutUserMedia(row: WithParts): WithParts {
+  if (row.info.role !== "user") return row
+  return {
+    ...row,
+    parts: row.parts.map((part) =>
+      part.type === "file" && isMedia(part.mime)
+        ? {
+            type: "text",
+            id: part.id,
+            messageID: part.messageID,
+            sessionID: part.sessionID,
+            text: `[Attached ${part.mime}: ${part.filename ?? "file"}]`,
+          }
+        : part,
+    ),
+  }
 }
 
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {

@@ -5,6 +5,8 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import os from "os"
 import { SessionID, MessageID, PartID } from "./schema"
 import { MessageV2 } from "./message-v2"
+import { usable } from "./overflow"
+import { estimateMessages, estimatePayload } from "./summary-budget"
 import { SessionRestoration } from "./restoration"
 import { SessionRevert } from "./revert"
 import { Session } from "./session"
@@ -1523,6 +1525,7 @@ const layer = Layer.effect(
             // it reads the disk as of the compaction moment, once per
             // compaction; it is not re-run per model step.
             if (result === "continue") {
+              if (task.part.overflow) compactionToken = "compacted"
               // Step P1 (comprec-1): trigger — inject exactly once inside the
               // compaction task arm after process returns continue (B6).
               yield* SessionRestoration.apply({ sessionID }).pipe(
@@ -1690,21 +1693,66 @@ const layer = Layer.effect(
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             }
             const preparedPayload = yield* llm.preparePayload(streamInput)
-            const token = compactionToken
-            const skipEstimate = token === "compacted"
-            if (token === "compacted") compactionToken = "skip"
-            if (token === "skip") compactionToken = "none"
-            const overflow = skipEstimate ? false : yield* compaction.willOverflow({ ...preparedPayload, model })
-            if (overflow && canCompact) {
-              compactionToken = "compacted"
-              yield* sessions.removeMessage({ sessionID, messageID: handle.message.id })
-              yield* compaction.create({
+            const recoveryMarker = Effect.fnUntraced(function* () {
+              const fixed = yield* Effect.tryPromise(() => estimatePayload({ ...preparedPayload, messages: [] })).pipe(
+                Effect.orElseSucceed(() => undefined),
+              )
+              const start = pendingInputStart(msgs, currentUserIndex)
+              const protectedFrom = msgs[start]!.info.id
+              const required = msgs
+                .slice(start)
+                .filter(MessageV2.isOriginal)
+                .map((m) => (m.info.id === protectedFrom ? MessageV2.withoutUserMedia(m) : m))
+              const size = estimateMessages(yield* MessageV2.toModelMessagesEffect(required, model))
+              if (
+                model.limit.context > 0 &&
+                size + (fixed ?? 0) >= usable({ cfg: yield* config.get(), model, outputTokenMax: flags.outputTokenMax })
+              ) {
+                // Steering may have replaced the system/tools while this request was
+                // in flight. Its old overhead cannot rule out the new user's request.
+                const latest = yield* sessions.findMessage(sessionID, (m) => m.info.role === "user").pipe(Effect.orDie)
+                if (Option.isNone(latest) || latest.value.info.id === lastUser.id) return undefined
+              }
+              return {
                 sessionID,
                 agent: lastUser.agent,
                 model: lastUser.model,
                 auto: true,
                 overflow: true,
-              })
+                protectedFrom,
+                fixedInputTokens: fixed,
+              }
+            })
+            const stopForInput = Effect.fnUntraced(function* () {
+              handle.message.error = new SessionV1.ContextOverflowError({
+                message: "The required user turn and fixed request context exceed the available input budget",
+              }).toObject()
+              handle.message.finish = "error"
+              handle.message.time.completed = Date.now()
+              yield* sessions.updateMessage(handle.message)
+              yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+              return "break" as const
+            })
+            const token = compactionToken
+            const resumingOverflow = token === "compacted"
+            if (token === "compacted") compactionToken = "skip"
+            if (token === "skip") compactionToken = "none"
+            const overflow = yield* compaction.willOverflow({ ...preparedPayload, model })
+            if (resumingOverflow && model.limit.context > 0) {
+              const full = yield* Effect.tryPromise(() => estimatePayload(preparedPayload)).pipe(Effect.option)
+              if (
+                overflow ||
+                (full._tag === "Some" &&
+                  full.value >= usable({ cfg: yield* config.get(), model, outputTokenMax: flags.outputTokenMax }))
+              )
+                return yield* stopForInput()
+            }
+            if (overflow && canCompact) {
+              const marker = yield* recoveryMarker()
+              if (!marker) return yield* stopForInput()
+              compactionToken = "compacted"
+              yield* sessions.removeMessage({ sessionID, messageID: handle.message.id })
+              yield* compaction.create(marker)
               return "continue" as const
             }
             if (overflow) compactionToken = "skip"
@@ -1759,14 +1807,20 @@ const layer = Layer.effect(
             // The provider rejected the request as too long: no response finished.
             const rejected = result === "compact" && !handle.message.finish
             if (result === "compact") {
-              if (rejected) compactionToken = "compacted"
-              yield* compaction.create({
-                sessionID,
-                agent: lastUser.agent,
-                model: lastUser.model,
-                auto: true,
-                overflow: rejected,
-              })
+              if (rejected) {
+                const marker = yield* recoveryMarker()
+                if (!marker) return yield* stopForInput()
+                compactionToken = "compacted"
+                yield* compaction.create(marker)
+              } else {
+                yield* compaction.create({
+                  sessionID,
+                  agent: lastUser.agent,
+                  model: lastUser.model,
+                  auto: true,
+                  overflow: false,
+                })
+              }
             }
             // Only a step whose response finished counts. One withdrawn above for
             // compaction before sending, or rejected by the provider as too long, is
@@ -2376,6 +2430,29 @@ export const node = LayerNode.make({
     Database.node,
   ],
 })
+
+// An ordinary user can steer while another is waiting. Preserve the whole
+// unanswered batch; a synthetic continue can also be working for an input
+// retained by an earlier compaction. Resolve those original IDs in this view.
+function pendingInputStart(messages: SessionV1.WithParts[], current: number) {
+  const marker = messages[0]?.parts.some((p) => p.type === "compaction") ? messages[0] : undefined
+  const inherited = new Set<string>()
+  let start = current
+  for (let i = current; i >= 0; i--) {
+    const row = messages[i]!
+    if (row.info.role === "assistant" && !row.info.summary && row.info.finish) break
+    if (marker && MessageV2.compareChronology(row.info, marker.info) <= 0) break
+    if (row.info.role !== "user" || !MessageV2.isOriginal(row)) continue
+    const control = row.parts.find((p) => p.type === "text" && p.synthetic && p.metadata?.compaction_continue)
+    if (control?.type === "text") {
+      if (typeof control.metadata?.protected_from === "string") inherited.add(control.metadata.protected_from)
+    } else start = i
+  }
+  const original = inherited.size
+    ? messages.findIndex((row) => row.info.role === "user" && inherited.has(row.info.id))
+    : -1
+  return original >= 0 ? Math.min(start, original) : start
+}
 
 /**
  * The outcome of a run from its exit. A success is classified like a delegation

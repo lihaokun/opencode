@@ -94,12 +94,9 @@ type ConfigV1Lite = {
  * stored output is NOT model-visible and must not enter the baseline —
  * matching against it would wrongly mark files as still-present (R3).
  */
-export function buildTailText(messages: SessionV1.WithParts[], tailStartID: string | undefined): string {
-  if (!tailStartID) return ""
-  const index = messages.findIndex((msg) => msg.info.id === tailStartID)
-  if (index === -1) return ""
+export function buildTailText(messages: SessionV1.WithParts[]): string {
   const parts: string[] = []
-  for (const msg of messages.slice(index)) {
+  for (const msg of messages) {
     if (!MessageV2.assistantVisible(msg)) continue
     for (const part of msg.parts) {
       if (part.type === "text" && !part.ignored && !isRestoration(part)) parts.push(part.text)
@@ -385,19 +382,18 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
   const cfg = restorationConfig(rawConfig as ConfigV1Lite | undefined)
   if (!cfg.enabled) return
 
-  // Step P2: full message read → locate the compaction part (tail_start_id)
+  // Step P2: full message read → locate the settled compaction marker
   // and any existing sentinel.
   const messages = yield* sessions.messages({ sessionID })
 
   let compactionIdx = -1
-  let tailStartID: string | undefined
   let restorationIdx = -1
   let restoredMarker: unknown
   // A marker counts as settled only when a completed summary points at it
   // (#77): summary && finish && !error, parentID = the marker's message —
   // the same predicate filterCompacted uses. This covers both settled shapes:
-  // a tail-retaining compaction (tail_start_id set by compaction.process) and
-  // a full-summary fallback (tail_start_id undefined because there is no tail
+  // a summary with retained originals and
+  // a full-summary fallback (n = 0 because there is no tail
   // to retain). A marker whose summary is in flight, failed, or was parked on
   // a newer user message by a retry has no such assistant — restoring "before
   // that compaction" would stack the block on top of a full, un-compacted
@@ -412,7 +408,6 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
     for (const part of msg.parts) {
       if (part.type === "compaction" && settledMarkers.has(msg.info.id)) {
         compactionIdx = index
-        tailStartID = part.tail_start_id
       }
       // Retired (ignored) blocks do not count as "already restored" — a
       // transcript whose only sentinels are ignored must re-fire.
@@ -456,7 +451,8 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
     (containsPath(file, instance) ||
       allowed("external_directory", FSUtil.normalizePathPattern(path.join(path.dirname(file), "*"))))
   const candidates = collectCandidates(messages, todos).filter((c) => c.kind !== "skill" || allowed("skill", c.ref))
-  const tailText = buildTailText(MessageV2.filterCompacted(messages.toReversed()), tailStartID)
+  const projected = MessageV2.filterCompacted(messages.toReversed())
+  const tailText = buildTailText(projected.slice(2))
   const materials = yield* materializeCandidates(candidates, tailText, { fs, skill: skillOpt, todos, cfg, readable })
   // Step P6: render within budget (max_files per file, exhaustion degrades to
   // bounded reference lines) into sentinel + Files/Skills/Todos + Not restored.

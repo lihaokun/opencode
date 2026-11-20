@@ -360,6 +360,7 @@ export type AssistantMessage = {
     root: string
   }
   summary?: boolean
+  n?: number
   cost: number
   tokens: {
     total?: number
@@ -625,6 +626,8 @@ export type CompactionPart = {
   auto: boolean
   overflow?: boolean
   tail_start_id?: string
+  fixed_input_tokens?: number
+  protected_from?: string
 }
 
 export type Part =

@@ -16366,6 +16366,10 @@
           "summary": {
             "type": "boolean"
           },
+          "n": {
+            "type": "integer",
+            "minimum": 0
+          },
           "cost": {
             "type": "number"
           },
@@ -17183,6 +17187,14 @@
             "type": "boolean"
           },
           "tail_start_id": {
+            "type": "string",
+            "pattern": "^msg"
+          },
+          "fixed_input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "protected_from": {
             "type": "string",
             "pattern": "^msg"
           }

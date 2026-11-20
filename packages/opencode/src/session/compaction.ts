@@ -2,7 +2,6 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Session } from "./session"
-import { isRestoration } from "./restoration"
 import { SessionID, MessageID, PartID } from "./schema"
 import { Provider } from "@/provider/provider"
 import { MessageV2 } from "./message-v2"
@@ -24,7 +23,11 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
-import { formatExitCodeLine, summarizeToolText, summarizeToolError } from "@opencode-ai/core/session/tool-result-projection"
+import {
+  formatExitCodeLine,
+  summarizeToolText,
+  summarizeToolError,
+} from "@opencode-ai/core/session/tool-result-projection"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 
 export const Event = SessionCompactionEvent
@@ -37,12 +40,6 @@ const MAX_PRESERVE_RECENT_TOKENS = 15_000
 type Turn = {
   start: number
   end: number
-  id: MessageID
-}
-
-type Tail = {
-  start: number
-  id: MessageID
 }
 
 type CompletedCompaction = {
@@ -125,6 +122,24 @@ function preserveRecentBudget(input: { cfg: ConfigV1.Info; model: Provider.Model
   )
 }
 
+// Old pending overflow markers lack a request ID. For usage-triggered compaction,
+// several users may already be waiting after the last completed working step.
+function protectedStart(
+  originals: SessionV1.WithParts[],
+  marker: SessionV1.CompactionPart | undefined,
+  auto: boolean,
+  overflow?: boolean,
+) {
+  if (!marker) return -1
+  if (marker.protected_from) return originals.findIndex((row) => row.info.id === marker.protected_from)
+  if (overflow) return originals.findLastIndex((row) => row.info.role === "user")
+  if (!auto) return -1
+  const finished = originals.findLast((row) => row.info.role === "assistant" && row.info.finish && !row.info.error)
+  return finished
+    ? originals.findIndex((row) => row.info.role === "user" && MessageV2.compareChronology(row.info, finished.info) > 0)
+    : -1
+}
+
 function turns(messages: SessionV1.WithParts[]) {
   const result: Turn[] = []
   for (let i = 0; i < messages.length; i++) {
@@ -134,7 +149,6 @@ function turns(messages: SessionV1.WithParts[]) {
     result.push({
       start: i,
       end: messages.length,
-      id: msg.info.id,
     })
   }
   for (let i = 0; i < result.length - 1; i++) {
@@ -159,10 +173,7 @@ function splitTurn(input: {
         model: input.model,
       })
       if (size > input.budget) continue
-      return {
-        start,
-        id: input.messages[start]!.info.id,
-      } satisfies Tail
+      return start
     }
     return undefined
   })
@@ -193,6 +204,8 @@ export interface Interface {
     model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
     auto: boolean
     overflow?: boolean
+    protectedFrom?: MessageID
+    fixedInputTokens?: number
   }) => Effect.Effect<void>
 }
 
@@ -253,28 +266,35 @@ const layer = Layer.effect(
 
     const select = Effect.fn("SessionCompaction.select")(function* (input: {
       messages: SessionV1.WithParts[]
+      available?: number
       cfg: ConfigV1.Info
       model: Provider.Model
     }) {
       const limit = input.cfg.compaction?.tail_turns
-      if (limit !== undefined && limit <= 0) return { head: input.messages, tail_start_id: undefined }
-      const budget = preserveRecentBudget({ cfg: input.cfg, model: input.model })
+      if (limit !== undefined && limit <= 0) return input.messages
+      const budget = Math.min(preserveRecentBudget({ cfg: input.cfg, model: input.model }), input.available ?? Infinity)
+      const measure =
+        input.available === undefined
+          ? estimate
+          : Effect.fnUntraced(function* (args: { messages: SessionV1.WithParts[]; model: Provider.Model }) {
+              return estimateMessages(yield* MessageV2.toModelMessagesEffect(args.messages, args.model))
+            })
       const all = turns(input.messages)
-      if (!all.length) return { head: input.messages, tail_start_id: undefined }
+      if (!all.length) return input.messages
       const recent = limit === undefined ? all : all.slice(-limit)
 
       let total = 0
-      let keep: Tail | undefined
+      let keep: number | undefined
       for (let i = recent.length - 1; i >= 0; i--) {
         const turn = recent[i]!
         // estimate lazily so cost stays proportional to the retained tail, not the whole session
-        const size = yield* estimate({
+        const size = yield* measure({
           messages: input.messages.slice(turn.start, turn.end),
           model: input.model,
         })
         if (total + size <= budget) {
           total += size
-          keep = { start: turn.start, id: turn.id }
+          keep = turn.start
           continue
         }
         const remaining = budget - total
@@ -283,20 +303,17 @@ const layer = Layer.effect(
           turn,
           model: input.model,
           budget: remaining,
-          estimate,
+          estimate: measure,
         })
-        if (split) keep = split
+        if (split !== undefined) keep = split
         else if (!keep) {
           yield* Effect.logInfo("tail fallback", { budget, size, total })
         }
         break
       }
 
-      if (!keep || keep.start === 0) return { head: input.messages, tail_start_id: undefined }
-      return {
-        head: input.messages.slice(0, keep.start),
-        tail_start_id: keep.id,
-      }
+      if (!keep) return input.messages
+      return input.messages.slice(0, keep)
     })
 
     // goes backwards through parts until there are PRUNE_PROTECT tokens worth of tool
@@ -375,41 +392,43 @@ const layer = Layer.effect(
       // A retry can have new inputs after its marker. Those belong to the
       // next turn, not to this summary or its retained tail.
       const history = compactionPart ? input.messages.slice(0, input.messages.indexOf(parent)) : input.messages
-      let messages = history
-      let replay:
-        | {
-            info: SessionV1.User
-            parts: SessionV1.Part[]
-          }
-        | undefined
-      if (input.overflow) {
-        const idx = input.messages.findIndex((m) => m.info.id === input.parentID)
-        for (let i = idx - 1; i >= 0; i--) {
-          const msg = input.messages[i]
-          if (msg.info.role === "user" && !msg.parts.some((p) => p.type === "compaction")) {
-            replay = { info: msg.info, parts: msg.parts }
-            messages = input.messages.slice(0, i)
-            break
-          }
-        }
-        const hasContent =
-          replay && messages.some((m) => m.info.role === "user" && !m.parts.some((p) => p.type === "compaction"))
-        if (!hasContent) {
-          replay = undefined
-          messages = history
-        }
-      }
-
+      const originals = history.filter(MessageV2.isOriginal)
+      const anchor = compactionPart?.protected_from
+      const start = protectedStart(originals, compactionPart, input.auto, input.overflow)
+      const mandatory = start < 0 ? [] : originals.slice(start)
+      const historyForSummary = start < 0 ? originals : originals.slice(0, start)
+      const currentInput = originals.findLast((m) => m.info.role === "user")?.info
+      const configUser = userMessage.id === parent.info.id && currentInput?.role === "user" ? currentInput : userMessage
       const agent = yield* agents.get("compaction")
       const model = agent.model
         ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
         : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+      const ordinaryModel = input.auto ? configUser.model : userMessage.model
+      const primary =
+        model.providerID === ordinaryModel.providerID && model.id === ordinaryModel.modelID
+          ? model
+          : yield* provider.getModel(ordinaryModel.providerID, ordinaryModel.modelID).pipe(Effect.orDie)
       const cfg = yield* config.get()
-      const prior = completedCompactions(messages)
-      const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
-      const previousSummary = prior.at(-1)?.summary
-      const historyForSummary = messages.filter((_, index) => !hidden.has(index))
-      let selected = yield* select({ messages: historyForSummary, cfg, model })
+      const previousSummary = completedCompactions(history).at(-1)?.summary
+      const budgeted = primary.limit.context > 0 && mandatory.length > 0
+      const rawRequired = mandatory.map((m) =>
+        input.overflow && m === mandatory[0] ? MessageV2.withoutUserMedia(m) : m,
+      )
+      const room = budgeted
+        ? usable({ cfg, model: primary, outputTokenMax: flags.outputTokenMax }) -
+          (anchor === configUser.id ? (compactionPart?.fixed_input_tokens ?? 0) : 0) -
+          estimateMessages(yield* MessageV2.toModelMessagesEffect(rawRequired, primary))
+        : Infinity
+      const optionalBudget = Math.max(
+        0,
+        Math.min(room, Math.floor(usable({ cfg, model: primary, outputTokenMax: flags.outputTokenMax }) / 4)),
+      )
+      let head = yield* select({
+        messages: historyForSummary,
+        cfg,
+        model: budgeted ? primary : model,
+        available: budgeted ? optionalBudget : undefined,
+      })
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
         "experimental.session.compacting",
@@ -471,29 +490,31 @@ const layer = Layer.effect(
         return { ...stream, preparedPayload }
       })
       const summarize = Effect.fnUntraced(function* (stream: LLM.StreamInput) {
+        msg.n = mandatory.length + historyForSummary.length - head.length
+        yield* session.updateMessage(msg)
         const processor = yield* processors.create({ assistantMessage: msg, sessionID: input.sessionID, model })
         const result = yield* processor.process(stream)
         return { result, error: processor.summaryOverflow }
       })
-      const original = yield* prepare(selected.head)
-      const attempt = yield* Effect.gen(function* () {
+      if (room <= 0 || (anchor && start < 0)) {
+        msg.error = new SessionV1.ContextOverflowError({
+          message:
+            room <= 0
+              ? "Required user turn plus system and tools exceeds the available input budget"
+              : "Required user input is unavailable for compaction",
+        }).toObject()
+        msg.finish = "error"
+        msg.time.completed = Date.now()
         yield* session.updateMessage(msg)
+        yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: msg.error })
+        return "stop"
+      }
+      const original = yield* prepare(head)
+      const attempt = yield* Effect.gen(function* () {
         let attempt = yield* summarize(original)
-        if (
-          attempt.result === "compact" &&
-          compactionPart &&
-          !replay &&
-          selected.head.length > 1 &&
-          cfg.compaction?.tail_turns !== 0
-        ) {
-          const primary = agent.model
-            ? yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
-            : model
+        if (attempt.result === "compact" && compactionPart && head.length > 1 && cfg.compaction?.tail_turns !== 0) {
           const budget = usable({ cfg, model, outputTokenMax: flags.outputTokenMax })
-          const cap = Math.min(
-            Math.floor(usable({ cfg, model: primary, outputTokenMax: flags.outputTokenMax }) / 4),
-            cfg.compaction?.preserve_recent_tokens ?? Infinity,
-          )
+          const cap = Math.min(optionalBudget, cfg.compaction?.preserve_recent_tokens ?? Infinity)
           if (budget > 0 && cap > 0) {
             const originalSize = yield* Effect.promise(() => estimatePayload(original.preparedPayload))
             const sample = (yield* session.get(input.sessionID).pipe(Effect.orDie)).metadata?.summaryBudgetSample
@@ -520,7 +541,7 @@ const layer = Layer.effect(
             // Work backwards once. Estimate the amount removed in summary form
             // separately from the cost of replaying that group as model messages.
             const candidates: { start: number; reduction: number }[] = []
-            let end = selected.head.length
+            let end = head.length
             const replayCost = Effect.fnUntraced(function* (slice: SessionV1.WithParts[]) {
               return estimateMessages(yield* MessageV2.toModelMessagesEffect(slice, primary))
             })
@@ -544,15 +565,15 @@ const layer = Layer.effect(
             let cursor = plan.next()
             while (!cursor.done && attempt.result === "compact") {
               const { start, target } = cursor.value
-              const head = historyForSummary.slice(0, start)
-              const stream = yield* prepare(head)
+              const candidate = historyForSummary.slice(0, start)
+              const stream = yield* prepare(candidate)
               const reduction = originalSize - (yield* Effect.promise(() => estimatePayload(stream.preparedPayload)))
               if (reduction < target) {
                 cursor = plan.next(undefined)
                 continue
               }
               if ((yield* replayCost(historyForSummary.slice(start))) > cap) break
-              selected = { head, tail_start_id: historyForSummary[start]!.info.id }
+              head = candidate
               attempt = yield* summarize(stream)
               cursor = plan.next(reduction)
             }
@@ -581,7 +602,7 @@ const layer = Layer.effect(
       )
       if (attempt.result === "compact") {
         msg.error = new SessionV1.ContextOverflowError({
-          message: replay
+          message: mandatory.length
             ? "Conversation history too large to compact - exceeds model context limit"
             : "Session too large to compact - context exceeds model limit even after stripping media",
         }).toObject()
@@ -593,109 +614,70 @@ const layer = Layer.effect(
       }
       if (attempt.result !== "continue" || msg.error) return "stop"
 
-      if (compactionPart && compactionPart.tail_start_id !== selected.tail_start_id) {
-        yield* session.updatePart({
-          ...compactionPart,
-          tail_start_id: selected.tail_start_id,
-        })
-      }
-
       if (input.auto) {
-        // A user can change configuration while the summary is streaming.
-        const current = (yield* latestUser(input.sessionID)) ?? userMessage
-        if (replay) {
-          const original = current.id === parent.info.id ? replay.info : current
-          const replayMsg = yield* session.updateMessage({
+        const continuationUser = Effect.fnUntraced(function* () {
+          const newest = yield* latestUser(input.sessionID)
+          return newest && newest.id !== parent.info.id ? newest : configUser
+        })
+        const current = yield* continuationUser()
+        const info = yield* provider.getProvider(current.model.providerID)
+        if (
+          (yield* plugin.trigger(
+            "experimental.compaction.autocontinue",
+            {
+              sessionID: input.sessionID,
+              agent: current.agent,
+              model: yield* provider.getModel(current.model.providerID, current.model.modelID).pipe(Effect.orDie),
+              provider: {
+                source: info.source,
+                info,
+                options: info.options,
+              },
+              message: current,
+              overflow: input.overflow === true,
+            },
+            { enabled: true },
+          )).enabled
+        ) {
+          // The plugin may await external work while another user arrives.
+          const next = yield* continuationUser()
+          const continueMsg = yield* session.updateMessage({
             id: MessageID.ascending(),
             role: "user",
             sessionID: input.sessionID,
             time: { created: Date.now() },
-            agent: original.agent,
-            model: original.model,
+            agent: next.agent,
+            model: next.model,
             format:
-              original.format?.type === "json_schema"
-                ? new SessionV1.OutputFormatJsonSchema(original.format)
-                : original.format?.type === "text"
-                  ? new SessionV1.OutputFormatText(original.format)
+              next.format?.type === "json_schema"
+                ? new SessionV1.OutputFormatJsonSchema(next.format)
+                : next.format?.type === "text"
+                  ? new SessionV1.OutputFormatText(next.format)
                   : undefined,
-            tools: original.tools,
-            system: original.system,
+            tools: next.tools,
+            system: next.system,
           })
-          for (const part of replay.parts) {
-            if (part.type === "compaction" || isRestoration(part)) continue
-            const replayPart =
-              part.type === "file" && MessageV2.isMedia(part.mime)
-                ? { type: "text" as const, text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` }
-                : part
-            yield* session.updatePart({
-              ...replayPart,
-              id: PartID.ascending(),
-              messageID: replayMsg.id,
-              sessionID: input.sessionID,
-            })
-          }
-        }
-
-        if (!replay) {
-          const info = yield* provider.getProvider(current.model.providerID)
-          if (
-            (yield* plugin.trigger(
-              "experimental.compaction.autocontinue",
-              {
-                sessionID: input.sessionID,
-                agent: current.agent,
-                model: yield* provider.getModel(current.model.providerID, current.model.modelID).pipe(Effect.orDie),
-                provider: {
-                  source: info.source,
-                  info,
-                  options: info.options,
-                },
-                message: current,
-                overflow: input.overflow === true,
-              },
-              { enabled: true },
-            )).enabled
-          ) {
-            // The plugin may await external work while another user arrives.
-            const next = (yield* latestUser(input.sessionID)) ?? current
-            const continueMsg = yield* session.updateMessage({
-              id: MessageID.ascending(),
-              role: "user",
-              sessionID: input.sessionID,
-              time: { created: Date.now() },
-              agent: next.agent,
-              model: next.model,
-              format:
-                next.format?.type === "json_schema"
-                  ? new SessionV1.OutputFormatJsonSchema(next.format)
-                  : next.format?.type === "text"
-                    ? new SessionV1.OutputFormatText(next.format)
-                    : undefined,
-              tools: next.tools,
-              system: next.system,
-            })
-            const text =
-              (input.overflow
-                ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
-                : "") +
-              "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
-            yield* session.updatePart({
-              id: PartID.ascending(),
-              messageID: continueMsg.id,
-              sessionID: input.sessionID,
-              type: "text",
-              // Internal marker for auto-compaction followups so provider plugins
-              // can distinguish them from manual post-compaction user prompts.
-              // This is not a stable plugin contract and may change or disappear.
-              metadata: { compaction_continue: true },
-              synthetic: true,
-              text,
-              time: {
-                start: Date.now(),
-                end: Date.now(),
-              },
-            })
-          }
+          const text =
+            (input.overflow
+              ? "The previous request exceeded the provider's size limit. Continue from the retained user input and tool results.\n\n"
+              : "") +
+            "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+          yield* session.updatePart({
+            id: PartID.ascending(),
+            messageID: continueMsg.id,
+            sessionID: input.sessionID,
+            type: "text",
+            // Internal marker for auto-compaction followups so provider plugins
+            // can distinguish them from manual post-compaction user prompts.
+            // This is not a stable plugin contract and may change or disappear.
+            metadata: { compaction_continue: true, ...(mandatory[0] ? { protected_from: mandatory[0].info.id } : {}) },
+            synthetic: true,
+            text,
+            time: {
+              start: Date.now(),
+              end: Date.now(),
+            },
+          })
         }
       }
 
@@ -708,6 +690,8 @@ const layer = Layer.effect(
       agent: string
       model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
       auto: boolean
+      protectedFrom?: MessageID
+      fixedInputTokens?: number
       overflow?: boolean
     }) {
       const msg = yield* session.updateMessage({
@@ -725,6 +709,8 @@ const layer = Layer.effect(
         type: "compaction",
         auto: input.auto,
         overflow: input.overflow,
+        protected_from: input.protectedFrom,
+        fixed_input_tokens: input.fixedInputTokens,
       })
     })
 

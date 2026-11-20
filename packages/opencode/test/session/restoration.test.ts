@@ -137,7 +137,7 @@ const itTight = testEffect(tightEnv)
 
 it.effect("buildTailText joins everything from the tail anchor onward", () =>
   Effect.gen(function* () {
-    expect(buildTailText([], undefined)).toBe("")
+    expect(buildTailText([])).toBe("")
 
     const messages = [
       { info: { id: "m1" }, parts: [{ type: "text", text: "early" }] },
@@ -154,9 +154,7 @@ it.effect("buildTailText joins everything from the tail anchor onward", () =>
       },
     ] as unknown as SessionV1.WithParts[]
 
-    expect(buildTailText(messages, undefined)).toBe("")
-    expect(buildTailText(messages, "m_missing")).toBe("")
-    expect(buildTailText(messages, "m2")).toBe("kept\n\nout")
+    expect(buildTailText(messages.slice(messages.findIndex((m) => m.info.id === "m2")))).toBe("kept\n\nout")
   }),
 )
 
@@ -477,7 +475,6 @@ it.instance("restored part reaches the model messages", () =>
   }),
 )
 
-
 itDisabled.instance("apply respects restoration.enabled = false", () =>
   Effect.gen(function* () {
     const test = yield* TestInstance
@@ -630,7 +627,7 @@ it.effect("buildTailText excludes compacted tool outputs from the dedup baseline
       },
     ] as unknown as SessionV1.WithParts[]
 
-    const tail = buildTailText(messages, "m2")
+    const tail = buildTailText(messages.slice(messages.findIndex((m) => m.info.id === "m2")))
     expect(tail).toContain("VISIBLE BODY")
     expect(tail).not.toContain("FILE BODY")
   }),

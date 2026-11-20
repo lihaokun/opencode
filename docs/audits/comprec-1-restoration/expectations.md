@@ -93,3 +93,5 @@ budget_tokens；渲染幂等（同输入同输出）。collect/materialize/build
 ## 2026-11-19 恢复材料的最终投影
 
 状态 PBT 逐轮验证两份文件的当前版本；包含普通压缩、重放、停止使用旧恢复块。当前授权由 agent、会话及本次工具可见性共同约束。不可访问的历史路径只影响自身，max_files 之外的正文不消耗其他材料预算。测试对照 provider 可见历史与实际磁盘版本；额外验证内建 skill、普通用户文本标记和长 missing reason。
+
+**成功即持久可读。** 即使进程停在摘要 step-finish 和 process 返回之间，再从 DB 读取得到的也是正确的 n、原消息 ID 和晚到输入。验证普通用量、预检、provider 拒绝、前两种和第三种依次发生、并发输入、媒体占位、跨页旧指针及 fork。必保工作量独立于额外尾部上限。[修复契约](../../fixes/session-fix-summary-retained-count.md)

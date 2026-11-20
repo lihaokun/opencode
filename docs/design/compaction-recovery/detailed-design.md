@@ -191,3 +191,7 @@ msgs = yield* SessionRestoration.apply({ sessionID: chat.id }).pipe(
 摘要请求被拒后，以确切缺口或同模型成功请求的实际输入加估值差选择起始档，按可用预算的 5% 逐档增加到 25%。每个更短的候选最多发一次；保留区另受主模型预算和配置约束。成功时使用选定边界进行 restoration；仅最终用尽才报告溢出。见[修复说明](../../fixes/session-fix-summary-overflow-tail.md)。
 
 2026-11-19 全量复核修订：自动重读以前提“当前 agent/session 仍允许 read 与适用的 external_directory，或允许该 skill”为准。文件去重仅依据当前模型仍可见的材料，不把即将退役的旧恢复块作为基准；原始 user 文本不参与恢复块的归属判定。恢复文本 part 记下对应 markerID，重放用户轮不复制旧恢复块。每个候选失败独立降级；只有实际内联的正文扣减预算，参考行中的路径和原因均有长度上限。
+
+### 摘要保留条数（2026-11-20）
+
+成功摘要 assistant 自带可选非负整数 `n`。标记之前最后 n 条原消息及标记后的输入由历史投影组装，沿用原 ID。旧 `tail_start_id` 仅在加载或复制旧会话时解释。普通请求超限保留原始输入和后续工具进展，续行使用独立控制消息；必保区单独核算，额外旧历史按 5% 分档及 25% 上限选择。见[写入与恢复契约](../../fixes/session-fix-summary-retained-count.md)。
