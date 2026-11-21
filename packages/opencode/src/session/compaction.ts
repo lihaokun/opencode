@@ -25,6 +25,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import {
   formatExitCodeLine,
+  hasOutputPath,
   summarizeToolText,
   summarizeToolError,
 } from "@opencode-ai/core/session/tool-result-projection"
@@ -75,7 +76,7 @@ const serialize = (message: SessionV1.WithParts) => {
           : summarizeToolText([part.state.output, ...attachments].join("\n"))
         const saved = part.state.metadata.outputPath
         const text =
-          !part.state.time.compacted && typeof saved === "string" && saved && !preview.includes(saved)
+          !part.state.time.compacted && typeof saved === "string" && saved && !hasOutputPath(preview, saved)
             ? preview + "\nFull output saved to: " + saved
             : preview
         const exit = part.state.time.compacted ? undefined : formatExitCodeLine(part.state.metadata)

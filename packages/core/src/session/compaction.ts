@@ -7,7 +7,7 @@ import type { EventV2 } from "../event"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
-import { savedOutputPath, summarizeToolText, summarizeToolError } from "./tool-result-projection"
+import { hasOutputPath, savedOutputPath, summarizeToolText, summarizeToolError } from "./tool-result-projection"
 import { Token } from "../util/token"
 
 const DEFAULT_BUFFER = 20_000
@@ -94,7 +94,7 @@ export function serializeToolContent(content: SessionMessage.ToolStateCompleted[
   for (const item of content) {
     if (item.type === "text") {
       const file = savedOutputPath(item.text)
-      if (file && !preview.includes(file)) paths.add(file)
+      if (file && !hasOutputPath(preview, file)) paths.add(file)
     }
   }
   // Leave room for a maximum-length artifact path even when the text preview
@@ -108,7 +108,9 @@ export function serializeToolContent(content: SessionMessage.ToolStateCompleted[
     remaining -= line.length
   }
   const omitted = paths.size - references.length
-  return preview + references.join("") + (omitted ? `\n[${omitted} more artifact paths in the original tool result]` : "")
+  return (
+    preview + references.join("") + (omitted ? `\n[${omitted} more artifact paths in the original tool result]` : "")
+  )
 }
 
 const serialize = (message: SessionMessage.Message) => {

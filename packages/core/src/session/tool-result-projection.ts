@@ -49,9 +49,14 @@ export function savedOutputPath(text: string) {
   )?.[1]
 }
 
+export function hasOutputPath(preview: string, file: string) {
+  const pointer = "Full output saved to: " + file
+  return preview.endsWith(pointer) || preview.includes(pointer + "\n")
+}
+
 export function summarizeToolError(text: string) {
   const preview = summarizeToolText(text)
   if (preview === text) return preview
   const saved = savedOutputPath(text)
-  return saved && !preview.includes(saved) ? preview + "\nFull output saved to: " + saved : preview
+  return saved && !hasOutputPath(preview, saved) ? preview + "\nFull output saved to: " + saved : preview
 }
