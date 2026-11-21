@@ -67,7 +67,7 @@
 
 ## 7. 不变量契约（property-based）
 
-本子计划的行为时序性强（进程/通知/取消），四组 PBT 性质（C11）未覆盖此模块；
+[历史记录，2026-11-19 的生成式测试已取代此覆盖说明] 本子计划的行为时序性强（进程/通知/取消），四组 PBT 性质（C11）未覆盖此模块；
 不变量以确定性测试背书：cancel 不投递、buffer 有界、结算清理、hasLiveDescendant
 自指排除。若未来增加纯函数性质的输入形状（如 appendCapped 独立化），补 PBT；
 当前 `appendCapped` 为模块内联函数，单测经真进程用例覆盖（cap 断言）。
@@ -91,3 +91,16 @@ N/A——单实现（V1 tool 层）；ZCode 契约为参照非对齐目标（架
 ## 2026-11-19 后台状态机与通知
 
 增加带 seed 的 30 组 start/read/kill/finish 操作序列；读取与停止核对实际 stdout 和所有权。真进程覆盖不响应 TERM 的子进程、父 shell 先退出、配置字节/行预算与 UTF-8、通知失败、同毫秒排序。真实提示词通路验证完成通知继承当前身份。
+
+## 2026-11-21 验收补充
+
+- P5 优先返回完整句柄；启动正文符合 tool_output 配置，标题/回显与输出切点均不制造孤立代理。
+- P7 使用投递时目标 Session 的身份。检查用户选择命名 variant 与显式默认 variant，既检查送入对话的消息，也检查完成后持久化的 Session。
+- P9 等待当前 runner 及其任务结束，重新观察取消中已经提交的登记。由 Deferred 强制造成在第一次观察之后才出现的第二个 shell，并检验其最终为 cancelled。
+- 正常退出并主动留下后台进程的 launcher 遵循与前台 shell 相同的所有权约定，见架构文档。关闭活动进程组及 TERM 后升级仍有真进程回归。
+
+### 本轮 Step 5 的机械验证
+
+shell-background.test.ts、run-state.test.ts 与 CLI 的真实进程测试验证启动、停止、通知和输出。独立复审与未覆盖范围见 [本轮修复记录](../../fixes/runtime-fix-pr60-boundary-regressions.md)。本地仓库没有通用 contract_audit 生成器。本子计划的功能与合并验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。
+
+父会话的取消遍历所有已登记的 agent 委派关系，包括已结算的中间节点。只有仍在运行的所属任务会被取消；已完成的委派保留终态，其他会话的任务继续执行。

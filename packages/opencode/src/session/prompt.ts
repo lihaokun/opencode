@@ -182,15 +182,6 @@ const layer = Layer.effect(
 
     const deliverAsync = Effect.fn("SessionPrompt.deliverAsync")(function* (input: PromptInput, identity?: "current") {
       const target = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      const message =
-        identity === "current"
-          ? {
-              ...input,
-              agent: target.agent ?? (yield* agents.defaultInfo()).name,
-              model: target.model ? { providerID: target.model.providerID, modelID: target.model.id } : undefined,
-              variant: target.model?.variant === "default" ? undefined : target.model?.variant,
-            }
-          : input
       const here = yield* InstanceState.context
 
       // Everything the fork does is reported this way, or the failure escapes
@@ -216,7 +207,7 @@ const layer = Layer.effect(
       // Same directory means this instance already is the target's, and loading
       // it again would be a detour to the same place.
       if (target.directory === here.directory) {
-        yield* report(prompt(message))
+        yield* report(prompt(input, identity))
         return
       }
 
@@ -236,7 +227,7 @@ const layer = Layer.effect(
           ),
         )
       }
-      yield* report(store.value.provide({ directory: target.directory }, prompt(message)))
+      yield* report(store.value.provide({ directory: target.directory }, prompt(input, identity)))
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -778,7 +769,18 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (
+      request: PromptInput,
+      target?: Session.Info,
+    ) {
+      const input = target
+        ? {
+            ...request,
+            agent: target.agent,
+            model: target.model ? { providerID: target.model.providerID, modelID: target.model.id } : undefined,
+            variant: target.model?.variant === "default" ? undefined : target.model?.variant,
+          }
+        : request
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -792,7 +794,7 @@ const layer = Layer.effect(
       const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
-        !input.variant && ag.variant && same
+        !target && !input.variant && ag.variant && same
           ? yield* provider
               .getModel(model.providerID, model.modelID)
               .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
@@ -815,12 +817,15 @@ const layer = Layer.effect(
         format: input.format,
       }
 
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      // A completion observes the session identity. It must never write an old
+      // observation over a user selection, including a switch during delivery.
+      const current = target ?? (yield* sessions.get(input.sessionID).pipe(Effect.orDie))
       if (
-        current.agent !== info.agent ||
-        current.model?.providerID !== info.model.providerID ||
-        current.model?.id !== info.model.modelID ||
-        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
+        !target &&
+        (current.agent !== info.agent ||
+          current.model?.providerID !== info.model.providerID ||
+          current.model?.id !== info.model.modelID ||
+          (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant)
       ) {
         yield* sessions.setAgentModel({
           sessionID: input.sessionID,
@@ -1195,12 +1200,12 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
+    const prompt: (input: PromptInput, identity?: "current") => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
       "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
+    )(function* (input: PromptInput, identity?: "current") {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input)
+      const message = yield* createUserMessage(input, identity === "current" ? session : undefined)
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []

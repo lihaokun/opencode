@@ -1,6 +1,6 @@
 import { expect } from "bun:test"
 import path from "path"
-import { Cause, Effect, Exit, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { FastCheck, TestClock } from "effect/testing"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -758,4 +758,152 @@ it.instance(
       expect(result.metadata).not.toHaveProperty("outputPath")
     }),
   { config: { tool_output: { max_bytes: 8192, max_lines: 8 } } },
+)
+
+it.instance(
+  "session stop covers shell admission during another job's finalizer",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* SessionRunState.Service
+      const jobs = yield* BackgroundJob.Service
+      const tools = yield* initTools
+      const ctx = makeCtx()
+      const fixture = yield* TestInstance
+      const ready = yield* Deferred.make<void>()
+      const closing = yield* Deferred.make<void>()
+      const admissionDone = yield* Deferred.make<void>()
+      yield* jobs.start({
+        type: "test",
+        metadata: { sessionId: ctx.sessionID },
+        run: Effect.never.pipe(
+          Effect.ensuring(Deferred.succeed(closing, undefined).pipe(Effect.andThen(Deferred.await(admissionDone)))),
+        ),
+      })
+      // Model a tool dispatch whose admission is already committed: the
+      // producer must join its registration even if cancellation arrives. The
+      // actual shell lifecycle still runs in an interruptible job scope.
+      const admitted = yield* Deferred.make<{ id: string; checkAfter: number }>()
+      const admission = Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(ready, undefined)
+          yield* Deferred.await(closing)
+          const dispatch = yield* restore(
+            tools.shell.execute(
+              {
+                command: `bun -e "console.log('late-shell-ready'); await Bun.sleep(1500); await Bun.write('survived-stop', 'yes')"`,
+                run_in_background: true,
+              },
+              ctx,
+            ),
+          ).pipe(Effect.forkChild)
+          const started = yield* Fiber.join(dispatch)
+          const id = startedTaskID(started)
+          yield* waitUntilOutput(tools.output, ctx, id, "late-shell-ready")
+          yield* Deferred.succeed(admitted, { id, checkAfter: Date.now() + 1800 })
+        }),
+      ).pipe(Effect.ensuring(Deferred.succeed(admissionDone, undefined)))
+      yield* state
+        .ensureRunning(ctx.sessionID, Effect.die("runner interrupted"), admission.pipe(Effect.andThen(Effect.never)))
+        .pipe(Effect.exit, Effect.forkScoped)
+      yield* Deferred.await(ready)
+      yield* state.cancel(ctx.sessionID)
+      const observed = yield* Deferred.await(admitted)
+      expect((yield* jobs.get(observed.id))?.status).toBe("cancelled")
+      // A registry-only cancellation would still let the worker write its file.
+      yield* Effect.sleep(Math.max(0, observed.checkAfter - Date.now()))
+      expect(yield* Effect.promise(() => Bun.file(path.join(fixture.directory, "survived-stop")).exists())).toBe(false)
+      expect((yield* jobs.list()).filter((job) => job.status === "running")).toEqual([])
+    }),
+  15_000,
+)
+
+it.instance(
+  "a long background command returns its handle within the configured launch budget",
+  () =>
+    Effect.gen(function* () {
+      const tools = yield* initTools
+      const ctx = makeCtx()
+      const started = yield* tools.shell.execute(
+        { command: `bun -e "/* ${"q".repeat(8000)} */"`, run_in_background: true },
+        ctx,
+      )
+      expect(started.output).toContain(startedTaskID(started))
+      expect(Buffer.byteLength(started.output)).toBeLessThanOrEqual(1024)
+      expect(started.output.split("\n").length).toBeLessThanOrEqual(3)
+    }),
+  { config: { tool_output: { max_bytes: 1024, max_lines: 3 } } },
+)
+
+it.instance(
+  "capping background output at an astral character keeps complete scalars",
+  () =>
+    Effect.gen(function* () {
+      const tools = yield* initTools
+      const jobs = yield* BackgroundJob.Service
+      const ctx = makeCtx()
+      const run = Effect.runPromiseWith(yield* Effect.context())
+      yield* Effect.promise(() =>
+        FastCheck.assert(
+          FastCheck.asyncProperty(FastCheck.integer({ min: 0x10000, max: 0x10ffff }), async (point) => {
+            const started = await run(
+              tools.shell.execute(
+                {
+                  command: `bun -e "console.log(String.fromCodePoint(${point})); for(let i=0;i<199;i++) console.log('x'.repeat(999)); console.log('x'.repeat(997))"`,
+                  run_in_background: true,
+                },
+                ctx,
+              ),
+            )
+            const id = startedTaskID(started)
+            await run(jobs.wait({ id }))
+            const result = await run(tools.output.execute({ task_id: id, tail_lines: 300 }, ctx))
+            const output = result.output.split("\n").slice(2).join("\n")
+            expect(output.isWellFormed()).toBe(true)
+            expect(output.endsWith("x".repeat(997))).toBe(true)
+          }),
+          { seed: 60021, numRuns: 6 },
+        ),
+      )
+    }),
+  { config: { tool_output: { max_bytes: 300000, max_lines: 300 } } },
+)
+
+it.instance("parent interrupt traverses settled delegations to a live descendant shell", () =>
+  Effect.gen(function* () {
+    const jobs = yield* BackgroundJob.Service
+    const state = yield* SessionRunState.Service
+    const tools = yield* initTools
+    const grandchild = SessionID.make("ses_bg_grandchild")
+    const ctx = makeCtx({ session: grandchild })
+    for (const [caller, child] of [
+      [otherSessionID, grandchild],
+      [sessionID, otherSessionID],
+    ] as const) {
+      yield* jobs.start({
+        id: child,
+        type: "agent",
+        metadata: { parentSessionId: caller, sessionId: child },
+        run: Effect.succeed("finished"),
+      })
+      yield* jobs.wait({ id: child })
+    }
+    const unrelated = yield* Deferred.make<void>()
+    const neighbor = yield* jobs.start({
+      type: "shell",
+      metadata: { sessionId: "ses_unrelated" },
+      run: Deferred.await(unrelated).pipe(Effect.as("done")),
+    })
+    const shell = yield* tools.shell.execute(
+      { command: `bun -e "console.log(12345); await Bun.sleep(4000)"`, run_in_background: true },
+      ctx,
+    )
+    const id = startedTaskID(shell)
+    yield* waitUntilOutput(tools.output, ctx, id, "12345")
+    yield* state.cancel(sessionID)
+    expect((yield* jobs.get(id))?.status).toBe("cancelled")
+    expect((yield* jobs.get(grandchild))?.status).toBe("completed")
+    expect((yield* jobs.get(otherSessionID))?.status).toBe("completed")
+    expect((yield* jobs.get(neighbor.id))?.status).toBe("running")
+    yield* Deferred.succeed(unrelated, undefined)
+  }),
 )

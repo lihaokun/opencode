@@ -83,12 +83,12 @@ shell_kill: { task_id: string }
   <输出尾部 tail_lines 行>
   (running) | (finished — completion was delivered as a message)
   ```
-- 正确性论证：trivial + 纯读（无分支嵌套；缺省 task_id 的选择规则已枚举）
+- 正确性论证：显式 ID 或按登记时间与插入次序选出的最近 ID 都走同一属主/类型校验。运行中读取有界尾缓冲，终态读取 job 快照的状态行与输出。两种读取都先按尾行数、再按 UTF-8 字节数裁剪；结果不写截断文件。
 
 ### 5.3 shell_kill 工具
 
 - **实现思路**：`BackgroundJob.cancel(task_id)` → 快照渲染（status: cancelled + 输出尾部）；任务不在本会话 Map → "unknown task"（防跨会话误杀）；已结束 → 返回现状态（幂等）
-- 正确性论证：trivial（cancel 语义由注册表保证；会话归属校验单点）
+- 正确性论证：运行中的属主任务在取消前移交当时的输出尾部。注册表只允许 running 转换一次，已完成或已取消的任务直接返回终态并检查属主和类型。
 
 ### 5.4 完成通知（M4，实现于 5.1 run 末尾）
 
@@ -118,3 +118,12 @@ shell_kill: { task_id: string }
 - [x] 上游事实显式（inbox deliverAsync 形状、promptOps 通道、settle 一次保证、注册表非持久化——均标注出处）
 
 2026-11-19 修订：完成通知采用目标 Session 当下的 agent、model、variant；投递异常不改写进程结局。取消向进程组发送 TERM，并有界升级，含 shell 先退出且子进程仍存活的情况。shell_output / shell_kill 在内存内按有效行数、UTF-8 字节预算保留尾部。终端换行不占用一个额外的输出行；同毫秒启动时选后启动的任务。
+
+## 2026-11-21 回执、取消交错与身份
+
+- 启动回执不复制命令正文。第一行独立放任务 ID，随后给出读取指引；回执经过与读取相同的行数和字节预算。命令在原有工具输入中仍完整可见。尾缓冲截取若落在 UTF-16 低代理处，从其后一位开始；有效的输入字符不会在缓冲左边界变成半个字符。
+- 自然退出先调度通知，再由 BackgroundJob 结算。投递在目标实例读取当前 Session 身份，明确区分默认 variant 和普通用户新 prompt 的省略值。通知不写回 Session 的 agent/model/variant，因此不会用一次较早的读取覆盖用户的新选择。
+- Session 取消并行中断 runner 和已有的任务，等待这批 finalizer 完成。此时 runner 已停止登记；以其间已发现的属主为起点，每次取消后重新读取 job 列表，直到没有仍在运行的所属任务。原子取消先记终态，再关闭该 job 的 scope。有限的已提交登记只需处理一次。取消不承诺跨重启恢复或回收已主动脱离的服务；进程组范围见架构文档。
+- 回归在已有任务的 finalizer 内阻塞，与同一 runner 已提交的第二个真实 shell 登记精确交错；读取第二个句柄的最终状态。另测通知抵达 provider 后的 Session 和用户消息 variant、长命令回执及随机非 BMP 码点落在缓冲左界。
+
+父会话的取消遍历所有已登记的 agent 委派关系，包括已结算的中间节点。只有仍在运行的所属任务会被取消；已完成的委派保留终态，其他会话的任务继续执行。

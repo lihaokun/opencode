@@ -45,13 +45,16 @@ const BACKGROUND_BUFFER_MAX_CHARS = 200_000
 // once per byte.
 const appendCapped = (buffer: string, chunk: string) => {
   const next = buffer + chunk
-  return next.length <= BACKGROUND_BUFFER_MAX_CHARS ? next : next.slice(next.length - BACKGROUND_BUFFER_MAX_CHARS)
+  const start = next.length - BACKGROUND_BUFFER_MAX_CHARS
+  if (start <= 0) return next
+  const first = next.charCodeAt(start)
+  return next.slice(first >= 0xdc00 && first <= 0xdfff ? start + 1 : start)
 }
 
-    /**
-     * Live state of background shell tasks lives in ./shell/tasks.ts (module
-     * cycle avoidance — see that file's header).
-     */
+function commandPreview(command: string, length: number) {
+  return command.slice(0, length).replace(/[\uD800-\uDBFF]$/, "").replace(/[\r\n]+/g, " ")
+}
+
 const tailOf = (text: string, lines: number) => {
   const all = text.split("\n")
   if (all.at(-1) === "") all.pop()
@@ -692,7 +695,7 @@ export const ShellTool = Tool.define(
           : entry.exit !== undefined
             ? `exit ${entry.exit}`
             : "terminated"
-        const body = `[shell task finished] ${taskId} ${input.command.slice(0, 160).replace(/[\r\n]+/g, " ")} · ${status}\n${tailOf(entry.buffer, 200)}`
+        const body = `[shell task finished] ${taskId} ${commandPreview(input.command, 160)} · ${status}\n${tailOf(entry.buffer, 200)}`
         if (ops) {
           yield* ops
             .deliverAsync(
@@ -726,7 +729,7 @@ export const ShellTool = Tool.define(
       const info = yield* background.start({
         id: taskId,
         type: "shell",
-        title: input.command.slice(0, 80).replace(/[\r\n]+/g, " "),
+        title: commandPreview(input.command, 80),
         // Same shape agent delegation uses: cancelBackgroundJobs walks the
         // session graph through this, so agent_stop and interrupt reach the
         // process, and a stopped session is never woken by the completion
@@ -734,17 +737,17 @@ export const ShellTool = Tool.define(
         metadata: { sessionId: ctx.sessionID },
         run,
       })
+      // Step P5: the original command is already in the tool call. Keep the
+      // handle on the first line when the configured preview is a single line.
+      const receipt = backgroundPreview(
+        `${info.id}\nStarted in the background. Use shell_output for interim output. Completion arrives as a message. The timeout does not apply. Background tasks live with this process; a restart loses them.`,
+        yield* trunc.limits(),
+        1,
+      )
       return {
-        title: input.command.slice(0, 80).replace(/[\r\n]+/g, " "),
-        // task_id/status ride the metadata too (detailed-design §5.1): the
-        // text is for the model, the metadata is the programmable surface —
-        // UI/SDK consumers read it from the tool part without parsing prose.
-        metadata: { task_id: info.id, status: "running", output: "", exit: null, truncated: false },
-        output: [
-          `[shell task ${info.id}] started in the background: ${input.command}`,
-          ``,
-          `Output and completion arrive as a message when it finishes; read interim output with shell_output (task_id: ${info.id}). The timeout parameter does not apply to background tasks. Note: background tasks live with this process — a restart loses them.`,
-        ].join("\n"),
+        title: info.title ?? info.id,
+        metadata: { task_id: info.id, status: "running", output: "", exit: null, truncated: receipt.truncated },
+        output: receipt.output,
       }
     })
 
@@ -778,6 +781,7 @@ export const ShellTool = Tool.define(
                   )
                   const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
                   if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
+                  // Step P1: foreground and background launches share the permission decision.
                   yield* ask(ctx, scan, params)
                 }),
               )
@@ -894,13 +898,13 @@ export const ShellOutputTool = Tool.define(
                     : "finished"
           const lines = tailOf(entry.buffer, params.tail_lines ?? 200)
           const output = [
-            `[shell task ${id}] ${entry.command.slice(0, 160).replace(/[\r\n]+/g, " ")}`,
+            `[shell task ${id}] ${commandPreview(entry.command, 160)}`,
             `status: ${status}`,
             ...(lines.length > 0 ? [lines] : []),
           ].join("\n")
           const view = backgroundPreview(output, yield* trunc.limits())
           return {
-            title: entry.command.slice(0, 80),
+            title: commandPreview(entry.command, 80),
             metadata: { truncated: view.truncated, task_id: id, status: job?.status },
             output: view.output,
           }
@@ -957,7 +961,7 @@ export const ShellKillTool = Tool.define(
             1,
           )
           return {
-            title: entry.command.slice(0, 80),
+            title: commandPreview(entry.command, 80),
             metadata: { truncated: view.truncated, task_id: params.task_id, status: finalStatus },
             output: view.output,
           }

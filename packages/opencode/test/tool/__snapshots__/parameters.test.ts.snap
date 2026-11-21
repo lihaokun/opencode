@@ -77,7 +77,7 @@ exports[`tool parameters JSON Schema (wire shape) bash 1`] = `
       "type": "string",
     },
     "run_in_background": {
-      "description": "Run the command in the background: the tool returns a task id immediately, output is read with shell_output, and a completion message arrives when it finishes. Intended for long-running processes like dev servers and watchers. The timeout parameter does not apply.",
+      "description": "Run the command in the background: the tool returns a task id immediately, output is read with shell_output, and a completion message arrives when it finishes. Start dev servers and watchers in their foreground mode so the task can track and stop them. A launcher that detaches a worker and exits completes its task. The timeout parameter does not apply.",
       "type": "boolean",
     },
     "timeout": {

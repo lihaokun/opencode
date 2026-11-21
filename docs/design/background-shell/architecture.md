@@ -45,9 +45,9 @@ bash(run_in_background: true)
   ├─ BackgroundJob.start({ type: "shell", title: command, run })
   ├─ 工具立即返回：task_id + 初始状态（"running"）+ 读法说明
   ↓ 进程退出
+向会话调度完成通知：[shell task finished] task_id / command / exit code / 输出尾部
+  ↓ run 返回或失败
 BackgroundJob settle（status: completed/error/cancelled + exit code + 输出尾部）
-  ↓ 完成通知
-会话消息注入：[shell task finished] task_id / command / exit code / 输出尾部
   ↓
 模型在下一轮请求看到通知（无需轮询）
 ```
@@ -81,7 +81,7 @@ BackgroundJob settle（status: completed/error/cancelled + exit code + 输出尾
 
 ### M4 完成通知
 
-BackgroundJob settle 后注入会话消息——**复用 agent 委派的 notify 管线**（同一条"结果作为消息"通路），消息文本：`[shell task finished] <command 截断> · exit <code>` + 输出尾部。失败/取消分别有明确文案。注入失败不影响任务本身。
+进程退出、run 结算前调度会话消息——**复用 agent 委派的 notify 管线**（同一条"结果作为消息"通路），消息文本：`[shell task finished] <command 截断> · exit <code>` + 输出尾部。失败/取消分别有明确文案。注入失败不影响任务本身。
 
 ### M5 可见性
 
@@ -111,7 +111,7 @@ BackgroundJob settle 后注入会话消息——**复用 agent 委派的 notify 
 - G1 要求"立即返回句柄、进程继续"。M1 的 spawn 在 BackgroundJob.start 的 job scope 内 fork——scope 与调用方 run 作用域解耦（注册表持有），工具返回不再等待进程 ⇒ 进程存活与工具返回解耦 ⇒ G1。
 - G2 要求随时可读。M2 直通注册表快照（status/output 实时）⇒ G2。
 - G3 要求可终止。M3 → BackgroundJob.cancel（杀 scope 内进程组）⇒ G3。
-- G4 要求结束可知。settle 触发 M4 注入 ⇒ 模型下一轮可见 ⇒ G4。
+- G4 要求结束可知。run 在退出时调度 M4 注入，投递失败独立处理 ⇒ 模型下一轮可见 ⇒ G4。
 - G5：通知制覆盖"结束"，句柄覆盖"运行中可查" ⇒ G5（最小形态）。
 
 **关键假设**
@@ -125,7 +125,7 @@ BackgroundJob settle 后注入会话消息——**复用 agent 委派的 notify 
 
 - I1：同步路径零行为变更（run_in_background 缺省 = 现状逐字节）— 维护方：M1 分支守卫。
 - I2：每任务的 settle 恰好一次 — 维护方：`BackgroundJob` 既有 token/pending 机制。
-- I3：通知消息每任务至多一条 — 维护方：M4 在 settle 回调注册一次。
+- I3：通知消息每任务至多一条 — 维护方：M4 在 run 的唯一自然退出路径上调度一次。
 
 **preservation 论证**：I1 由分支守卫保证（后台路径仅在新参数为 true 时进入）；I2/I3 是既有基础设施性质（注册表与回调注册点各一处）。
 
@@ -135,3 +135,9 @@ BackgroundJob settle 后注入会话消息——**复用 agent 委派的 notify 
 - shell 进程句柄能否在"不等待"模式下保持输出流累积（现同步管线 stream.forEach 累积——后台形态需要把累积挂在 job scope 而非工具调用 scope）
 - 工具注册表对新增两个工具的接线（registry.ts 内置列表 + 权限键）
 - 权限语义确认：后台命令的 ask 时机（启动时）与同步一致，无需新权限键
+
+### 任务和操作系统进程组的所有权（2026-11-21）
+
+与前台 bash 一样，任务跟踪启动的 shell 及其输出流。取消仍在运行的任务会向其进程组发 TERM，超期升级 KILL，包含在 TERM 之后领头 shell 已退出的情况。程序若自行启动重定向 stdio 的后台工作进程并成功退出，shell 任务可完成；其后 shell_kill 返回终态。已脱离进程组的服务也不属于此句柄。要用任务句柄观察和停止一个服务，应以前台模式启动该服务、由工具将其放入后台。
+
+Session 停止同时中断本轮 runner 和已登记任务，再在两者收尾后重读注册表，直到所属会话及已发现的子会话都无运行任务。后台启动回执在配置的字节、行数上限内首先显示 task_id；即使文本上限容不下完整 ID，metadata 始终携带它。通知只读投递目标的身份，显式默认 variant 不会触发 agent variant 回退。
