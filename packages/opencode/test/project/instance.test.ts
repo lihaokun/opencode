@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { Context, Deferred, Effect, Exit, Fiber, Layer, Option, Scope } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
@@ -15,11 +15,11 @@ const noopBootstrap = Layer.succeed(
   InstanceBootstrap.Service.of({ run: Effect.suspend(() => bootstrapRun) }),
 )
 
-const it = testEffect(
-  LayerNode.compile(LayerNode.group([InstanceStore.node, CrossSpawnSpawner.node]), [
-    [InstanceStore.bootstrapNode, noopBootstrap],
-  ]),
-)
+const storeLayer = LayerNode.compile(LayerNode.group([InstanceStore.node, CrossSpawnSpawner.node]), [
+  [InstanceStore.bootstrapNode, noopBootstrap],
+])
+
+const it = testEffect(storeLayer)
 
 const setBootstrap = (run: Effect.Effect<void>) =>
   Effect.acquireRelease(
@@ -243,6 +243,60 @@ describe("InstanceStore", () => {
       yield* store.load({ directory: dir2 })
       yield* store.disposeAll()
       expect(disposed).toEqual([dir1, dir2])
+    }),
+  )
+
+  it.live("closing the store scope interrupts an in-flight load without deadlocking disposeAll", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const started = yield* Deferred.make<void>()
+      const never = yield* Deferred.make<void>()
+      yield* setBootstrap(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined)
+          yield* Deferred.await(never)
+        }),
+      )
+
+      const storeScope = yield* Scope.make()
+      const ctx = yield* Layer.buildWithMemoMap(storeLayer, Layer.makeMemoMapUnsafe(), storeScope)
+      const store = Context.get(ctx, InstanceStore.Service)
+      const loading = yield* store.load({ directory: dir }).pipe(Effect.forkScoped)
+
+      yield* Deferred.await(started)
+      const closed = yield* Scope.close(storeScope, Exit.void).pipe(Effect.timeout("5 seconds"), Effect.option)
+      const exit = yield* Fiber.await(loading).pipe(Effect.timeout("5 seconds"), Effect.option)
+
+      expect(Option.isSome(closed)).toBe(true)
+      expect(Option.isSome(exit) && Exit.isFailure(exit.value)).toBe(true)
+    }),
+  )
+
+  it.live("closing the store scope interrupts an in-flight reload without deadlocking disposeAll", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const started = yield* Deferred.make<void>()
+      const never = yield* Deferred.make<void>()
+
+      const storeScope = yield* Scope.make()
+      const ctx = yield* Layer.buildWithMemoMap(storeLayer, Layer.makeMemoMapUnsafe(), storeScope)
+      const store = Context.get(ctx, InstanceStore.Service)
+
+      yield* store.load({ directory: dir })
+      yield* setBootstrap(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined)
+          yield* Deferred.await(never)
+        }),
+      )
+      const reloading = yield* store.reload({ directory: dir }).pipe(Effect.forkScoped)
+
+      yield* Deferred.await(started)
+      const closed = yield* Scope.close(storeScope, Exit.void).pipe(Effect.timeout("5 seconds"), Effect.option)
+      const exit = yield* Fiber.await(reloading).pipe(Effect.timeout("5 seconds"), Effect.option)
+
+      expect(Option.isSome(closed)).toBe(true)
+      expect(Option.isSome(exit) && Exit.isFailure(exit.value)).toBe(true)
     }),
   )
 })
