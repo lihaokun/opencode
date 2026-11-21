@@ -158,20 +158,35 @@ test("tool failures stay bounded for result and protocol errors over a real MCP 
   await Promise.all([client.connect(peer), server.connect(transport)])
   try {
     await FastCheck.assert(
-      FastCheck.asyncProperty(FastCheck.boolean(), FastCheck.boolean(), FastCheck.string({ minLength: 1, maxLength: 24 }), async (rpc, data, word) => {
-        const detail = word.repeat(1000)
-        const saved: string[] = []
-        const tool = McpCatalog.convertTool(mcpTool(), client, undefined, async (text) => {
-          saved.push(text)
-          return "bounded preview; full output saved"
-        })
-        await expect(tool.execute?.({ rpc, data, detail }, options)).rejects.toThrow("bounded preview; full output saved")
-        expect(saved).toHaveLength(1)
-        if (rpc && data) expect(JSON.parse(saved[0]!.split("\n\n").at(-1)!)).toEqual({ detail })
-        else if (rpc) expect(saved[0]).toContain(detail)
-        else expect(JSON.parse(saved[0]!)).toEqual({ detail })
-      }),
-      { seed: 60413, numRuns: 24, examples: [[true, true, "rpc-data"], [true, false, "rpc-message"], [false, false, "result"]] },
+      FastCheck.asyncProperty(
+        FastCheck.boolean(),
+        FastCheck.boolean(),
+        FastCheck.string({ minLength: 1, maxLength: 24 }),
+        async (rpc, data, word) => {
+          const detail = word.repeat(1000)
+          const saved: string[] = []
+          const tool = McpCatalog.convertTool(mcpTool(), client, undefined, async (text) => {
+            saved.push(text)
+            return "bounded preview; full output saved"
+          })
+          await expect(tool.execute?.({ rpc, data, detail }, options)).rejects.toThrow(
+            "bounded preview; full output saved",
+          )
+          expect(saved).toHaveLength(1)
+          if (rpc && data) expect(JSON.parse(saved[0]!.split("\n\n").at(-1)!)).toEqual({ detail })
+          else if (rpc) expect(saved[0]).toContain(detail)
+          else expect(JSON.parse(saved[0]!)).toEqual({ detail })
+        },
+      ),
+      {
+        seed: 60413,
+        numRuns: 24,
+        examples: [
+          [true, true, "rpc-data"],
+          [true, false, "rpc-message"],
+          [false, false, "result"],
+        ],
+      },
     )
   } finally {
     await Promise.all([client.close(), server.close()])
@@ -182,7 +197,11 @@ test("cancellation retains the original signal error", async () => {
   const controller = new AbortController()
   const abort = new DOMException("cancelled by caller", "AbortError")
   controller.abort(abort)
-  const client = { callTool: async () => { throw abort } } as unknown as Client
+  const client = {
+    callTool: async () => {
+      throw abort
+    },
+  } as unknown as Client
   let calls = 0
   const tool = McpCatalog.convertTool(mcpTool(), client, undefined, async (text) => {
     calls++

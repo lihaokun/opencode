@@ -366,15 +366,25 @@ describe("code mode execute", () => {
     const tool = await Effect.runPromise(
       CodeModeTool.pipe(
         Effect.flatMap(Tool.init),
-        Effect.provide(harness({
-          mcpTools: { bad_tool: mcpTool("tool", () => { throw new McpError(ErrorCode.InternalError, detail) }) },
-          servers: ["bad"],
-          truncate: (text, options) => {
-            if (!options?.error) return Effect.succeed({ content: text, truncated: false as const })
-            saved.push(text)
-            return Effect.succeed({ content: "diagnostic saved", truncated: true as const, outputPath: "/tmp/test-mcp-error" })
-          },
-        })),
+        Effect.provide(
+          harness({
+            mcpTools: {
+              bad_tool: mcpTool("tool", () => {
+                throw new McpError(ErrorCode.InternalError, detail)
+              }),
+            },
+            servers: ["bad"],
+            truncate: (text, options) => {
+              if (!options?.error) return Effect.succeed({ content: text, truncated: false as const })
+              saved.push(text)
+              return Effect.succeed({
+                content: "diagnostic saved",
+                truncated: true as const,
+                outputPath: "/tmp/test-mcp-error",
+              })
+            },
+          }),
+        ),
       ),
     )
     const result = await Effect.runPromise(
