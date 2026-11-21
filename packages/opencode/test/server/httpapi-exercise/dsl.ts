@@ -3,6 +3,7 @@ import { looksJson } from "./assertions"
 import type {
   ActiveScenario,
   AuthPolicy,
+  AuthProbeSpec,
   BuilderState,
   CallResult,
   Comparison,
@@ -50,7 +51,7 @@ class ScenarioBuilder<S = undefined> {
     return this.clone({ request })
   }
 
-  probe(authProbe: RequestSpec) {
+  probe(authProbe: AuthProbeSpec) {
     return this.clone({ authProbe })
   }
 

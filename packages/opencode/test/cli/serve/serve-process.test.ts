@@ -62,4 +62,22 @@ describe("opencode serve (subprocess)", () => {
       }),
     TEST_TIMEOUT_MS,
   )
+
+  cliIt.live(
+    "fails immediately when the subprocess exits before becoming ready",
+    ({ opencode }) =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(
+          opencode.serve({
+            extraArgs: ["--not-a-real-flag"],
+            readyTimeoutMs: CLI_SERVE_READY_TIMEOUT_MS,
+          }),
+        )
+        expect(error.message).toContain("opencode serve exited with code 1 before becoming ready")
+        expect(error.message).toContain("stdout (last 2000):")
+        expect(error.message).toContain("stderr (last 2000):")
+        expect(error.message).toContain("opencode serve")
+      }),
+    TEST_TIMEOUT_MS,
+  )
 })

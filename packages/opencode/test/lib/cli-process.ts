@@ -22,7 +22,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppProcess } from "@opencode-ai/core/process"
-import { Deferred, Duration, Effect, Layer, Queue, Schedule, Scope, Stream } from "effect"
+import { Deferred, Duration, Effect, Fiber, Layer, Queue, Schedule, Scope, Stream } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/unstable/http"
 import { ChildProcess } from "effect/unstable/process"
 import path from "node:path"
@@ -355,19 +355,21 @@ export function withCliFixture<A, E>(
           }).pipe(Effect.ignore),
       )
 
-      // Tail buffer so timeout failures can include stderr context. The fork
-      // also keeps the OS pipe buffer from filling and wedging the child.
+      // Tail buffers so early-exit and timeout failures include subprocess output.
+      // Draining both pipes also keeps OS pipe buffers from filling and wedging the child.
       const stderrChunks: string[] = []
-      yield* forkStderrDrain(proc.stderr, stderrChunks)
+      const stderrFiber = yield* forkStderrDrain(proc.stderr, stderrChunks)
 
       // Watch stdout line-by-line for the listening sentinel. Format
       // (see src/cli/cmd/serve.ts):
       //   "opencode server listening on http://<host>:<port>"
+      const stdoutChunks: string[] = []
       const readyRe = /listening on (http:\/\/([^\s:]+):(\d+))/
-      const readyDeferred = yield* Deferred.make<{ url: string; hostname: string; port: number }>()
-      yield* Effect.forkScoped(
+      const readyDeferred = yield* Deferred.make<{ url: string; hostname: string; port: number }, Error>()
+      const stdoutFiber = yield* Effect.forkScoped(
         fromBunStream("stdout", () => proc.stdout).pipe(
           Stream.decodeText(),
+          Stream.tap((chunk) => Effect.sync(() => stdoutChunks.push(chunk))),
           Stream.splitLines,
           Stream.runForEach((line) => {
             const m = line.match(readyRe)
@@ -375,6 +377,28 @@ export function withCliFixture<A, E>(
           }),
           Effect.ignore({ log: true }),
         ),
+      )
+
+      const tail = (chunks: string[]) => chunks.join("").slice(-2000)
+
+      yield* Effect.forkScoped(
+        Effect.gen(function* () {
+          const code = yield* Effect.promise(() => proc.exited)
+          // Give pipe drainers a brief window after exit so final output (or a
+          // listening line emitted right before exit) lands before failing.
+          yield* Effect.all([Fiber.await(stdoutFiber), Fiber.await(stderrFiber)], {
+            concurrency: "unbounded",
+            discard: true,
+          }).pipe(Effect.timeout("500 millis"), Effect.ignore)
+          yield* Deferred.fail(
+            readyDeferred,
+            new Error(
+              `opencode serve exited with code ${code} before becoming ready\n` +
+                `stdout (last 2000):\n${tail(stdoutChunks)}\n` +
+                `stderr (last 2000):\n${tail(stderrChunks)}`,
+            ),
+          )
+        }),
       )
 
       const readyTimeoutMs = opts?.readyTimeoutMs ?? CLI_SERVE_READY_TIMEOUT_MS
@@ -385,7 +409,8 @@ export function withCliFixture<A, E>(
             Effect.fail(
               new Error(
                 `opencode serve did not become ready within ${readyTimeoutMs}ms\n` +
-                  `stderr (last 2000):\n${stderrChunks.join("").slice(-2000)}`,
+                  `stdout (last 2000):\n${tail(stdoutChunks)}\n` +
+                  `stderr (last 2000):\n${tail(stderrChunks)}`,
               ),
             ),
         }),

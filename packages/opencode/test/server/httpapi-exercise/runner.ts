@@ -52,6 +52,9 @@ function runAuth(scenario: ActiveScenario) {
       if (result.status !== 401) throw new Error(`auth expected 401, got ${result.status}`)
       const authed = yield* callAuthProbe(scenario, "valid")
       if (authed.status === 401) throw new Error("auth rejected valid credentials")
+      if (scenario.authProbe?.status !== undefined && authed.status !== scenario.authProbe.status) {
+        throw new Error(`auth expected ${scenario.authProbe.status}, got ${authed.status}: ${authed.text}`)
+      }
       return
     }
 
