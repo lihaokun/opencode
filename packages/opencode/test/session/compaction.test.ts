@@ -3578,3 +3578,117 @@ itCompaction.instance("an over-budget required tool result fails without summari
     }),
   )
 })
+
+itCompaction.instance("automatic compaction caps optional replay when there are no pending inputs", () => {
+  const stub = llm()
+  return Effect.gen(function* () {
+    const sessions = yield* SessionNs.Service
+    const compact = yield* SessionCompaction.Service
+    const dir = (yield* TestInstance).directory
+    const run = Effect.runPromiseWith(
+      yield* Effect.context<SessionNs.Service | Database.Service | SessionCompaction.Service>(),
+    )
+    yield* Effect.promise(() =>
+      FastCheck.assert(
+        FastCheck.asyncProperty(
+          FastCheck.array(FastCheck.integer({ min: 1, max: 6500 }), { minLength: 1, maxLength: 6 }),
+          (costs) =>
+            run(
+              Effect.gen(function* () {
+                const chat = yield* sessions.create({})
+                yield* createUserMessage(chat.id, "p".repeat(30_000))
+                const users = yield* Effect.forEach(costs, (tokens) =>
+                  createUserMessage(chat.id, "x".repeat(3 * tokens)),
+                )
+                const finish = yield* createAssistantMessage(chat.id, users.at(-1)!.id, dir)
+                stub.push(reply("summary"))
+                yield* compact.create({ sessionID: chat.id, agent: "build", model: ref, auto: true })
+                const rows = yield* MessageV2.filterCompactedEffect(chat.id)
+                yield* compact.process({
+                  sessionID: chat.id,
+                  parentID: rows.at(-1)!.info.id,
+                  messages: rows,
+                  auto: true,
+                })
+                const view = yield* MessageV2.filterCompactedEffect(chat.id)
+                // The 16k primary window allows 4k optional, below preserve_recent_tokens.
+                // Each generated user contributes exactly its specified cost.
+                const expected = users.filter((_, i) => costs.slice(i).reduce((sum, n) => sum + n, 0) <= 4000)
+                const ids = [...expected.map((u) => u.id), finish.id]
+                expect(view[1]?.info).toMatchObject({ n: ids.length })
+                expect(view.slice(2, 2 + ids.length).map((m) => m.info.id)).toEqual(ids)
+              }),
+            ),
+        ),
+        { seed: 600702, numRuns: 12, examples: [[[6000, 6000, 6000]], [[1000, 3000]], [[3999, 2]]] },
+      ),
+    )
+  }).pipe(
+    withCompaction({
+      llm: stub.llmLayer,
+      provider: ProviderTest.fake({ model: createModel({ context: 20_000, output: 4_000 }) }),
+      config: cfg({ preserve_recent_tokens: 12_000 }),
+    }),
+  )
+})
+
+itCompaction.instance(
+  "later compactions keep media from in-flight arrivals and preserve the selected batch's placeholders",
+  () => {
+    const stub = llm()
+    stub.push(reply("earlier work"))
+    stub.push(reply("updated summary"))
+    return Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const chat = yield* sessions.create({})
+      yield* createUserMessage(chat.id, "old prefix " + "x".repeat(10_000))
+      yield* createUserMessage(chat.id, "optional")
+      const add = Effect.fnUntraced(function* (name: string, chars: number) {
+        const msg = yield* createUserMessage(chat.id, name)
+        const part = yield* sessions.updatePart({
+          type: "file",
+          id: PartID.ascending(),
+          sessionID: chat.id,
+          messageID: msg.id,
+          filename: name + ".png",
+          url: "data:image/png;base64," + "Q".repeat(chars),
+          mime: "image/png",
+        })
+        return { msg, part }
+      })
+      const first = yield* add("first pending", 9000)
+      const second = yield* add("last selected", 9000)
+      const late = yield* add("arrived after selection", 32)
+      const compact = yield* SessionCompaction.Service
+      for (const overflow of [true, false]) {
+        yield* compact.create({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          auto: overflow,
+          overflow,
+          ...(overflow ? { protectedFrom: first.msg.id, requestUserID: second.msg.id } : {}),
+        })
+        const snapshot = yield* MessageV2.filterCompactedEffect(chat.id)
+        expect(
+          yield* compact.process({
+            sessionID: chat.id,
+            parentID: snapshot.at(-1)!.info.id,
+            messages: snapshot,
+            auto: overflow,
+            overflow,
+          }),
+        ).toBe("continue")
+        const active = yield* MessageV2.filterCompactedEffect(chat.id)
+        for (const item of [first, second, late]) {
+          const row = active.find((m) => m.info.id === item.msg.id)
+          const part = row?.parts.find((p) => p.id === item.part.id)
+          if (item === late) expect(part).toMatchObject({ type: "file", url: item.part.url })
+          else expect(part).toMatchObject({ type: "text", text: "[Attached image/png: " + item.part.filename + "]" })
+          const saved = yield* MessageV2.get({ sessionID: chat.id, messageID: item.msg.id })
+          expect(saved.parts.find((p) => p.id === item.part.id)).toMatchObject({ type: "file", url: item.part.url })
+        }
+      }
+    }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 4, preserve_recent_tokens: 1500 }) }))
+  },
+)

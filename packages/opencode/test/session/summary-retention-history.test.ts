@@ -303,7 +303,7 @@ it.instance("a fork remaps both the recovery marker and its continuation to the 
     const marker = yield* h.marker()
     const part = (yield* MessageV2.get({ sessionID: h.id, messageID: marker })).parts[0]
     if (part?.type !== "compaction") throw new Error("expected a compaction marker")
-    yield* sessions.updatePart({ ...part, overflow: true, protected_from: source })
+    yield* sessions.updatePart({ ...part, overflow: true, protected_from: source, request_user_id: source })
     yield* h.assistant(marker, "success", 1)
     const continuation = yield* h.user()
     yield* sessions.updatePart({
@@ -320,7 +320,7 @@ it.instance("a fork remaps both the recovery marker and its continuation to the 
     const rows = yield* sessions.messages({ sessionID: fork.id })
     const forkedUser = rows[0]!.info.id
     expect(forkedUser).not.toBe(source)
-    expect(rows[1]?.parts[0]).toMatchObject({ type: "compaction", protected_from: forkedUser })
+    expect(rows[1]?.parts[0]).toMatchObject({ type: "compaction", protected_from: forkedUser, request_user_id: forkedUser })
     expect(rows[3]?.parts[0]).toMatchObject({
       type: "text",
       metadata: { compaction_continue: true, protected_from: forkedUser },
@@ -328,5 +328,26 @@ it.instance("a fork remaps both the recovery marker and its continuation to the 
     expect((yield* MessageV2.get({ sessionID: h.id, messageID: continuation })).parts[0]).toMatchObject({
       metadata: { protected_from: source },
     })
+  }),
+)
+
+it.instance("fork keeps the calibration sample exactly when its source message is copied", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const h = yield* transcript()
+    const source = yield* h.user()
+    const measured = yield* h.assistant(source, "ordinary")
+    const next = yield* h.user()
+    yield* sessions.updateMetadata({
+      sessionID: h.id,
+      update: () => ({ label: "unchanged", summaryBudgetSample: { messageID: measured, estimate: 1000 } }),
+    })
+    for (const boundary of [undefined, next, measured, source]) {
+      const child = yield* sessions.fork({ sessionID: h.id, messageID: boundary })
+      const assistant = (yield* sessions.messages({ sessionID: child.id })).find((m) => m.info.role === "assistant")
+      expect(child.metadata?.label).toBe("unchanged")
+      expect(child.metadata?.summaryBudgetSample).toEqual(assistant ? { messageID: assistant.info.id, estimate: 1000 } : undefined)
+    }
+    expect((yield* sessions.get(h.id)).metadata?.summaryBudgetSample.messageID).toBe(measured)
   }),
 )

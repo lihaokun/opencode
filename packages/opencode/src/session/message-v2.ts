@@ -573,12 +573,21 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
     if (marker && summary?.info.role === "assistant") {
       const stored = summary.info.n
       const tail: WithParts[] = []
-      const stripped = new Set<MessageID>()
+      // The raw stream runs backwards. Each rejected request covers an inclusive
+      // range of original users, ending before any inputs that arrived in flight.
+      const mediaRanges = new Map<MessageID, MessageID[]>()
+      const activeUntil = new Set<MessageID>()
       let stripPreviousUser = false
       const rememberMedia = (part: CompactionPart) => {
         if (!part.overflow) return
-        if (part.protected_from) stripped.add(part.protected_from)
-        else stripPreviousUser = true // completed a pending marker from an older build
+        if (!part.protected_from) {
+          stripPreviousUser = true // completed a pending marker from an older build
+          return
+        }
+        const last = part.request_user_id ?? part.protected_from // older known-anchor markers stripped one user
+        const ranges = mediaRanges.get(last) ?? []
+        ranges.push(part.protected_from)
+        mediaRanges.set(last, ranges)
       }
       if (stored !== undefined) rememberMedia(marker)
       // New summaries count original rows. Legacy anchors are matched against
@@ -590,11 +599,14 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
           if (next.done) break
           const row = next.value
           if (isOriginal(row)) {
-            if (stripPreviousUser && row.info.role === "user") {
-              stripped.add(row.info.id)
+            if (row.info.role === "user") {
+              for (const first of mediaRanges.get(row.info.id) ?? []) activeUntil.add(first)
+              tail.push(stripPreviousUser || activeUntil.size ? withoutUserMedia(row) : row)
+              activeUntil.delete(row.info.id)
               stripPreviousUser = false
+            } else {
+              tail.push(row)
             }
-            tail.push(stripped.has(row.info.id) ? withoutUserMedia(row) : row)
           } else if (row.info.role === "assistant" && row.info.summary && row.info.finish && !row.info.error) {
             completed.set(row.info.parentID, row)
           } else if (row.info.role === "user") {

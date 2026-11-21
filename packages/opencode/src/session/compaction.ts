@@ -206,6 +206,7 @@ export interface Interface {
     auto: boolean
     overflow?: boolean
     protectedFrom?: MessageID
+    requestUserID?: MessageID
     fixedInputTokens?: number
   }) => Effect.Effect<void>
 }
@@ -412,12 +413,16 @@ const layer = Layer.effect(
       const cfg = yield* config.get()
       const previousSummary = completedCompactions(history).at(-1)?.summary
       const budgeted = primary.limit.context > 0 && mandatory.length > 0
-      const rawRequired = mandatory.map((m) =>
-        input.overflow && m === mandatory[0] ? MessageV2.withoutUserMedia(m) : m,
+      // Arrivals before the marker still need replay, but attachments from users
+      // outside the rejected request must reach the next model unchanged.
+      const requestUser = compactionPart?.request_user_id
+      const mediaEnd = requestUser ? mandatory.findIndex((row) => row.info.id === requestUser) : 0
+      const rawRequired = mandatory.map((row, index) =>
+        input.overflow && index <= mediaEnd ? MessageV2.withoutUserMedia(row) : row,
       )
       const room = budgeted
         ? usable({ cfg, model: primary, outputTokenMax: flags.outputTokenMax }) -
-          (anchor === configUser.id ? (compactionPart?.fixed_input_tokens ?? 0) : 0) -
+          ((requestUser ?? anchor) === configUser.id ? (compactionPart?.fixed_input_tokens ?? 0) : 0) -
           estimateMessages(yield* MessageV2.toModelMessagesEffect(rawRequired, primary))
         : Infinity
       const optionalBudget = Math.max(
@@ -427,8 +432,8 @@ const layer = Layer.effect(
       let head = yield* select({
         messages: historyForSummary,
         cfg,
-        model: budgeted ? primary : model,
-        available: budgeted ? optionalBudget : undefined,
+        model: input.auto ? primary : model,
+        available: input.auto && primary.limit.context > 0 ? optionalBudget : undefined,
       })
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
@@ -692,6 +697,7 @@ const layer = Layer.effect(
       model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
       auto: boolean
       protectedFrom?: MessageID
+      requestUserID?: MessageID
       fixedInputTokens?: number
       overflow?: boolean
     }) {
@@ -711,6 +717,7 @@ const layer = Layer.effect(
         auto: input.auto,
         overflow: input.overflow,
         protected_from: input.protectedFrom,
+        request_user_id: input.requestUserID,
         fixed_input_tokens: input.fixedInputTokens,
       })
     })

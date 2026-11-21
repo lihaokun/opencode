@@ -628,6 +628,7 @@ export type CompactionPart = {
   tail_start_id?: string
   fixed_input_tokens?: number
   protected_from?: string
+  request_user_id?: string
 }
 
 export type Part =

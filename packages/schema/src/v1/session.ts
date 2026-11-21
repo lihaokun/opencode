@@ -199,7 +199,8 @@ export const CompactionPart = Schema.Struct({
   overflow: Schema.optional(Schema.Boolean),
   tail_start_id: Schema.optional(MessageID), // legacy marker boundary
   fixed_input_tokens: Schema.optional(NonNegativeInt), // system and tool overhead of the rejected request
-  protected_from: Schema.optional(MessageID), // user whose unfinished request triggered compaction
+  protected_from: Schema.optional(MessageID), // oldest original input retained for the unfinished request
+  request_user_id: Schema.optional(MessageID), // last user selected before this request was transformed or sent
 }).annotate({ identifier: "CompactionPart" })
 export type CompactionPart = Types.DeepMutable<Schema.Schema.Type<typeof CompactionPart>>
 

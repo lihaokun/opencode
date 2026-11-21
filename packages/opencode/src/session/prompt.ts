@@ -1611,6 +1611,13 @@ const layer = Layer.effect(
               .some(
                 (message) => message.info.role === "user" && !message.parts.some((part) => part.type === "compaction"),
               )
+            // The transform hook may remove, reorder, or edit any row in the provider view.
+            // Only durable IDs selected for this request can define its eventual recovery.
+            const requestUserID = lastUser.id
+            const requiredIDs = msgs
+              .slice(pendingInputStart(msgs, currentUserIndex))
+              .filter(MessageV2.isOriginal)
+              .map((m) => m.info.id)
             const promptOps = yield* ops()
 
             const tools = yield* SessionTools.resolve({
@@ -1697,12 +1704,11 @@ const layer = Layer.effect(
               const fixed = yield* Effect.tryPromise(() => estimatePayload({ ...preparedPayload, messages: [] })).pipe(
                 Effect.orElseSucceed(() => undefined),
               )
-              const start = pendingInputStart(msgs, currentUserIndex)
-              const protectedFrom = msgs[start]!.info.id
-              const required = msgs
-                .slice(start)
-                .filter(MessageV2.isOriginal)
-                .map((m) => (m.info.id === protectedFrom ? MessageV2.withoutUserMedia(m) : m))
+              const selected = new Set(requiredIDs)
+              const durable = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+                Effect.provideService(Database.Service, database),
+              )
+              const required = durable.filter((row) => selected.has(row.info.id)).map(MessageV2.withoutUserMedia)
               const size = estimateMessages(yield* MessageV2.toModelMessagesEffect(required, model))
               if (
                 model.limit.context > 0 &&
@@ -1711,7 +1717,7 @@ const layer = Layer.effect(
                 // Steering may have replaced the system/tools while this request was
                 // in flight. Its old overhead cannot rule out the new user's request.
                 const latest = yield* sessions.findMessage(sessionID, (m) => m.info.role === "user").pipe(Effect.orDie)
-                if (Option.isNone(latest) || latest.value.info.id === lastUser.id) return undefined
+                if (Option.isNone(latest) || latest.value.info.id === requestUserID) return undefined
               }
               return {
                 sessionID,
@@ -1719,7 +1725,8 @@ const layer = Layer.effect(
                 model: lastUser.model,
                 auto: true,
                 overflow: true,
-                protectedFrom,
+                protectedFrom: requiredIDs[0],
+                requestUserID,
                 fixedInputTokens: fixed,
               }
             })

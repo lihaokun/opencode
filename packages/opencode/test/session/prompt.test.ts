@@ -8150,3 +8150,156 @@ it.instance("provider rejection preserves consecutive unanswered original users"
     ])
   }),
 )
+
+it.instance(
+  "overflow recovery downgrades media anywhere in the selected unanswered batch",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => {
+        const config = preflightCfg(url)
+        const test = config.provider.test
+        return {
+          ...config,
+          provider: {
+            test: {
+              ...test,
+              models: {
+                "test-model": {
+                  ...test.models["test-model"],
+                  attachment: true,
+                  modalities: { input: ["text", "image"], output: ["text"] },
+                },
+              },
+            },
+          },
+        }
+      })
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const run = Effect.runPromiseWith(yield* Effect.context<Session.Service | Database.Service>())
+      const attachment = "data:image/png;base64," + "Q".repeat(400_000)
+      yield* Effect.promise(() =>
+        FastCheck.assert(
+          FastCheck.asyncProperty(
+            FastCheck.array(FastCheck.boolean(), { minLength: 1, maxLength: 4 }).filter((batch) =>
+              batch.includes(true),
+            ),
+            (batch) =>
+              run(
+                Effect.gen(function* () {
+                  const chat = yield* sessions.create({ title: "Pending attachments" })
+                  yield* seed(chat.id, { finish: "stop" })
+                  const inputs = yield* Effect.forEach(batch, (media, index) =>
+                    Effect.gen(function* () {
+                      const row = yield* user(chat.id, "pending-task-" + index)
+                      if (media)
+                        yield* sessions.updatePart({
+                          type: "file",
+                          id: PartID.ascending(),
+                          messageID: row.id,
+                          sessionID: chat.id,
+                          filename: "pending-" + index + ".png",
+                          mime: "image/png",
+                          url: attachment,
+                        })
+                      return row.id
+                    }),
+                  )
+                  const before = yield* llm.calls
+                  yield* llm.text("Summary of earlier work")
+                  yield* llm.text("Recovered task")
+                  const result = yield* prompt.loop({ sessionID: chat.id })
+                  const hits = (yield* llm.hits).slice(before)
+                  expect(result.info).toMatchObject({ finish: "stop" })
+                  expect(hits).toHaveLength(2)
+                  const body = JSON.stringify(hits[1]?.body)
+                  const view = yield* MessageV2.filterCompactedEffect(chat.id)
+                  expect(view.filter((row) => inputs.includes(row.info.id)).map((row) => row.info.id)).toEqual(inputs)
+                  for (const [index, hasMedia] of batch.entries()) {
+                    expect(body).toContain("pending-task-" + index)
+                    if (!hasMedia) continue
+                    expect(body).toContain("[Attached image/png: pending-" + index + ".png]")
+                    const original = yield* MessageV2.get({ sessionID: chat.id, messageID: inputs[index]! })
+                    expect(original.parts.find((p) => p.type === "file")?.url).toBe(attachment)
+                  }
+                }),
+              ),
+          ),
+          { seed: 600701, numRuns: 5, examples: [[[false, true]], [[true, true]], [[true, false, true]]] },
+        ),
+      )
+    }),
+  30_000,
+)
+
+withFilePlugin.instance(
+  "a plugin pruning the provider view cannot change the durable overflow boundary",
+  () =>
+    Effect.gen(function* () {
+      const dir = (yield* TestInstance).directory
+      const llm = yield* TestLLMServer
+      const plugin = path.join(dir, "prune-view.ts")
+      yield* writeText(
+        plugin,
+        `export default async () => ({
+      "experimental.chat.messages.transform": async (_input, { messages }) => {
+        const command = messages.flatMap(row => row.parts).find(part => part.text?.startsWith("transform current request: "))
+        if (!command || !messages[0]?.parts.some(part => part.text === "completed prefix")) return
+        const [drop, reverse] = JSON.parse(command.text.slice("transform current request: ".length))
+        messages.splice(0, drop)
+        if (reverse) messages.reverse()
+      }
+    })`,
+      )
+      yield* writeConfig(dir, {
+        ...providerCfg(llm.url),
+        compaction: { tail_turns: 0 },
+        plugin: [pathToFileURL(plugin).href],
+      })
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const run = Effect.runPromiseWith(yield* Effect.context<Session.Service | Database.Service>())
+      yield* Effect.promise(() =>
+        FastCheck.assert(
+          FastCheck.asyncProperty(FastCheck.integer({ min: 0, max: 3 }), FastCheck.boolean(), (drop, reverse) =>
+            run(
+              Effect.gen(function* () {
+                const chat = yield* sessions.create({ title: "Pruned request" })
+                yield* seed(chat.id, { finish: "stop", userText: "completed prefix" })
+                const a = yield* user(chat.id, "first pending instruction")
+                const b = yield* user(chat.id, "transform current request: " + JSON.stringify([drop, reverse]))
+                const before = yield* llm.calls
+                yield* llm.error(413, { error: { message: "request entity too large" } })
+                yield* llm.text("Prior progress")
+                yield* llm.text("Completed both tasks")
+                const result = yield* prompt.loop({ sessionID: chat.id })
+                expect(result.info).toMatchObject({ finish: "stop" })
+                const hits = (yield* llm.hits).slice(before)
+                expect(hits).toHaveLength(3)
+                expect(JSON.stringify(hits[0]?.body).includes("first pending instruction")).toBe(drop < 3)
+                expect(JSON.stringify(hits[1]?.body)).toContain("completed prefix")
+                expect(JSON.stringify(hits[2]?.body)).toContain("first pending instruction")
+                const view = yield* MessageV2.filterCompactedEffect(chat.id)
+                expect(view[0]?.parts[0]).toMatchObject({
+                  type: "compaction",
+                  protected_from: a.id,
+                  request_user_id: b.id,
+                })
+                expect(view.slice(2, 4).map((row) => row.info.id)).toEqual([a.id, b.id])
+              }),
+            ),
+          ),
+          {
+            seed: 600703,
+            numRuns: 6,
+            examples: [
+              [3, false],
+              [0, true],
+              [2, true],
+            ],
+          },
+        ),
+      )
+    }),
+  30_000,
+)

@@ -17197,6 +17197,10 @@
           "protected_from": {
             "type": "string",
             "pattern": "^msg"
+          },
+          "request_user_id": {
+            "type": "string",
+            "pattern": "^msg"
           }
         },
         "required": ["id", "sessionID", "messageID", "type", "auto"],
