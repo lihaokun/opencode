@@ -10,6 +10,9 @@ import {
 } from "../../lib/periodic-tool-calls"
 
 const TEST_TIMEOUT_MS = 180_000
+// Fix doc session-fix-step-tail-repeat-and-agents §4.2: the repeat is refused
+// inside the response, without a permission request, and the run goes on.
+const REFUSED = "Not run: within this one response, the same tool calls have now been repeated three times in a row."
 
 function isTitleInput(body: Record<string, unknown>) {
   return JSON.stringify(body).includes("Generate a title for this conversation")
@@ -81,11 +84,7 @@ function sessionID(result: { stdout: string }, fixture: CliFixture) {
   return value
 }
 
-function expectCalls(
-  parts: Array<Record<string, unknown>>,
-  response: PeriodicToolCallFixture,
-  expected: "completed" | "terminal",
-) {
+function expectCalls(parts: Array<Record<string, unknown>>, response: PeriodicToolCallFixture, refusedTool?: string) {
   expect(parts).toHaveLength(response.calls.length)
   for (const call of response.calls) {
     const matches = parts.filter((part) => part.callID === call.id)
@@ -98,48 +97,21 @@ function expectCalls(
       },
     })
   }
-  const statuses = parts.map((part) => record(part.state).status)
-  if (expected === "completed") {
-    expect(statuses.every((status) => status === "completed")).toBe(true)
-    return
-  }
-  // AI SDK tool execution is concurrent with permission settlement, so rejection cannot roll back completed calls.
-  expect(statuses.every((status) => status === "completed" || status === "error")).toBe(true)
+  // Everything that did not complete is exactly the refused repeat, if any.
+  const unfinished = parts
+    .filter((part) => record(part.state).status !== "completed")
+    .map((part) => [part.tool, record(part.state).status, record(part.state).error])
+  expect(unfinished).toEqual(refusedTool ? [[refusedTool, "error", REFUSED]] : [])
 }
 
-function expectAsk(input: {
-  readonly fixture: CliFixture
-  readonly response: PeriodicToolCallFixture
-  readonly prompt: string
-  readonly expectedPattern: string
-}) {
-  return Effect.gen(function* () {
-    const continuation = `${input.prompt} continuation must remain queued`
-    yield* input.fixture.llm.pushMatch(
-      ({ body }) => hasUserText(body, input.prompt) && !isTitleInput(body),
-      input.response.item,
-      reply().text(continuation).stop(),
-    )
-
-    const result = yield* input.fixture.opencode.run(input.prompt, {
-      format: "json",
-      permission: { doom_loop: "ask" },
-    })
-
-    input.fixture.opencode.expectExit(result, 1, input.prompt)
-    expect(result.stderr).toContain(`permission requested: doom_loop (${input.expectedPattern}); auto-rejecting`)
-    expect(result.stdout).not.toContain(continuation)
-    const parts = yield* storedToolParts(input.fixture.opencode, sessionID(result, input.fixture))
-    expectCalls(parts, input.response, "terminal")
-    expectPromptInputs(yield* input.fixture.llm.inputs, input.prompt, 1)
-    expect(yield* input.fixture.llm.pending).toBe(1)
-  })
-}
-
+// The run always continues: the second request carries the tool results, the
+// refusal included, and the model's text ends the run.
 function expectContinuation(input: {
   readonly fixture: CliFixture
   readonly response: PeriodicToolCallFixture
   readonly prompt: string
+  readonly doomLoop?: "ask" | "allow" | "deny"
+  readonly refusedTool?: string
 }) {
   return Effect.gen(function* () {
     const continuation = `${input.prompt} completed`
@@ -151,14 +123,14 @@ function expectContinuation(input: {
 
     const result = yield* input.fixture.opencode.run(input.prompt, {
       format: "json",
-      permission: { doom_loop: "ask" },
+      permission: { doom_loop: input.doomLoop ?? "ask" },
     })
 
     input.fixture.opencode.expectExit(result, 0)
     expect(result.stderr).not.toContain("permission requested: doom_loop")
     expect(result.stdout).toContain(continuation)
     const parts = yield* storedToolParts(input.fixture.opencode, sessionID(result, input.fixture))
-    expectCalls(parts, input.response, "completed")
+    expectCalls(parts, input.response, input.refusedTool)
     expectPromptInputs(yield* input.fixture.llm.inputs, input.prompt, 2)
     expect(yield* input.fixture.llm.pending).toBe(0)
   })
@@ -166,70 +138,70 @@ function expectContinuation(input: {
 
 describe("periodic doom-loop spawned CLI", () => {
   cliIt.live(
-    "asks after three period-1 repetitions encoded in one batch",
+    "refuses the repeat after three period-1 repetitions encoded in one batch",
     (test) => {
       const block = globBlock(1)
-      return expectAsk({
+      return expectContinuation({
         fixture: test,
         response: fixture(repeated(block, 3), "all-batched"),
         prompt: "period-one all-batched",
-        expectedPattern: "glob",
+        refusedTool: "glob",
       })
     },
     TEST_TIMEOUT_MS,
   )
 
   cliIt.live(
-    "asks after three period-2 repetitions encoded one call per chunk",
+    "refuses the repeat after three period-2 repetitions encoded one call per chunk",
     (test) => {
       const block = alternatingBlock()
-      return expectAsk({
+      return expectContinuation({
         fixture: test,
         response: fixture(repeated(block, 3), "one-per-chunk"),
         prompt: "period-two one-per-chunk",
-        expectedPattern: "grep",
+        refusedTool: "grep",
       })
     },
     TEST_TIMEOUT_MS,
   )
 
   cliIt.live(
-    "asks after three period-3 repetitions encoded in pairs",
+    "refuses the repeat after three period-3 repetitions encoded in pairs",
     (test) => {
       const block = globBlock(3)
-      return expectAsk({
+      return expectContinuation({
         fixture: test,
         response: fixture(repeated(block, 3), "pairs"),
         prompt: "period-three pairs",
-        expectedPattern: "glob",
+        refusedTool: "glob",
       })
     },
     TEST_TIMEOUT_MS,
   )
 
   cliIt.live(
-    "asks after three period-10 repetitions with sequential argument fragments",
+    "refuses the repeat after three period-10 repetitions with sequential argument fragments",
     (test) => {
       const block = globBlock(10)
-      return expectAsk({
+      return expectContinuation({
         fixture: test,
         response: fixture(repeated(block, 3), "fragmented-sequential"),
         prompt: "period-ten fragmented-sequential",
-        expectedPattern: "glob",
+        refusedTool: "glob",
       })
     },
     TEST_TIMEOUT_MS,
   )
 
   cliIt.live(
-    "asks for an alternating period-2 cycle with starts before reverse fragments",
+    "refuses the repeat in an alternating period-2 cycle with starts before reverse fragments",
     (test) => {
       const block = alternatingBlock()
-      return expectAsk({
+      return expectContinuation({
         fixture: test,
         response: fixture(repeated(block, 3), "starts-then-reverse-fragments"),
         prompt: "period-two reverse-fragments",
-        expectedPattern: "glob",
+        refusedTool: "glob",
       })
     },
     TEST_TIMEOUT_MS,
@@ -300,7 +272,7 @@ describe("periodic doom-loop spawned CLI", () => {
         expect(result.stderr).not.toContain("permission requested: doom_loop")
         expect(result.stdout).toContain(continuation)
         const parts = yield* storedToolParts(test.opencode, sessionID(result, test))
-        expectCalls(parts, response, "completed")
+        expectCalls(parts, response)
         expectPromptInputs(yield* test.llm.inputs, prompt, 2)
         expect(yield* test.llm.pending).toBe(0)
       }),
@@ -308,32 +280,14 @@ describe("periodic doom-loop spawned CLI", () => {
   )
 
   cliIt.live(
-    "stops a period-2 cycle when doom_loop is denied",
+    "refuses a period-2 repeat without asking when doom_loop is denied, and continues",
     (test) =>
-      Effect.gen(function* () {
-        const block = alternatingBlock()
-        const response = fixture(repeated(block, 3), "all-batched")
-        const prompt = "period-two explicitly-denied"
-        const continuation = `${prompt} continuation must remain queued`
-        yield* test.llm.pushMatch(
-          ({ body }) => hasUserText(body, prompt) && !isTitleInput(body),
-          response.item,
-          reply().text(continuation).stop(),
-        )
-
-        const result = yield* test.opencode.run(prompt, {
-          format: "json",
-          permission: { doom_loop: "deny" },
-        })
-
-        test.opencode.expectExit(result, 1, prompt)
-        expect(result.stderr).not.toContain("permission requested: doom_loop")
-        expect(result.stdout).not.toContain(continuation)
-        expect(result.stdout).toContain("prevents you from using this specific tool call")
-        const parts = yield* storedToolParts(test.opencode, sessionID(result, test))
-        expectCalls(parts, response, "terminal")
-        expectPromptInputs(yield* test.llm.inputs, prompt, 1)
-        expect(yield* test.llm.pending).toBe(1)
+      expectContinuation({
+        fixture: test,
+        response: fixture(repeated(alternatingBlock(), 3), "all-batched"),
+        prompt: "period-two explicitly-denied",
+        doomLoop: "deny",
+        refusedTool: "grep",
       }),
     TEST_TIMEOUT_MS,
   )

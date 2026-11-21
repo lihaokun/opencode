@@ -150,7 +150,7 @@ Keep the list focused on trusted paths, and layer extra allow or deny rules as n
 OpenCode permissions are keyed by tool name, plus a couple of safety guards:
 
 - `read` — reading a file (matches the file path)
-- `edit` — all file modifications (covers `edit`, `write`, `patch`)
+- `edit` — file creation and content changes through `edit` and `write` (matches the file path)
 - `glob` — file globbing (matches the glob pattern)
 - `grep` — content search (matches the regex pattern)
 - `bash` — running shell commands (matches parsed commands like `git status --porcelain`)
@@ -161,9 +161,11 @@ OpenCode permissions are keyed by tool name, plus a couple of safety guards:
 - `webfetch` — fetching a URL (matches the URL)
 - `websearch` — web search (matches the query)
 - `external_directory` — triggered when a tool touches paths outside the project working directory
-- `doom_loop` — triggered when an identical tool-call sequence with period 1 through 10 repeats 3 times; 3 identical consecutive calls are the period-1 case
+- `doom_loop` — repeated tool calls within one model response: when an identical tool-call sequence with period 1 through 10 repeats 3 times (3 identical consecutive calls are the period-1 case), the repeating call is not run and the model gets an error instead. `allow` turns this off; `ask` and `deny` both refuse without prompting
 
 ---
+
+The removed `apply_patch` built-in is no longer part of the `edit` tool group. In older configurations, `tools.patch: false` also disabled `write` and `edit`; that alias no longer applies. Use `permission.edit: "deny"` at the same global or Agent scope to preserve that restriction. `tools.patch: true` likewise no longer enables editing. Exact-name rules for custom `patch` or `apply_patch` tools remain independent.
 
 ## Defaults
 

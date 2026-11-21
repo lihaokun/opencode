@@ -3,6 +3,7 @@ import path from "path"
 import fs from "fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
 import { Effect, Layer, Result, Schema } from "effect"
+import { FastCheck } from "effect/testing"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ToolRegistry } from "@/tool/registry"
 import { Tool } from "@/tool/tool"
@@ -20,6 +21,9 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
+import { Session } from "@/session/session"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { Permission } from "@/permission"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
 
 const configLayer = TestConfig.layer({
@@ -50,7 +54,7 @@ const brokenPluginLayer = Layer.succeed(
   }),
 )
 
-const root = LayerNode.group([ToolRegistry.node, Agent.node])
+const root = LayerNode.group([ToolRegistry.node, Agent.node, Session.node, SessionProjector.node])
 const replacements = [
   [Config.node, configLayer],
   [RuntimeFlags.node, RuntimeFlags.layer()],
@@ -116,6 +120,111 @@ describe("tool.registry", () => {
 
       expect(ids).not.toContain("execute")
     }),
+  )
+
+  // Regression for #74: the registry used to swap write/edit out for
+  // apply_patch whenever the model ID contained "gpt-", which broke
+  // path-gated integrations built on the (tool, filePath) contract. The
+  // tool surface must not depend on the model ID at all.
+  it.instance("offers the same editing tools regardless of model ID", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const agent = yield* agents.defaultInfo()
+      const idsFor = (modelID: string) =>
+        registry
+          .tools({
+            providerID: ProviderV2.ID.make("openai"),
+            modelID: ModelV2.ID.make(modelID),
+            agent,
+          })
+          .pipe(Effect.map((tools) => tools.map((tool) => tool.id)))
+
+      for (const modelID of ["gpt-6-luna", "gpt-5.3-codex", "gpt-5.5", "claude-opus-4-5"]) {
+        const ids = yield* idsFor(modelID)
+        expect(ids).toContain("write")
+        expect(ids).toContain("edit")
+        expect(ids).not.toContain("apply_patch")
+      }
+    }),
+  )
+
+  it.instance(
+    "keeps registry identity and schema invariant under generated model IDs at fixed provider, depth and permissions",
+    () =>
+      Effect.gen(function* () {
+        const registry = yield* ToolRegistry.Service
+        const agents = yield* Agent.Service
+        const sessions = yield* Session.Service
+        const agent = yield* agents.defaultInfo()
+        const parent = yield* sessions.create({})
+        const child = yield* sessions.create({ parentID: parent.id })
+        const grandchild = yield* sessions.create({ parentID: child.id })
+        const leaf = yield* sessions.create({ parentID: grandchild.id })
+        const context = yield* Effect.context()
+        const scenarios = [
+          {
+            providerID: ProviderV2.ID.make("openai"),
+            sessionID: parent.id,
+            permission: Permission.fromConfig({ edit: "allow" }),
+          },
+          {
+            providerID: ProviderV2.ID.opencode,
+            sessionID: parent.id,
+            permission: Permission.fromConfig({ edit: "deny" }),
+          },
+          {
+            providerID: ProviderV2.ID.make("openai"),
+            sessionID: leaf.id,
+            permission: Permission.fromConfig({ edit: { "*": "deny", "allowed/**": "allow" } }),
+          },
+        ]
+        const baselines = yield* Effect.forEach(scenarios, (scenario) =>
+          registry.tools({ ...scenario, agent, modelID: ModelV2.ID.make("reference-model") }),
+        )
+        expect(baselines[0].map((tool) => tool.id)).not.toContain("websearch")
+        expect(baselines[1].map((tool) => tool.id)).toContain("websearch")
+        expect(baselines[0].map((tool) => tool.id)).toContain("agent")
+        expect(baselines[2].map((tool) => tool.id)).not.toContain("agent")
+        const suffix = FastCheck.array(FastCheck.constantFrom("a", "b", "0", "1", "-", ".", "/"), {
+          minLength: 1,
+          maxLength: 18,
+        }).map((chars) => chars.join(""))
+        const modelID = FastCheck.oneof(
+          FastCheck.constantFrom("gpt-6-luna", "gpt-5.3-codex", "gpt-5.5", "claude-opus-4-5"),
+          FastCheck.tuple(FastCheck.constantFrom("gpt-", "vendor/gpt-", "claude-", "custom-"), suffix).map((parts) =>
+            parts.join(""),
+          ),
+        )
+        yield* Effect.promise(() =>
+          FastCheck.assert(
+            FastCheck.asyncProperty(modelID, async (id) => {
+              for (const [index, scenario] of scenarios.entries()) {
+                const actual = await Effect.runPromiseWith(context)(
+                  registry.tools({ ...scenario, agent, modelID: ModelV2.ID.make(id) }),
+                )
+                expect(actual.map((tool) => tool.id)).toEqual(baselines[index].map((tool) => tool.id))
+                expect(actual.map((tool) => tool.id)).not.toContain("apply_patch")
+                for (const name of ["write", "edit"]) {
+                  const tool = actual.find((tool) => tool.id === name)
+                  const baseline = baselines[index].find((tool) => tool.id === name)
+                  if (!tool || !baseline) throw new Error(`missing stock ${name}`)
+                  expect(tool.execute).toBe(baseline.execute)
+                  expect(ToolJsonSchema.fromTool(tool)).toEqual(ToolJsonSchema.fromTool(baseline))
+                }
+                // Registry membership precedes request permission filtering.
+                const disabled = Permission.disabled(
+                  actual.map((tool) => tool.id),
+                  scenario.permission,
+                )
+                expect(disabled.has("write")).toBe(index === 1)
+                expect(disabled.has("edit")).toBe(index === 1)
+              }
+            }),
+            { numRuns: 24, seed: 79 },
+          ),
+        )
+      }),
   )
 
   withCodeMode.instance("exposes execute when code mode is enabled", () =>

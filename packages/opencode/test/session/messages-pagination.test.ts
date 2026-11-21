@@ -9,11 +9,24 @@ import { MessageID, PartID, type SessionID } from "../../src/session/schema"
 
 import { NotFoundError } from "@/storage/storage"
 import { testEffect } from "../lib/effect"
+
+/** mulberry32: deterministic seeded LCG for finite-random histories. */
+const lcg = (seed: number) => {
+  let s = seed >>> 0
+  return () => {
+    s = (s + 0x6d2b79f5) >>> 0
+    let t = s
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Identifier } from "../../src/id/id"
 import { Database } from "@opencode-ai/core/database/database"
-import { PartTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { eq } from "drizzle-orm"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionNs.node, MessageV2.node, SessionProjector.node])))
@@ -419,6 +432,247 @@ describe("MessageV2.stream", () => {
   )
 })
 
+describe("MessageV2.latestRole", () => {
+  it.instance("returns undefined for an empty session", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        expect(yield* MessageV2.latestRole(sessionID)).toBeUndefined()
+      }),
+    ),
+  )
+
+  it.instance("returns user when the latest message is a user", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        yield* fill(sessionID, 2)
+        yield* session.updateMessage({
+          id: MessageID.ascending(),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() + 100 },
+          agent: "test",
+          model: { providerID: "test", modelID: "test" },
+          tools: {},
+          mode: "",
+        } as unknown as SessionV1.Info)
+        expect(yield* MessageV2.latestRole(sessionID)).toBe("user")
+      }),
+    ),
+  )
+
+  it.instance("returns assistant when the latest message is an assistant", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        yield* fill(sessionID, 1)
+        const session = yield* SessionNs.Service
+        yield* session.updateMessage({
+          id: MessageID.ascending(),
+          sessionID,
+          role: "assistant",
+          parentID: MessageID.ascending(),
+          time: { created: Date.now() + 100 },
+          mode: "build",
+          agent: "build",
+          path: { cwd: "/tmp", root: "/tmp" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: "test",
+          providerID: "test",
+        } as unknown as SessionV1.Info)
+        expect(yield* MessageV2.latestRole(sessionID)).toBe("assistant")
+      }),
+    ),
+  )
+
+  // Same-millisecond tie: the id breaks the tie, matching the SQL order
+  // (desc time_created, desc id) and compareChronology.
+  it.instance("breaks same-timestamp ties by id", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        const now = Date.now()
+        const first = MessageID.ascending()
+        yield* session.updateMessage({
+          id: first,
+          sessionID,
+          role: "user",
+          time: { created: now },
+          agent: "test",
+          model: { providerID: "test", modelID: "test" },
+          tools: {},
+          mode: "",
+        } as unknown as SessionV1.Info)
+        const second = MessageID.ascending()
+        yield* session.updateMessage({
+          id: second,
+          sessionID,
+          role: "assistant",
+          parentID: first,
+          time: { created: now },
+          mode: "build",
+          agent: "build",
+          path: { cwd: "/tmp", root: "/tmp" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: "test",
+          providerID: "test",
+        } as unknown as SessionV1.Info)
+        expect(yield* MessageV2.latestRole(sessionID)).toBe("assistant")
+      }),
+    ),
+  )
+
+  // Cost guard (#85): this runs inside finishRun's critical section, so it
+  // must stay O(1) pages even on a large session. The fill helper writes one
+  // row per call; two thousand rows is well past any plausible session for a
+  // unit test while keeping the suite fast.
+  it.instance("stays fast on a large session", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        yield* fill(sessionID, 2000)
+        const start = performance.now()
+        const role = yield* MessageV2.latestRole(sessionID)
+        const elapsed = performance.now() - start
+        expect(role).toBe("user")
+        // Generous bound for slow CI: a full-session load takes seconds at
+        // this size; the indexed single-row read is milliseconds.
+        expect(elapsed).toBeLessThan(500)
+      }),
+    ),
+  )
+
+  it.instance("preserves JS chronology for valid custom Unicode IDs at the same timestamp", () =>
+    Effect.gen(function* () {
+      for (const [userID, assistantID, expected] of [
+        ["msg_\uE000", "msg_\u{10000}", "user"],
+        ["msg_\u{10000}", "msg_\uE000", "assistant"],
+        ["msg_z", "msg_a", "user"],
+      ] as const) {
+        yield* withSession((input) =>
+          Effect.gen(function* () {
+            const user = yield* addUser(input.sessionID, undefined, { id: MessageID.make(userID), created: 100 })
+            yield* addAssistant(input.sessionID, user, { id: MessageID.make(assistantID), created: 100 })
+            const latest = MessageV2.latest(yield* MessageV2.filterCompactedEffect(input.sessionID))
+            expect(yield* MessageV2.latestRole(input.sessionID)).toBe(expected)
+            expect(
+              Boolean(
+                latest.user && (!latest.assistant || MessageV2.compareChronology(latest.user, latest.assistant) > 0),
+              ),
+            ).toBe(expected === "user")
+          }),
+        )
+      }
+    }),
+  )
+
+  it.instance("matches the old predicate when compaction reorders retained history", () =>
+    withSession((input) =>
+      Effect.gen(function* () {
+        yield* addUser(input.sessionID, "old", { created: 100 })
+        const tail = yield* addUser(input.sessionID, "retained", { created: 200 })
+        const marker = yield* addUser(input.sessionID, undefined, { created: 300 })
+        yield* addCompactionPart(input.sessionID, marker, tail)
+        const summary = yield* addAssistant(input.sessionID, marker, { created: 301, summary: true, finish: "stop" })
+        const filtered = yield* MessageV2.filterCompactedEffect(input.sessionID)
+        expect(filtered.map((message) => message.info.id)).toEqual([marker, summary, tail])
+        expect(yield* MessageV2.latestRole(input.sessionID)).toBe("assistant")
+        const latest = MessageV2.latest(filtered)
+        expect(latest.user && latest.assistant && MessageV2.compareChronology(latest.user, latest.assistant) < 0).toBe(
+          true,
+        )
+        yield* addUser(input.sessionID, "continue", { created: 302 })
+        expect(yield* MessageV2.latestRole(input.sessionID)).toBe("user")
+      }),
+    ),
+  )
+
+  it.instance("custom ID fallback respects the completed compaction boundary", () =>
+    withSession((input) => Effect.gen(function* () {
+      const hidden = yield* addUser(input.sessionID, "compacted", { id: MessageID.make("msg_\uE000"), created: 100 })
+      const marker = yield* addUser(input.sessionID, undefined, { id: MessageID.make("msg_\u{10001}"), created: 100 })
+      yield* addCompactionPart(input.sessionID, marker)
+      const summary = yield* addAssistant(input.sessionID, marker, {
+        id: MessageID.make("msg_\u{10002}"), created: 100, summary: true, finish: "stop",
+      })
+      const filtered = yield* MessageV2.filterCompactedEffect(input.sessionID)
+      expect(filtered.map(message => message.info.id)).toEqual([marker, summary])
+      expect(filtered.some(message => message.info.id === hidden)).toBe(false)
+      expect(yield* MessageV2.latestRole(input.sessionID)).toBe("assistant")
+    })),
+  )
+
+  // Independent sessions and a check after every write. Updating an existing
+  // message changes JSON data while the projector preserves time_created;
+  // verify that mismatch exists instead of merely claiming it in the fixture.
+  it.instance("matches persisted chronology after every randomized insert and JSON-time update", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const rand = lcg(20261030)
+      const histories: Array<Array<{ role: "user" | "assistant"; t: number; json?: number }>> = [
+        [],
+        [{ role: "user", t: 100 }],
+        [{ role: "assistant", t: 100 }],
+        [
+          { role: "user", t: 20, json: 0 },
+          { role: "assistant", t: 10, json: 1000 },
+        ],
+      ]
+      for (let h = 0; h < 12; h++) {
+        histories.push(
+          Array.from({ length: 1 + Math.floor(rand() * 30) }, () => ({
+            role: rand() < 0.5 ? ("user" as const) : ("assistant" as const),
+            t: 1000 + Math.floor(rand() * 7),
+            ...(rand() < 0.3 ? { json: 2000 + Math.floor(rand() * 100) } : {}),
+          })),
+        )
+      }
+      let mismatches = 0
+      for (const [h, history] of histories.entries()) {
+        yield* withSession((input) =>
+          Effect.gen(function* () {
+            let max: { role: "user" | "assistant"; t: number; id: MessageID } | undefined
+            expect(yield* MessageV2.latestRole(input.sessionID)).toBeUndefined()
+            for (const [i, message] of history.entries()) {
+              const char = ["a", "z", "\uE000", "\u{10000}", "\u{1F600}"][Math.floor(rand() * 5)]!
+              const id = MessageID.make("msg_" + char + "_" + h + "_" + i)
+              if (message.role === "user") {
+                yield* addUser(input.sessionID, undefined, { id, created: message.t })
+              } else {
+                yield* addAssistant(input.sessionID, MessageID.make("msg_parent"), { id, created: message.t })
+              }
+              if (message.json !== undefined) {
+                const stored = yield* MessageV2.get({ sessionID: input.sessionID, messageID: id })
+                yield* input.session.updateMessage({
+                  ...stored.info,
+                  time: { ...stored.info.time, created: message.json },
+                })
+                const row = yield* database.db.select().from(MessageTable).where(eq(MessageTable.id, id)).get()
+                expect(row?.time_created).toBe(message.t)
+                expect(row?.data.time.created).toBe(message.json)
+                mismatches++
+              }
+              if (!max || message.t > max.t || (message.t === max.t && id > max.id)) {
+                max = { role: message.role, t: message.t, id }
+              }
+              const role = yield* MessageV2.latestRole(input.sessionID)
+              expect(role, "history " + h + " write " + i).toBe(max?.role)
+              const latest = MessageV2.latest(yield* MessageV2.filterCompactedEffect(input.sessionID))
+              expect(role === "user").toBe(
+                Boolean(
+                  latest.user && (!latest.assistant || MessageV2.compareChronology(latest.user, latest.assistant) > 0),
+                ),
+              )
+            }
+          }),
+        )
+      }
+      expect(mismatches).toBeGreaterThan(0)
+    }),
+  )
+
+})
+
 describe("MessageV2.parts", () => {
   it.instance("returns parts for a message", () =>
     withSession(({ sessionID }) =>
@@ -780,7 +1034,7 @@ describe("MessageV2.filterCompacted", () => {
     ),
   )
 
-  it.instance("skips assistant with error even if marked as summary", () =>
+  it.instance("excludes an error summary from the projection without completing the marker (#77)", () =>
     withSession(({ sessionID }) =>
       Effect.gen(function* () {
         const u1 = yield* addUser(sessionID, "hello")
@@ -794,24 +1048,28 @@ describe("MessageV2.filterCompacted", () => {
         yield* addUser(sessionID, "retry")
 
         const result = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
-        // Error assistant doesn't add to completed, so compaction boundary never triggers
-        expect(result).toHaveLength(3)
+        // The failed summary is dropped from the model projection (#77: its
+        // reasoning/partial text must not reach the next request) and does not
+        // complete the marker — only u1 and the retry turn remain.
+        expect(result).toHaveLength(2)
+        expect(result.map((item) => item.info.role)).toEqual(["user", "user"])
       }),
     ),
   )
 
-  it.instance("skips assistant without finish even if marked as summary", () =>
+  it.instance("excludes an unfinished summary from the projection without completing the marker (#77)", () =>
     withSession(({ sessionID }) =>
       Effect.gen(function* () {
         const u1 = yield* addUser(sessionID, "hello")
         yield* addCompactionPart(sessionID, u1)
 
-        // summary=true but no finish
+        // summary=true but no finish — an in-flight attempt, same exclusion.
         yield* addAssistant(sessionID, u1, { summary: true })
         yield* addUser(sessionID, "next")
 
         const result = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
-        expect(result).toHaveLength(3)
+        expect(result).toHaveLength(2)
+        expect(result.map((item) => item.info.role)).toEqual(["user", "user"])
       }),
     ),
   )

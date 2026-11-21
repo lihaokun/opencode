@@ -85,6 +85,10 @@ export const Info = Schema.Struct({
     description:
       "Maximum subagent nesting depth, counted from the main session at depth 0. Defaults to 3. Set it to 0 to stop agents from launching agents.",
   }),
+  stop_hook_block_cap: Schema.optional(NonNegativeInt).annotate({
+    description:
+      "How many times in a row the experimental.session.stop plugin hook may keep a run going before the run ends without asking it. Defaults to 8. A tool call or a new user message resets the count; 0 never calls the hook.",
+  }),
   username: Schema.optional(Schema.String).annotate({
     description: "Custom username to display in conversations instead of system username",
   }),

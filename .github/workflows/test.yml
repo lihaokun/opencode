@@ -113,7 +113,8 @@ jobs:
       matrix:
         settings:
           - name: linux
-            host: ubuntu-latest
+            # Playwright 1.59.1 supports Chromium on Ubuntu 24.04.
+            host: ubuntu-24.04
             workers: 4
           - name: windows
             host: windows-latest

@@ -1,4 +1,5 @@
 import { Effect, Schema } from "effect"
+import { PositiveInt } from "@opencode-ai/core/schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { SessionPrompt } from "../session/prompt"
 import { SessionID } from "../session/schema"
@@ -14,9 +15,40 @@ import { SessionID } from "../session/schema"
 export type AgentStatus = "running" | "idle"
 
 /**
- * How many Agents an injected roster or neighbour snapshot will name.
+ * Makes a model-supplied string safe to interpolate into a system-written line:
+ * a message header's fields, a row of agent_list, a line of the step tail.
  *
- * The lists exist so a reader knows it has company and who that is; enumerating
+ * A name and an agent type both come from the model, and both land inside the
+ * first line of a message. Left alone, a name containing `]` and a newline ends
+ * that line early and starts whatever it likes on the next one — a second
+ * message header, for instance.
+ *
+ * Encoding, not stripping: stripping renders `a\nb` and `ab` the same, so two
+ * different agents become indistinguishable. And the backslash has to go first,
+ * or a real newline encodes to `\n` and collides with a name that literally
+ * contained those two characters, which loses the same property by a longer
+ * route.
+ *
+ * What this guarantees is about the header's fields, not about the whole
+ * message: a body is free to contain anything, `[Agent message from …`
+ * included, because the boundary is the first line and the first line is built
+ * entirely from encoded fields.
+ */
+export function escapeField(value: string) {
+  return value
+    .replaceAll("\\", "\\\\")
+    .replaceAll("\r", "\\r")
+    .replaceAll("\n", "\\n")
+    .replaceAll("\t", "\\t")
+    .replaceAll("[", "\\[")
+    .replaceAll("]", "\\]")
+}
+
+/**
+ * How many Agents the neighbour snapshot will name. (The roster that shared
+ * this cap is retired; the step tail's view has its own, StepTail.LIST_ROWS.)
+ *
+ * The list exists so a reader knows it has company and who that is; enumerating
  * everyone is agent_list's job and reaching anyone is agent_send's. Ten keeps a
  * widely fanned-out session from trading one unbounded list for a longer one,
  * and sits at the same order of magnitude as the task prompt it travels with.
@@ -68,6 +100,8 @@ export interface AgentSkeleton {
   relation: AgentRelation
   time_created: number
   workdir: AgentWorkdir | undefined
+  /** The run record, read off the same row; absent for a session that never ran or is nobody's subagent. */
+  run?: AgentRun
 }
 
 export interface AgentInfo extends AgentSkeleton {
@@ -107,6 +141,87 @@ export const METADATA_AGENT_NOTIFY = "agentNotify"
  * on both sides.
  */
 export const NOTIFICATION_METADATA_KIND = "agent_notification"
+
+/**
+ * TextPart.metadata.kind of the user message the run loop writes when the
+ * experimental.session.stop hook blocks a stop: the plugin's reason, which the
+ * model reads as its next instruction. Synthetic, so the TUI hides it today
+ * (issue #90 renders it from this kind).
+ */
+export const STOP_HOOK_METADATA_KIND = "stop_hook"
+
+/**
+ * TextPart.metadata.kind of a message from another agent — agent_send traffic
+ * and the cancellation notice — with the sender alongside it: `sender`
+ * (SessionID), `sender_name?`, `sender_agent?`. The model-facing text is
+ * unchanged; the TUI reads the kind (#73) and the run record reads the sender.
+ */
+export const AGENT_MESSAGE_METADATA_KIND = "agent_message"
+
+/**
+ * TextPart.metadata.kind of the header line a human's message gets when it
+ * arrives through the TUI's agent-message route. No fields: there is no sender
+ * session.
+ */
+export const USER_MESSAGE_METADATA_KIND = "user_message"
+
+/**
+ * Every part kind this feature writes. The TUI holds its own copy of these
+ * literals (it cannot import this file); the two are held together by fixture
+ * tests on both sides.
+ */
+export const PART_KINDS = {
+  agent_notification: NOTIFICATION_METADATA_KIND,
+  stop_hook: STOP_HOOK_METADATA_KIND,
+  agent_message: AGENT_MESSAGE_METADATA_KIND,
+  user_message: USER_MESSAGE_METADATA_KIND,
+} as const
+
+/**
+ * Session metadata key of the run record (subplan agentmgmt-2-run-state §4.1):
+ * a subagent's current run and the end of the one before it. Only
+ * SessionPrompt.loop writes it, at run start and run end; the agent tools, the
+ * step tail and the run-end report read it. Readers tolerate its absence —
+ * sessions from before it existed, and an HTTP session.update that replaced
+ * the metadata wholesale.
+ */
+export const METADATA_AGENT_RUN = "agentRun"
+
+export const RUN_OUTCOMES = ["completed", "failed", "stopped", "lost"] as const
+export type RunOutcome = (typeof RUN_OUTCOMES)[number]
+export const WAKE_KINDS = ["agent", "user", "system"] as const
+
+/** Who woke a run. `session` is present exactly when `kind` is "agent". */
+export const WakeSource = Schema.Struct({
+  kind: Schema.Literals(WAKE_KINDS),
+  session: Schema.optional(SessionID),
+  name: Schema.optional(Schema.String),
+  agent: Schema.optional(Schema.String),
+})
+export type WakeSource = typeof WakeSource.Type
+
+/** The end of a run: what the record keeps of the one before the current. */
+export const RunEnd = Schema.Struct({
+  number: PositiveInt,
+  ended_at: Schema.Finite,
+  outcome: Schema.Literals(RUN_OUTCOMES),
+})
+export type RunEnd = typeof RunEnd.Type
+
+/**
+ * `ended_at` and `outcome` are present together or not at all; `lost` is only
+ * ever written when a new run finds the record still open (the process died or
+ * the end write failed), and no report corresponds to it.
+ */
+export const AgentRun = Schema.Struct({
+  number: PositiveInt,
+  started_at: Schema.Finite,
+  woken_by: WakeSource,
+  ended_at: Schema.optional(Schema.Finite),
+  outcome: Schema.optional(Schema.Literals(RUN_OUTCOMES)),
+  previous: Schema.optional(RunEnd),
+})
+export type AgentRun = typeof AgentRun.Type
 
 /**
  * Instance names must not be mistakable for a SessionID, because target

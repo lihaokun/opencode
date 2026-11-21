@@ -295,7 +295,11 @@ export function Prompt(props: PromptProps) {
     if (!props.sessionID) return
     const session = sync.session.get(props.sessionID)
     const msg = sync.data.message[props.sessionID] ?? []
-    const last = msg.findLast((item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0)
+    // Skip compaction summaries (#77): right after a compaction the newest
+    // assistant is the summary request whose input is the entire old history.
+    const last = msg.findLast(
+      (item): item is AssistantMessage => item.role === "assistant" && !item.summary && item.tokens.output > 0,
+    )
     if (!last) return
 
     const tokens =

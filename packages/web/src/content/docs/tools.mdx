@@ -95,7 +95,7 @@ Create new files or overwrite existing ones.
 Use this to allow the LLM to create new files. It will overwrite existing files if they already exist.
 
 :::note
-The `write` tool is controlled by the `edit` permission, which covers all file modifications (`edit`, `write`, `apply_patch`).
+The `write` and `edit` tools share the `edit` permission.
 :::
 
 ---
@@ -171,31 +171,6 @@ This tool is only available when `OPENCODE_EXPERIMENTAL_LSP_TOOL=true` (or `OPEN
 Supported operations include `goToDefinition`, `findReferences`, `hover`, `documentSymbol`, `workspaceSymbol`, `goToImplementation`, `prepareCallHierarchy`, `incomingCalls`, and `outgoingCalls`.
 
 To configure which LSP servers are available for your project, see [LSP Servers](/docs/lsp).
-
----
-
-### apply_patch
-
-Apply patches to files.
-
-```json title="opencode.json" {4}
-{
-  "$schema": "https://opencode.ai/config.json",
-  "permission": {
-    "edit": "allow"
-  }
-}
-```
-
-This tool applies patch files to your codebase. Useful for applying diffs and patches from various sources.
-
-When handling `tool.execute.before` or `tool.execute.after` hooks, check `input.tool === "apply_patch"` (not `"patch"`).
-
-`apply_patch` uses `output.args.patchText` instead of `output.args.filePath`. Paths are embedded in marker lines within `patchText` and are relative to the project root (for example: `*** Add File: src/new-file.ts`, `*** Update File: src/existing.ts`, `*** Move to: src/renamed.ts`, `*** Delete File: src/obsolete.ts`).
-
-:::note
-The `apply_patch` tool is controlled by the `edit` permission, which covers all file modifications (`edit`, `write`, `apply_patch`).
-:::
 
 ---
 
@@ -309,6 +284,18 @@ This tool allows the LLM to ask the user questions during a task. It's useful fo
 - Offering choices about what direction to take
 
 Each question includes a header, the question text, and a list of options. Users can select from the provided options or type a custom answer. When there are multiple questions, users can navigate between them before submitting all answers.
+
+---
+
+## Migrating older patch configurations
+
+This fork no longer ships the `apply_patch` tool. All model families use the same built-in `write` and `edit` tools when permitted. Hooks for these tools receive the target path as `output.args.filePath`.
+
+The old `tools.patch` setting no longer controls editing: `false` no longer disables `write`/`edit`, and `true` no longer enables them. To keep an editing restriction, use `permission.edit` in the same global or Agent configuration. The remaining `tools.patch` and `tools.apply_patch` keys are rules for tools with those exact names; they do not restore the removed built-in. See [Permissions](/docs/permissions#configuration).
+
+`write` and `edit` support creating and updating file contents. They do not replace the removed patch tool's file deletion or move operations; those require another permitted tool.
+
+Historical `apply_patch` messages remain readable in the TUI, web app and ACP, and in model history. CLI `run` uses its generic tool display for these records; the patch-specific file summaries and diff panels have been removed.
 
 ---
 

@@ -140,3 +140,33 @@ describe("toExit", () => {
     expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
   })
 })
+
+// Subplan agentmgmt-2-run-state §4.6: a report names the run it closes when
+// the record closed, and claims nothing when it is missing or still open.
+describe("renderOutput", () => {
+  const sessionID = SessionID.make("ses_child")
+
+  test("carries run and ended when both are given", () => {
+    const text = AgentDelegation.renderOutput({
+      sessionID,
+      state: "completed",
+      summary: "Agent completed: x (run 5, ended 03:41:18)",
+      text: "done",
+      run: 5,
+      ended: "2026-10-20T03:41:18+08:00",
+    })
+    expect(text.split("\n")[0]).toBe(
+      `<agent id="ses_child" state="completed" run="5" ended="2026-10-20T03:41:18+08:00">`,
+    )
+    expect(text).toContain("<summary>Agent completed: x (run 5, ended 03:41:18)</summary>")
+  })
+
+  test("carries neither when either is missing", () => {
+    expect(AgentDelegation.renderOutput({ sessionID, state: "error", text: "boom" }).split("\n")[0]).toBe(
+      `<agent id="ses_child" state="error">`,
+    )
+    expect(AgentDelegation.renderOutput({ sessionID, state: "completed", text: "", run: 5 }).split("\n")[0]).toBe(
+      `<agent id="ses_child" state="completed">`,
+    )
+  })
+})

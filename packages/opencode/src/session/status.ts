@@ -10,9 +10,17 @@ export type Info = SessionStatusEvent.Info
 
 export const Event = SessionStatusEvent
 
+/**
+ * A status as the projection holds it: the wire status plus when it was set,
+ * epoch ms. In memory only — the event carries the status alone. `at` is
+ * absent for the idle default, which nothing ever set; for a running session
+ * it is the start of its last step, because the loop sets busy at every step.
+ */
+export type Projected = Info & { readonly at?: number }
+
 export interface Interface {
-  readonly get: (sessionID: SessionID) => Effect.Effect<Info>
-  readonly list: () => Effect.Effect<Map<SessionID, Info>>
+  readonly get: (sessionID: SessionID) => Effect.Effect<Projected>
+  readonly list: () => Effect.Effect<Map<SessionID, Projected>>
   readonly set: (sessionID: SessionID, status: Info) => Effect.Effect<void>
 }
 
@@ -24,7 +32,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
 
     const state = yield* InstanceState.make(
-      Effect.fn("SessionStatus.state")(() => Effect.succeed(new Map<SessionID, Info>())),
+      Effect.fn("SessionStatus.state")(() => Effect.succeed(new Map<SessionID, Projected>())),
     )
 
     const get = Effect.fn("SessionStatus.get")(function* (sessionID: SessionID) {
@@ -44,7 +52,8 @@ const layer = Layer.effect(
         data.delete(sessionID)
         return
       }
-      data.set(sessionID, status)
+      // Step S9: stamped on the way in; the event above carries the status alone.
+      data.set(sessionID, { ...status, at: Date.now() })
     })
 
     return Service.of({ get, list, set })

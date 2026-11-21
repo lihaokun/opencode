@@ -28,7 +28,9 @@ function defer<T = void>() {
   return { promise, resolve, reject }
 }
 
-async function waitFor<T>(check: () => T | undefined, timeout = 1_000): Promise<T> {
+// Readiness budget, not a latency assertion: CI runs CLI subprocesses alongside
+// these event consumers, so a delayed scheduler must not fail a correct state.
+async function waitFor<T>(check: () => T | undefined, timeout = 5_000): Promise<T> {
   const end = Date.now() + timeout
   while (Date.now() < end) {
     const value = check()

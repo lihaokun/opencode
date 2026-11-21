@@ -357,7 +357,9 @@ function normalizeMessages(
 
 function applyCaching(msgs: ModelMessage[], model: Provider.Model): ModelMessage[] {
   const system = msgs.filter((msg) => msg.role === "system").slice(0, 2)
-  const final = msgs.filter((msg) => msg.role !== "system").slice(-2)
+  // The step tail (session/step-tail.ts) is rebuilt for every step and never
+  // persisted; a breakpoint on it would write a cache entry nothing reads.
+  const final = msgs.filter((msg) => msg.role !== "system" && msg.providerOptions?.opencode?.tail !== true).slice(-2)
 
   const providerOptions = {
     anthropic: {
@@ -482,6 +484,35 @@ export function message(msgs: ModelMessage[], model: Provider.Model, options: Re
   ) {
     msgs = applyCaching(msgs, model)
   }
+
+  // Automatic caching puts the server's breakpoint on the last block. When that
+  // is the step tail, which changes every step, nothing written is ever read
+  // back, so the last block before the tail gets an explicit breakpoint with the
+  // same cache control, TTL included (fix doc session-fix-step-tail-repeat-and-agents §4.1).
+  const tail = msgs.findIndex((msg) => msg.providerOptions?.opencode?.tail === true)
+  const beforeTail = msgs.findLastIndex((msg, index) => index < tail && msg.role !== "system")
+  if (usesAnthropicAutomaticCaching && beforeTail >= 0) {
+    msgs = msgs.map((msg, index) =>
+      index === beforeTail
+        ? ({
+            ...msg,
+            providerOptions: mergeDeep(msg.providerOptions ?? {}, {
+              anthropic: { cacheControl: options.cacheControl },
+            }),
+          } as typeof msg)
+        : msg,
+    )
+  }
+
+  // Only the cache placement above reads the step-tail marker. Drop it before the
+  // remap below, which would hand it to the SDK as an option of a provider whose
+  // ID is "opencode".
+  msgs = msgs.map((msg) => {
+    if (msg.providerOptions?.opencode?.tail !== true) return msg
+    const opencode = Object.fromEntries(Object.entries(msg.providerOptions.opencode).filter(([key]) => key !== "tail"))
+    const rest = Object.fromEntries(Object.entries(msg.providerOptions).filter(([key]) => key !== "opencode"))
+    return { ...msg, providerOptions: Object.keys(opencode).length === 0 ? rest : { ...rest, opencode } } as typeof msg
+  })
 
   // Remap providerOptions keys from stored providerID to expected SDK key
   const key = sdkKey(model.api.npm)

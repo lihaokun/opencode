@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import type { AuthenticateResponse, InitializeResponse } from "@agentclientprotocol/sdk"
 import { Effect } from "effect"
 import { cliIt } from "../../lib/cli-process"
+import { ACP_TEST_TIMEOUT_MS } from "./acp-test-client"
 import { createAcpClient, expectErrorCode, initialize } from "./helpers"
 
 describe("opencode acp initialize/auth subprocess", () => {
@@ -23,7 +24,7 @@ describe("opencode acp initialize/auth subprocess", () => {
         expect(initialized.agentCapabilities?.sessionCapabilities?.resume).toEqual({})
         expect(initialized.agentInfo?.name).toBe("OpenCode")
       }),
-    60_000,
+    ACP_TEST_TIMEOUT_MS,
   )
 
   cliIt.live(
@@ -43,7 +44,7 @@ describe("opencode acp initialize/auth subprocess", () => {
         expectErrorCode(rejected.error, -32602)
         expect(JSON.stringify(rejected.error)).not.toContain(process.env.OPENCODE_AUTH_CONTENT ?? "not-present")
       }),
-    60_000,
+    ACP_TEST_TIMEOUT_MS,
   )
 
   cliIt.live(
@@ -56,6 +57,6 @@ describe("opencode acp initialize/auth subprocess", () => {
         expect(initialized.result?.authMethods?.[0]?.id).toBe("opencode-login")
         expect(initialized.result?.authMethods?.[0]?._meta?.["terminal-auth"]).toBeUndefined()
       }),
-    60_000,
+    ACP_TEST_TIMEOUT_MS,
   )
 })

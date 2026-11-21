@@ -1262,18 +1262,15 @@ describe("opencode run waits for the agents it started", () => {
   // this wrong in the other direction and a long but productive agent is killed
   // mid-task.
   //
-  // The scenario is real rather than accidentally fast: drop the ceiling to
-  // 200ms and this same run does give up, which is what makes the 700ms result
-  // mean something. What resets the clock here is the child's own busy/idle
-  // transitions, one per provider turn — the message and part events feed the
-  // same reset and carry a child that stays inside a single long turn.
+  // Four 2s waits exceed the 5s ceiling in total, while each gap leaves room
+  // for process startup and CI scheduling. Disabling the activity resets must
+  // still fail this test: increasing only the ceiling would lose that property.
+  // The child's status, message and part events all reset the clock.
   //
   // POSIX only. The property is a wall-clock one and needs each gap to stay
   // under the ceiling while the total goes past it. On the Windows runner a
-  // single subprocess launch can take longer than the whole ceiling, so that
-  // window closes and the run gives up for reasons that have nothing to do with
-  // what is being tested. Widening it far enough to be safe there would make the
-  // ceiling so long that the test no longer distinguishes reset from never-armed.
+  // subprocess launch alone can dominate that interval; keep the existing
+  // platform guard rather than making this a Windows startup timing test.
   posixOnly(
     "does not give up on a subagent that is still doing things",
     ({ llm, opencode }) =>
@@ -1291,14 +1288,12 @@ describe("opencode run waits for the agents it started", () => {
             cwd: ".",
           }),
         )
-        // Four waits of 400ms — bun rather than sleep, which the shell behind the
-        // bash tool does not provide on every platform. Each gap is under the
-        // 700ms ceiling, the total is comfortably over it, and every tool round
-        // trip is an event.
+        // Bun rather than sleep, which the shell does not provide everywhere.
+        // Every tool round trip is observable activity.
         for (let i = 0; i < 4; i++) {
           yield* llm.pushMatch(
             ({ body }) => hasUserText(body, childPrompt),
-            reply().tool("bash", { command: `bun -e "await Bun.sleep(400)"`, description: "wait" }),
+            reply().tool("bash", { command: `bun -e "await Bun.sleep(2000)"`, description: "wait" }),
           )
         }
         yield* llm.pushMatch(({ body }) => hasUserText(body, childPrompt), reply().text(finding).stop())
@@ -1306,13 +1301,13 @@ describe("opencode run waits for the agents it started", () => {
         yield* llm.push(reply().text(`the subagent said: ${finding}`).stop())
 
         const result = yield* opencode.run(parentPrompt, {
-          env: { OPENCODE_RUN_AGENT_WAIT_MS: "700" },
+          env: { OPENCODE_RUN_AGENT_WAIT_MS: "5000" },
           extraArgs: ["--dangerously-skip-permissions"],
         })
 
         // Proof the child really worked past the ceiling: without that this
         // asserts nothing about resetting.
-        expect(result.durationMs).toBeGreaterThan(1_600)
+        expect(result.durationMs).toBeGreaterThan(8_000)
         expect(result.stderr).not.toContain("Gave up waiting for agents")
         expect(result.stdout).toContain(finding)
         expect(result.exitCode).toBe(0)
