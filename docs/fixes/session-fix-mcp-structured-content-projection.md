@@ -99,3 +99,7 @@ harness 说明：投影循环提取为纯函数 `projectMcpToolResult`（`tools.
 | `docs/research/runtime-alignment-research.md` | §7 决议 #4-5 实施回填 | 已改: commit hash 见 devlog `docs/devlog/2026-10-12-session-fix-mcp-structured-content-projection.md` |
 | `docs/devlog/` | P0-2 实施日志（含度量） | 已加: `docs/devlog/2026-10-12-session-fix-mcp-structured-content-projection.md` |
 | 无 schema/枚举/接口契约文档 | 新契约（追加格式、判等规则、占位文案、错误 message 组装）权威记录为本文第四部分 | 无（+理由） |
+
+## 2026-11-21 · 协议错误出口
+
+普通工具与 code-mode 通过同一工具调用入口处理两种失败。工具返回 isError 时提取正文和 structuredContent；JSON-RPC 拒绝时保留 message 和可选 data，再按原有工具预算生成预览与全文引用。取消信号保留原有异常。真实 SDK 内存传输产生两种合法错误；性质测试核对实际交给截断器的完整内容以及对调用者可见的预览。

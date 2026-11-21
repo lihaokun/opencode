@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import {
   CallToolResultSchema,
   ListToolsResultSchema,
+  McpError,
   ToolSchema,
   type CallToolResult,
   type Tool as MCPToolDef,
@@ -65,6 +66,34 @@ export function defs(client: Client, timeout?: number) {
   return listTools(client, timeout ?? DEFAULT_TIMEOUT).pipe(Effect.catch(() => Effect.void))
 }
 
+// Both MCP entry points must bound server diagnostics before they enter a session.
+export async function callTool(
+  client: Client,
+  name: string,
+  args: Record<string, unknown>,
+  signal: AbortSignal | undefined,
+  timeout: number | undefined,
+  truncateError: (text: string) => Promise<string>,
+): Promise<CallToolResult> {
+  const result = await client
+    .callTool({ name, arguments: args }, CallToolResultSchema, {
+      resetTimeoutOnProgress: true,
+      signal,
+      timeout,
+      // The SDK requests progress updates only when a hook is present.
+      onprogress: () => {},
+    })
+    .catch(async (error: unknown) => {
+      if (signal?.aborted || !(error instanceof McpError)) throw error
+      const diagnostic = error.data === undefined ? error.message : error.message + "\n\n" + JSON.stringify(error.data)
+      const bounded = await truncateError(diagnostic)
+      if (bounded === error.message) throw error
+      throw new Error(bounded)
+    })
+  if (result.isError) throw new Error(await truncateError(callToolErrorMessage(result)))
+  return result
+}
+
 export function convertTool(
   mcpTool: MCPToolDef,
   client: Client,
@@ -82,21 +111,14 @@ export function convertTool(
     description: mcpTool.description ?? "",
     inputSchema: jsonSchema(inputSchema),
     execute: async (args: unknown, options) => {
-      const result = await client.callTool(
-        {
-          name: mcpTool.name,
-          arguments: (args || {}) as Record<string, unknown>,
-        },
-        CallToolResultSchema,
-        {
-          resetTimeoutOnProgress: true,
-          signal: options.abortSignal,
-          timeout,
-          // The MCP SDK only sends a progress token when this hook is present, enabling timeout resets.
-          onprogress: () => {},
-        },
+      const result = await callTool(
+        client,
+        mcpTool.name,
+        (args || {}) as Record<string, unknown>,
+        options.abortSignal,
+        timeout,
+        truncateError,
       )
-      if (result.isError) throw new Error(await truncateError(callToolErrorMessage(result)))
       if (result.content.length > 0 || result.structuredContent === undefined || result.structuredContent === null)
         return result
       return {
