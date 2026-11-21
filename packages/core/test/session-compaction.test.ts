@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { FastCheck } from "effect/testing"
 import { SessionCompaction } from "@opencode-ai/core/session/compaction"
 
 test("compaction prompt preserves detailed work state and relevant files", () => {
@@ -83,4 +84,43 @@ test("formatExitCodeLine renders only finite non-zero exits", () => {
   expect(formatExitCodeLine({ exit: "7" })).toBeUndefined()
   expect(formatExitCodeLine({})).toBeUndefined()
   expect(formatExitCodeLine(undefined)).toBeUndefined()
+})
+
+test("the V2 summary keeps the saved output path when attachments displace it from the tail", () => {
+  FastCheck.assert(
+    FastCheck.property(FastCheck.integer({ min: 0, max: 80 }), FastCheck.nat(4_000), (count, extra) => {
+      const file = "/tmp/artifacts/" + "p".repeat(20 + extra % 800)
+      const footer = "The tool call succeeded but the output was truncated. Full output saved to: " + file +
+        "\nUse Grep to search the full content or Read with offset/limit to view specific sections."
+      const result = SessionCompaction.serializeToolContent([
+        { type: "text", text: "log ".repeat(800 + extra) + "\n" + footer },
+        ...Array.from({ length: count }, (_, index) => ({
+          type: "file" as const, uri: "data:image/png;base64,AAAA", mime: "image/png", name: `image-${index}.png`,
+        })),
+      ])
+      expect(result).toContain(file)
+      expect(result.length).toBeLessThan(2200 + file.length)
+      expect(result).not.toContain("base64")
+    }),
+    { seed: 60414, numRuns: 80, examples: [[40, 1000], [0, 0]] },
+  )
+})
+
+test("V2 summaries retain distinct text-block artifacts and count references beyond their allowance", () => {
+  for (const count of [2, 200]) {
+    const files = Array.from({ length: count }, (_, index) => "/output/" + index + "/" + "p".repeat(400))
+    const blocks = files.map((file) => ({
+      type: "text" as const,
+      text: "body ".repeat(400) + "\nThe tool call succeeded but the output was truncated. Full output saved to: " + file +
+        "\nUse Grep to search the full content or Read with offset/limit to view specific sections.",
+    }))
+    const preview = SessionCompaction.serializeToolContent([...blocks, blocks[0]!, { type: "text", text: "tail".repeat(500) }])
+    const included = files.filter((file) => preview.includes(file))
+    if (count === 2) expect(included).toEqual(files)
+    else {
+      expect(included.length).toBeGreaterThan(0)
+      expect(preview).toContain(`[${count - included.length} more artifact paths in the original tool result]`)
+      expect(preview.length).toBeLessThan(35_000)
+    }
+  }
 })

@@ -42,13 +42,16 @@ export function summarizeToolText(text: string): string {
   return `${prefix}\n[... ${text.length - prefix.length - suffix.length} chars truncated ...]\n${suffix}`
 }
 
-/** Errors store the truncator's continuation as text rather than tool metadata. */
+// V2 stores the truncator's artifact reference in text, including on errors.
+export function savedOutputPath(text: string) {
+  return /(?:^|\n)The tool call (?:failed; error output was truncated|succeeded but the output was truncated)\. Full output saved to: ([^\r\n]{1,32767})\nUse Grep to search the full content or Read with offset\/limit to view specific sections\.(?:\n|$)/.exec(
+    text,
+  )?.[1]
+}
+
 export function summarizeToolError(text: string) {
   const preview = summarizeToolText(text)
   if (preview === text) return preview
-  const saved =
-    /(?:^|\n)The tool call failed; error output was truncated\. Full output saved to: ([^\r\n]{1,32767})\nUse Grep to search the full content or Read with offset\/limit to view specific sections\.$/.exec(
-      text,
-    )?.[1]
+  const saved = savedOutputPath(text)
   return saved && !preview.includes(saved) ? preview + "\nFull output saved to: " + saved : preview
 }
