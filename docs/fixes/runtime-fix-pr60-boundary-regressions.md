@@ -55,3 +55,5 @@ V1 prompt/compaction/history/processor/fork、restoration、run-state/background
 - 6180dc53a7、0a3d2db7d1 修复由 Session 所有的 shell 生命周期、通知、输出和分页。主动脱离并由其启动器交给系统管理的进程遵循 shell 前台进程的既有语义。
 - cdca48e158、7679537252、a86db3b038 覆盖 MCP 和摘要投影。多路径超出引用区时给出省略数，较长路径的前缀出现在日志中不会被当作完整引用。
 - 两次交叉复核中，实施者分别验证其他模块。主要证据包括真实 HTTP provider、SQLite 独立读取、真实子进程和 SDK 的内存传输。原 CI 失败用例及相关 CLI 用例共三项通过；六个独立的恢复/进程反例通过。Core 的五份测试共 129 项通过。30 项工作区类型检查通过；重新运行客户端与 SDK 生成入口，发布的 OpenAPI 和 JS 类型均包含 request_user_id。远端状态见 PR #60 的同提交检查。
+
+GitHub 的 Linux unit 1/3 另外定位到 processor-effect 仍在断言可恢复的 LiteLLM 错误会发布终局事件。组件用例现同时核对可恢复时没有错误事件、禁止恢复时保留完整 LiteLLM 报错并恰好发布一次。它与真实 CLI 用例共同约束同一行为。
