@@ -73,3 +73,7 @@ C11 四组 PBT 未含本模块（无算法性输入域）。如未来模板数�
   摘要输入经 `summarizeToolText` 共享的 helper 与本子计划无交叠）
 - wire 级背书：default agent 线上含 SHARED、被删规则与委派处方均不在
   （prompt.test）；显式 prompt 线上两者皆无（opt-out）
+
+### 本轮 Step 5 的机械验证
+
+system.test.ts 的路由矩阵与 prompt.test.ts 的模型请求检验覆盖和共享段。独立复审与未覆盖范围见 [本轮修复记录](../../fixes/runtime-fix-pr60-boundary-regressions.md)。本地仓库没有通用 contract_audit 生成器。本子计划的功能与合并验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。
