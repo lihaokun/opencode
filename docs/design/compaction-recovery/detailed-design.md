@@ -6,11 +6,11 @@
 
 ## 1. 范围
 
-- 新模块 `packages/opencode/src/session/restoration.ts`（M1 collect / materialize / render / buildTailText）
+- 新模块 `packages/opencode/src/session/restoration.ts`（M1 collect / materialize / render / retainedFileVersions）
 - 注入入口 `apply`（M2，同文件）
 - 装配：`session/prompt.ts` 的 compaction task arm——`compaction.process` 返回 `"continue"` 后内联调用（2026-10-18 复审核意见 B6 修订：初版挂在每 provider step 的 `applyAgentRoster` 之后，被审出每步全量读历史；修订后只在压缩结算点注入一次，快照语义 = 压缩时刻的磁盘状态，同时消除"压缩后模型改文件会重复追加 sentinel part"的初版缺陷）
 - 配置：`packages/core/src/v1/config/config.ts` 的 `compaction` struct 增加 `restoration` 子结构
-- 测试：restoration 单元测试（collect/materialize/render/buildTailText 纯函数）+ apply 幂等集成测试 + 注入后模型消息可见性测试
+- 测试：restoration 单元测试（collect/materialize/render/retainedFileVersions 纯函数）+ apply 幂等集成测试 + 注入后模型消息可见性测试
 
 不覆盖：roster（既有）、插件契约（非目标）、core V2 runner 路径（V1 主循环专用；V2 摘要丢失 structured 是独立 follow-up）。
 
@@ -19,7 +19,7 @@
 | 项 | 核实结果 | 复用方式 |
 |---|---|---|
 | H1 路径字段 ★（2026-10-20 独立审 B5 同步修订） | read → `metadata.display.path` 且仅 `display.type === "file"`（`read.ts:288-298` 目录读取同形 type:"directory"，须过滤）；edit → **`metadata.filediff.file`**（`edit.ts:181-211`——初稿的 `metadata.filepath` 是 permission request 的 metadata 形状，edit **result** metadata 从未含 filepath，按初稿实现 edit 候选恒空） | collect 的候选提取 |
-| H3 tail 重建 ★ | `Session.messages({sessionID})` 返回全量 `WithParts[]`（`session.ts:536`）；tail 体量受 preserve_recent 预算（2k~15k token）约束，全量读取后切片成本同阶 | `buildTailText` |
+| H3 tail 重建 ★ | `Session.messages({sessionID})` 返回全量 `WithParts[]`（`session.ts:536`）；tail 体量受 preserve_recent 预算（2k~15k token）约束，全量读取后切片成本同阶 | `retainedFileVersions` |
 | skill 定位 ★ | skill tool part `metadata: { name, dir }`（`skill.ts:62-65`）；`Skill.Service` 可按 name 解析 `info.location` | materialize 的 skill 正文重读 |
 | synthetic part ★ | `{ id, messageID, sessionID, type: "text", text, synthetic: true }` 经 `sessions.updatePart` + push 入 `userMessage.parts`（`reminders.ts:138-151`）；哨兵前缀 + `findLast` + 逐字节比较的去重先例 | apply 的写入与去重 |
 | config ★ | `compaction` struct（`config.ts:150-161`，含 auto/prune/tail_turns/preserve_recent_tokens） | 新增 `restoration` 子结构 |
@@ -66,23 +66,15 @@ restoration: Schema.optional(Schema.Struct({
 }))
 ```
 
-函数局部类型（ephemeral，不进本节）：`tailText: string`、渲染用的节缓冲。
+函数局部类型（ephemeral，不进本节）：`versions: ReadonlyMap<string, string>`、渲染用的节缓冲。
 
 ## 5. 模块细化
 
-### 5.1 buildTailText
+### 5.1 retainedFileVersions
 
-- **签名**：`buildTailText(messages: SessionV1.WithParts[], tailStartID: MessageID | undefined): string`
-- **功能描述**：拼接 `tail_start_id` 指向消息及其之后所有 parts 的 text 内容（text part 的 text、tool part 的 output）。
-- **调用关系**：callers: apply；callees: 无。
-- **实现思路**（§4.3.1 六条）：
-  1. `tailStartID === undefined` → 返回 `""`（无 tail → 比对基线为空，全部候选照常物化——对应"全量摘要"压缩形态）
-  2. 定位 `messages` 中 `info.id === tailStartID` 的消息下标（找不到 → 视同 1，返回 `""`）
-  3. 从该下标起遍历：text part → push `part.text`；tool completed part → push `part.state.output`；其余类型跳过
-  4. `join("\n\n")` 返回
-- **退出覆盖**：仅正常返回（纯函数）。
-- **循环刻画**：步骤 2-3 均为有限数组线性扫描，终止显然。
-- **正确性论证**：前置：messages 为全量、tailStartID 来自 compaction part。步骤 2 定位唯一（ID 唯一）；步骤 3 覆盖承载文本的两种 part 类型（text/tool-completed——file part 无正文、reasoning 不属于"模型可见原文"的重复判定对象，是显式取舍）；拼接结果包含 tail 的全部相关文本 ⇒ 后置（作为 materialize 比对基线的语义成立）。
+输入是此次成功摘要之后实际保留的模型历史。扫描其中 assistant 消息里可见的 completed read，按文件路径记录最近完整版本。被清理、被截断、非完整范围的工具结果不能证明版本相同。缺少指纹的历史记录按当前权限重新展示。出现同一路径的后续 edit 时，旧指纹失效。
+
+read 在读取源字节的同一条流上计算 SHA-256，只为从第一行开始的完整显示保留指纹；截断、略去超长行或超出字节上限都省略指纹。返回正文仍需包含当时显示的行。因而换行符差异、删去末行、清空文件和同内容的其他路径都不能误判为同一版本。此扫描访问已加载的有限消息序列，无额外磁盘遍历。
 
 ### 5.2 collectCandidates
 
@@ -100,20 +92,20 @@ restoration: Schema.optional(Schema.Struct({
 
 ### 5.3 materializeCandidates
 
-- **签名**：`materializeCandidates(candidates, tailText: string, deps: { fs; skill; todo; cfg }): Effect.Effect<RestorationMaterial[]>`（deps 以参数传入便于单测）
+- **签名**：`materializeCandidates(candidates, versions: ReadonlyMap<string, string>, deps: { fs; skill; todo; cfg }): Effect.Effect<RestorationMaterial[]>`（deps 以参数传入便于单测）
 - **功能描述**：逐候选物化。
 - **调用关系**：callers: apply；callees: FSUtil（读盘/stat）、Skill.Service（按 name 定位 location）、Token.estimate。
 - **实现思路**（分支全覆盖）：
   1. `todo` 候选 → 渲染 todo 列表（复用 todo 工具的渲染格式）→ `inlined`
   2. `skill` 候选 → Skill.Service 解析 name → 失败 → `missing`；成功 → 读 `info.location` 文件 → 估算超 `file_max_tokens` → `reference`；成功 → `inlined`（**无 tail 比对**——架构已定：skill 正文压缩后只剩截断版，比对无意义）
-  3. `file` 候选 → `stat`：失败 → `missing(reason)`；估算超限 → `reference`；否则读全文 → `tailText.includes(content)`（原始包含判定）→ 命中 `skipped-duplicate`；否则 `inlined`
+  3. `file` 候选 → `stat`：失败 → `missing(reason)`；估算超限 → `reference`；否则读全文 → 与同路径完整 read 的 SHA-256 比对→ 命中 `skipped-duplicate`；否则 `inlined`
   4. 顺序执行，单候选失败被 catch → `missing`（错误处理策略 §3）
 - **callee 契约引用**：`FSUtil` read/stat 的错误语义按平台错误处理；`Skill.Service` 解析失败为类型化错误（catch 转 missing）。
 - **提前停止（2026-11-05 R4）**：`spent ≥ budget_tokens` 后不再对剩余候选做 stat/read，直接标记 `reference("restoration budget exhausted")`——候选按最近使用降序，被放弃的尾部是最陈旧的材料。
 - **循环刻画**：候选有限，逐个处理，终止显然。
 - **正确性论证**（non-trivial）：
-  - 前置：候选来自 5.2；tailText 语义见 5.1。
-  - 论证：file 分支——读盘成功时 `content` 即磁盘当前版本（架构 H2：磁盘即现状）；`tailText.includes(content)` 为真 ⇒ 该当前版本已完整存在于模型上下文 ⇒ 注入是冗余 ⇒ skip 正确；为假 ⇒ 当前版本不在 tail ⇒ 注入满足"当前版本"验收（重复仅可能因格式差异漏判——冗余方向，无数据损失，预算兜底）。skill 分支跳过比对符合其正文必然只剩截断版的事实。三分支（missing/reference/inlined）覆盖全部读盘结局 ⇒ 后置（每个候选恰有一个处置且处置可诊断）。
+  - 前置：候选来自 5.2；versions 语义见 5.1。
+  - 论证：read 对源字节生成的完整指纹与同路径当前源字节（含 UTF-8 BOM）的 SHA-256 相等，且完整 read 仍可见，才可省略恢复。其余文件按当前权限、大小与预算恢复或说明失败；skill 和 todo 独立处置。
   - 副作用论证：只读（read/stat/skill 解析），无写入。
 
 ### 5.4 renderMaterials
@@ -124,27 +116,27 @@ restoration: Schema.optional(Schema.Struct({
 - **实现思路**：
   1. 过滤：`max_files` 对 file 类 `inlined` 候选取前 N（排序已在 collect 保证按最近）
   2. 组装三节：Files（inlined 的 `### file: path` + content 围栏）/ Skills / Todos；reference/missing/skipped-budget 以单行引用形式集中列入 **`## Not restored` 节**（2026-10-20 独立审同步：初稿"列入对应节"，实现为独立降级节——展示形状以实现为准）
-  3. 顺序累加，累计 token 估算超过 `budget_tokens` 时：当前候选降级为引用行，后续全部同样降级（2026-11-05 二轮审核 R4 再修订：2026-10-20 的"引用行不计预算"例外使 I2 上界不成立——1,000 条历史引用实测 47,496 token ≈ 预算 5.9 倍。现 Not restored 节条目数封顶 `MAX_REFERENCE_LINES = 20`，超出合并为一条有界汇总行 `- ...and N more`；`budget_tokens ≤ 0` 直接返回 `undefined`（0 预算 = 不恢复，堵住 1-2 字符内容因 round 后估算为 0 而免费注入的角落）。输出上界 = budget + 封顶引用节的固定框架开销）
+  3. 每个内联项先计入实际 markdown 长度（含头部、分节、路径、换行、围栏）。放不下的项成为诊断，后续较小材料仍可装入。令 B=budget_tokens，D=max(128,min(2000,B))；诊断最多 20 条，路径和原因最多各 160 个 UTF-16 单元，超限或总长不足时合并尾部条数。整块最多 B+D tokens，B=0 直接返回 undefined。
   4. 整体无任何节有内容 → 返回 `undefined`
   5. 输出 = `RESTORATION_SENTINEL` 行 + 三节 markdown
 - **退出覆盖**：`undefined`（无材料）与文本两种返回。
 - **循环刻画**：材料有限，逐个累加，token 计数单调不减 → 终止。
 - **正确性论证**（non-trivial）：
   - 前置：materials 来自 5.3，状态语义成立。
-  - 论证：不变量——任意前缀处理完毕时，已输出文本 token 估算 ≤ budget（归纳：每加入一个 inlined 前检查，超限即降级为引用行且引用行短于其内容 ⇒ 仍不超）；max_files 在 inlined file 上先于预算执行 ⇒ 两约束同时满足 ⇒ 后置（I2 成立：输出 ≤ budget_tokens）。
+  - 论证：初始扣除固定头部，各节首次内联时扣除节标题，每次内联再扣除整项的实际长度和分隔换行；剩余长度始终非负。诊断折叠最多遍历 20 条，单调删除尾部引用，合并计数和固定头部能放入最小 128 tokens 余量。
   - 副作用论证：纯函数。
 
 ### 5.5 apply（M2 编排）
 
 - **签名**：`apply(input: { sessionID: SessionID }): Effect.Effect<void>`（服务方法；内部经 `Session.Service` 读 messages、经 Config 读配置）
-- **功能描述**：幂等入口：读配置（`enabled === false` → 直接返回）→ 读 messages → 触发判定 → findLast user message → buildTailText → collect → materialize → render → 哨兵去重 → 条件落库。
+- **功能描述**：幂等入口：读配置（`enabled === false` → 直接返回）→ 读 messages → 触发判定 → findLast user message → retainedFileVersions → collect → materialize → render → 哨兵去重 → 条件落库。
 - **调用关系**：callers: prompt.ts（roster 之后）；callees: 5.1-5.4 + Session + Config + Todo + FSUtil + Skill。
 - **实现思路**：
   1. `cfg.compaction.restoration?.enabled === false` → return
   2. `messages = yield* sessions.messages({ sessionID })`
   3. 触发判定：找**最后一个** completed compaction part 的消息下标 `c`；`findLast` 哨兵前缀 text part 的下标 `r`；`c` 不存在 → return；`r` 存在且 `r > c` → return（已恢复过且无新压缩）
   4. `userMessage` = messages 中最后一个 user message（compaction user 之后的 auto-continue/replay user——与 roster 取同一定位函数，复用其实现）
-  5. tail：`completedCompactions` 同款逻辑取最新 `tail_start_id` → `buildTailText`
+  5. 依据已完成摘要的 n 投影保留历史，再由 retainedFileVersions 取各路径的完整可见指纹。
   6. `collectCandidates` → 读 todo → `materializeCandidates` → `renderMaterials` → `undefined` → return
   7. 与 `findLast` 哨兵 part **逐字节比较**：相同 → return；不同（或不存在）→ `sessions.updatePart({..., type: "text", text, synthetic: true })` + push 入 userMessage.parts
   8. 全程 `Effect.catch` 吸收异常 → `Effect.logWarning` → return（错误处理策略）
@@ -173,7 +165,7 @@ msgs = yield* SessionRestoration.apply({ sessionID: chat.id }).pipe(
 
 ### 5.7 测试设计
 
-- **单元**（`test/session/restoration.test.ts`）：buildTailText（undefined/找不到/切片正确）、collectCandidates（read/edit/skill/去重/排序/todo）、materializeCandidates（临时目录真读盘：missing/reference/duplicate/inlined 四分支 + skill 解析失败）、renderMaterials（预算降级/max_files/空 → undefined/哨兵行）。
+- **单元**（`test/session/restoration.test.ts`）：retainedFileVersions（缺指纹、投影被清理、保留区内完整显示）、collectCandidates（read/edit/skill/去重/排序/todo）、materializeCandidates（临时目录真读盘：missing/reference/duplicate/inlined 四分支 + skill 解析失败）、renderMaterials（预算降级/max_files/空 → undefined/哨兵行）。
 - **集成**：`apply` 幂等——构造压缩后 messages，连续调用两次 `apply`，断言仅一个恢复 part 且第二次零写入；触发判定——无 compaction 时零写入。
 - **可见性**：恢复 part 写入后经 `toModelMessages` 断言模型消息包含恢复文本（复用 P0 E2E 的驱动方式：压缩 + 下一轮请求捕获）。
 
@@ -190,7 +182,7 @@ msgs = yield* SessionRestoration.apply({ sessionID: chat.id }).pipe(
 
 摘要请求被拒后，以确切缺口或同模型成功请求的实际输入加估值差选择起始档，按可用预算的 5% 逐档增加到 25%。每个更短的候选最多发一次；保留区另受主模型预算和配置约束。成功时使用选定边界进行 restoration；仅最终用尽才报告溢出。见[修复说明](../../fixes/session-fix-summary-overflow-tail.md)。
 
-2026-11-19 全量复核修订：自动重读以前提“当前 agent/session 仍允许 read 与适用的 external_directory，或允许该 skill”为准。文件去重仅依据当前模型仍可见的材料，不把即将退役的旧恢复块作为基准；原始 user 文本不参与恢复块的归属判定。恢复文本 part 记下对应 markerID，重放用户轮不复制旧恢复块。每个候选失败独立降级；只有实际内联的正文扣减预算，参考行中的路径和原因均有长度上限。
+2026-11-19 全量复核修订：自动重读以前提“当前 agent/session 仍允许 read 与适用的 external_directory，或允许该 skill”为准。文件去重仅依据当前模型仍可见的材料，不把即将退役的旧恢复块作为基准；原始 user 文本不参与恢复块的归属判定。恢复文本 part 记下对应 markerID，重放用户轮不复制旧恢复块。每个候选失败独立降级；成功内联时扣减该项的完整格式开销，引用行中的路径和原因均有长度上限。
 
 ### 摘要保留条数（2026-11-20）
 

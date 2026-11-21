@@ -200,16 +200,17 @@ it.instance("restoration deduplicates only files already visible inside the succ
           status: "completed",
           input: { filePath },
           title: file,
-          output: `1: ${body}`,
+          output: body.split("\n").map((line, index) => `${index + 1}: ${line}`).join("\n"),
           metadata: {
             display: {
               path: filePath,
               type: "file",
               text: body,
+              sha256: Bun.SHA256.hash(body, "hex"),
               truncated: false,
               lineStart: 1,
-              lineEnd: 1,
-              totalLines: 1,
+              lineEnd: body.split("\n").length,
+              totalLines: body.split("\n").length,
             },
           },
           time: { start: 0, end: 1 },
@@ -218,10 +219,18 @@ it.instance("restoration deduplicates only files already visible inside the succ
       return [user, assistant]
     })
     yield* saved("older.md", "OLDER_FILE_BODY")
-    const keep = yield* saved("tail.md", "RETAINED_FILE_BODY")
+    const keep = [
+      ...(yield* saved("tail.md", "RETAINED_FILE_BODY")),
+      ...(yield* saved("shrunk.md", "first line\nsecond line")),
+      ...(yield* saved("cleared.md", "remove contents")),
+      ...(yield* saved("other.md", "version on another path")),
+    ]
+    yield* fs.writeWithDirs(path.join(dir, "shrunk.md"), "first line")
+    yield* fs.writeWithDirs(path.join(dir, "cleared.md"), "")
+    yield* fs.writeWithDirs(path.join(dir, "other.md"), "RETAINED_FILE_BODY")
     const last = yield* h.user()
     const marker = yield* h.marker()
-    const summary = yield* h.assistant(marker, "success", 3)
+    const summary = yield* h.assistant(marker, "success", keep.length + 1)
     const late = yield* h.user()
     yield* SessionRestoration.apply({ sessionID: h.id })
     const active = yield* MessageV2.filterCompactedEffect(h.id)
@@ -230,9 +239,16 @@ it.instance("restoration deduplicates only files already visible inside the succ
     const tool = JSON.stringify(wire.filter((m) => m.role === "tool"))
     const user = JSON.stringify(wire.filter((m) => m.role === "user"))
     expect(tool).toContain("RETAINED_FILE_BODY")
-    expect(user).not.toContain("RETAINED_FILE_BODY")
+    const blocks = active.flatMap((message) => message.parts).filter((p) => p.type === "text" && SessionRestoration.isRestoration(p))
+    expect(blocks).toHaveLength(1)
+    const block = blocks[0]
+    if (block?.type !== "text") throw new Error("missing restoration text")
+    expect(block.text).not.toContain("### " + path.join(dir, "tail.md"))
+    for (const [name, body] of [["shrunk.md", "first line"], ["cleared.md", ""], ["other.md", "RETAINED_FILE_BODY"]] as const) {
+      expect(block.text).toContain(`### ${path.join(dir, name)}\n\`\`\`\n${body}\n\`\`\``)
+    }
     expect(user).toContain("OLDER_FILE_BODY")
-    expect(JSON.stringify(wire).match(/(?:RETAINED|OLDER)_FILE_BODY/g)).toHaveLength(2)
+    expect(JSON.stringify(wire).match(/(?:RETAINED|OLDER)_FILE_BODY/g)).toHaveLength(3)
   }),
 )
 

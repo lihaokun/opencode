@@ -40,7 +40,7 @@
 - P2 全量读 messages → 找 compaction part（tail_start_id）与既有 sentinel 位置
 - P3 判定：无 compaction → 不动；sentinel 晚于 compaction → 不动
 - P4 collect：completed tool parts → read（**B5 修订**：仅 `display.type === "file"`）取 `display.path`、edit 取 `filediff.file`、skill 取 `name`；最近使用排序；todo 追加
-- P5 materialize：stat 守卫（File 限定）→ 字节/token 上限 → 读盘 → tail 包含则 skip-duplicate
+- P5 materialize：权限和大小检查后读取当前文件，仅以同一路径的完整可见 read 指纹判重。旧 read 无指纹时重新展示。
 - P6 render：max_files 逐文件上限 + 预算耗尽降级引用行 → sentinel + 三节（Files/Skills/Todos）+ Not restored
 - P7 与上一份 sentinel 逐字节比较，不同才 `updatePart` 落库
 - P8 失败吸收：候选级 catch → `missing`；apply 顶层 `Effect.exit` → logWarning，绝不断 loop
@@ -48,7 +48,7 @@
 ## 5. 行为契约（语义）
 
 - 恢复的是**当前磁盘版本**（G1，决议 F① 磁盘重读），与 tail 同版本时去重
-- 预算：回填不把刚压小的上下文重新撑满（G3）——超限降级为可诊断引用行（2026-11-05 R4 修订：Not restored 引用节条目数封顶 20、超出合并为一条汇总行、budget ≤ 0 不恢复、materialize 按预算提前停读——上界为 budget + 固定框架开销，取代"引用行不计预算"旧口径）
+- 预算：B 为 budget_tokens，内联区（含哨兵、标题和围栏）≤ B。含引用的全文 ≤ B + max(128,min(2000,B))。B=0 无注入。todo 查询失败显示 missing 诊断，空列表省略。
 - 幂等（G4）：内容不变不重复写入；多次压缩后不丢不重（GAP-1 三压缩全链）
 - **标记必须已结算**（2026-10-20 审核补充，#77 交互防御；**2026-11-05 口径修正**：settled 判据 = 指向该标记消息的完成摘要 assistant（`summary && finish && !error`，与 filterCompacted 同谓词），**不是** `tail_start_id` 是否存在——全量摘要回退路径的 `tail_start_id` 合法地为 undefined，属 settled 形态之一。回归：`apply accepts a full-summary marker (tail_start_id undefined)`）：无完成摘要指向的 compaction part（摘要在途/失败/重试挂错消息）不作为恢复触发——恢复块不叠加在未生效的完整历史上
 - `enabled: false` → 零注入（GAP-3 矩阵）
@@ -62,12 +62,7 @@
 
 ## 7. 不变量契约（property-based）
 
-C11 第三组（`test/session/pbt-render-materials.test.ts`，固定 seed）：任意
-材料序列（**2026-10-20 独立审勘误：生成器当前只产 `kind: "file"` 的材料**——
-skill/todo 类由确定性单测覆盖，PBT 措辞收窄为 file 类序列）下，每 ref 的
-inlined 标题数 ≤ max_files；token 预算不超
-budget_tokens；渲染幂等（同输入同输出）。collect/materialize/buildTailText
-由确定性单测覆盖（目录过滤负例在 B5 修订中加入）。
+固定 seed 的 PBT 检查最终文本的文件数、单次及多次渲染的结果、内联区估值及含诊断全文的上限。样本涵盖大量极短 skill、长名称、紧预算和混合材料。真实磁盘与模型投影覆盖同路径缩短、清空、同内容异路径、换行变化和保留的完整读；读工具验证截断或部分读取不产生完整指纹。
 
 ## 8. 性能契约（机械化）
 
@@ -95,3 +90,9 @@ budget_tokens；渲染幂等（同输入同输出）。collect/materialize/build
 状态 PBT 逐轮验证两份文件的当前版本；包含普通压缩、重放、停止使用旧恢复块。当前授权由 agent、会话及本次工具可见性共同约束。不可访问的历史路径只影响自身，max_files 之外的正文不消耗其他材料预算。测试对照 provider 可见历史与实际磁盘版本；额外验证内建 skill、普通用户文本标记和长 missing reason。
 
 **成功即持久可读。** 即使进程停在摘要 step-finish 和 process 返回之间，再从 DB 读取得到的也是正确的 n、原消息 ID 和晚到输入。验证普通用量、预检、provider 拒绝、前两种和第三种依次发生、并发输入、媒体占位、跨页旧指针及 fork。必保工作量独立于额外尾部上限。[修复契约](../../fixes/session-fix-summary-retained-count.md)
+
+**2026-11-21 原始请求与保留批次。** 插件变换前的原消息 ID 决定保护边界；新 overflow marker 的 `protected_from` 与 `request_user_id` 分别限定附件降级的第一、最后一个原用户。选定请求之后到达的用户附件仍然可见。自动压缩首次选择可选保留区也受主模型可用输入的 25% 限制。核验入口为 prompt 测试中的批次媒体、插件变换性质测试和 compaction 测试中的可选尾部成本、连续压缩附件用例。[修复说明](../../fixes/session-fix-summary-retained-count.md)
+
+### 本轮 Step 5 的机械验证
+
+summary-retention-history、compaction、restoration、pbt-render-materials 与 CLI 用例核对 SQLite 和最终请求。独立复审与未覆盖范围见 [本轮修复记录](../../fixes/runtime-fix-pr60-boundary-regressions.md)。本地仓库没有通用 contract_audit 生成器。本子计划的功能与合并验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。

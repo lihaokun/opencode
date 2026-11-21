@@ -162,3 +162,28 @@ it("bounds the complete diagnostic when both its reference and its reason name a
     { seed: 0x5560, numRuns: 50 },
   )
 })
+
+it("charges each inline heading and fence for arbitrarily small skill bodies", () => {
+  const check = (budget: number, count: number, body: string, width: number) => {
+    const materials = Array.from({ length: count }, (_, i) => ({
+      candidate: { kind: "skill" as const, ref: `skill-${i}-${"s".repeat(width)}`, lastUseSeq: i },
+      status: "inlined" as const,
+      content: body,
+    }))
+    const text = renderMaterials(materials, { ...restorationConfig(undefined), budget_tokens: budget })!
+    const inline = text.split("\n## Not restored")[0]!
+    if (inline.includes("### ")) expect(Token.estimate(inline)).toBeLessThanOrEqual(budget)
+    expect(Token.estimate(text)).toBeLessThanOrEqual(budget + Math.max(128, Math.min(2000, budget)))
+  }
+  check(100, 1000, "x", 20)
+  fc.assert(
+    fc.property(
+      fc.integer({ min: 1, max: 500 }),
+      fc.integer({ min: 25, max: 200 }),
+      fc.constantFrom("", "x", "xx", "abcd", "😀"),
+      fc.integer({ min: 1, max: 160 }),
+      check,
+    ),
+    { seed: 60021, numRuns: 100 },
+  )
+})

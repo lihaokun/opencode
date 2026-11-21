@@ -22,15 +22,15 @@
 ## 2. 核心流程
 
 ```
-压缩完成（summary 落库、tail_start_id 回写）
-  ↓ 下一轮 runLoop（每轮都执行，prompt.ts turn-boundary，roster 之后）
+压缩完成（成功摘要与保留条数 n 一起落库）
+  ↓ V1 compaction task 返回 continue，进入恢复步骤
 SessionRestoration.apply({ sessionID })
   ├─ 读取全量 messages → 触发判定：
   │    存在 completed compaction part，且其位置晚于最近一个恢复标记 part
   │    （与 roster 的 compacted 判据同构；无 compaction → 不动）
   ├─ collect：扫描 tool parts（read/edit → path；skill → name/dir）按最近使用排序，
   │    读取 todo 现状（DB）
-  ├─ materialize：逐候选读盘（当前版本）→ 与 tail 保留文本比对 → 同版本则 skip-duplicate
+  ├─ materialize：按当前权限读盘，取得同一路径在保留区最近的完整可见 read 指纹，相同时去重
   ├─ render：file/token 上限裁剪 → markdown 块（Files / Skills / Todos 三节，
   │    失效与超限降级为引用行）
   └─ 渲染非空且与上一份恢复 part 逐字节不同 → 作为 synthetic text part
@@ -60,7 +60,7 @@ filterCompacted 重排自然携带该 part（位置在 tail_start_id 之后，�
 - `content`: string（可选）— `inlined` 时的正文
 - `reason`: string（可选）— `reference`/`missing` 的人类可读原因
 
-类型不变量：`inlined ⇒ content 非空`；`missing ⇒ reason 非空`。
+类型不变量：`inlined ⇒ content 是字符串`（空文件可为 ""）；`missing ⇒ reason 非空`。
 生命周期：render 的输入，不持久化。
 
 **数据结构：恢复 part（持久化）**
@@ -74,7 +74,7 @@ filterCompacted 重排自然携带该 part（位置在 tail_start_id 之后，�
 - `enabled`: boolean — 默认 `true`
 - `max_files`: integer — 默认 `5`
 - `file_max_tokens`: integer — 默认 `4_000`（单文件上限，超限降级 reference）
-- `budget_tokens`: integer — 默认 `8_000`（全部恢复材料总量上限）
+- `budget_tokens`: integer — 默认 `8_000`（完整内联区的预算，诊断余量见 I2）
 
 ## 4. 模块划分与功能规约（§3.2 格式）
 
@@ -93,9 +93,9 @@ filterCompacted 重排自然携带该 part（位置在 tail_start_id 之后，�
 功能描述：逐候选生成 RestorationMaterial。
 前置条件：候选列表非空；可访问文件系统与 todo 服务。
 后置条件：
-- file：读盘成功 → 内容与 tail 文本归一化比对，tail 已完整包含同版本 → `skipped-duplicate`；内容超 `file_max_tokens` → `reference`（含路径与大小）；读取失败（不存在/权限）→ `missing`（含原因）；否则 `inlined`。
+- file：按权限和大小限制读盘；同路径保留区内的完整 read 结果仍然可见、且其 SHA-256 与新读内容相同，则归为 skipped-duplicate。旧 read 缺指纹时按预算恢复。
 - skill：读 skill 目录正文，规则同 file（无 tail 比对——skill 正文压缩后必然只剩截断版）。
-- todo：渲染当前列表，恒 `inlined`（体量小）。
+- todo：已知非空的当前列表首先申请预算；空列表省略，查询失败产生 missing 诊断，不影响文件或 skill。
 不变式：`inlined` 材料的 token 估算和 ≤ 预算（由 render 的裁剪兜底）。
 副作用：只读磁盘。
 
@@ -103,8 +103,8 @@ filterCompacted 重排自然携带该 part（位置在 tail_start_id 之后，�
 
 功能描述：按预算合成最终 markdown 文本。
 前置条件：materialize 的输出。
-后置条件：返回文本或 `undefined`（全部 skipped/missing 且无 reference 时为 undefined）；`inlined` 按候选顺序装入直至 `budget_tokens`，装不下的降级为 `skipped-budget` 引用行；输出以恢复标记行开头。
-不变式：输出 token 估算 ≤ `budget_tokens`。
+后置条件：返回文本或 `undefined`（全部 skipped-duplicate 或预算为零时为 undefined）；`inlined` 按候选顺序装入直至 `budget_tokens`，装不下的降级为 `skipped-budget` 引用行；输出以恢复标记行开头。
+不变式：内联区整体不超过 B = budget_tokens。含诊断时全文不超过 B + max(128, min(2000, B))。B 为零时没有恢复文本。
 副作用：无。
 
 collect / materialize / render 均为纯或只读函数，可独立单元测试。
@@ -113,7 +113,7 @@ collect / materialize / render 均为纯或只读函数，可独立单元测试�
 
 **函数/模块名称**：`SessionRestoration.apply`
 
-功能描述：每轮 turn-boundary 调用的幂等入口。
+功能描述：V1 压缩成功后的幂等入口。
 前置条件：`messages` 为本轮全量消息。
 后置条件：满足触发条件且渲染非空、与最近一份恢复 part 不同 → 写入新的恢复 part；否则零写入。
 不变式：任意时刻上下文中语义有效的恢复 part 至多一份（I1）；触发判定不依赖 wall-clock。
@@ -121,7 +121,7 @@ collect / materialize / render 均为纯或只读函数，可独立单元测试�
 
 ### M3 装配点（`session/prompt.ts`）
 
-在 roster 注入（`prompt.ts:1332`）之后追加一行 `SessionRestoration.apply` 调用；不改变既有注入顺序（restore 材料位于 roster 之后、模型消息装配之前）。
+在 V1 压缩成功且即将继续会话时调用恢复，后续请求由持久化消息读取恢复材料。
 
 ## 5. 接口规约（§3.3 格式）
 
@@ -138,7 +138,7 @@ collect / materialize / render 均为纯或只读函数，可独立单元测试�
 1. **磁盘重读而非缓存投影**（决议 F①）：ZCode 式缓存回填可能注入过时版本，不满足验收"当前版本"。
 2. **持久化 synthetic part 而非每轮重建**：roster 先例——缓存前缀友好、与 filterCompacted 重排兼容、天然支持逐字节去重。
 3. **触发判据复用 roster 的位置比较**（compaction part 位置 vs 标记 part 位置）：不新增 schema 游标字段（razor：无第二个消费者的 seam 不设）。
-4. **版本判定用"与 tail 文本比对"而非读时 hash**：read/edit part 未存储读时 hash，新增 hash 属于 schema 变更且只有此一处消费——tail 保留的原文本身就是"读过的版本"的权威样本（假设 H2 下成立，见 §7）。
+4. **按路径与内容指纹判重**：read 对完整展示的文本记录源字节 SHA-256，沿用现有可选 metadata。老数据没有精确证据，按当前权限和预算重新展示。
 5. **v1 无插件契约**（决议 F②）：`session.compacted` 事件与 apply 挂点原样保留，作为将来契约的引入条件与可复用件。
 
 ## 7. 架构正确性论证（§4.2.1）
@@ -153,7 +153,7 @@ collect / materialize / render 均为纯或只读函数，可独立单元测试�
 **模块协作论证**
 
 - G1 要求"当前版本文件回到模型上下文"。M1.collect 从本会话 read/edit parts 产出候选（来源可信，pre：路径由工具写入且经权限门禁）；M1.materialize 读盘 ensures 内容为**当前**版本（假设 H2）；与 tail 比对 ensures 同版本不重复注入（不变量 I1 的来源）；render ensures 输出在预算内（I2）。三者串联 ⇒ 压缩后首轮模型请求即含当前版本文件（或可诊断降级）⇒ G1 成立。
-- G2：todo 恒 inlined、skill 同 file 管线（无 tail 比对，因 skill 正文压缩后必然只剩截断版，比对无意义）⇒ G2 成立。
+- G2：todo 先申请预算，失败产生可定位的引用；skill 依据当前授权和预算重读。
 - G3：render 的预算裁剪 ensures I2 ⇒ G3 成立。
 - G4：apply 幂等 + 触发判据只依赖持久化位置 ⇒ 重复压缩后新 compaction part 位置晚于旧恢复 part → 判定再次成立 → 重新收集注入；内容未变则逐字节相同跳过 ⇒ I1/I4 ⇒ G4 成立。
 
@@ -168,11 +168,11 @@ collect / materialize / render 均为纯或只读函数，可独立单元测试�
 **模块级不变量**
 
 - I1：任意轮次上下文中语义有效的恢复 part ≤ 1 份 — 维护方：M2 逐字节去重 + 位置判据；filterCompacted 保证旧恢复 part 随旧 compaction 对截断。
-- I2：恢复材料 token 估算 ≤ `budget_tokens` — 维护方：M1.render 裁剪。
+- I2：带有正文时，哨兵、分节标题、路径、换行、围栏和正文一起计入预算 B。诊断独享有界余量，整块最多 B + max(128, min(2000, B))。
 - I3：恢复注入不改变既有消息的相对顺序 — 维护方：M2 只在 last user message 上追加 synthetic part。
 - I4：重复压缩幂等 — 维护方：M2 触发判据 + 逐字节比对。
 
-**preservation 论证**：破坏 I1 的唯一途径是重复写入恢复 part——每次写入前 M2 必经位置判据与字节比对，写入是唯一的 part 产生点；破坏 I2 的唯一途径是未裁剪的 inlined 内容——render 是唯一文本出口且出口处执行裁剪。I3/I4 由写入路径的单一性（apply 是唯一写方）结构性地保证。
+**preservation 论证**：每个标记只触发一次恢复；新标记会退役旧块。任意内联项进入前检查其完整渲染长度，每个新节的标题只计算一次。引用节限制条数、路径和原因长度；发送前删除放不下的尾部引用并合并计数。空预算不产生恢复块。
 
 ## 8. 细化阶段待核实清单
 

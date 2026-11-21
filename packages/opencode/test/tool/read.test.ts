@@ -310,6 +310,24 @@ describe("tool.read env file permissions", () => {
 })
 
 describe("tool.read truncation", () => {
+  it.instance("only fully displayed files carry a fingerprint of the original bytes", () =>
+    Effect.gen(function* () {
+      const filePath = path.join((yield* TestInstance).directory, "version.txt")
+      for (const content of ["", "line", "line\n", "line\r\nline\n"]) {
+        yield* put(filePath, content)
+        const result = yield* run({ filePath })
+        expect(result.metadata.display).toMatchObject({ sha256: Bun.SHA256.hash(content, "hex") })
+      }
+      for (const params of [{ offset: 2 }, { limit: 1 }]) {
+        const result = yield* run({ filePath, ...params })
+        expect(result.metadata.display).not.toHaveProperty("sha256")
+      }
+      yield* put(filePath, "x".repeat(3000))
+      const result = yield* run({ filePath })
+      expect(result.metadata.display).not.toHaveProperty("sha256")
+    }),
+  )
+
   it.instance("truncates large file by bytes and sets truncated metadata", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance

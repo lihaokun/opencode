@@ -28,7 +28,7 @@ import {
   RESTORATION_SENTINEL,
   apply,
   isRestoration,
-  buildTailText,
+  retainedFileVersions,
   collectCandidates,
   materializeCandidates,
   renderMaterials,
@@ -135,29 +135,6 @@ const tightEnv = Layer.mergeAll(env, configLayer({ compaction: { restoration: { 
 const itDisabled = testEffect(disabledEnv)
 const itTight = testEffect(tightEnv)
 
-it.effect("buildTailText joins everything from the tail anchor onward", () =>
-  Effect.gen(function* () {
-    expect(buildTailText([])).toBe("")
-
-    const messages = [
-      { info: { id: "m1" }, parts: [{ type: "text", text: "early" }] },
-      { info: { id: "m2" }, parts: [{ type: "text", text: "kept" }] },
-      {
-        info: { id: "m3" },
-        parts: [
-          {
-            type: "tool",
-            tool: "bash",
-            state: { status: "completed", output: "out" },
-          },
-        ],
-      },
-    ] as unknown as SessionV1.WithParts[]
-
-    expect(buildTailText(messages.slice(messages.findIndex((m) => m.info.id === "m2")))).toBe("kept\n\nout")
-  }),
-)
-
 it.effect("collectCandidates keeps the most recent ref and appends todos", () =>
   Effect.gen(function* () {
     const toolPart = (tool: string, metadata: unknown) =>
@@ -214,7 +191,7 @@ it.effect("todo survives budget pressure that degrades files to references", () 
     // should the todo itself ever degrade, its reason must not point at a
     // nonexistent read-tool path (there is no todo-reading tool).
     const todos = [{ content: "ship it" }] as unknown as Todo.Info[]
-    const tight = { ...cfg, budget_tokens: 10 }
+    const tight = { ...cfg, budget_tokens: 45 }
     const order = collectCandidates(
       [
         {
@@ -229,7 +206,7 @@ it.effect("todo survives budget pressure that degrades files to references", () 
     // A budget too small for any file still inlines the todo (it is tiny and
     // processed first); the file's degradation keeps the read-tool guidance,
     // which IS honest for files.
-    const materials = yield* materializeCandidates(order, "", {
+    const materials = yield* materializeCandidates(order, new Map(), {
       fs: {
         stat: () => Effect.succeed({ type: "File", size: 100_000 }),
         readFileStringSafe: () => Effect.succeed("x".repeat(100_000)),
@@ -272,12 +249,16 @@ it.instance("materializeCandidates covers inlined, duplicate, missing and refere
       { kind: "file" as const, ref: `${dir}/big.txt`, lastUseSeq: 3 },
       { kind: "todo" as const, ref: "todo", lastUseSeq: 4 },
     ]
-    const materials = yield* materializeCandidates(candidates, "FILE BODY\n is already in the tail", {
-      fs,
-      skill: Option.none(),
-      todos: [{ content: "ship it" } as Todo.Info],
-      cfg,
-    })
+    const materials = yield* materializeCandidates(
+      candidates,
+      new Map([[candidates[0]!.ref, Bun.SHA256.hash(body, "hex")]]),
+      {
+        fs,
+        skill: Option.none(),
+        todos: [{ content: "ship it" } as Todo.Info],
+        cfg,
+      },
+    )
 
     expect(materials.map((m) => m.status)).toStrictEqual([
       "skipped-duplicate",
@@ -308,11 +289,8 @@ it.effect("renderMaterials applies budget, max_files and the sentinel", () =>
 
     // budget exhaustion degrades later files to reference lines
     const costA = Token.estimate("x".repeat(200))
-    const tight = { ...cfg, budget_tokens: costA + 1, max_files: 10 }
-    const text = renderMaterials(
-      [inlined("/a", "x".repeat(200)), inlined("/b", "y".repeat(200))],
-      tight,
-    )!
+    const tight = { ...cfg, budget_tokens: costA + 30, max_files: 10 }
+    const text = renderMaterials([inlined("/a", "x".repeat(200)), inlined("/b", "y".repeat(200))], tight)!
     expect(text).toContain(RESTORATION_SENTINEL)
     expect(text).toContain("### /a")
     expect(text).not.toContain("### /b")
@@ -600,36 +578,39 @@ it.instance("apply accepts a full-summary marker (tail_start_id undefined)", () 
   }),
 )
 
-// R3: the dedup baseline must match what the model actually sees. A read part
-// whose output was cleared by compaction (time.compacted set) renders as
-// "[Old tool result content cleared]" in the projection — the file body is NOT
-// model-visible even though it still sits in storage. buildTailText must skip
-// such parts, or a file whose disk body matches only the cleared history would
-// be wrongly deduped away and never restored.
-it.effect("buildTailText excludes compacted tool outputs from the dedup baseline", () =>
-  Effect.gen(function* () {
-    const messages = [
-      { info: { id: "m1" }, parts: [] },
-      {
-        info: { id: "m2" },
-        parts: [
-          {
-            type: "tool",
-            tool: "read",
-            state: { status: "completed", output: "FILE BODY", time: { compacted: 1 } },
-          },
-          {
-            type: "tool",
-            tool: "read",
-            state: { status: "completed", output: "VISIBLE BODY", time: {} },
-          },
-        ],
-      },
-    ] as unknown as SessionV1.WithParts[]
-
-    const tail = buildTailText(messages.slice(messages.findIndex((m) => m.info.id === "m2")))
-    expect(tail).toContain("VISIBLE BODY")
-    expect(tail).not.toContain("FILE BODY")
+it.effect("partial, cleared, and historical reads cannot establish a retained version", () =>
+  Effect.sync(() => {
+    const full = {
+      type: "file",
+      path: "/f",
+      truncated: false,
+      lineStart: 1,
+      lineEnd: 2,
+      totalLines: 2,
+      sha256: "full",
+    }
+    for (const [display, time, truncated] of [
+      [{ ...full, sha256: undefined }, {}, false],
+      [{ ...full, lineStart: 2 }, {}, false],
+      [{ ...full, lineEnd: 1 }, {}, false],
+      [{ ...full, truncated: true }, {}, false],
+      [full, { compacted: 1 }, false],
+      [full, {}, true],
+    ]) {
+      const rows = [
+        {
+          info: { role: "assistant" },
+          parts: [
+            {
+              type: "tool",
+              tool: "read",
+              state: { status: "completed", time, metadata: { display, truncated } },
+            },
+          ],
+        },
+      ] as unknown as SessionV1.WithParts[]
+      expect(retainedFileVersions(rows).size).toBe(0)
+    }
   }),
 )
 
@@ -851,12 +832,16 @@ it.instance("the built-in skill can be restored without a backing file", () =>
     const fs = yield* FSUtil.Service
     const info = yield* skill.get("customize-opencode")
     expect(info?.location).toBe("<built-in>")
-    const materials = yield* materializeCandidates([{ kind: "skill", ref: "customize-opencode", lastUseSeq: 1 }], "", {
-      skill: Option.some(skill),
-      fs,
-      todos: [],
-      cfg: { ...cfg, file_max_tokens: 1_000_000, budget_tokens: 1_000_000 },
-    })
+    const materials = yield* materializeCandidates(
+      [{ kind: "skill", ref: "customize-opencode", lastUseSeq: 1 }],
+      new Map(),
+      {
+        skill: Option.some(skill),
+        fs,
+        todos: [],
+        cfg: { ...cfg, file_max_tokens: 1_000_000, budget_tokens: 1_000_000 },
+      },
+    )
     expect(materials[0]?.content).toBe(info?.content)
     expect(materials[0]?.status).toBe("inlined")
   }),
@@ -873,5 +858,98 @@ it.effect("ordinary user text bearing a restoration header remains user-owned", 
     }
     expect(isRestoration(text)).toBe(false)
     expect(isRestoration({ ...text, synthetic: true })).toBe(true)
+  }),
+)
+
+it.instance("only a complete visible read of the same file version suppresses restoration", () =>
+  Effect.gen(function* () {
+    const fs = yield* FSUtil.Service
+    const dir = (yield* TestInstance).directory
+    const files = [
+      ["same", "first\nsecond\n", "first\nsecond\n"],
+      ["shrunk", "first\nsecond\n", "first\n"],
+      ["cleared", "first\nsecond\n", ""],
+      ["different", "old text", "first\nsecond\n"],
+      ["newline", "first\n", "first"],
+      ["empty", "", ""],
+      ["bom", "\uFEFFbody\n", "\uFEFFbody\n"],
+      ["user-row", "user tool metadata", "user tool metadata"],
+    ] as const
+    const candidates = files.map(([name], lastUseSeq) => ({
+      kind: "file" as const,
+      ref: path.join(dir, name),
+      lastUseSeq,
+    }))
+    const parts = files.map(([, old], i) => {
+      const lines = old === "" ? [] : old.replace(/\n$/, "").split("\n")
+      return {
+        type: "tool",
+        tool: "read",
+        state: {
+          status: "completed",
+          time: {},
+          output: lines.length
+            ? lines.map((line, i) => `${i + 1}: ${line}`).join("\n")
+            : "(End of file - total 0 lines)",
+          metadata: {
+            display: {
+              type: "file",
+              path: candidates[i]!.ref,
+              truncated: false,
+              lineStart: 1,
+              lineEnd: lines.length,
+              totalLines: lines.length,
+              text: lines.join("\n"),
+              sha256: new Bun.CryptoHasher("sha256").update(old).digest("hex"),
+            },
+          },
+        },
+      }
+    })
+    const history = [
+      { info: { role: "assistant" }, parts: parts.slice(0, -1) },
+      { info: { role: "user" }, parts: parts.slice(-1) },
+    ] as unknown as SessionV1.WithParts[]
+    for (const [i, file] of files.entries()) yield* fs.writeWithDirs(candidates[i]!.ref, file[2])
+    const materials = yield* materializeCandidates(candidates, retainedFileVersions(history), {
+      fs,
+      skill: Option.none(),
+      todos: [],
+      cfg: { ...cfg, max_files: 10 },
+    })
+    expect(materials.map((m) => m.status)).toEqual([
+      "skipped-duplicate",
+      "inlined",
+      "inlined",
+      "inlined",
+      "inlined",
+      "skipped-duplicate",
+      "skipped-duplicate",
+      "inlined",
+    ])
+    expect(materials[2]?.content).toBe("")
+  }),
+)
+
+it.instance("a failed todo lookup restores other materials and reports the unavailable list", () =>
+  Effect.gen(function* () {
+    const sessions = yield* SessionNs.Service
+    const session = yield* sessions.create({})
+    yield* seedRestorable(session.id, path.join((yield* TestInstance).directory, "keep.txt"), "keep this material")
+    yield* apply({ sessionID: session.id }).pipe(
+      Effect.provideService(
+        Todo.Service,
+        Todo.Service.of({
+          get: () => Effect.die(new Error("unavailable test database")),
+          update: () => Effect.void,
+        }),
+      ),
+    )
+    const rows = yield* sessions.messages({ sessionID: session.id })
+    const block = rows
+      .flatMap((m) => m.parts)
+      .find((p): p is SessionV1.TextPart => p.type === "text" && isRestoration(p))
+    expect(block?.text).toContain("keep this material")
+    expect(block?.text).toContain("todo list unavailable")
   }),
 )

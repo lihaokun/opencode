@@ -6,7 +6,7 @@ import { containsPath } from "@/project/instance-context"
 import { MessageV2 } from "./message-v2"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Effect, Exit, Option } from "effect"
+import { Cause, Effect, Exit, Option } from "effect"
 import { Config } from "@/config/config"
 import { Skill } from "@/skill"
 import { Todo } from "./todo"
@@ -87,43 +87,44 @@ type ConfigV1Lite = {
   }
 }
 
-/**
- * Text of everything filterCompacted still shows verbatim: the dedup baseline.
- * Mirrors the model projection (message-v2.ts completed branch): a part with
- * `time.compacted` renders as "[Old tool result content cleared]", so its
- * stored output is NOT model-visible and must not enter the baseline —
- * matching against it would wrongly mark files as still-present (R3).
- */
-export function buildTailText(messages: SessionV1.WithParts[]): string {
-  const parts: string[] = []
+/** Latest complete read in the retained model history, identified by its file and exact bytes. */
+export function retainedFileVersions(messages: SessionV1.WithParts[]) {
+  const versions = new Map<string, string>()
   for (const msg of messages) {
-    if (!MessageV2.assistantVisible(msg)) continue
+    if (msg.info.role !== "assistant" || !MessageV2.assistantVisible(msg)) continue
     for (const part of msg.parts) {
-      if (part.type === "text" && !part.ignored && !isRestoration(part)) parts.push(part.text)
-      else if (part.type === "tool" && part.state.status === "completed" && !part.state.time?.compacted) {
-        parts.push(part.state.output)
-        const display = part.state.metadata?.display
-        if (
-          part.tool === "read" &&
-          display?.type === "file" &&
-          !display.truncated &&
-          !part.state.metadata.truncated &&
-          display.lineStart === 1 &&
-          display.lineEnd === display.totalLines &&
-          typeof display.text === "string"
-        ) {
-          // read renders line numbers; the full raw lines are the same model-visible content.
-          parts.push(display.text + "\n")
-        }
-      }
+      if (part.type !== "tool" || part.state.status !== "completed" || part.state.time.compacted) continue
+      const metadata = part.state.metadata
+      if (part.tool === "edit" && typeof metadata.filediff?.file === "string") versions.delete(metadata.filediff.file)
+      const display = metadata.display
+      if (part.tool !== "read" || display?.type !== "file" || typeof display.path !== "string") continue
+      versions.delete(display.path)
+      if (
+        metadata.truncated ||
+        display.truncated ||
+        display.lineStart !== 1 ||
+        display.lineEnd !== display.totalLines ||
+        typeof display.sha256 !== "string" ||
+        typeof display.text !== "string"
+      )
+        continue
+      // A plugin may rewrite the tool output independently of its display metadata.
+      const shown =
+        display.totalLines === 0
+          ? "(End of file - total 0 lines)"
+          : display.text
+              .split("\n")
+              .map((line: string, index: number) => `${index + 1}: ${line}`)
+              .join("\n")
+      if (("\n" + part.state.output + "\n").includes("\n" + shown + "\n")) versions.set(display.path, display.sha256)
     }
   }
-  return parts.join("\n\n")
+  return versions
 }
 
 export function collectCandidates(
   messages: SessionV1.WithParts[],
-  todos: Todo.Info[],
+  todos: Todo.Info[] | undefined,
 ): RestorationCandidate[] {
   const byRef = new Map<string, RestorationCandidate>()
   let seq = 0
@@ -158,39 +159,32 @@ export function collectCandidates(
   // smallest material by far. Appending it after the sort processed it LAST,
   // so any budget pressure degraded the whole current todo list to a
   // reference line — the cheapest item paid first.
-  const todo = todos.length > 0 ? [{ kind: "todo" as const, ref: "todo", lastUseSeq: seq + 1 }] : []
+  const todo = !todos || todos.length > 0 ? [{ kind: "todo" as const, ref: "todo", lastUseSeq: seq + 1 }] : []
   return [...todo, ...candidates]
 }
 
 export function materializeCandidates(
   candidates: RestorationCandidate[],
-  tailText: string,
+  versions: ReadonlyMap<string, string>,
   deps: {
     fs: FSUtil.Interface
     readable?: (path: string) => boolean
     skill: Option.Option<Skill.Interface>
-    todos: Todo.Info[]
+    todos: Todo.Info[] | undefined
     cfg: RestorationConfig
   },
 ): Effect.Effect<RestorationMaterial[]> {
-  // R4: stop reading once inlined content has consumed the budget — later
-  // candidates can only become reference lines, and stat/read-ing every
-  // historical file just to render "- path (skipped: …)" wastes IO on
-  // thousand-file histories. Candidates are ordered most-recent-first, so the
-  // dropped tail is the stalest material.
-  let spent = 0
-  let files = 0
-  const include = (candidate: RestorationCandidate, content: string): RestorationMaterial => {
-    const cost = Token.estimate(content)
-    if (spent + cost > deps.cfg.budget_tokens)
-      return { candidate, status: "reference", reason: "restoration budget exhausted" }
-    spent += cost
-    if (candidate.kind === "file") files++
-    return { candidate, status: "inlined", content }
-  }
+  const budget = inlineBudget(deps.cfg)
+  const include = (candidate: RestorationCandidate, content: string): RestorationMaterial =>
+    budget.admit(candidate, content)
+      ? { candidate, status: "inlined", content }
+      : { candidate, status: "reference", reason: "restoration budget exhausted" }
   return Effect.forEach(candidates, (candidate) =>
     Effect.gen(function* () {
-      if (spent >= deps.cfg.budget_tokens) {
+      if (candidate.kind === "todo" && !deps.todos) {
+        return { candidate, status: "missing" as const, reason: "todo list unavailable" }
+      }
+      if (budget.exhausted()) {
         // Kind-specific honest guidance: skills and files are reloadable
         // with their tools, but there is no todo-reading tool — pointing
         // the model at "the read tool" for a todo list is a dead end.
@@ -231,7 +225,7 @@ export function materializeCandidates(
         }
         return include(candidate, content)
       }
-      if (files >= deps.cfg.max_files)
+      if (budget.fileLimit())
         return { candidate, status: "reference" as const, reason: `beyond max_files=${deps.cfg.max_files}` }
       if (deps.readable && !deps.readable(candidate.ref))
         return { candidate, status: "reference" as const, reason: "read permission required" }
@@ -253,10 +247,11 @@ export function materializeCandidates(
           reason: `file is ${stat.value.size} bytes (over the ${deps.cfg.file_max_tokens} token cap); read it with the read tool if needed`,
         }
       }
-      const content = yield* deps.fs.readFileStringSafe(resolved.value)
-      if (content === undefined) {
+      const bytes = yield* deps.fs.readFile(resolved.value).pipe(Effect.option)
+      if (Option.isNone(bytes)) {
         return { candidate, status: "missing" as const, reason: `file unreadable: ${candidate.ref}` }
       }
+      const content = new TextDecoder().decode(bytes.value)
       if (Token.estimate(content) > deps.cfg.file_max_tokens) {
         return {
           candidate,
@@ -264,7 +259,8 @@ export function materializeCandidates(
           reason: `file is ~${Token.estimate(content)} tokens (over the ${deps.cfg.file_max_tokens} cap); read it with the read tool if needed`,
         }
       }
-      if (tailText.includes(content)) {
+      const version = versions.get(candidate.ref)
+      if (version && Bun.SHA256.hash(bytes.value, "hex") === version) {
         return { candidate, status: "skipped-duplicate" as const, reason: "already intact in the retained tail" }
       }
       return include(candidate, content)
@@ -291,6 +287,33 @@ export function materializeCandidates(
 const MAX_REFERENCE_LINES = 20
 const MAX_REF_CHARS = 160
 
+const HEADER = RESTORATION_SENTINEL + "\nContext restored from before the last compaction:"
+const SECTION = { file: "## Files", skill: "## Skills", todo: "## Todos" }
+const clipRef = (ref: string) =>
+  ref.length > MAX_REF_CHARS ? ref.slice(0, MAX_REF_CHARS).replace(/[\uD800-\uDBFF]$/u, "") + "…" : ref
+
+// Charge the actual markdown in code units, including every separating newline. The
+// token estimator rounds length / 4; using at most 4 * budget units is conservative.
+function inlineBudget(cfg: RestorationConfig) {
+  const seen = new Set<RestorationCandidate["kind"]>()
+  let remaining = cfg.budget_tokens * TOKEN_BYTES - HEADER.length
+  let files = 0
+  return {
+    exhausted: () => remaining <= 0,
+    fileLimit: () => files >= cfg.max_files,
+    admit(candidate: RestorationCandidate, content: string) {
+      const kind = candidate.kind
+      const block = `### ${clipRef(candidate.ref)}\n\`\`\`\n${content}\n\`\`\``
+      const cost = block.length + 1 + (seen.has(kind) ? 0 : SECTION[kind].length + 1)
+      if (cost > remaining) return
+      remaining -= cost
+      seen.add(kind)
+      if (kind === "file") files++
+      return block
+    },
+  }
+}
+
 export function renderMaterials(materials: RestorationMaterial[], cfg: RestorationConfig): string | undefined {
   // budget_tokens: 0 means "restore nothing" — without this gate, content
   // whose rounded token estimate is 0 (1–2 chars) would still inline "for
@@ -299,9 +322,7 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
   const sectionsByKind: Record<"file" | "skill" | "todo", string[]> = { file: [], skill: [], todo: [] }
   const lines: string[] = []
   let overflowLines = 0
-  let used = 0
-  let fileCount = 0
-  let overBudget = false
+  const budget = inlineBudget(cfg)
 
   const referenceLine = (material: RestorationMaterial) => {
     const reason = material.reason ?? material.status
@@ -315,21 +336,17 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
     lines.push(line)
   }
 
-  // Both ends of every reference line are attacker-sized (paths up to
-  // PATH_MAX, reasons with guidance prose): clip the ref so 20 lines can
-  // never blow the budget on their own.
-  const clipRef = (ref: string) => (ref.length > MAX_REF_CHARS ? ref.slice(0, MAX_REF_CHARS) + "…" : ref)
-
   for (const material of materials) {
     const kind = material.candidate.kind
     if (material.status === "inlined") {
-      if (kind === "file" && fileCount >= cfg.max_files) {
-        pushLine(`- ${clipRef(material.candidate.ref)} (beyond max_files=${cfg.max_files}; read it with the read tool if needed)`)
+      if (kind === "file" && budget.fileLimit()) {
+        pushLine(
+          `- ${clipRef(material.candidate.ref)} (beyond max_files=${cfg.max_files}; read it with the read tool if needed)`,
+        )
         continue
       }
-      const cost = Token.estimate(material.content ?? "")
-      if (overBudget || used + cost > cfg.budget_tokens) {
-        overBudget = true
+      const block = budget.admit(material.candidate, material.content ?? "")
+      if (!block) {
         pushLine(
           `- ${clipRef(material.candidate.ref)} (skipped: restoration budget exhausted; ${
             kind === "file"
@@ -341,9 +358,7 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
         )
         continue
       }
-      used += cost
-      if (kind === "file") fileCount += 1
-      sectionsByKind[kind].push(`### ${clipRef(material.candidate.ref)}\n\`\`\`\n${material.content}\n\`\`\``)
+      sectionsByKind[kind].push(block)
       continue
     }
     if (material.status === "skipped-duplicate") continue
@@ -351,15 +366,25 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
   }
 
   const sections = (["file", "skill", "todo"] as const).flatMap((kind) =>
-    sectionsByKind[kind].length > 0 ? [kind === "file" ? "## Files" : kind === "skill" ? "## Skills" : "## Todos", ...sectionsByKind[kind]] : [],
+    sectionsByKind[kind].length > 0 ? [SECTION[kind], ...sectionsByKind[kind]] : [],
   )
   if (sections.length === 0 && lines.length === 0) return undefined
 
-  const notRestored = [
-    ...(lines.length > 0 ? ["## Not restored", ...lines] : []),
-    ...(overflowLines > 0 ? [`- ...and ${overflowLines} more (use the read/glob tools if needed)`] : []),
-  ]
-  return [RESTORATION_SENTINEL, "Context restored from before the last compaction:", ...sections, ...notRestored].join("\n")
+  const inline = [HEADER, ...sections].join("\n")
+  if (lines.length === 0) return inline
+  const allowance = Math.max(128, Math.min(2000, cfg.budget_tokens))
+  const available = (cfg.budget_tokens + allowance) * TOKEN_BYTES - inline.length
+  for (;;) {
+    const diagnostics = [
+      "",
+      "## Not restored",
+      ...lines,
+      ...(overflowLines > 0 ? [`- ...and ${overflowLines} more (use the read/glob tools if needed)`] : []),
+    ].join("\n")
+    if (diagnostics.length <= available || lines.length === 0) return inline + diagnostics
+    lines.pop()
+    overflowLines++
+  }
 }
 
 export const apply = Effect.fn("SessionRestoration.apply")(function* (input: { sessionID: SessionID }) {
@@ -425,12 +450,19 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
   const userMessage = messages.findLast((msg) => msg.info.role === "user")
   if (userMessage?.info.role !== "user") return
 
-  const todos = Option.isSome(todoOpt) ? yield* todoOpt.value.get(sessionID).pipe(Effect.orElseSucceed(() => [])) : []
+  const todos = Option.isSome(todoOpt)
+    ? yield* todoOpt.value.get(sessionID).pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterrupts(cause),
+          () => Effect.succeed(undefined),
+        ),
+      )
+    : []
 
   // Step P4/P5: collect candidates (B5: read only display.type === "file";
   // edit via filediff.file; skill via name; most-recent-first; todo appended),
   // then materialize (stat File-guard → byte/token caps → disk read →
-  // tail-substring skip-duplicate, budget-aware early stop).
+  // compare complete retained versions, then apply the rendered budget).
   const current = yield* sessions.get(sessionID)
   const agents = yield* Agent.Service
   const agent = yield* agents.get(userMessage.info.agent)
@@ -452,8 +484,8 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
       allowed("external_directory", FSUtil.normalizePathPattern(path.join(path.dirname(file), "*"))))
   const candidates = collectCandidates(messages, todos).filter((c) => c.kind !== "skill" || allowed("skill", c.ref))
   const projected = MessageV2.filterCompacted(messages.toReversed())
-  const tailText = buildTailText(projected.slice(2))
-  const materials = yield* materializeCandidates(candidates, tailText, { fs, skill: skillOpt, todos, cfg, readable })
+  const versions = retainedFileVersions(projected.slice(2))
+  const materials = yield* materializeCandidates(candidates, versions, { fs, skill: skillOpt, todos, cfg, readable })
   // Step P6: render within budget (max_files per file, exhaustion degrades to
   // bounded reference lines) into sentinel + Files/Skills/Todos + Not restored.
   const text = renderMaterials(materials, cfg)
