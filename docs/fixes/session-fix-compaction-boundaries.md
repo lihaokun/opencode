@@ -1,5 +1,7 @@
 # #86 压缩边界与失败摘要投影修复
 
+> 2026-11-20：本文保留当时的实现和验证。新摘要的持久化边界、超限用户原文与必保区预算见[保留条数方案](session-fix-summary-retained-count.md)。
+
 基线：`eaf99cfb`（原 #86 合入 dev `7bd8532a`）。用户已授权按 workflow 修复并完善 PBT。范围为 legacy Session 压缩；不改公开 API、数据库 schema、V2、模型预算或 Runner 调度。
 
 ## 一、现象与复现

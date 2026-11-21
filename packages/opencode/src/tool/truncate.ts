@@ -17,6 +17,7 @@ export const GLOB = path.join(TRUNCATION_DIR, "*")
 export type Result = { content: string; truncated: false } | { content: string; truncated: true; outputPath: string }
 
 export interface Options {
+  error?: boolean
   maxLines?: number
   maxBytes?: number
   direction?: "head" | "tail"
@@ -119,7 +120,7 @@ const layer = Layer.effect(
       const preview = out.join("\n")
       const file = yield* write(text)
 
-      const hint = `The tool call succeeded but the output was truncated. Full output saved to: ${file}\nUse Grep to search the full content or Read with offset/limit to view specific sections.`
+      const hint = `${options.error ? "The tool call failed; error output was truncated." : "The tool call succeeded but the output was truncated."} Full output saved to: ${file}\nUse Grep to search the full content or Read with offset/limit to view specific sections.`
 
       return {
         content:

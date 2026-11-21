@@ -391,7 +391,26 @@ export const make = Effect.gen(function* () {
               const send = (s: NodeJS.Signals) =>
                 Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
               const sig = command.options.killSignal ?? "SIGTERM"
-              const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
+              const attempt = Effect.gen(function* () {
+                yield* send(sig)
+                yield* Deferred.await(signal)
+                // A shell may exit on TERM while its detached process group still
+                // owns children. Give those children the same bounded grace period.
+                if (
+                  command.options.forceKillAfter &&
+                  process.platform !== "win32" &&
+                  command.options.detached !== false
+                ) {
+                  while (true) {
+                    try {
+                      globalThis.process.kill(-proc.pid!, 0)
+                    } catch {
+                      return
+                    }
+                    yield* Effect.sleep("50 millis")
+                  }
+                }
+              })
               const escalated = command.options.forceKillAfter
                 ? Effect.timeoutOrElse(attempt, {
                     duration: command.options.forceKillAfter,

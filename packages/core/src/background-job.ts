@@ -82,7 +82,7 @@ export interface Interface {
   readonly start: (input: StartInput) => Effect.Effect<Info>
   readonly extend: (input: ExtendInput) => Effect.Effect<boolean>
   readonly wait: (input: WaitInput) => Effect.Effect<WaitResult>
-  readonly cancel: (id: string) => Effect.Effect<Info | undefined>
+  readonly cancel: (id: string, options?: { output?: string }) => Effect.Effect<Info | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/BackgroundJob") {}
@@ -286,7 +286,7 @@ export const make = Effect.gen(function* () {
     return { info: snapshot(job), timedOut: true }
   })
 
-  const cancel: Interface["cancel"] = Effect.fn("BackgroundJob.cancel")(function* (id) {
+  const cancel: Interface["cancel"] = Effect.fn("BackgroundJob.cancel")(function* (id, options) {
     const completed_at = yield* Clock.currentTimeMillis
     const result = yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [FinishResult, Map<string, Active>] => {
       const job = jobs.get(id)
@@ -296,10 +296,16 @@ export const make = Effect.gen(function* () {
         ...job,
         onPromote: undefined,
         pending: 0,
+        // A caller holding the run's final output (e.g. the shell tool's
+        // accumulated buffer at kill time) hands it over so the cancelled
+        // snapshot stays observable — the interrupted fiber never reaches
+        // settle, so without this the output would be lost.
+        ...(options?.output !== undefined ? { output: { sequence: job.next, text: options.output } } : {}),
         info: {
           ...job.info,
           status: "cancelled" as const,
           completed_at,
+          ...(options?.output !== undefined ? { output: options.output } : {}),
         },
       }
       return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]

@@ -3,6 +3,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
+import { cancelSnapshot } from "@/tool/shell/tasks"
 import { Effect, Latch, Layer, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
@@ -85,14 +86,23 @@ const layer = Layer.effect(
     })
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
-      yield* cancelBackgroundJobs(background, sessionID)
+      const owners = new Set<string>([sessionID])
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
-      if (!existing) {
-        yield* status.set(sessionID, { type: "idle" })
-        return "Idle" as const
-      }
-      return yield* existing.cancel
+      const stopJobs = cancelBackgroundJobs(background, owners)
+      // Stop both the producer and jobs that could wake it. An admission
+      // already committed by the producer may miss the first job snapshot.
+      const [stopped] = yield* Effect.all(
+        [
+          existing ? existing.cancel : status.set(sessionID, { type: "idle" }).pipe(Effect.as("Idle" as const)),
+          stopJobs,
+        ],
+        { concurrency: "unbounded" },
+      )
+      // The producer has quiesced. Follow newly discovered descendant owners
+      // and take a fresh snapshot after each batch of cancellation finalizers.
+      yield* stopJobs.pipe(Effect.repeat({ while: (count) => count > 0 }))
+      return stopped
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
@@ -120,38 +130,47 @@ const layer = Layer.effect(
   }),
 )
 
+// Step P9 (bgshell-1): the session-level cancel cascade reaches shell jobs
+// through metadata.sessionId (agent_stop / runState.cancel).
 const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(function* (
   background: BackgroundJob.Interface,
-  sessionID: SessionID,
+  owners: Set<string>,
 ) {
-  const jobs = yield* background.list()
-  const pending = new Set<string>([sessionID])
-  const cancelled = new Set<string>()
-  const matches = (job: BackgroundJob.Info) => {
+  const all = yield* background.list()
+  const children = new Map<string, string[]>()
+  for (const job of all) {
+    const parent = job.metadata?.parentSessionId
+    if (job.type !== "agent" || typeof parent !== "string") continue
+    const child = typeof job.metadata?.sessionId === "string" ? job.metadata.sessionId : job.id
+    const siblings = children.get(parent)
+    if (!siblings) {
+      children.set(parent, [child])
+      continue
+    }
+    siblings.push(child)
+  }
+  // A delegation can have finished while its shell is live. Set iteration
+  // visits newly added descendants and terminates even if an edge repeats.
+  for (const owner of owners) {
+    for (const child of children.get(owner) ?? []) owners.add(child)
+  }
+  const jobs = all.filter((job) => {
     if (job.status !== "running") return false
-    if (cancelled.has(job.id)) return false
-    if (pending.has(job.id)) return true
-    if (typeof job.metadata?.sessionId === "string" && pending.has(job.metadata.sessionId)) return true
-    return typeof job.metadata?.parentSessionId === "string" && pending.has(job.metadata.parentSessionId)
-  }
-  let batch = jobs.filter(matches)
-  while (batch.length > 0) {
-    yield* Effect.forEach(
-      batch,
-      (job) =>
-        background.cancel(job.id).pipe(
-          Effect.tap(() =>
-            Effect.sync(() => {
-              cancelled.add(job.id)
-              pending.add(job.id)
-              if (typeof job.metadata?.sessionId === "string") pending.add(job.metadata.sessionId)
-            }),
-          ),
-        ),
-      { concurrency: "unbounded", discard: true },
-    )
-    batch = jobs.filter(matches)
-  }
+    if (owners.has(job.id)) return true
+    if (typeof job.metadata?.sessionId === "string" && owners.has(job.metadata.sessionId)) return true
+    return typeof job.metadata?.parentSessionId === "string" && owners.has(job.metadata.parentSessionId)
+  })
+  yield* Effect.forEach(
+    jobs,
+    (job) => {
+      owners.add(job.id)
+      if (typeof job.metadata?.sessionId === "string") owners.add(job.metadata.sessionId)
+      // The interrupted shell cannot settle its own output.
+      return background.cancel(job.id, { output: cancelSnapshot(job.id) })
+    },
+    { concurrency: "unbounded", discard: true },
+  )
+  return jobs.length
 })
 
 function busyError(sessionID: SessionID) {

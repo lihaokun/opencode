@@ -1,12 +1,15 @@
 import path from "path"
 import { Effect, Schema } from "effect"
+import { NonNegativeInt, PositiveInt } from "@opencode-ai/core/schema"
 import { InstanceState } from "@/effect/instance-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { assertExternalDirectoryEffect } from "./external-directory"
+import { Truncate } from "./truncate"
 import DESCRIPTION from "./grep.txt"
 import * as Tool from "./tool"
 
+// Step P1: schema — every new parameter optional; absent = legacy behavior.
 export const Parameters = Schema.Struct({
   pattern: Schema.String.annotate({ description: "The regex pattern to search for in file contents" }),
   path: Schema.optional(Schema.String).annotate({
@@ -15,27 +18,78 @@ export const Parameters = Schema.Struct({
   include: Schema.optional(Schema.String).annotate({
     description: 'File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")',
   }),
+  output_mode: Schema.optional(
+    Schema.Literals(["content", "files_with_matches", "count"]),
+  ).annotate({
+    description:
+      "Output format: 'content' shows matching lines (default), 'files_with_matches' lists matching file paths, 'count' shows match counts per file",
+  }),
+  insensitive: Schema.optional(Schema.Boolean).annotate({
+    description: "Case-insensitive search",
+  }),
+  before: Schema.optional(NonNegativeInt).annotate({
+    description: "Lines of context before each match, content mode only (max 10)",
+  }),
+  after: Schema.optional(NonNegativeInt).annotate({
+    description: "Lines of context after each match, content mode only (max 10)",
+  }),
+  context: Schema.optional(NonNegativeInt).annotate({
+    description:
+      "Lines of context before and after each match, content mode only (max 10). Shorthand for before and after together; an explicit before or after overrides it for that side",
+  }),
+  offset: Schema.optional(NonNegativeInt).annotate({
+    description: "Skip the first N results (for pagination)",
+  }),
+  head_limit: Schema.optional(PositiveInt).annotate({
+    description: "Maximum number of results to return (default 100; bounded by the tool output line limit)",
+  }),
 })
 
 export const GrepTool = Tool.define(
   "grep",
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
+    const trunc = yield* Truncate.Service
     const ripgrep = yield* Ripgrep.Service
     return {
       description: DESCRIPTION,
       parameters: Parameters,
-      execute: (params: { pattern: string; path?: string; include?: string }, ctx: Tool.Context) =>
+      execute: (
+        params: {
+          pattern: string
+          path?: string
+          include?: string
+          output_mode?: "content" | "files_with_matches" | "count"
+          insensitive?: boolean
+          before?: number
+          after?: number
+          context?: number
+          offset?: number
+          head_limit?: number
+        },
+        ctx: Tool.Context,
+      ) =>
         Effect.gen(function* () {
-          const empty = {
-            title: params.pattern,
-            metadata: { matches: 0, truncated: false },
-            output: "No files found",
-          }
           if (!params.pattern) {
             throw new Error("pattern is required")
           }
-
+          const mode = params.output_mode ?? "content"
+          // Step P2: validation — context caps and content-mode-only rule.
+          const context = params.context ?? 0
+          // Step P4: `context` is the shorthand for both sides; an explicit
+          // before/after wins over it per side, so {context: 3, after: 1} reads
+          // as before=3, after=1.
+          const before = params.before ?? context
+          const after = params.after ?? context
+          if (before > 10 || after > 10 || context > 10) {
+            throw new Error("context lines are capped at 10 (before/after/context)")
+          }
+          if (mode !== "content" && (before > 0 || after > 0 || context > 0)) {
+            throw new Error("context lines only apply to output_mode=content")
+          }
+          const headLimit = Math.min(params.head_limit ?? 100, (yield* trunc.limits()).maxLines)
+          const offset = params.offset ?? 0
+          // Step P3: permission ask (patterns=[pattern], unchanged).
           yield* ctx.ask({
             permission: "grep",
             patterns: [params.pattern],
@@ -47,6 +101,7 @@ export const GrepTool = Tool.define(
             },
           })
 
+          // Step P5: path resolution + external-directory assertion (existing).
           const ins = yield* InstanceState.context
           const requested = path.isAbsolute(params.path ?? ins.directory)
             ? (params.path ?? ins.directory)
@@ -58,6 +113,12 @@ export const GrepTool = Tool.define(
           })
 
           const search = FSUtil.resolve(requested)
+          // #107 hardened path handling: missing paths reject instead of
+          // silently degrading to a cwd search, non-file/dir shapes are
+          // refused, and a single-file target scopes rg to exactly that file
+          // (a bare "-" basename would mean stdin to rg even after "--").
+          // Our multi-mode branch keeps those semantics; the catch-to-
+          // undefined variant is gone.
           const info = yield* fs
             .stat(search)
             .pipe(
@@ -69,54 +130,118 @@ export const GrepTool = Tool.define(
             throw new Error(`Search path must be a file or directory: ${requested}`)
           }
           const cwd = info.type === "Directory" ? search : path.dirname(search)
-          const result = yield* ripgrep.grep({
+          // Step P6: dispatch rg args by mode (content --json; files
+          // --files-with-matches; count --count-matches; -B/-A, -i, --sort).
+          const result = yield* ripgrep.search({
             cwd,
             pattern: params.pattern,
             // A bare "-" means stdin to ripgrep, even after "--".
             file: info.type === "File" ? `./${path.basename(search)}` : undefined,
             include: params.include,
-            limit: 100,
+            limit: headLimit,
+            signal: ctx.abort,
+            offset,
+            mode,
+            insensitive: params.insensitive ?? false,
+            before,
+            after,
           })
-          if (result.length === 0) return empty
 
-          const rows = result.map((item) => ({
-            path: info.type === "File" ? path.resolve(requested) : path.resolve(requested, item.entry.path),
-            line: item.line,
-            text: item.text,
+          // Step P9: render (absolute paths) + pagination outcome copy.
+          // The service returns search-relative paths; render absolute paths
+          // like the legacy projection did, in every mode. #107: FSUtil.resolve
+          // follows symlinks, so a File target must render back to the
+          // REQUESTED path, not the realpath rg reported under.
+          const rowBase = requested
+          const requestedFile = info.type === "File" ? requested : undefined
+
+          // Only EOF proves an exact total. An early page observes one extra
+          // entry beyond its window; context lines never count as entries.
+          const quantity = result.hasMore ? `at least ${result.total}` : String(result.total)
+          const metadata = {
+            matches: Math.max(0, Math.min(headLimit, result.total - offset)),
+            ...(result.hasMore ? { total_lower_bound: result.total } : { total: result.total }),
+            truncated: result.hasMore,
+            output_mode: mode,
+            offset,
+            head_limit: headLimit,
+          }
+          const render = Effect.fnUntraced(function* (output: string) {
+            const page = yield* trunc.output(output)
+            return {
+              title: params.pattern,
+              metadata: {
+                ...metadata,
+                truncated: result.hasMore || page.truncated,
+                ...(page.truncated ? { outputPath: page.outputPath } : {}),
+              },
+              output: page.content,
+            }
+          })
+          const tail = result.hasMore ? [``, `(more results available; increase offset to ${offset + headLimit})`] : []
+
+          if (metadata.matches === 0) {
+            if (offset === 0) return yield* render("No files found")
+            const unit = mode === "content" ? "matches" : "files"
+            const label = mode === "files_with_matches" ? "files" : "matches"
+            return yield* render(`No ${label} at offset ${offset} (total ${unit}: ${result.total})`)
+          }
+
+          if (result.mode === "files_with_matches") {
+            const output = [
+              `Found ${quantity} files`,
+              // #107: a File target renders back as the requested path even
+              // when rg matched through a symlink (FSUtil.resolve realpaths).
+              ...(requestedFile
+                ? [requestedFile]
+                : result.files.map((file) => path.resolve(rowBase, file))),
+              ...tail,
+            ]
+            return yield* render(output.join("\n"))
+          }
+
+          if (result.mode === "count") {
+            const totalMatches = result.counts.reduce((sum: number, item) => sum + item.count, 0)
+            const output = [
+              offset > 0 || result.hasMore
+                ? `Found ${quantity} files. This page contains ${result.counts.length} files with ${totalMatches} matches`
+                : `Found ${quantity} files with ${totalMatches} matches`,
+              ...(requestedFile
+                ? [`${requestedFile}: ${result.counts[0]?.count ?? 0} matches`]
+                : result.counts.map((item) => `${path.resolve(rowBase, item.path)}: ${item.count} matches`)),
+              ...tail,
+            ]
+            return yield* render(output.join("\n"))
+          }
+
+          // The service returns search-relative paths; render absolute paths
+          // like the legacy projection did. A File target renders back as the
+          // requested path (symlink name preserved).
+          const rows = result.rows.map((row) => ({
+            ...row,
+            path: requestedFile ?? path.resolve(rowBase, row.path),
           }))
 
-          const limit = 100
-          const truncated = rows.length === limit
-          const final = rows
-          if (final.length === 0) return empty
-
-          const total = rows.length
-          const hasMore = truncated || result.length === limit
-          const output = [`Found ${total} matches${hasMore ? " (more matches available)" : ""}`]
-
+          const output = [`Found ${quantity} matches`]
+          // The shown range counts MATCH rows only — context rows ride along
+          // but are not results, so rows.length would overstate the window.
+          if (offset > 0 || result.hasMore) {
+            output.push(
+              `Showing matches ${offset + 1}-${offset + metadata.matches} (offset ${offset}, limit ${headLimit})`,
+            )
+          }
           let current = ""
-          for (const match of final) {
-            if (current !== match.path) {
+          for (const row of rows) {
+            if (current !== row.path) {
               if (current !== "") output.push("")
-              current = match.path
-              output.push(`${match.path}:`)
+              current = row.path
+              output.push(`${row.path}:`)
             }
-            output.push(`  Line ${match.line}: ${match.text}`)
+            output.push(`  Line ${row.line}${row.context ? "-" : ":"} ${row.text}`)
           }
+          output.push(...tail)
 
-          if (truncated) {
-            output.push("")
-            output.push("(Results truncated. Consider using a more specific path or pattern.)")
-          }
-
-          return {
-            title: params.pattern,
-            metadata: {
-              matches: total,
-              truncated,
-            },
-            output: output.join("\n"),
-          }
+          return yield* render(output.join("\n"))
         }).pipe(Effect.orDie),
     }
   }),

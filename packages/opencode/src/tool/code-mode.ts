@@ -1,5 +1,6 @@
+import { Truncate } from "./truncate"
 import * as Tool from "./tool"
-import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js"
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { Cause, Effect, Schema } from "effect"
 import { CodeMode, Tool as SandboxTool, toolError } from "@opencode-ai/codemode"
 import { MCP } from "@/mcp"
@@ -132,6 +133,7 @@ function toolTree(catalog: readonly CatalogEntry[], run: (entry: CatalogEntry) =
 }
 
 const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: {
+  truncate: Truncate.Interface
   plugin: Plugin.Interface
   entry: CatalogEntry
   args: Record<string, unknown>
@@ -145,28 +147,17 @@ const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: 
   )
   const result: CallToolResult = yield* Effect.gen(function* () {
     yield* input.ctx.ask({ permission: input.entry.key, metadata: {}, patterns: ["*"], always: ["*"] })
-    // Deliberately mirrors McpCatalog.convertTool's transport call so the MCP service stays free of tool-loop concerns.
-    return yield* Effect.promise(async () => {
-      const raw = await input.entry.tool.client.callTool(
-        { name: input.entry.tool.def.name, arguments: input.args },
-        CallToolResultSchema,
-        {
-          resetTimeoutOnProgress: true,
-          signal: input.ctx.abort,
-          timeout: input.entry.tool.timeout,
-          // The MCP SDK only sends a progress token when this hook is present, enabling timeout resets.
-          onprogress: () => {},
-        },
-      )
-      if (raw.isError)
-        throw new Error(
-          raw.content
-            .flatMap((item) => (item.type === "text" ? [item.text] : []))
-            .filter((text) => text.trim())
-            .join("\n\n") || "MCP tool returned an error",
-        )
-      return raw
-    })
+    const run = Effect.runPromiseWith(yield* Effect.context())
+    return yield* Effect.promise(() =>
+      McpCatalog.callTool(
+        input.entry.tool.client,
+        input.entry.tool.def.name,
+        input.args,
+        input.ctx.abort,
+        input.entry.tool.timeout,
+        (text) => run(input.truncate.output(text, { error: true }).pipe(Effect.map((out) => out.content))),
+      ),
+    )
   }).pipe(
     Effect.withSpan("Tool.execute", {
       attributes: {
@@ -188,6 +179,7 @@ const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: 
 export const CodeModeTool = Tool.define(
   CODE_MODE_TOOL,
   Effect.gen(function* () {
+    const truncate = yield* Truncate.Service
     const mcp = yield* MCP.Service
     const agents = yield* Agent.Service
     const sessions = yield* Session.Service
@@ -221,6 +213,7 @@ export const CodeModeTool = Tool.define(
           Effect.gen(function* () {
             childCalls += 1
             const result = yield* invokeChildTool({
+              truncate,
               plugin,
               entry,
               args: (input ?? {}) as Record<string, unknown>,

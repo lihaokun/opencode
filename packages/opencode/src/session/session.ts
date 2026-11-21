@@ -5,6 +5,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import path from "path"
 import { BackgroundJob } from "@/background/job"
+import { cancelSnapshot } from "@/tool/shell/tasks"
 import { Decimal } from "decimal.js"
 import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
@@ -795,22 +796,25 @@ const layer: Layer.Layer<
     const fork = Effect.fn("Session.fork")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
       const ctx = yield* InstanceState.context
       const original = yield* get(input.sessionID)
-      const title = getForkedTitle(original.title)
+      const msgs = yield* messages({ sessionID: input.sessionID })
+      const target = input.messageID ? msgs.findIndex((msg) => msg.info.id === input.messageID) : msgs.length
+      const copied = msgs.slice(0, target < 0 ? msgs.length : target)
+      const idMap = new Map<string, MessageID>(copied.map((msg) => [msg.info.id, MessageID.ascending()]))
+      const metadata = structuredClone(original.metadata)
+      if (metadata?.summaryBudgetSample) {
+        const messageID = idMap.get(metadata.summaryBudgetSample.messageID)
+        if (messageID) metadata.summaryBudgetSample.messageID = messageID
+        else delete metadata.summaryBudgetSample
+      }
       const session = yield* createNext({
         directory: ctx.directory,
         path: sessionPath(ctx.worktree, ctx.directory),
         workspaceID: original.workspaceID,
-        title,
-        metadata: structuredClone(original.metadata),
+        title: getForkedTitle(original.title),
+        metadata,
       })
-      const msgs = yield* messages({ sessionID: input.sessionID })
-      const idMap = new Map<string, MessageID>()
-      const target = input.messageID ? msgs.findIndex((msg) => msg.info.id === input.messageID) : msgs.length
-
-      for (const msg of msgs.slice(0, target < 0 ? msgs.length : target)) {
-        const newID = MessageID.ascending()
-        idMap.set(msg.info.id, newID)
-
+      for (const msg of copied) {
+        const newID = idMap.get(msg.info.id)!
         const parentID = msg.info.role === "assistant" && msg.info.parentID ? idMap.get(msg.info.parentID) : undefined
         const cloned = yield* updateMessage({
           ...msg.info,
@@ -826,6 +830,22 @@ const layer: Layer.Layer<
             messageID: cloned.id,
             sessionID: session.id,
           }
+          if (
+            p.type === "text" &&
+            p.synthetic &&
+            p.metadata?.compaction_continue &&
+            typeof p.metadata.protected_from === "string"
+          )
+            p.metadata = { ...p.metadata, protected_from: idMap.get(MessageID.make(p.metadata.protected_from)) }
+          if (
+            p.type === "text" &&
+            p.synthetic &&
+            p.metadata?.kind === "compaction_restoration" &&
+            typeof p.metadata.markerID === "string"
+          )
+            p.metadata = { ...p.metadata, markerID: idMap.get(p.metadata.markerID) }
+          if (p.type === "compaction" && p.request_user_id) p.request_user_id = idMap.get(p.request_user_id)
+          if (p.type === "compaction" && p.protected_from) p.protected_from = idMap.get(p.protected_from)
           if (p.type === "compaction" && p.tail_start_id) {
             p.tail_start_id = idMap.get(p.tail_start_id)
           }
@@ -1126,7 +1146,9 @@ const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function*
       if (job.metadata?.sessionId === sessionID) return true
       return job.metadata?.parentSessionId === sessionID
     }),
-    (job) => background.cancel(job.id),
+    // R6 parity: session removal interrupts the run fiber before settle —
+    // pass the shell buffer snapshot so the tail survives in the job output.
+    (job) => background.cancel(job.id, { output: cancelSnapshot(job.id) }),
     { concurrency: "unbounded", discard: true },
   )
 })

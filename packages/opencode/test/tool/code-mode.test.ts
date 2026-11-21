@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { CODE_MODE_TOOL, CodeModeTool, Parameters, describeCatalog } from "@/tool/code-mode"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js"
 import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Agent } from "@/agent/agent"
 import { MCP } from "@/mcp"
@@ -42,13 +43,14 @@ function harness(input: {
   servers: string[]
   permission?: PermissionV1.Rule[]
   trigger?: Plugin.Interface["trigger"]
+  truncate?: Truncate.Interface["output"]
 }) {
   return Layer.mergeAll(
     Layer.mock(Plugin.Service, {
       trigger: input.trigger ?? (((_name, _input, output) => Effect.succeed(output)) as Plugin.Interface["trigger"]),
     }),
     Layer.mock(Truncate.Service, {
-      output: (text: string) => Effect.succeed({ content: text, truncated: false as const }),
+      output: input.truncate ?? ((text: string) => Effect.succeed({ content: text, truncated: false as const })),
     }),
     Layer.mock(Agent.Service, {
       get: () => Effect.succeed({ name: "build", permission: input.permission ?? [] } as any),
@@ -356,6 +358,52 @@ describe("code mode execute", () => {
       tool.execute({ code: "try { await tools.bad.tool({}) } catch (e) { return 'caught: ' + e.message }" }, ctx),
     )
     expect(output.output).toBe("caught: server exploded")
+  })
+
+  test("bounds an RPC rejection before the sandbox catches the error", async () => {
+    const detail = "server diagnostic ".repeat(6000)
+    const saved: string[] = []
+    const tool = await Effect.runPromise(
+      CodeModeTool.pipe(
+        Effect.flatMap(Tool.init),
+        Effect.provide(
+          harness({
+            mcpTools: {
+              bad_tool: mcpTool("tool", () => {
+                throw new McpError(ErrorCode.InternalError, detail)
+              }),
+            },
+            servers: ["bad"],
+            truncate: (text, options) => {
+              if (!options?.error) return Effect.succeed({ content: text, truncated: false as const })
+              saved.push(text)
+              return Effect.succeed({
+                content: "diagnostic saved",
+                truncated: true as const,
+                outputPath: "/tmp/test-mcp-error",
+              })
+            },
+          }),
+        ),
+      ),
+    )
+    const result = await Effect.runPromise(
+      tool.execute({ code: "try { await tools.bad.tool({}) } catch (e) { return e.message }" }, ctx),
+    )
+    expect(saved).toHaveLength(1)
+    expect(saved[0]).toContain(detail)
+    expect(result.output).toBe("diagnostic saved")
+  })
+
+  test("an MCP error carrying only structuredContent surfaces the JSON in the message", async () => {
+    const structuredContent = { code: 3007, detail: "quota exceeded" }
+    const tool = await build({
+      bad_tool: mcpTool("tool", () => ({ isError: true, content: [], structuredContent })),
+    })
+    const output = await Effect.runPromise(
+      tool.execute({ code: "try { await tools.bad.tool({}) } catch (e) { return 'caught: ' + e.message }" }, ctx),
+    )
+    expect(output.output).toBe(`caught: ${JSON.stringify(structuredContent)}`)
   })
 
   test("asks permission before each child tool call", async () => {

@@ -7,11 +7,11 @@ import type { EventV2 } from "../event"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
+import { hasOutputPath, savedOutputPath, summarizeToolText, summarizeToolError } from "./tool-result-projection"
 import { Token } from "../util/token"
 
 const DEFAULT_BUFFER = 20_000
 const DEFAULT_KEEP_TOKENS = 8_000
-const TOOL_OUTPUT_MAX_CHARS = 2_000
 const SUMMARY_OUTPUT_TOKENS = 4_096
 const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
 <template>
@@ -82,15 +82,36 @@ type Input = {
 
 const estimate = (value: unknown) => Token.estimate(JSON.stringify(value))
 
-const truncate = (value: string) =>
-  value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
-
-export const serializeToolContent = (content: SessionMessage.ToolStateCompleted["content"]) =>
-  content
+export function serializeToolContent(content: SessionMessage.ToolStateCompleted["content"]) {
+  const text = content
     .map((item) =>
       item.type === "text" ? item.text : `[Attached ${item.mime}${item.name === undefined ? "" : `: ${item.name}`}]`,
     )
     .join("\n")
+  const preview = summarizeToolText(text)
+  if (preview === text) return text
+  const paths = new Set<string>()
+  for (const item of content) {
+    if (item.type === "text") {
+      const file = savedOutputPath(item.text)
+      if (file && !hasOutputPath(preview, file)) paths.add(file)
+    }
+  }
+  // Leave room for a maximum-length artifact path even when the text preview
+  // is full. A result with many artifacts cannot make the summary unbounded.
+  const references: string[] = []
+  let remaining = 32_767 + "\nFull output saved to: ".length
+  for (const file of paths) {
+    const line = "\nFull output saved to: " + file
+    if (line.length > remaining) continue
+    references.push(line)
+    remaining -= line.length
+  }
+  const omitted = paths.size - references.length
+  return (
+    preview + references.join("") + (omitted ? `\n[${omitted} more artifact paths in the original tool result]` : "")
+  )
+}
 
 const serialize = (message: SessionMessage.Message) => {
   if (message.type === "user") {
@@ -106,17 +127,20 @@ const serialize = (message: SessionMessage.Message) => {
         if (part.state.status === "completed")
           return [
             `[Assistant tool call]: ${part.name}(${input})`,
-            `[Tool result]: ${truncate(serializeToolContent(part.state.content))}`,
+            `[Tool result]: ${serializeToolContent(part.state.content)}`,
           ]
         if (part.state.status === "error")
-          return [`[Assistant tool call]: ${part.name}(${input})`, `[Tool error]: ${part.state.error.message}`]
+          return [
+            `[Assistant tool call]: ${part.name}(${input})`,
+            `[Tool error]: ${summarizeToolError(part.state.error.message)}`,
+          ]
         return [`[Assistant tool call]: ${part.name}(${input})`]
       })
       .join("\n")
   }
   if (message.type === "system") return `[System update]: ${message.text}`
   if (message.type === "synthetic") return `[Synthetic context]: ${message.text}`
-  if (message.type === "shell") return `[Shell]: ${message.command}\n${truncate(message.output)}`
+  if (message.type === "shell") return `[Shell]: ${message.command}\n${summarizeToolText(message.output)}`
   return ""
 }
 

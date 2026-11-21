@@ -145,6 +145,11 @@ describe("tool parameters", () => {
     test("rejects missing pattern", () => {
       expect(accepts(Grep, {})).toBe(false)
     })
+    test("rejects negative context params at the schema layer", () => {
+      expect(accepts(Grep, { pattern: "x", context: -1 })).toBe(false)
+      expect(accepts(Grep, { pattern: "x", before: -2 })).toBe(false)
+      expect(accepts(Grep, { pattern: "x", after: -3 })).toBe(false)
+    })
   })
 
   describe("invalid", () => {

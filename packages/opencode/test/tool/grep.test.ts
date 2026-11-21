@@ -1,5 +1,6 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { describe, expect } from "bun:test"
+import fc from "fast-check"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
@@ -145,7 +146,11 @@ describe("tool.grep", () => {
       const grep = yield* info.init()
       const result = yield* grep.execute({ pattern: "needle", path: test.directory, include: "*.txt" }, ctx)
 
-      expect(result.output).toContain("(Results truncated. Consider using a more specific path or pattern.)")
+      // The tail wording was redesigned with pagination (grep extension): the
+      // regression target here is that a truncated result never claims an
+      // unknown total, and the new copy points at the offset escape hatch.
+      expect(result.output).toContain("Showing matches 1-100 (offset 0, limit 100)")
+      expect(result.output).toContain("(more results available; increase offset to 100)")
       expect(result.output).not.toMatch(/showing \d+ of \d+ matches/)
     }),
   )
@@ -297,6 +302,217 @@ describe("tool.grep", () => {
     }),
   )
 
+  it.instance("files_with_matches mode lists matching file paths", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "a.txt"), "needle\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "b.txt"), "needle\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "c.md"), "needle\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const result = yield* grep.execute(
+        { pattern: "needle", path: test.directory, include: "*.txt", output_mode: "files_with_matches" },
+        ctx,
+      )
+      expect(result.output).toContain("Found 2 files")
+      expect(result.output).toContain(path.join(test.directory, "a.txt"))
+      expect(result.output).toContain(path.join(test.directory, "b.txt"))
+      expect(result.output).not.toContain("c.md")
+    }),
+  )
+
+  it.instance("count mode reports per-file match counts", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "a.txt"), "x\nx\nx\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "b.txt"), "x\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const result = yield* grep.execute(
+        { pattern: "x", path: test.directory, include: "*.txt", output_mode: "count" },
+        ctx,
+      )
+      expect(result.output).toContain("Found 2 files with 4 matches")
+      expect(result.output).toContain("a.txt: 3 matches")
+      expect(result.output).toContain("b.txt: 1 matches")
+    }),
+  )
+
+  it.instance("count mode handles a single-file search target", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const file = path.join(test.directory, "solo.txt")
+      yield* Effect.promise(() => Bun.write(file, "x\nx\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const result = yield* grep.execute(
+        { pattern: "x", path: file, output_mode: "count" },
+        ctx,
+      )
+      expect(result.output).toContain("Found 1 files with 2 matches")
+      expect(result.output).toContain(file)
+    }),
+  )
+
+  it.instance("content mode renders context lines with dash prefixes", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "ctx.txt"), "before\nMIDDLE\nafter\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const result = yield* grep.execute(
+        { pattern: "MIDDLE", path: test.directory, include: "ctx.txt", before: 1, after: 1 },
+        ctx,
+      )
+      expect(result.output).toContain("Line 1- before")
+      expect(result.output).toContain("Line 2: MIDDLE")
+      expect(result.output).toContain("Line 3- after")
+    }),
+  )
+
+  // The shorthand must reach ripgrep: before = after = context, and an
+  // explicit side overrides the shorthand for that side only.
+  it.instance("context shorthand expands to before and after, explicit sides win", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "sh.txt"), "b1\nb2\nMIDDLE\na2\na1\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      const both = yield* grep.execute(
+        { pattern: "MIDDLE", path: test.directory, include: "sh.txt", context: 2 },
+        ctx,
+      )
+      expect(both.output).toContain("Line 1- b1")
+      expect(both.output).toContain("Line 5- a1")
+
+      const mixed = yield* grep.execute(
+        { pattern: "MIDDLE", path: test.directory, include: "sh.txt", context: 2, after: 1 },
+        ctx,
+      )
+      expect(mixed.output).toContain("Line 1- b1")
+      expect(mixed.output).toContain("Line 4- a2")
+      expect(mixed.output).not.toContain("Line 5- a1")
+    }),
+  )
+
+  it.instance("pagination distinguishes has-more, exact end and offset beyond", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      for (let index = 0; index < 5; index += 1) {
+        yield* Effect.promise(() => Bun.write(path.join(test.directory, `p${index}.txt`), "needle\n"))
+      }
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      // has-more
+      const page = yield* grep.execute(
+        { pattern: "needle", path: test.directory, include: "p*.txt", head_limit: 2 },
+        ctx,
+      )
+      expect(page.output).toContain("Showing matches 1-2 (offset 0, limit 2)")
+      expect(page.output).toContain("(more results available; increase offset to 2)")
+
+      // exact end
+      const last = yield* grep.execute(
+        { pattern: "needle", path: test.directory, include: "p*.txt", head_limit: 2, offset: 4 },
+        ctx,
+      )
+      expect(last.output).toContain("Showing matches 5-5 (offset 4, limit 2)")
+      expect(last.output).not.toContain("more results available")
+
+      // offset beyond results is distinct from no matches at all, and the
+      // total shown is the real match count (5), not the empty page length.
+      const beyond = yield* grep.execute(
+        { pattern: "needle", path: test.directory, include: "p*.txt", head_limit: 2, offset: 9 },
+        ctx,
+      )
+      expect(beyond.output).toContain("No matches at offset 9 (total matches: 5)")
+      expect(beyond.output).not.toContain("No files found")
+      // The metadata of an empty page still reflects this request.
+      expect(beyond.metadata).toMatchObject({ matches: 0, truncated: false, output_mode: "content", offset: 9 })
+    }),
+  )
+
+  it.instance("insensitive search matches case variants", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "case.txt"), "HeLLo\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      const sensitive = yield* grep.execute({ pattern: "hello", path: test.directory }, ctx)
+      expect(sensitive.output).toContain("No files found")
+
+      const loose = yield* grep.execute({ pattern: "hello", path: test.directory, insensitive: true }, ctx)
+      expect(loose.output).toContain("HeLLo")
+    }),
+  )
+
+  it.instance("rejects oversized context and context outside content mode", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "f.txt"), "needle\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      const oversized = yield* Effect.exit(
+        grep.execute({ pattern: "needle", path: test.directory, context: 11 }, ctx),
+      )
+      expect(Exit.isFailure(oversized)).toBe(true)
+
+      const wrongMode = yield* Effect.exit(
+        grep.execute(
+          { pattern: "needle", path: test.directory, output_mode: "files_with_matches", context: 2 },
+          ctx,
+        ),
+      )
+      expect(Exit.isFailure(wrongMode)).toBe(true)
+      if (Exit.isFailure(wrongMode)) {
+        expect(String(Cause.squash(wrongMode.cause))).toContain("only apply to output_mode=content")
+      }
+    }),
+  )
+
+  // Schema-level guards: a negative offset or zero limit would degenerate the
+  // pagination window (nonsense ranges, empty pages reported as truncated).
+  // The dedicated invalid-pattern channel must survive the search rewrite:
+  // an illegal expression is a diagnostic error, not a generic failure.
+  it.instance("invalid regex reports the ripgrep parse error", () =>
+    Effect.gen(function* () {
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const exit = yield* Effect.exit(grep.execute({ pattern: "[", path: "/" }, ctx))
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const message = String(Cause.squash(exit.cause))
+        expect(message.toLowerCase()).toContain("regex parse error")
+      }
+    }),
+  )
+
+  it.instance("rejects negative offset and non-positive head_limit at the schema", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "f.txt"), "needle\n"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      const negativeOffset = yield* Effect.exit(
+        grep.execute({ pattern: "needle", path: test.directory, offset: -5 }, ctx),
+      )
+      expect(Exit.isFailure(negativeOffset)).toBe(true)
+
+      const zeroLimit = yield* Effect.exit(
+        grep.execute({ pattern: "needle", path: test.directory, head_limit: 0 }, ctx),
+      )
+      expect(Exit.isFailure(zeroLimit)).toBe(true)
+    }),
+  )
+
+  // #107: single-file scoping — an exact file target searches only that file
+  // (a bare "-" basename would read stdin to rg; symlinks keep the requested
+  // name and never leak sibling matches). Applies to the multi-mode tool too.
   it.instance("an exact symlink file keeps its requested name and excludes siblings", () =>
     Effect.gen(function* () {
       if (process.platform === "win32") return
@@ -316,3 +532,282 @@ describe("tool.grep", () => {
     }),
   )
 })
+
+it.instance(
+  "each page keeps the complete context of its own isolated matches",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const rg = yield* Ripgrep.Service
+      const groups = Array.from({ length: 6 }, (_, i) => ({
+        file: `group-${Math.floor(i / 2)}.txt`,
+        before: `before-${i}`,
+        match: `hit-${i}`,
+        after: `after-${i}`,
+      }))
+      for (const file of new Set(groups.map((group) => group.file))) {
+        const lines = groups
+          .filter((group) => group.file === file)
+          .flatMap((group) => [group.before, group.match, group.after, "gap", "gap"])
+        yield* Effect.promise(() => Bun.write(path.join(test.directory, file), lines.join("\n") + "\n"))
+      }
+      yield* Effect.promise(() =>
+        fc.assert(
+          fc.asyncProperty(
+            fc.integer({ min: 0, max: groups.length }),
+            fc.integer({ min: 1, max: 3 }),
+            fc.boolean(),
+            fc.boolean(),
+            async (offset, limit, before, after) => {
+              const page = await Effect.runPromise(
+                rg.search({
+                  cwd: test.directory,
+                  pattern: "^hit-",
+                  offset,
+                  limit,
+                  before: Number(before),
+                  after: Number(after),
+                }),
+              )
+              if (page.mode !== "content") throw new Error("Expected a content page")
+              expect(page.rows.map((row) => [row.path, row.text.trimEnd()])).toEqual(
+                groups
+                  .slice(offset, offset + limit)
+                  .flatMap((group) =>
+                    [...(before ? [group.before] : []), group.match, ...(after ? [group.after] : [])].map((text) => [
+                      group.file,
+                      text,
+                    ]),
+                  ),
+              )
+              expect(page.hasMore).toBe(offset + limit < groups.length)
+            },
+          ),
+          {
+            seed: 4619,
+            numRuns: 24,
+            examples: [
+              [1, 1, true, true],
+              [2, 1, false, true],
+            ],
+          },
+        ),
+      )
+    }),
+  30_000,
+)
+
+it.instance("a skipped adjacent match preserves shared leading context for the admitted match", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const file = path.join(test.directory, "adjacent.txt")
+    yield* Effect.promise(() => Bun.write(file, "prefix\nhit-first\nhit-second\n"))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const result = yield* grep.execute({ path: file, pattern: "^hit-", before: 2, offset: 1, head_limit: 1 }, ctx)
+    expect(result.output).toContain("Line 1- prefix")
+    expect(result.output).toContain("Line 3: hit-second")
+    expect(result.output).not.toContain("hit-first")
+  }),
+)
+
+it.instance("a non-UTF-8 context row preserves its neighboring ASCII match", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const file = path.join(test.directory, "mixed.txt")
+    yield* Effect.promise(() => Bun.write(file, Uint8Array.of(104, 105, 116, 10, 255, 10)))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const result = yield* grep.execute({ path: file, pattern: "hit", after: 1 }, ctx)
+    expect(result.output).toContain("Line 1: hit")
+    expect(result.metadata.matches).toBe(1)
+  }),
+)
+
+it.instance("a context-heavy grep page bounds its bytes and keeps a continuation", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const file = path.join(test.directory, "contexts.txt")
+    const groups = Array.from({ length: 80 }, (_, index) => `hit-${index}\n${"界".repeat(500)}\n`)
+    yield* Effect.promise(() => Bun.write(file, groups.join("")))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const result = yield* grep.execute({ path: file, pattern: "^hit-", head_limit: 100, after: 1 }, ctx)
+    expect(result.output).toContain("hit-0")
+    expect(Buffer.byteLength(result.output)).toBeLessThan(Truncate.MAX_BYTES + 2_048)
+    expect(result.output).toMatch(/offset|saved to/i)
+  }),
+)
+
+it.instance("a deep grep offset still returns the final matches exactly once", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const file = path.join(test.directory, "deep.txt")
+    yield* Effect.promise(() => Bun.write(file, Array.from({ length: 10_002 }, (_, i) => `hit-${i}\n`).join("")))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const result = yield* grep.execute({ path: file, pattern: "^hit-", offset: 10_000, head_limit: 2 }, ctx)
+    expect(result.output.match(/hit-\d+/g)).toEqual(["hit-10000", "hit-10001"])
+    expect(result.metadata.truncated).toBe(false)
+  }),
+)
+
+// R2: every page is an independent rg invocation, so pagination only works if
+// the traversal order is identical across invocations. Walk a wider tree in
+// pages and demand the union is exactly the file set — no duplicates, no gaps.
+// The oracle keys on dir/file pairs (base names repeat across directories).
+it.instance("pagination across invocations covers every file exactly once", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    for (let dir = 0; dir < 11; dir += 1) {
+      for (let file = 0; file < 15; file += 1) {
+        yield* Effect.promise(() =>
+          Bun.write(path.join(test.directory, `d${dir}`, `f${file}.txt`), "needle\n"),
+        )
+      }
+    }
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+
+    for (const mode of ["files_with_matches", "count", "content"] as const) {
+      const seen: string[] = []
+      for (let offset = 0; offset < 165; offset += 20) {
+        const page = yield* grep.execute(
+          { pattern: "needle", path: test.directory, output_mode: mode, head_limit: 20, offset },
+          ctx,
+        )
+        // The tool renders absolute paths; key the oracle on dir/file pairs so
+        // identical base names in different directories stay distinct.
+        seen.push(...(page.output.match(/d\d+[\\/]f\d+\.txt/g) ?? []))
+      }
+      const unique = new Set(seen)
+      expect(unique.size).toBe(165)
+      expect(seen.length).toBe(unique.size)
+    }
+  }),
+  30_000,
+)
+
+// R7a: an offset past the last match must yield an empty page — the trailing
+// context of the final (skipped) match is not a result.
+it.instance("offset beyond the last match returns no context-only rows", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "r7a.txt"), "hit\nnot-a-match\n"))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+
+    const beyond = yield* grep.execute(
+      { pattern: "^hit$", path: test.directory, include: "r7a.txt", after: 1, offset: 1, head_limit: 1 },
+      ctx,
+    )
+    expect(beyond.metadata).toMatchObject({ matches: 0 })
+    expect(beyond.output).toContain("No matches at offset 1")
+    expect(beyond.output).not.toContain("not-a-match")
+  }),
+)
+
+// R7b: the "Showing matches" range counts matches; context rows ride along
+// without inflating the window.
+it.instance("showing-range counts matches, not context rows", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* Effect.promise(() =>
+      Bun.write(path.join(test.directory, "r7b.txt"), "hit\nafter\nhit\nafter\n"),
+    )
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+
+    const page = yield* grep.execute(
+      { pattern: "hit", path: test.directory, include: "r7b.txt", context: 1, offset: 1, head_limit: 1 },
+      ctx,
+    )
+    // One match admitted (the second "hit"); its before/after context rows
+    // appear in the listing but the range says exactly one match: 2-2.
+    expect(page.output).toContain("Showing matches 2-2 (offset 1, limit 1)")
+  }),
+)
+
+// Negative context values are rejected at the schema layer, not silently
+// treated as zero.
+it.instance("negative context parameters are rejected", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "neg.txt"), "needle\n"))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+
+    for (const params of [
+      { context: -1 },
+      { before: -2 },
+      { after: -3 },
+    ] as const) {
+      const exit = yield* Effect.exit(
+        grep.execute({ pattern: "needle", path: test.directory, ...params }, ctx),
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+    }
+  }),
+)
+
+it.instance("grep metadata and page headers distinguish observed lower bounds from exact totals", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const run = Effect.runPromiseWith(yield* Effect.context())
+    for (let i = 0; i < 5; i++) yield* Effect.promise(() => Bun.write(path.join(test.directory, `p${i}.txt`), "hit\n"))
+    yield* Effect.promise(() =>
+      fc.assert(
+        fc.asyncProperty(
+          fc.constantFrom("content" as const, "files_with_matches" as const, "count" as const),
+          fc.integer({ min: 0, max: 6 }),
+          fc.integer({ min: 1, max: 4 }),
+          async (output_mode, offset, head_limit) => {
+            const result = await run(
+              grep.execute({ pattern: "hit", include: "*.txt", output_mode, offset, head_limit }, ctx),
+            )
+            expect(result.metadata.matches).toBe(Math.max(0, Math.min(head_limit, 5 - offset)))
+            if (offset + head_limit < 5) {
+              expect(result.metadata).toMatchObject({ total_lower_bound: offset + head_limit + 1 })
+              expect(result.metadata).not.toHaveProperty("total")
+              expect(result.output).toContain(`at least ${offset + head_limit + 1}`)
+            } else {
+              expect(result.metadata).toMatchObject({ total: 5 })
+              expect(result.metadata).not.toHaveProperty("total_lower_bound")
+              expect(result.output).not.toContain("at least")
+            }
+          },
+        ),
+        {
+          seed: 60022,
+          numRuns: 30,
+          examples: [
+            ["content", 0, 1],
+            ["count", 2, 1],
+            ["files_with_matches", 6, 1],
+          ],
+        },
+      ),
+    )
+  }),
+)
+
+if (process.platform !== "win32") {
+  it.instance("grep preserves literal backslashes as distinct POSIX filenames in every mode", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const literal = path.join(test.directory, "a\\b.txt")
+      const nested = path.join(test.directory, "a", "b.txt")
+      yield* Effect.promise(() => Bun.write(literal, "hit-one\n"))
+      yield* Effect.promise(() => Bun.write(nested, "hit-two\n"))
+      for (const output_mode of ["files_with_matches", "count", "content"] as const) {
+        const result = yield* grep.execute({ pattern: "hit-", include: "*.txt", output_mode }, ctx)
+        expect(result.output).toContain(literal)
+        expect(result.output).toContain(nested)
+      }
+    }),
+  )
+}

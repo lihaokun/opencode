@@ -16366,6 +16366,10 @@
           "summary": {
             "type": "boolean"
           },
+          "n": {
+            "type": "integer",
+            "minimum": 0
+          },
           "cost": {
             "type": "number"
           },
@@ -17183,6 +17187,18 @@
             "type": "boolean"
           },
           "tail_start_id": {
+            "type": "string",
+            "pattern": "^msg"
+          },
+          "fixed_input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "protected_from": {
+            "type": "string",
+            "pattern": "^msg"
+          },
+          "request_user_id": {
             "type": "string",
             "pattern": "^msg"
           }
@@ -21381,6 +21397,10 @@
             "type": "integer",
             "minimum": 0
           },
+          "stop_hook_block_cap": {
+            "type": "integer",
+            "minimum": 0
+          },
           "username": {
             "type": "string"
           },
@@ -21615,6 +21635,27 @@
               "reserved": {
                 "type": "integer",
                 "minimum": 0
+              },
+              "restoration": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "max_files": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "file_max_tokens": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "budget_tokens": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
               }
             },
             "additionalProperties": false

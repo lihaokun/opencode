@@ -13,6 +13,7 @@ import { Session } from "./session"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
 import { isOverflow } from "./overflow"
+import { estimatePayload } from "./summary-budget"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
@@ -50,6 +51,7 @@ class IncompleteStreamControl extends Error {
 }
 
 export interface Handle {
+  readonly summaryOverflow?: { message: string; responseBody?: string }
   readonly message: SessionV1.Assistant
   readonly updateToolCall: (
     toolCallID: string,
@@ -180,6 +182,7 @@ const layer = Layer.effect(
       }
       let aborted = false
       let evidence = providerTurnEvidence()
+      let summaryOverflow: Handle["summaryOverflow"]
       let recoverContextOverflow = true
       let attempt: PhysicalAttemptCheckpoint | undefined
       let hasPluginActivity = false
@@ -742,6 +745,7 @@ const layer = Layer.effect(
           })
         }
         ctx.toolcalls = {}
+        if (summaryOverflow) return
         ctx.assistantMessage.time.completed = Date.now()
         yield* session.updateMessage(ctx.assistantMessage)
       })
@@ -772,7 +776,21 @@ const layer = Layer.effect(
         if (SessionV1.ContextOverflowError.isInstance(error)) {
           const canRecover =
             (yield* config.get()).compaction?.auto !== false && recoverContextOverflow && !evidence.hasAssistantStarted
-          if (!ctx.assistantMessage.summary && !canRecover) {
+          if (
+            ctx.assistantMessage.summary &&
+            !evidence.hasAssistantStarted &&
+            !evidence.completedSteps &&
+            !hasPluginActivity &&
+            !hasToolActivity
+          ) {
+            // Keep the logical summary pending across rejected physical inputs.
+            yield* rollbackAttempt(e).pipe(Effect.orDie)
+            ctx.snapshot = undefined
+            summaryOverflow = error.data
+            ctx.needsCompaction = true
+            return
+          }
+          if (ctx.assistantMessage.summary || !canRecover) {
             ctx.assistantMessage.error = error
             ctx.assistantMessage.finish = "error"
             yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
@@ -780,7 +798,8 @@ const layer = Layer.effect(
             return
           }
           ctx.needsCompaction = true
-          yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+          // The caller reports any terminal failure after attempting compaction.
+          // Publishing here makes a successfully recovered CLI turn exit with an error.
           return
         }
         ctx.assistantMessage.error = error
@@ -797,6 +816,11 @@ const layer = Layer.effect(
         options?: ProcessOptions,
       ) {
         let incompleteRetryCount = 0
+        const payload = streamInput.preparedPayload
+        const estimated =
+          payload && !ctx.assistantMessage.summary
+            ? yield* Effect.tryPromise(() => estimatePayload(payload)).pipe(Effect.option)
+            : undefined
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
@@ -916,6 +940,23 @@ const layer = Layer.effect(
             ),
           )
 
+          if (
+            estimated?._tag === "Some" &&
+            !ctx.assistantMessage.error &&
+            ctx.assistantMessage.finish &&
+            evidence.completedSteps === 1
+          ) {
+            const t = ctx.assistantMessage.tokens
+            if (t.input + t.cache.read + t.cache.write > 0) {
+              const sample = { messageID: ctx.assistantMessage.id, estimate: estimated.value }
+              yield* session
+                .updateMetadata({
+                  sessionID: ctx.sessionID,
+                  update: (current) => ({ ...current, summaryBudgetSample: sample }),
+                })
+                .pipe(Effect.catchCause(() => Effect.logWarning("could not save summary budget sample")))
+            }
+          }
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           if (ctx.needsCompaction) return "compact"
           return "continue"
@@ -923,6 +964,9 @@ const layer = Layer.effect(
       })
 
       return {
+        get summaryOverflow() {
+          return summaryOverflow
+        },
         get message() {
           return ctx.assistantMessage
         },

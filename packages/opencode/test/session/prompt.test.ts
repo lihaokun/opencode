@@ -17,6 +17,7 @@ import { Command } from "../../src/command"
 import { Config } from "@/config/config"
 import { LSP } from "@/lsp/lsp"
 import { MCP } from "../../src/mcp"
+import type { Client as MCPClient } from "@modelcontextprotocol/sdk/client/index.js"
 import { Permission } from "../../src/permission"
 import { Plugin } from "../../src/plugin"
 import type { Hooks } from "@opencode-ai/plugin"
@@ -122,14 +123,14 @@ function errorTool(parts: SessionV1.Part[]) {
   return part?.state.status === "error" ? (part as ErrorToolPart) : undefined
 }
 
-function makeMcp(instructions: MCP.ServerInstructions[] = []) {
+function makeMcp(instructions: MCP.ServerInstructions[] = [], tools: Record<string, MCP.McpTool> = {}) {
   return Layer.succeed(
     MCP.Service,
     MCP.Service.of({
       status: () => Effect.succeed({}),
       clients: () => Effect.succeed({}),
       instructions: () => Effect.succeed(instructions),
-      tools: () => Effect.succeed({}),
+      tools: () => Effect.succeed(tools),
       prompts: () => Effect.succeed({}),
       resources: () => Effect.succeed({}),
       resourceTemplates: () => Effect.succeed({}),
@@ -291,11 +292,15 @@ const promptRoot = LayerNode.group([
   RuntimeFlags.node,
 ])
 
-function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makePrompt(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  mcpTools?: Record<string, MCP.McpTool>
+  processor?: "blocking"
+}) {
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
-    [MCP.node, makeMcp(input?.mcpInstructions)],
+    [MCP.node, makeMcp(input?.mcpInstructions, input?.mcpTools)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
   if (input?.processor === "blocking") {
@@ -350,6 +355,7 @@ const failingMetadataSession = LayerNode.make({
 
 function makeHttp(input?: {
   mcpInstructions?: MCP.ServerInstructions[]
+  mcpTools?: Record<string, MCP.McpTool>
   processor?: "blocking"
   plugin?: "oversized-tool" | "stop-hook" | "file-loaded"
   session?: "failing-metadata"
@@ -358,7 +364,7 @@ function makeHttp(input?: {
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
-    [MCP.node, makeMcp(input?.mcpInstructions)],
+    [MCP.node, makeMcp(input?.mcpInstructions, input?.mcpTools)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
   if (input?.processor === "blocking") {
@@ -400,6 +406,36 @@ const withMcpInstructions = testEffect(
         tools: ["guide-server_lookup"],
       },
     ],
+  }),
+)
+// An MCP server exposing one tool whose result carries structuredContent — the
+// wire path under projection (session/tools.ts projectMcpToolResult).
+const withMcpTool = testEffect(
+  makeHttp({
+    mcpTools: {
+      "guide-server": {
+        def: {
+          name: "lookup",
+          description: "lookup things",
+          inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+        },
+        client: {
+          callTool: async (request: { arguments?: { q?: string } }) => {
+            if (request.arguments?.q === "large diagnostics")
+              return {
+                content: [{ type: "text", text: "lookup failed for test query" }],
+                structuredContent: { detail: "界".repeat(65_536) },
+                isError: true,
+              }
+            return {
+              content: [{ type: "text", text: "查询完成" }],
+              structuredContent: { matches: [{ path: "src/a.ts", line: 42 }] },
+              isError: false,
+            }
+          },
+        } as unknown as MCPClient,
+      },
+    },
   }),
 )
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
@@ -940,6 +976,322 @@ it.instance("loop calls LLM and returns assistant message", () =>
     const parts = result.parts.filter((p) => p.type === "text")
     expect(parts.some((p) => p.type === "text" && p.text === "world")).toBe(true)
     expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+it.instance("a successful provider request pairs its input usage with a durable local estimate", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Budget sample", permission: allowAll })
+    yield* user(chat.id, "estimate this request")
+    yield* llm.push(reply().text("done").usage({ input: 91, output: 13 }).stop())
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    expect(result.info.role === "assistant" && result.info.tokens.input).toBe(91)
+    expect((yield* sessions.get(chat.id)).metadata?.summaryBudgetSample).toEqual({
+      messageID: result.info.id,
+      estimate: expect.any(Number),
+    })
+    expect((yield* sessions.get(chat.id)).metadata?.summaryBudgetSample.estimate).toBeGreaterThan(0)
+  }),
+)
+
+it.instance("loop delivers the shared working agreement on the wire", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Shared agreement e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.text("ok")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const body = (yield* llm.inputs).at(-1)!
+    const wire = JSON.stringify(body)
+    // the shared agreement rides the system prompt…
+    expect(wire).toContain("# Working agreement")
+    expect(wire).toContain("carry it to completion")
+    // …and the dropped hard rules are gone from the wire too
+    expect(wire).not.toContain("fewer than 4 lines")
+    expect(wire).not.toContain("DO NOT ADD ***ANY***")
+    // #59: tool descriptions state mechanics, they do not prescribe workflow —
+    // the delegation prescription this PR once added is gone from the wire.
+    expect(wire).not.toContain("When to delegate")
+  }),
+)
+
+it.instance("explicit agent prompt opts out of the shared section on the wire", () =>
+  Effect.gen(function* () {
+    const marker = "CUSTOM_MARKER_PROMPT_AGENT_BUILD"
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      agent: { build: { prompt: marker } },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Opt-out e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.text("ok")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const body = (yield* llm.inputs).at(-1)!
+    const wire = JSON.stringify(body)
+    expect(wire).toContain(marker)
+    expect(wire).not.toContain("# Working agreement")
+    // the model template is replaced wholesale by the explicit prompt
+    expect(wire).not.toContain("interactive CLI tool that helps users with software engineering tasks")
+  }),
+)
+
+it.instance("loop replays a non-zero bash exit code into the next model request", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Exit code e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "run it" }],
+    })
+    yield* llm.tool("bash", { command: `bun -e "process.exit(7)"` })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    const toolMessage = (replay!.messages as { role: string; content: unknown }[]).find((m) => m.role === "tool")
+    expect(JSON.stringify(toolMessage)).toContain("(no output)")
+    expect(JSON.stringify(toolMessage)).toContain("[exit code: 7]")
+  }),
+)
+
+it.instance("loop replays grep output_mode results into the next model request", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Grep e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "needle-a.txt"), "needle\n"))
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "needle-b.txt"), "needle\n"))
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "find needles" }],
+    })
+    yield* llm.tool("grep", { pattern: "needle", output_mode: "files_with_matches" })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    const wire = JSON.stringify(replay)
+    expect(wire).toContain("Found 2 files")
+    expect(wire).toContain("needle-a.txt")
+    expect(wire).toContain("needle-b.txt")
+  }),
+)
+
+withMcpTool.instance("a long structured MCP error is bounded on the next model request", () =>
+  Effect.gen(function* () {
+    const llm = yield* TestLLMServer
+    const dir = (yield* TestInstance).directory
+    yield* writeConfig(dir, providerCfg(llm.url))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "look it up" }],
+    })
+    yield* llm.tool("guide-server", { q: "large diagnostics" })
+    yield* llm.text("done")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const replay = (yield* llm.inputs).at(-1)!
+    const message = (replay.messages as { role: string; content: unknown }[]).find((m) => m.role === "tool")
+    expect(message).toBeDefined()
+    const wire = JSON.stringify(message)
+    expect(wire).toContain("lookup failed for test query")
+    expect(wire).not.toContain("tool call succeeded")
+    expect(Buffer.byteLength(wire)).toBeLessThan(Truncate.MAX_BYTES + 2_048)
+  }),
+)
+
+// The MCP projection runs on the real tool-call path (session/tools.ts): the
+// model's request must carry the appended structuredContent, not just the text
+// item — this is what the unit tests on projectMcpToolResult cannot prove.
+withMcpTool.instance("loop replays an MCP structuredContent into the next model request", () =>
+  Effect.gen(function* () {
+    const llm = yield* TestLLMServer
+    const dir = (yield* TestInstance).directory
+    yield* writeConfig(dir, providerCfg(llm.url))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "MCP projection e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "look it up" }],
+    })
+    yield* llm.tool("guide-server", { q: "needle" })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    const wire = JSON.stringify(replay)
+    // The text item AND the appended structuredContent both ride the replay;
+    // "src/a.ts" appears twice — once in the appended JSON payload, once in
+    // the text item's own copy through the projection's \n\n append.
+    expect(wire).toContain("src/a.ts")
+    expect(wire).toContain("查询完成")
+    // 2 = one in the text item's replay, one in the appended structured JSON
+    expect(wire.split("src/a.ts")).toHaveLength(2)
+  }),
+)
+
+for (const variant of ["turbo", "default"]) {
+  it.instance(`shell completion preserves the current ${variant} variant on the wire`, () =>
+    Effect.gen(function* () {
+      const { llm, dir } = yield* useServerConfig((url) => {
+        const cfg = providerCfg(url)
+        const test = cfg.provider.test
+        return {
+          ...cfg,
+          agent: { plan: { model: "test/test-model", variant: "high" } },
+          provider: {
+            ...cfg.provider,
+            test: {
+              ...test,
+              models: { "test-model": { ...test.models["test-model"], variants: { high: {}, turbo: {} } } },
+            },
+          },
+        }
+      })
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Background shell e2e",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "start the server" }],
+      })
+      yield* llm.tool("bash", {
+        command: `bun -e "const end = Date.now() + 15000; while (!(await Bun.file('finish-shell').exists()) && Date.now() < end) await Bun.sleep(20); console.log('bg-done-marker')"`,
+        run_in_background: true,
+      })
+      yield* llm.text("started")
+      yield* llm.text("ack")
+
+      yield* prompt.loop({ sessionID: chat.id })
+
+      // The shell waits on the file, so the user can switch after its tool
+      // call has returned and before the completion notice is delivered.
+      yield* sessions.setAgentModel({
+        sessionID: chat.id,
+        agent: "plan",
+        model: { providerID: ref.providerID, id: ref.modelID, variant },
+        time: Date.now(),
+      })
+      yield* writeText(path.join(dir, "finish-shell"), "ready")
+
+      // The background process exits, the completion notification is delivered
+      // through the real deliverAsync path, and that message wakes a new model
+      // request — the notification must be on that wire.
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const hits = yield* llm.hits
+          return hits.length >= 3 ? true : undefined
+        }),
+        "background completion never reached the model",
+      )
+      const bodies = yield* llm.inputs
+      const notification = bodies.filter((body) => JSON.stringify(body).includes("[shell task finished]")).at(-1)
+      expect(notification).toBeDefined()
+      const wire = JSON.stringify(notification)
+      expect(wire).toContain("bg-done-marker")
+      expect(wire).toContain("exit 0")
+      const session = yield* sessions.get(chat.id)
+      expect(session.agent).toBe("plan")
+      expect(session.model?.variant).toBe(variant)
+      const notice = (yield* sessions.messages({ sessionID: chat.id })).find((row) =>
+        row.parts.some((part) => part.type === "text" && part.text.startsWith("[shell task finished]")),
+      )
+      expect(notice?.info.role).toBe("user")
+      if (notice?.info.role === "user") {
+        expect(notice.info.model.variant).toBe(variant === "default" ? undefined : variant)
+      }
+    }),
+  )
+}
+
+it.instance("loop stays silent for a zero bash exit code", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Exit zero e2e",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "run it" }],
+    })
+    yield* llm.tool("bash", { command: `bun -e "process.exit(0)"` })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const bodies = yield* llm.inputs
+    const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
+    expect(replay).toBeDefined()
+    expect(JSON.stringify(replay)).not.toContain("[exit code:")
   }),
 )
 
@@ -1659,40 +2011,20 @@ it.instance(
           message.info.role === "user" &&
           message.parts.some((part) => part.type === "text" && part.text === currentMarker),
       )
-      expect(markerUsers).toHaveLength(2)
-      expect(
-        active.filter(
-          (message) =>
-            message.info.role === "user" &&
-            message.parts.some((part) => part.type === "text" && part.text === currentMarker),
-        ),
-      ).toHaveLength(1)
-      const replay = markerUsers.find((message) => message.info.id !== original.info.id)
-      if (!replay || replay.info.role !== "user" || original.info.role !== "user") {
-        throw new Error("Expected one replayed user message")
-      }
-      expect(replay.info.agent).toBe(original.info.agent)
-      expect(replay.info.model.providerID).toBe(original.info.model.providerID)
-      expect(replay.info.model.modelID).toBe(original.info.model.modelID)
-      expect(replay.info.model.variant).toBe(original.info.model.variant)
-      expect(replay.info.system).toBe(original.info.system)
-      expect(replay.info.tools).toEqual(original.info.tools)
-      expect(replay.info.format).toEqual(original.info.format)
-      expect(
-        replay.parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
-      ).toEqual(
-        original.parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+      expect(markerUsers.map((row) => row.info.id)).toEqual([original.info.id])
+      expect(active.filter((row) => row.info.id === original.info.id)).toHaveLength(1)
+      const continuation = messages.find((row) =>
+        row.parts.some((p) => p.type === "text" && p.metadata?.compaction_continue),
       )
-      expect(
-        messages.filter((message) => message.info.role === "assistant" && message.info.parentID === original.info.id),
-      ).toHaveLength(0)
-
-      expect(result.info.role).toBe("assistant")
-      if (result.info.role === "assistant") {
-        expect(result.info.parentID).toBe(replay.info.id)
-        expect(result.info.finish).toBe("stop")
-        expect(result.info.error).toBeUndefined()
-      }
+      if (continuation?.info.role !== "user" || original.info.role !== "user")
+        throw new Error("Missing original user or continuation")
+      expect(continuation.info.agent).toBe(original.info.agent)
+      expect(continuation.info.model).toEqual(original.info.model)
+      expect(continuation.info.system).toBe(original.info.system)
+      expect(continuation.info.tools).toEqual(original.info.tools)
+      expect(continuation.info.format).toEqual(original.info.format)
+      expect(result.info).toMatchObject({ role: "assistant", finish: "stop", parentID: continuation.info.id })
+      expect(result.info.role === "assistant" && result.info.error).toBeUndefined()
       expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: answerMarker }))
     }),
   15_000,
@@ -1819,97 +2151,159 @@ it.instance(
   20_000,
 )
 
-it.instance("loop compacts and replays once after provider context overflow", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    const currentMarker = "provider-overflow-current-marker"
-    const detailMarker = "provider-overflow-detail-marker"
-    const systemMarker = "provider-overflow-system-marker"
-    const summaryMarker = "provider-overflow-summary-marker"
-    const answerMarker = "provider-overflow-recovered-marker"
+it.instance(
+  "loop compacts and replays once after provider context overflow",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const currentMarker = "provider-overflow-current-marker"
+      const detailMarker = "provider-overflow-detail-marker"
+      const systemMarker = "provider-overflow-system-marker"
+      const summaryMarker = "provider-overflow-summary-marker"
+      const answerMarker = "provider-overflow-recovered-marker"
 
-    yield* seed(chat.id, { finish: "stop" })
-    const original = yield* prompt.prompt({
-      sessionID: chat.id,
-      agent: "build",
-      noReply: true,
-      tools: { bash: false },
-      system: systemMarker,
-      parts: [
-        { type: "text", text: currentMarker },
-        { type: "text", text: detailMarker },
-      ],
-    })
-    yield* llm.error(400, { error: { message: "Prompt exceeds max length" } })
-    yield* llm.text(summaryMarker)
-    yield* llm.text(answerMarker)
+      yield* seed(chat.id, { finish: "stop" })
+      // A completed read gives the restoration something to restore: after the
+      // overflow-triggered compaction settles, the task arm injects the file's
+      // current on-disk body, and this test asserts it on the third request.
+      // The read rides the CURRENT turn (the one overflow replays), so the
+      // summary payload stays free of the replayed markers.
+      const restoredFile = path.join((yield* TestInstance).directory, "overflow-restored.md")
+      yield* writeText(restoredFile, "OVERFLOW-RESTORED-BODY")
+      const original = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        tools: { bash: false },
+        system: systemMarker,
+        parts: [
+          { type: "text", text: currentMarker },
+          { type: "text", text: detailMarker },
+        ],
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: original.info.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: "overflow-read-call",
+        tool: "read",
+        state: {
+          status: "completed",
+          input: { filePath: restoredFile },
+          output: "read overflow-restored.md",
+          title: "overflow-restored.md",
+          metadata: { display: { type: "file", path: restoredFile } },
+          time: { start: 1, end: 2 },
+        },
+      })
+      yield* llm.error(400, { error: { message: "Prompt exceeds max length" } })
+      yield* llm.text(summaryMarker)
+      yield* llm.text(answerMarker)
 
-    const result = yield* awaitWithTimeout(
-      prompt.loop({ sessionID: chat.id }),
-      "provider overflow recovery did not terminate",
-      "10 seconds",
-    )
-    const hits = yield* llm.hits
-    const messages = yield* sessions.messages({ sessionID: chat.id })
-    const active = yield* MessageV2.filterCompactedEffect(chat.id)
-    const firstBody = JSON.stringify(hits[0]?.body)
-    const summaryBody = JSON.stringify(hits[1]?.body)
-    const finalBody = JSON.stringify(hits[2]?.body)
+      const result = yield* awaitWithTimeout(
+        prompt.loop({ sessionID: chat.id }),
+        "provider overflow recovery did not terminate",
+        "10 seconds",
+      )
+      const hits = yield* llm.hits
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const active = yield* MessageV2.filterCompactedEffect(chat.id)
+      const firstBody = JSON.stringify(hits[0]?.body)
+      const summaryBody = JSON.stringify(hits[1]?.body)
+      const finalBody = JSON.stringify(hits[2]?.body)
 
-    expect(hits).toHaveLength(3)
-    expect(yield* llm.pending).toBe(0)
-    expect(firstBody).toContain(currentMarker)
-    expect(summaryBody).not.toContain(currentMarker)
-    expect(summaryBody).not.toContain(detailMarker)
-    expect(finalBody).toContain(summaryMarker)
-    expect(finalBody).toContain(currentMarker)
-    expect(finalBody).toContain(detailMarker)
-    expect(finalBody).toContain(systemMarker)
-    expect(finalBody.split(currentMarker)).toHaveLength(2)
-    expect(finalBody.split(detailMarker)).toHaveLength(2)
+      expect(hits).toHaveLength(3)
+      expect(yield* llm.pending).toBe(0)
+      expect(firstBody).toContain(currentMarker)
+      expect(summaryBody).not.toContain(currentMarker)
+      expect(summaryBody).not.toContain(detailMarker)
+      expect(finalBody).toContain(summaryMarker)
+      expect(finalBody).toContain(currentMarker)
+      expect(finalBody).toContain(detailMarker)
+      expect(finalBody).toContain(systemMarker)
+      expect(finalBody.split(currentMarker)).toHaveLength(2)
+      expect(finalBody.split(detailMarker)).toHaveLength(2)
+      // B6: the compaction task arm injects the restoration block, and the
+      // post-compaction request carries the file's current on-disk body.
+      expect(finalBody).toContain("OVERFLOW-RESTORED-BODY")
+      expect(finalBody).toContain("restored from before the last compaction")
 
-    const markerUsers = messages.filter(
-      (message) =>
-        message.info.role === "user" &&
-        message.parts.some((part) => part.type === "text" && part.text === currentMarker),
-    )
-    expect(markerUsers).toHaveLength(2)
-    expect(
-      active.filter(
+      const markerUsers = messages.filter(
         (message) =>
           message.info.role === "user" &&
           message.parts.some((part) => part.type === "text" && part.text === currentMarker),
-      ),
-    ).toHaveLength(1)
-    const replay = markerUsers.find((message) => message.info.id !== original.info.id)
-    if (!replay || replay.info.role !== "user" || original.info.role !== "user") {
-      throw new Error("Expected one replayed user message")
-    }
-    expect(replay.info.agent).toBe(original.info.agent)
-    expect(replay.info.model.providerID).toBe(original.info.model.providerID)
-    expect(replay.info.model.modelID).toBe(original.info.model.modelID)
-    expect(replay.info.model.variant).toBe(original.info.model.variant)
-    expect(replay.info.system).toBe(original.info.system)
-    expect(replay.info.tools).toEqual(original.info.tools)
-    expect(
-      replay.parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
-    ).toEqual(
-      original.parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
-    )
-    expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
-    expect(messages.filter((message) => message.info.role === "assistant" && message.info.summary)).toHaveLength(1)
+      )
+      expect(markerUsers.map((row) => row.info.id)).toEqual([original.info.id])
+      expect(active.filter((row) => row.info.id === original.info.id)).toHaveLength(1)
+      const continuation = messages.find((row) =>
+        row.parts.some((p) => p.type === "text" && p.metadata?.compaction_continue),
+      )
+      if (continuation?.info.role !== "user" || original.info.role !== "user")
+        throw new Error("Missing original user or continuation")
+      expect(continuation.info.agent).toBe(original.info.agent)
+      expect(continuation.info.model).toEqual(original.info.model)
+      expect(continuation.info.system).toBe(original.info.system)
+      expect(continuation.info.tools).toEqual(original.info.tools)
+      expect(continuation.info.format).toEqual(original.info.format)
+      expect(result.info).toMatchObject({ role: "assistant", finish: "stop", parentID: continuation.info.id })
+      expect(result.info.role === "assistant" && result.info.error).toBeUndefined()
+      expect(
+        continuation.parts.filter((p) => p.type === "text" && p.metadata?.kind === "compaction_restoration"),
+      ).toHaveLength(1)
+      expect(messages.filter((row) => row.info.role === "assistant" && row.info.summary)).toHaveLength(1)
+      expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: answerMarker }))
+    }),
+  20_000,
+)
 
-    expect(result.info.role).toBe("assistant")
-    if (result.info.role === "assistant") {
-      expect(result.info.parentID).toBe(replay.info.id)
-      expect(result.info.finish).toBe("stop")
-      expect(result.info.error).toBeUndefined()
-    }
-    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: answerMarker }))
-  }),
+it.instance(
+  "a user arriving after request selection but before the overflow marker cannot displace U1 or its tool result",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* seed(chat.id, { userText: "prefix-for-summary", finish: "stop" })
+      const u1 = yield* user(chat.id, "original-unfinished-task")
+      const seen = new Set<string>()
+      const off = yield* events.listen((event) => {
+        if (event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
+        const info = (event.data as { info: SessionV1.Info }).info
+        if (info.role !== "assistant" || info.parentID !== u1.id || seen.has(info.id)) return Effect.void
+        seen.add(info.id)
+        if (seen.size !== 2) return Effect.void
+        return user(chat.id, "incoming-steering").pipe(Effect.provideService(Session.Service, sessions), Effect.asVoid)
+      })
+      yield* Effect.addFinalizer(() => off)
+      yield* llm.tool("glob", { pattern: "unique-retained-work*.txt" })
+      yield* llm.error(400, { error: { message: "Prompt exceeds max length" } })
+      yield* llm.text("summary-of-prefix")
+      yield* llm.text("work-finished")
+      const done = yield* prompt.loop({ sessionID: chat.id })
+      const hits = yield* llm.hits
+      expect(hits).toHaveLength(4)
+      expect(JSON.stringify(hits[2]!.body)).toContain("prefix-for-summary")
+      for (const text of ["original-unfinished-task", "incoming-steering", "unique-retained-work"]) {
+        expect(JSON.stringify(hits[2]!.body)).not.toContain(text)
+        expect(JSON.stringify(hits[3]!.body)).toContain(text)
+      }
+      const history = yield* sessions.messages({ sessionID: chat.id })
+      expect(history.flatMap((m) => m.parts).filter((p) => p.type === "tool" && p.tool === "glob")).toHaveLength(1)
+      expect(
+        history.flatMap((m) => m.parts).filter((p) => p.type === "text" && p.text === "original-unfinished-task"),
+      ).toHaveLength(1)
+      expect(history.flatMap((m) => m.parts).find((p) => p.type === "compaction")).toMatchObject({
+        protected_from: u1.id,
+      })
+      expect(done.parts).toContainEqual(expect.objectContaining({ type: "text", text: "work-finished" }))
+    }),
+  20_000,
 )
 
 it.instance("loop persists a second provider context overflow after one recovery", () =>
@@ -1970,7 +2364,7 @@ it.instance("loop persists a second provider context overflow after one recovery
           message.info.role === "user" &&
           message.parts.some((part) => part.type === "text" && part.text === currentMarker),
       ),
-    ).toHaveLength(2)
+    ).toHaveLength(1)
     expect(
       active.filter(
         (message) =>
@@ -1983,7 +2377,7 @@ it.instance("loop persists a second provider context overflow after one recovery
       messages
         .flatMap((message) => message.parts)
         .some((part) => part.type === "text" && part.metadata && part.metadata.compaction_continue === true),
-    ).toBe(false)
+    ).toBe(true)
 
     const replay = yield* prompt.loop({ sessionID: chat.id })
     expect(replay.info.id).toBe(result.info.id)
@@ -2092,7 +2486,6 @@ it.instance("loop accounts for prompt-specific system text before sending", () =
     const oldMarker = "prompt-system-old-history-marker"
     const currentMarker = "prompt-system-current-marker"
     const systemMarker = "oversized-prompt-system-marker"
-    const summaryMarker = "prompt-system-summary-marker"
 
     yield* seed(chat.id, { finish: "stop", userText: oldMarker })
     const submitted = yield* prompt.prompt({
@@ -2102,8 +2495,6 @@ it.instance("loop accounts for prompt-specific system text before sending", () =
       system: `${systemMarker}\n${"x".repeat(400_000)}`,
       parts: [{ type: "text", text: currentMarker }],
     })
-    yield* llm.text(summaryMarker)
-    yield* llm.error(413, { error: { message: "request entity too large" } })
 
     const result = yield* awaitWithTimeout(
       Effect.raceFirst(prompt.loop({ sessionID: chat.id }), llm.wait(3).pipe(Effect.as("repeated" as const))),
@@ -2117,34 +2508,16 @@ it.instance("loop accounts for prompt-specific system text before sending", () =
     const messages = yield* sessions.messages({ sessionID: chat.id })
     const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: result.info.id })
     const ids = messages.map((message) => message.info.id)
-    const summaryBody = JSON.stringify(hits[0]?.body)
-    const retryBody = JSON.stringify(hits[1]?.body)
-
-    expect(hits).toHaveLength(2)
+    expect(hits).toHaveLength(0)
     expect(yield* llm.pending).toBe(0)
-    expect(summaryBody).toContain(oldMarker)
-    expect(summaryBody).not.toContain(currentMarker)
-    expect(summaryBody).not.toContain(systemMarker)
-    expect(retryBody).toContain(summaryMarker)
-    expect(retryBody).toContain(currentMarker)
-    expect(retryBody).toContain(systemMarker)
-    expect(messages.filter((message) => message.info.id === submitted.info.id)).toHaveLength(1)
-    expect(
-      messages.filter(
-        (message) =>
-          message.info.role === "user" &&
-          message.parts.some((part) => part.type === "text" && part.text === currentMarker),
-      ),
-    ).toHaveLength(2)
-    expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
-    expect(messages.filter((message) => message.info.role === "assistant" && message.info.summary)).toHaveLength(1)
+    expect(messages.some((row) => row.info.id === submitted.info.id)).toBe(true)
     expect(result.info.role).toBe("assistant")
     expect(stored.info.role).toBe("assistant")
     if (result.info.role === "assistant" && stored.info.role === "assistant") {
       expect(result.info.finish).toBe("error")
       expect(result.info.error).toMatchObject({
         name: "ContextOverflowError",
-        data: { message: expect.stringContaining("request entity too large") },
+        data: { message: expect.stringContaining("available input budget") },
       })
       expect(result.info.time.completed).toBeNumber()
       expect(stored.info.finish).toBe(result.info.finish)
@@ -2155,7 +2528,7 @@ it.instance("loop accounts for prompt-specific system text before sending", () =
     const replay = yield* prompt.loop({ sessionID: chat.id })
     expect(replay.info.id).toBe(result.info.id)
     expect((yield* sessions.messages({ sessionID: chat.id })).map((message) => message.info.id)).toEqual(ids)
-    expect(yield* llm.hits).toHaveLength(2)
+    expect(yield* llm.hits).toHaveLength(0)
   }),
 )
 
@@ -2739,8 +3112,7 @@ for (let seedNumber = 1; seedNumber <= 8; seedNumber++) {
           const summaryBody = JSON.stringify(summaryHit?.body)
           expect(summaryBody).toContain(oldText)
           for (const message of late) expect(summaryBody).not.toContain(message.text)
-          if (overflow || seedNumber % 3 !== 0) expect(summaryBody).not.toContain(currentText)
-          else expect(summaryBody).toContain(currentText)
+          expect(summaryBody).not.toContain(currentText)
           if (outcome !== "success") {
             forbidden.push(text, reason)
             failedIDs.push(partial.info.id)
@@ -2765,8 +3137,7 @@ for (let seedNumber = 1; seedNumber <= 8; seedNumber++) {
             const body = JSON.stringify(hits.at(-1)?.body)
             expect(body).toContain(text)
             expect(body).not.toContain(oldText)
-            if (overflow || seedNumber % 3 !== 0) expect(body).toContain(currentText)
-            else expect(body).not.toContain(currentText)
+            expect(body).toContain(currentText)
             for (const message of late) expect(body).toContain(message.text)
             expect(hits).toHaveLength(plan.length + 1)
             const projected = yield* MessageV2.filterCompactedEffect(chat.id)
@@ -2899,8 +3270,6 @@ withOversizedTool.instance("loop includes enabled tools in preflight payload siz
     const chat = yield* sessions.create({ title: "Pinned" })
     const oldMarker = "enabled-oversized-tool-old-marker"
     const currentMarker = "enabled-oversized-tool-current-marker"
-    const summaryMarker = "enabled-oversized-tool-summary-marker"
-    const answerMarker = "enabled-oversized-tool-answer-marker"
 
     yield* seed(chat.id, { finish: "stop", userText: oldMarker })
     yield* prompt.prompt({
@@ -2909,9 +3278,6 @@ withOversizedTool.instance("loop includes enabled tools in preflight payload siz
       noReply: true,
       parts: [{ type: "text", text: currentMarker }],
     })
-    yield* llm.text(summaryMarker)
-    yield* llm.text(answerMarker)
-
     const result = yield* awaitWithTimeout(
       Effect.raceFirst(prompt.loop({ sessionID: chat.id }), llm.wait(3).pipe(Effect.as("repeated" as const))),
       "enabled oversized tool neither completed nor repeated compaction",
@@ -2920,27 +3286,11 @@ withOversizedTool.instance("loop includes enabled tools in preflight payload siz
 
     expect(result).not.toBe("repeated")
     if (result === "repeated") return
-    const hits = yield* llm.hits
-    const messages = yield* sessions.messages({ sessionID: chat.id })
-    const summaryBody = JSON.stringify(hits[0]?.body)
-    const retryBody = JSON.stringify(hits[1]?.body)
-
-    expect(hits).toHaveLength(2)
-    expect(yield* llm.pending).toBe(0)
-    expect(summaryBody).toContain(oldMarker)
-    expect(summaryBody).not.toContain(currentMarker)
-    expect(summaryBody).not.toContain(oversizedToolID)
-    expect(retryBody).toContain(summaryMarker)
-    expect(retryBody).toContain(currentMarker)
-    expect(retryBody).toContain(oversizedToolID)
-    expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toHaveLength(1)
-    expect(messages.filter((message) => message.info.role === "assistant" && message.info.summary)).toHaveLength(1)
-    expect(result.info.role).toBe("assistant")
-    if (result.info.role === "assistant") {
-      expect(result.info.finish).toBe("stop")
-      expect(result.info.error).toBeUndefined()
-    }
-    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: answerMarker }))
+    expect(yield* llm.hits).toHaveLength(0)
+    expect(result.info).toMatchObject({ role: "assistant", finish: "error", error: { name: "ContextOverflowError" } })
+    const rows = yield* sessions.messages({ sessionID: chat.id })
+    expect(rows.flatMap((r) => r.parts).filter((p) => p.type === "compaction")).toHaveLength(0)
+    expect(rows.flatMap((r) => r.parts).filter((p) => p.type === "text" && p.text === currentMarker)).toHaveLength(1)
   }),
 )
 
@@ -2986,7 +3336,6 @@ it.instance("loop terminates with overflow when invariant system context cannot 
     const oldMarker = "invariant-system-old-marker"
     const currentMarker = "invariant-system-current-marker"
     const instructionMarker = "invariant-system-instruction-marker"
-    const summaryMarker = "invariant-system-summary-marker"
     yield* writeText(path.join(dir, "oversized.md"), `${instructionMarker}\n${"x".repeat(400_000)}`)
     yield* seed(chat.id, { finish: "stop", userText: oldMarker })
 
@@ -2996,8 +3345,6 @@ it.instance("loop terminates with overflow when invariant system context cannot 
       noReply: true,
       parts: [{ type: "text", text: currentMarker }],
     })
-    yield* llm.text(summaryMarker)
-    yield* llm.error(413, { error: { message: "request entity too large" } })
 
     const result = yield* awaitWithTimeout(
       Effect.raceFirst(prompt.loop({ sessionID: chat.id }), llm.wait(3).pipe(Effect.as("repeated" as const))),
@@ -3011,17 +3358,9 @@ it.instance("loop terminates with overflow when invariant system context cannot 
     const messages = yield* sessions.messages({ sessionID: chat.id })
     const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: result.info.id })
     const ids = messages.map((message) => message.info.id)
-    const summaryBody = JSON.stringify(hits[0]?.body)
-    const retryBody = JSON.stringify(hits[1]?.body)
-
-    expect(hits).toHaveLength(2)
+    expect(hits).toHaveLength(0)
     expect(yield* llm.pending).toBe(0)
-    expect(summaryBody).toContain(oldMarker)
-    expect(summaryBody).not.toContain(currentMarker)
-    expect(summaryBody).not.toContain(instructionMarker)
-    expect(retryBody).toContain(summaryMarker)
-    expect(retryBody).toContain(currentMarker)
-    expect(retryBody).toContain(instructionMarker)
+    expect(messages.some((row) => row.info.id === submitted.info.id)).toBe(true)
     expect(result.info.role).toBe("assistant")
     expect(stored.info.role).toBe("assistant")
     if (result.info.role === "assistant" && stored.info.role === "assistant") {
@@ -3035,8 +3374,8 @@ it.instance("loop terminates with overflow when invariant system context cannot 
     expect(messages.filter((message) => message.info.id === submitted.info.id)).toHaveLength(1)
     const compactions = messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")
     const summaries = messages.filter((message) => message.info.role === "assistant" && message.info.summary)
-    expect(compactions).toHaveLength(1)
-    expect(summaries).toHaveLength(1)
+    expect(compactions).toHaveLength(0)
+    expect(summaries).toHaveLength(0)
     expect(
       summaries.every((message) => "completed" in message.info.time && message.info.time.completed !== undefined),
     ).toBe(true)
@@ -3509,7 +3848,7 @@ it.instance(
         permission: [{ permission: "*", pattern: "*", action: "allow" }],
       })
       // Compaction needs earlier history to summarize.
-      yield* seed(session.id, { finish: "stop", userText: "an earlier turn" })
+      yield* seed(session.id, { finish: "stop", userText: "an earlier turn" + "h".repeat(170_000) })
       const file = path.join(dir, "lemma.v")
       yield* writeText(file, "Proof. lia. Qed.\n")
       yield* prompt.prompt({
@@ -3519,7 +3858,7 @@ it.instance(
         parts: [{ type: "text", text: "fix the proof" }],
       })
       // Two of these calls fit the preflight budget; the third request does not.
-      const big = "x".repeat(80_000)
+      const big = "x".repeat(25_000)
       const edit = { filePath: file, oldString: big, newString: big }
       yield* llm.tool("edit", edit)
       yield* llm.tool("edit", edit)
@@ -4875,6 +5214,28 @@ unixNoLLMServer(
   30_000,
 )
 
+it.instance(
+  "shell records non-zero exit code in completed metadata",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        const { prompt, chat } = yield* boot()
+
+        const exit = yield* prompt
+          .shell({ sessionID: chat.id, agent: "build", command: `bun -e "process.exit(7)"` })
+          .pipe(Effect.exit)
+        expect(Exit.isSuccess(exit)).toBe(true)
+
+        const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+        const tool = msgs.flatMap((m) => toolPart(m.parts)).find((p) => p?.state.status === "completed")
+        expect(tool).toBeDefined()
+        expect((tool!.state as SessionV1.ToolStateCompleted).metadata?.exit).toBe(7)
+      }),
+    ),
+  { config: cfg },
+  30_000,
+)
+
 // bun rather than sleep for the command that has to take a moment: the shell
 // behind this brings its own builtins and sleep is not among them, so on Windows
 // the command failed and the test sat waiting for a shell run that was never
@@ -5769,6 +6130,50 @@ it.instance("every run end reports, not only the first", () =>
     expect(list[1].part.text).toContain("second done")
     yield* awaitWithTimeout(llm.wait(4), "the parent never ran on the second notice", "5 seconds")
   }),
+)
+
+// #53 via the review round's D14: a child that stops while its OWN background
+// shell is still running has not finished its work — the shell's completion
+// message will wake it for another turn, so the parent must not hear "Agent
+// completed" yet. Only when the shell settles does the notice go out.
+it.instance("a child with a running background shell does not report until the shell settles", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const parent = yield* (yield* Session.Service).create({ title: "root", permission: allowAll })
+    const child = yield* subagent(parent.id)
+    yield* user(child.id, "start the watcher")
+    // The child starts a background shell that outlives its run, then the run
+    // ends with one more model turn.
+    yield* llm.pushMatch(matching("start the watcher"), reply().tool("bash", {
+      command: `bun -e "await Bun.sleep(1_500)"`,
+      run_in_background: true,
+    }).stop())
+    yield* llm.textMatch(matching("Bun.sleep"), "started the watcher")
+
+    yield* prompt.loop({ sessionID: child.id })
+
+    // The run ended while the shell was still running: the parent hears
+    // nothing yet — the shell's completion will wake the child (D14/#53).
+    const before = yield* notices(parent.id)
+    expect(before).toEqual([])
+
+    // The shell settles normally: its completion notice wakes the child, that
+    // run ends, and only then does the parent hear "Agent completed".
+    const bg = yield* BackgroundJob.Service
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const jobs = yield* bg.list()
+      const shell = jobs.find((job) => job.type === "shell" && job.metadata?.sessionId === child.id)
+      if (shell && shell.status !== "running") break
+      yield* Effect.sleep(50)
+    }
+    const [notice] = yield* awaitNotices(parent.id, 1)
+    expect(notice.part.metadata?.summary).toContain("Agent completed")
+    yield* awaitWithTimeout(llm.wait(3), "the parent never ran on the notice", "5 seconds")
+  }),
+  20_000,
 )
 
 it.instance("reads the parent's identity when it delivers, not when the child started", () =>
@@ -6752,7 +7157,7 @@ it.instance(
       setSystemTime(t0)
       yield* Effect.addFinalizer(() => Effect.sync(() => setSystemTime()))
       const parent = yield* sessions.create({ title: "window", permission: allowAll })
-      yield* seed(parent.id, { finish: "stop", userText: "earlier turn" })
+      yield* seed(parent.id, { finish: "stop", userText: "earlier turn" + "h".repeat(170_000) })
       const child = yield* sessions.create({
         parentID: parent.id,
         title: "child",
@@ -6772,7 +7177,7 @@ it.instance(
       // Two edit calls with arguments large enough that the third request fails
       // the overflow check. The second response and the summary wait on gates,
       // so the clock can move between them.
-      const large = "x".repeat(80_000)
+      const large = "x".repeat(25_000)
       const args = { filePath: file, oldString: large, newString: large }
       const second = defer<void>()
       const summary = defer<void>()
@@ -7661,3 +8066,261 @@ for (let n = 0; n < 12; n++) {
     60_000,
   )
 }
+
+it.instance("proactive usage compaction retains both unprocessed users", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(preflightCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const previous = yield* seed(chat.id, { finish: "stop" })
+    yield* sessions.updateMessage({ ...previous.assistant, tokens: { ...previous.assistant.tokens, input: 100_001 } })
+    const one = yield* user(chat.id, "first-new-user-to-process")
+    const two = yield* user(chat.id, "second-new-user-to-process")
+    yield* llm.text("summary for older completed work")
+    yield* llm.text("finished current work")
+    yield* prompt.loop({ sessionID: chat.id })
+    const hits = yield* llm.hits
+    expect(hits).toHaveLength(2)
+    const after = JSON.stringify(hits[1].body)
+    expect(after).toContain("second-new-user-to-process")
+    expect(after).toContain("first-new-user-to-process")
+    const visible = yield* MessageV2.filterCompactedEffect(chat.id)
+    expect(visible.filter((m) => m.info.id === one.id || m.info.id === two.id).map((m) => m.info.id)).toEqual([
+      one.id,
+      two.id,
+    ])
+  }),
+)
+
+it.instance("rejecting a usage continuation retains the original pending user", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(preflightCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const previous = yield* seed(chat.id, { finish: "stop" })
+    yield* sessions.updateMessage({ ...previous.assistant, tokens: { ...previous.assistant.tokens, input: 100_001 } })
+    const u1 = yield* user(chat.id, "the-real-user-task-pending-through-both-compactions")
+    yield* llm.text("summary of completed work")
+    yield* llm.error(413, { error: { message: "request entity too large" } })
+    yield* llm.text("short second summary")
+    yield* llm.text("done")
+    yield* prompt.loop({ sessionID: chat.id })
+    const hits = yield* llm.hits
+    expect(hits).toHaveLength(4)
+    expect(JSON.stringify(hits[1].body)).toContain("the-real-user-task-pending-through-both-compactions")
+    const projected = yield* MessageV2.filterCompactedEffect(chat.id)
+    expect(projected.map((m) => m.info.id)).toContain(u1.id)
+    expect(JSON.stringify(hits[3].body)).toContain("the-real-user-task-pending-through-both-compactions")
+  }),
+)
+
+it.instance("a rejected continuation retains real inputs received during its usage summary", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(preflightCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const previous = yield* seed(chat.id, { finish: "tool-calls" })
+    yield* sessions.updateMessage({ ...previous.assistant, tokens: { ...previous.assistant.tokens, input: 100_001 } })
+    const gate = yield* Deferred.make<void>()
+    yield* llm.push(reply().wait(deferredAsPromise(gate)).text("summary of completed work").stop())
+    yield* llm.error(413, { error: { message: "request entity too large" } })
+    yield* llm.text("short second summary")
+    yield* llm.text("finished final work")
+    const work = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "first usage summary not started", "5 seconds")
+    const late = yield* user(chat.id, "new-task-arriving-while-summary-in-flight")
+    yield* Deferred.succeed(gate, undefined)
+    yield* Fiber.join(work)
+    const hits = yield* llm.hits
+    expect(hits).toHaveLength(4)
+    expect(JSON.stringify(hits[1].body)).toContain("new-task-arriving-while-summary-in-flight")
+    const projected = yield* MessageV2.filterCompactedEffect(chat.id)
+    expect({
+      originalIdInProjection: projected.some((m) => m.info.id === late.id),
+      realInputInFinalRequest: JSON.stringify(hits[3].body).includes("new-task-arriving-while-summary-in-flight"),
+    }).toEqual({ originalIdInProjection: true, realInputInFinalRequest: true })
+  }),
+)
+
+it.instance("provider rejection preserves consecutive unanswered original users", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), compaction: { tail_turns: 0 } }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pending batch" })
+    yield* seed(chat.id, { finish: "stop", userText: "older finished work" })
+    const first = yield* user(chat.id, "first pending instruction")
+    const second = yield* user(chat.id, "second pending instruction")
+    yield* llm.error(413, { error: { message: "request entity too large" } })
+    yield* llm.text("earlier progress")
+    yield* llm.text("completed both")
+    yield* prompt.loop({ sessionID: chat.id })
+    const hits = yield* llm.hits
+    expect(hits).toHaveLength(3)
+    for (const text of ["first pending instruction", "second pending instruction"]) {
+      expect(JSON.stringify(hits[1]!.body)).not.toContain(text)
+      expect(JSON.stringify(hits[2]!.body).split(text)).toHaveLength(2)
+    }
+    const view = yield* MessageV2.filterCompactedEffect(chat.id)
+    expect(view.filter((m) => m.info.id === first.id || m.info.id === second.id).map((m) => m.info.id)).toEqual([
+      first.id,
+      second.id,
+    ])
+  }),
+)
+
+it.instance(
+  "overflow recovery downgrades media anywhere in the selected unanswered batch",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => {
+        const config = preflightCfg(url)
+        const test = config.provider.test
+        return {
+          ...config,
+          provider: {
+            test: {
+              ...test,
+              models: {
+                "test-model": {
+                  ...test.models["test-model"],
+                  attachment: true,
+                  modalities: { input: ["text", "image"], output: ["text"] },
+                },
+              },
+            },
+          },
+        }
+      })
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const run = Effect.runPromiseWith(yield* Effect.context<Session.Service | Database.Service>())
+      const attachment = "data:image/png;base64," + "Q".repeat(400_000)
+      yield* Effect.promise(() =>
+        FastCheck.assert(
+          FastCheck.asyncProperty(
+            FastCheck.array(FastCheck.boolean(), { minLength: 1, maxLength: 4 }).filter((batch) =>
+              batch.includes(true),
+            ),
+            (batch) =>
+              run(
+                Effect.gen(function* () {
+                  const chat = yield* sessions.create({ title: "Pending attachments" })
+                  yield* seed(chat.id, { finish: "stop" })
+                  const inputs = yield* Effect.forEach(batch, (media, index) =>
+                    Effect.gen(function* () {
+                      const row = yield* user(chat.id, "pending-task-" + index)
+                      if (media)
+                        yield* sessions.updatePart({
+                          type: "file",
+                          id: PartID.ascending(),
+                          messageID: row.id,
+                          sessionID: chat.id,
+                          filename: "pending-" + index + ".png",
+                          mime: "image/png",
+                          url: attachment,
+                        })
+                      return row.id
+                    }),
+                  )
+                  const before = yield* llm.calls
+                  yield* llm.text("Summary of earlier work")
+                  yield* llm.text("Recovered task")
+                  const result = yield* prompt.loop({ sessionID: chat.id })
+                  const hits = (yield* llm.hits).slice(before)
+                  expect(result.info).toMatchObject({ finish: "stop" })
+                  expect(hits).toHaveLength(2)
+                  const body = JSON.stringify(hits[1]?.body)
+                  const view = yield* MessageV2.filterCompactedEffect(chat.id)
+                  expect(view.filter((row) => inputs.includes(row.info.id)).map((row) => row.info.id)).toEqual(inputs)
+                  for (const [index, hasMedia] of batch.entries()) {
+                    expect(body).toContain("pending-task-" + index)
+                    if (!hasMedia) continue
+                    expect(body).toContain("[Attached image/png: pending-" + index + ".png]")
+                    const original = yield* MessageV2.get({ sessionID: chat.id, messageID: inputs[index]! })
+                    expect(original.parts.find((p) => p.type === "file")?.url).toBe(attachment)
+                  }
+                }),
+              ),
+          ),
+          { seed: 600701, numRuns: 5, examples: [[[false, true]], [[true, true]], [[true, false, true]]] },
+        ),
+      )
+    }),
+  30_000,
+)
+
+withFilePlugin.instance(
+  "a plugin pruning the provider view cannot change the durable overflow boundary",
+  () =>
+    Effect.gen(function* () {
+      const dir = (yield* TestInstance).directory
+      const llm = yield* TestLLMServer
+      const plugin = path.join(dir, "prune-view.ts")
+      yield* writeText(
+        plugin,
+        `export default async () => ({
+      "experimental.chat.messages.transform": async (_input, { messages }) => {
+        const command = messages.flatMap(row => row.parts).find(part => part.text?.startsWith("transform current request: "))
+        if (!command || !messages[0]?.parts.some(part => part.text === "completed prefix")) return
+        const [drop, reverse] = JSON.parse(command.text.slice("transform current request: ".length))
+        messages.splice(0, drop)
+        if (reverse) messages.reverse()
+      }
+    })`,
+      )
+      yield* writeConfig(dir, {
+        ...providerCfg(llm.url),
+        compaction: { tail_turns: 0 },
+        plugin: [pathToFileURL(plugin).href],
+      })
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const run = Effect.runPromiseWith(yield* Effect.context<Session.Service | Database.Service>())
+      yield* Effect.promise(() =>
+        FastCheck.assert(
+          FastCheck.asyncProperty(FastCheck.integer({ min: 0, max: 3 }), FastCheck.boolean(), (drop, reverse) =>
+            run(
+              Effect.gen(function* () {
+                const chat = yield* sessions.create({ title: "Pruned request" })
+                yield* seed(chat.id, { finish: "stop", userText: "completed prefix" })
+                const a = yield* user(chat.id, "first pending instruction")
+                const b = yield* user(chat.id, "transform current request: " + JSON.stringify([drop, reverse]))
+                const before = yield* llm.calls
+                yield* llm.error(413, { error: { message: "request entity too large" } })
+                yield* llm.text("Prior progress")
+                yield* llm.text("Completed both tasks")
+                const result = yield* prompt.loop({ sessionID: chat.id })
+                expect(result.info).toMatchObject({ finish: "stop" })
+                const hits = (yield* llm.hits).slice(before)
+                expect(hits).toHaveLength(3)
+                expect(JSON.stringify(hits[0]?.body).includes("first pending instruction")).toBe(drop < 3)
+                expect(JSON.stringify(hits[1]?.body)).toContain("completed prefix")
+                expect(JSON.stringify(hits[2]?.body)).toContain("first pending instruction")
+                const view = yield* MessageV2.filterCompactedEffect(chat.id)
+                expect(view[0]?.parts[0]).toMatchObject({
+                  type: "compaction",
+                  protected_from: a.id,
+                  request_user_id: b.id,
+                })
+                expect(view.slice(2, 4).map((row) => row.info.id)).toEqual([a.id, b.id])
+              }),
+            ),
+          ),
+          {
+            seed: 600703,
+            numRuns: 6,
+            examples: [
+              [3, false],
+              [0, true],
+              [2, true],
+            ],
+          },
+        ),
+      )
+    }),
+  30_000,
+)

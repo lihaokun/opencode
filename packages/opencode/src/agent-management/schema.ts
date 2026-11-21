@@ -329,7 +329,7 @@ export interface AgentPromptOps {
    * SessionPrompt reaches AgentInbox through the tool registry. Importing back
    * would close the cycle; this indirection is what keeps the graph acyclic.
    */
-  deliverAsync(input: SessionPrompt.PromptInput): Effect.Effect<void>
+  deliverAsync(input: SessionPrompt.PromptInput, identity?: "current"): Effect.Effect<void>
 }
 
 /**
