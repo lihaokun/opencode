@@ -103,6 +103,11 @@ export type SpawnOpts = { readonly timeoutMs?: number; readonly env?: Record<str
 // healthy, so keep the child deadline below the outer 120s test deadline.
 export const CLI_PROCESS_TIMEOUT_MS = 60_000
 
+// Windows CI cold starts of `bun run src/index.ts serve` can exceed 15s before
+// binding a port, so match ACP's startup budget on Windows while leaving room
+// below outer test timeouts for fixture setup and teardown.
+export const CLI_SERVE_READY_TIMEOUT_MS = process.platform === "win32" ? 60_000 : 30_000
+
 // Typed equivalent of constructing argv for `opencode run`. New flags should
 // land here so tests stay grep-able and refactor-safe.
 export type RunOpts = SpawnOpts & {
@@ -124,8 +129,8 @@ export type ServeOpts = SpawnOpts & {
   readonly hostname?: string
   readonly extraArgs?: string[]
   // How long to wait for the "listening on http://..." line before failing.
-  // Default 15s — startup is dominated by bun's transpile + plugin init, not
-  // the actual listen() call.
+  // Defaults to `CLI_SERVE_READY_TIMEOUT_MS` — startup is dominated by bun's
+  // transpile + plugin init, not the actual listen() call.
   readonly readyTimeoutMs?: number
 }
 
@@ -372,7 +377,7 @@ export function withCliFixture<A, E>(
         ),
       )
 
-      const readyTimeoutMs = opts?.readyTimeoutMs ?? 15_000
+      const readyTimeoutMs = opts?.readyTimeoutMs ?? CLI_SERVE_READY_TIMEOUT_MS
       const match = yield* Deferred.await(readyDeferred).pipe(
         Effect.timeoutOrElse({
           duration: Duration.millis(readyTimeoutMs),
