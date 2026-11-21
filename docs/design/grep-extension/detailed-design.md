@@ -86,13 +86,13 @@ head_limit: PositiveInt（默认 100）
      - content：现 RawMatch 解析扩展——接受 `type: "match" | "context"`（同一 data shape），产出 `{ ...match.data, context: type === "context" }`
      - files：行 → 相对路径字符串（同 glob 的归一化）
      - count：行 → `path:count`；**单文件目标时裸数字** → path 取 `input.file`，count 取数字
-  3. 窗口切片（offset）：run 的输入扩展 `offset`；`Stream.take(limit + offset + 1)` → `rows.length > limit + offset` ⇒ hasMore 且 `items = rows.slice(offset, offset + limit)`；`rows.length <= offset` ⇒ `items = []`（越界）且 hasMore=false
-  4. content + context 的窗口计数：切片计数**按 match 记录**而非原始行——实现为 parse 后的有状态 filter：维护 `matchesSeen`；match 记录使计数 +1，超过 `limit + offset` 后丢弃该记录及后续（首个被排除 match 的前导 context 一并丢弃）；context 记录在 `matchesSeen >= 1` 后保留（附着于已计入的 match）。**已知边界**（显式接受）：rg 的 context 去重可能使窗口边界处的 match 丢失一侧上下文行——match 本身永不丢失
+  3. [已被下文 2026-11-19/21 的流式窗口替代] 窗口切片（offset）：run 的输入扩展 `offset`；`Stream.take(limit + offset + 1)` → `rows.length > limit + offset` ⇒ hasMore 且 `items = rows.slice(offset, offset + limit)`；`rows.length <= offset` ⇒ `items = []`（越界）且 hasMore=false
+  4. [已被下文按文件及行号选择的窗口替代] content + context 的窗口计数：切片计数**按 match 记录**而非原始行——实现为 parse 后的有状态 filter：维护 `matchesSeen`；match 记录使计数 +1，超过 `limit + offset` 后丢弃该记录及后续（首个被排除 match 的前导 context 一并丢弃）；context 记录在 `matchesSeen >= 1` 后保留（附着于已计入的 match）。**已知边界**（显式接受）：rg 的 context 去重可能使窗口边界处的 match 丢失一侧上下文行——match 本身永不丢失
   5. 退出覆盖：三模式共用 run 的全部退出（正常/exit1 空/exit2 非法表达式/其他失败）
   6. 循环刻画：流式有限处理；`matchesSeen` 单调递增 → 终止
 - **正确性论证**（non-trivial）：
   - 前置：input 经工具层校验；rg 语义如 §2 核实
-  - 论证：args 展开守卫保证缺省参数时 args 与现状逐项一致 ⇒ I1（字节兼容）。窗口切片：`take(limit+offset+1)` 使「是否还有更多」可由行数判定（>limit+offset ⇒ 有余量）——条目级（files/count 天然条目；content 按 match 计数）⇒ 三态结局可判定 ⇒ G3。context 的有状态过滤：matchesSeen 只在 match 记录上递增 ⇒ offset/limit 语义以 match 为单位（架构决策）⇒ G2 的上下文行跟随 match 且不跨 match 计数
+  - [历史方案的论证，现行论证见下文 2026-11-21] args 展开守卫保证缺省参数时 args 与现状逐项一致 ⇒ I1（字节兼容）。窗口切片：`take(limit+offset+1)` 使「是否还有更多」可由行数判定（>limit+offset ⇒ 有余量）——条目级（files/count 天然条目；content 按 match 计数）⇒ 三态结局可判定 ⇒ G3。context 的有状态过滤：matchesSeen 只在 match 记录上递增 ⇒ offset/limit 语义以 match 为单位（架构决策）⇒ G2 的上下文行跟随 match 且不跨 match 计数
   - 后置：三模式各返回声明形态；InvalidPattern 错误通道不变
   - 副作用论证：无新副作用（进程执行既有）
 
@@ -147,3 +147,9 @@ head_limit: PositiveInt（默认 100）
 - **换行文件名（边界③，已知限制）**：`files_with_matches` 按 rg 文本行解析路径，POSIX 文件名含换行时会被拆成两个虚构路径；count 模式同理（静态分析，未实测）。rg 的 line-delimited 文本输出无法无歧义表达换行文件名，除非换 `--json` 协议——留作后续修订条件：若实际工作负载出现此类文件名，files/count 迁移到 JSON 输出。
 
 2026-11-19 全量复核修订：P7/P8 在消费 rg 流时计数并跳过 offset。页面按文件及真实行号收集所选命中前后的上下文，跨页共享的上下文可在各自页面出现。非法 UTF-8 的辅助行可省略；真实匹配仍可用。有效 head_limit 至多为配置的工具行上限，渲染后的页面也经工具输出预算保护，超长页面返回预览和该页的全文路径。
+
+## 2026-11-21 有界计数的后置条件
+
+固定目录视图和排序后，选中第 offset+1 至 offset+limit 个条目。按文件名和真实行号附加前后文，同一个匹配只占一项。流上首次看见额外条目只证明总条目数 ≥ offset+limit+1，工具显示至少该数；观察到 EOF 时，已观察条目数才等于实际总数。metadata.matches 只描述当前页，由窗口和已观察条目数推出，返回 total 或 total_lower_bound 之一。当有更多时，读取在最后一个已选匹配所需的后文结束后停止；否则依赖有限的 rg 输入抵达 EOF 或调用方取消。
+
+以原文件的宿主相对路径作为行标识。POSIX 中反斜杠不得改变路径身份，否则两个不同文件还可能在上下文归组时合并。实际 rg 模式分别检查文件名含反斜杠和同名目录结构。

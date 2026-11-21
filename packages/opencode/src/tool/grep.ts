@@ -89,15 +89,6 @@ export const GrepTool = Tool.define(
           }
           const headLimit = Math.min(params.head_limit ?? 100, (yield* trunc.limits()).maxLines)
           const offset = params.offset ?? 0
-          // Empty-result metadata reflects THIS request (mode/offset/limit),
-          // not hardcoded defaults — a caller reading metadata after a
-          // beyond-window result still sees what was asked.
-          const empty = {
-            title: params.pattern,
-            metadata: { matches: 0, truncated: false, output_mode: mode, offset, head_limit: headLimit },
-            output: "No files found",
-          }
-
           // Step P3: permission ask (patterns=[pattern], unchanged).
           yield* ctx.ask({
             permission: "grep",
@@ -164,11 +155,12 @@ export const GrepTool = Tool.define(
           const rowBase = requested
           const requestedFile = info.type === "File" ? requested : undefined
 
-          // `matches` counts match entries, not rendered rows: context rows ride
-          // along in content mode but are not matches. The service's `total` is
-          // the match/file count in every mode, so reuse it.
+          // Only EOF proves an exact total. An early page observes one extra
+          // entry beyond its window; context lines never count as entries.
+          const quantity = result.hasMore ? `at least ${result.total}` : String(result.total)
           const metadata = {
-            matches: result.total,
+            matches: Math.max(0, Math.min(headLimit, result.total - offset)),
+            ...(result.hasMore ? { total_lower_bound: result.total } : { total: result.total }),
             truncated: result.hasMore,
             output_mode: mode,
             offset,
@@ -188,19 +180,16 @@ export const GrepTool = Tool.define(
           })
           const tail = result.hasMore ? [``, `(more results available; increase offset to ${offset + headLimit})`] : []
 
+          if (metadata.matches === 0) {
+            if (offset === 0) return yield* render("No files found")
+            const unit = mode === "content" ? "matches" : "files"
+            const label = mode === "files_with_matches" ? "files" : "matches"
+            return yield* render(`No ${label} at offset ${offset} (total ${unit}: ${result.total})`)
+          }
+
           if (result.mode === "files_with_matches") {
-            if (result.files.length === 0) {
-              return {
-                ...empty,
-                metadata: { ...metadata, matches: 0 },
-                output:
-                  offset > 0
-                    ? `No files at offset ${offset} (total files: ${result.total})`
-                    : "No files found",
-              }
-            }
             const output = [
-              `Found ${result.files.length} files`,
+              `Found ${quantity} files`,
               // #107: a File target renders back as the requested path even
               // when rg matched through a symlink (FSUtil.resolve realpaths).
               ...(requestedFile
@@ -212,31 +201,17 @@ export const GrepTool = Tool.define(
           }
 
           if (result.mode === "count") {
-            if (result.counts.length === 0) {
-              return {
-                ...empty,
-                output: offset > 0 ? `No matches at offset ${offset} (total files: ${result.total})` : "No files found",
-              }
-            }
             const totalMatches = result.counts.reduce((sum: number, item) => sum + item.count, 0)
             const output = [
-              `Found ${result.counts.length} files with ${totalMatches} matches`,
+              offset > 0 || result.hasMore
+                ? `Found ${quantity} files. This page contains ${result.counts.length} files with ${totalMatches} matches`
+                : `Found ${quantity} files with ${totalMatches} matches`,
               ...(requestedFile
                 ? [`${requestedFile}: ${result.counts[0]?.count ?? 0} matches`]
                 : result.counts.map((item) => `${path.resolve(rowBase, item.path)}: ${item.count} matches`)),
               ...tail,
             ]
             return yield* render(output.join("\n"))
-          }
-
-          if (result.rows.length === 0) {
-            return {
-              ...empty,
-              output:
-                offset > 0
-                  ? `No matches at offset ${offset} (total matches: ${result.total})`
-                  : "No files found",
-            }
           }
 
           // The service returns search-relative paths; render absolute paths
@@ -247,13 +222,12 @@ export const GrepTool = Tool.define(
             path: requestedFile ?? path.resolve(rowBase, row.path),
           }))
 
-          const output = [`Found ${result.total} matches`]
+          const output = [`Found ${quantity} matches`]
           // The shown range counts MATCH rows only — context rows ride along
           // but are not results, so rows.length would overstate the window.
-          const matchCount = rows.filter((row) => !row.context).length
           if (offset > 0 || result.hasMore) {
             output.push(
-              `Showing matches ${offset + 1}-${offset + matchCount} (offset ${offset}, limit ${headLimit})`,
+              `Showing matches ${offset + 1}-${offset + metadata.matches} (offset ${offset}, limit ${headLimit})`,
             )
           }
           let current = ""

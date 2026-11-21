@@ -106,6 +106,7 @@ export interface GrepRow {
   readonly context: boolean
 }
 
+/** total counts observed entries. With hasMore it is a lower bound, and at EOF it is exact. */
 export type GrepResult =
   | { readonly mode: "content"; readonly rows: readonly GrepRow[]; readonly total: number; readonly hasMore: boolean }
   | { readonly mode: "files_with_matches"; readonly files: readonly string[]; readonly total: number; readonly hasMore: boolean }
@@ -218,13 +219,7 @@ const layer = Layer.effect(
             "--glob=!**/.git/**",
             ".",
           ],
-          parse: (line) =>
-            Effect.succeed(
-              line
-                .replace(/^(?:\.[\\/])+/u, "")
-                .replace(/^[\\/]+/u, "")
-                .replaceAll("\\", "/"),
-            ),
+          parse: (line) => Effect.succeed(normalizeEntryPath(line)),
         }).pipe(
           Effect.map((result) =>
             result.items.map((relative) =>
@@ -251,13 +246,9 @@ const layer = Layer.effect(
             ".",
           ],
           parse: (line) => {
-            const relative = line
-              .replace(/^(?:\.[\\/])+/u, "")
-              .replace(/^[\\/]+/u, "")
-              .replaceAll("\\", "/")
             return Effect.succeed(
               Entry.make({
-                path: RelativePath.make(relative),
+                path: RelativePath.make(normalizeEntryPath(line)),
                 type: "file",
               }),
             )
@@ -298,7 +289,6 @@ const layer = Layer.effect(
                 return Schema.decodeUnknownEffect(RawMatch)(json).pipe(
                   Effect.map((match) => ({
                     ...match.data,
-                    path: { text: match.data.path.text.replace(/^\.[\\/]/, "") },
                     submatches: match.data.submatches.slice(0, MAX_SUBMATCHES),
                   })),
                   Effect.mapError((cause) => failure("Invalid ripgrep match output", cause)),
@@ -308,13 +298,9 @@ const layer = Layer.effect(
         }).pipe(
           Effect.map((result) =>
             result.items.map((match) => {
-              const relative = match.path.text
-                .replace(/^(?:\.[\\/])+/u, "")
-                .replace(/^[\\/]+/u, "")
-                .replaceAll("\\", "/")
               return Match.make({
                 entry: Entry.make({
-                  path: RelativePath.make(relative),
+                  path: RelativePath.make(normalizeEntryPath(match.path.text)),
                   type: "file",
                 }),
                 line: match.line_number,
@@ -363,7 +349,7 @@ const layer = Layer.effect(
               if (mode === "files_with_matches") return Effect.succeed(normalizeEntryPath(line))
               // A single-file target prints a bare count without the path prefix.
               const bare = /^(\d+)$/u.exec(line)
-              if (bare && input.file) return Effect.succeed({ path: input.file, count: Number(bare[1]) })
+              if (bare && input.file) return Effect.succeed({ path: normalizeEntryPath(input.file), count: Number(bare[1]) })
               const index = line.lastIndexOf(":")
               if (index === -1) return Effect.fail(failure(`Invalid ripgrep count output: ${line}`))
               return Effect.succeed({
@@ -442,7 +428,7 @@ const layer = Layer.effect(
                   return Effect.succeed(undefined)
                 return Schema.decodeUnknownEffect(RawMatch)(json).pipe(
                   Effect.map((match) => ({
-                    path: { text: match.data.path.text.replace(/^\.[\\/]/, "") },
+                    path: match.data.path,
                     line_number: match.data.line_number,
                     absolute_offset: match.data.absolute_offset,
                     lines: match.data.lines,
@@ -514,8 +500,11 @@ export function windowContentRows(rows: readonly RawRow[], offset: number, limit
   return page.result()
 }
 
-const normalizeEntryPath = (line: string) =>
-  line.replace(/^(?:\.[\\/])+/u, "").replace(/^[\\/]+/u, "").replaceAll("\\", "/")
+// A backslash is an ordinary filename character on POSIX.
+function normalizeEntryPath(line: string) {
+  const native = process.platform === "win32" ? line.replaceAll("\\", "/") : line
+  return native.replace(/^(?:\.\/)+/u, "").replace(/^\/+/, "")
+}
 
 export type RawRow = {
   path: { text: string }

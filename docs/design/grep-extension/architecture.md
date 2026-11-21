@@ -82,7 +82,7 @@ schema 扩展 + 校验（context 上限 10、mode 与 context 互斥说明）+ �
 
 ## 5. 接口规约（§3.3）
 
-**接口：tool/grep.ts → Ripgrep.Service**：`GrepInput` 扩展为超集；服务责任：按 mode 选择 rg 形态并返回对应行 + **全量条目计数 `total`**（非页切片长度——越界文案引用的是全量）；非法 pattern 仍走 `InvalidPatternError`；limit 语义 = 本页条目数（服务内完成 offset 跳过）。
+**接口：tool/grep.ts → Ripgrep.Service**：`GrepInput` 扩展为超集；服务责任：按 mode 选择 rg 形态并返回对应行 + **已观测条目数 `total` 与 `hasMore`**（hasMore 为真时计数是下界；读到 EOF 才是确数，因此越界时是确数）；非法 pattern 仍走 `InvalidPatternError`；limit 语义 = 本页条目数（服务内完成 offset 跳过）。
 
 **接口：模型 → grep 工具**：新参数全 optional；`offset`/`head_limit` 有 schema 级非负/正整数约束。缺省行为与旧版兼容（G5/I1，**修订**见下）。
 
@@ -119,3 +119,7 @@ schema 扩展 + 校验（context 上限 10、mode 与 context 互斥说明）+ �
 - files/count 解析的行形态（rg 对 `--files-with-matches`/`--count-matches` 的确切输出格式与 `--no-messages` 的交互）
 - 既有 grep 测试清单（`test/tool/grep.test.ts` 是否存在、覆盖哪些）
 - 渲染状态行的确切措辞（对齐既有 "Found N matches" 风格）
+
+### 2026-11-21 对外计数与路径
+
+工具 metadata 的 matches 是本页条目数，单位随模式为匹配行或文件。已读完时同时给 total；有下一页时只给 total_lower_bound，文本标明 “at least”。count 模式的匹配次数之和仅属于显示的这一页。路径按宿主解释，POSIX 上反斜杠属于文件名；Windows 分隔符在 Core 中规范化。

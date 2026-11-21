@@ -749,3 +749,65 @@ it.instance("negative context parameters are rejected", () =>
     }
   }),
 )
+
+it.instance("grep metadata and page headers distinguish observed lower bounds from exact totals", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const run = Effect.runPromiseWith(yield* Effect.context())
+    for (let i = 0; i < 5; i++) yield* Effect.promise(() => Bun.write(path.join(test.directory, `p${i}.txt`), "hit\n"))
+    yield* Effect.promise(() =>
+      fc.assert(
+        fc.asyncProperty(
+          fc.constantFrom("content" as const, "files_with_matches" as const, "count" as const),
+          fc.integer({ min: 0, max: 6 }),
+          fc.integer({ min: 1, max: 4 }),
+          async (output_mode, offset, head_limit) => {
+            const result = await run(
+              grep.execute({ pattern: "hit", include: "*.txt", output_mode, offset, head_limit }, ctx),
+            )
+            expect(result.metadata.matches).toBe(Math.max(0, Math.min(head_limit, 5 - offset)))
+            if (offset + head_limit < 5) {
+              expect(result.metadata).toMatchObject({ total_lower_bound: offset + head_limit + 1 })
+              expect(result.metadata).not.toHaveProperty("total")
+              expect(result.output).toContain(`at least ${offset + head_limit + 1}`)
+            } else {
+              expect(result.metadata).toMatchObject({ total: 5 })
+              expect(result.metadata).not.toHaveProperty("total_lower_bound")
+              expect(result.output).not.toContain("at least")
+            }
+          },
+        ),
+        {
+          seed: 60022,
+          numRuns: 30,
+          examples: [
+            ["content", 0, 1],
+            ["count", 2, 1],
+            ["files_with_matches", 6, 1],
+          ],
+        },
+      ),
+    )
+  }),
+)
+
+if (process.platform !== "win32") {
+  it.instance("grep preserves literal backslashes as distinct POSIX filenames in every mode", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const literal = path.join(test.directory, "a\\b.txt")
+      const nested = path.join(test.directory, "a", "b.txt")
+      yield* Effect.promise(() => Bun.write(literal, "hit-one\n"))
+      yield* Effect.promise(() => Bun.write(nested, "hit-two\n"))
+      for (const output_mode of ["files_with_matches", "count", "content"] as const) {
+        const result = yield* grep.execute({ pattern: "hit-", include: "*.txt", output_mode }, ctx)
+        expect(result.output).toContain(literal)
+        expect(result.output).toContain(nested)
+      }
+    }),
+  )
+}

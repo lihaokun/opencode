@@ -81,3 +81,11 @@ context）。模型与 `ripgrep.ts` content 窗口逐行对应。
 ## 2026-11-19 分页的文件及上下文归属
 
 真实 rg 小目录测试生成多个文件、相隔命中、before/after 和分页；额外验证相邻命中共享前文、非 UTF-8 辅助行、深 offset、结果字节预算及下一页或全文入口。已复核 61,200 个窗口。实现 P7、P8 对应流式计数和上下文选择；固定路径排序适用于全部模式。
+
+## 2026-11-21 可观察的页计数和路径
+
+工具 metadata.matches 是返回条目数。P9 未抵达 EOF 时给 total_lower_bound 和 “at least” 文案；EOF 时给真实 total，包括 offset 越界的空页。随机生成三种模式、offset 和 limit，用已知文件集合验证元数据和文案。真实 POSIX 目录中的字面反斜杠和路径分隔符代表不同文件，三种模式都须能区分。
+
+### 本轮 Step 5 的机械验证
+
+grep.test.ts、pbt-grep-pagination.test.ts、Core ripgrep.test.ts 对照实际文件和服务层窗口。独立复审与未覆盖范围见 [本轮修复记录](../../fixes/runtime-fix-pr60-boundary-regressions.md)。本地仓库没有通用 contract_audit 生成器。本子计划的功能与合并验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。
