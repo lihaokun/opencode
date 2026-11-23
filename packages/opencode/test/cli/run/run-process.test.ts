@@ -6,7 +6,7 @@
 import { describe, expect } from "bun:test"
 import { Effect, Schema } from "effect"
 import { raw, reply, type Usage } from "../../lib/llm-server"
-import { CLI_PROCESS_TIMEOUT_MS, cliIt } from "../../lib/cli-process"
+import { CLI_PROCESS_TIMEOUT_MS, CLI_SERVE_READY_TIMEOUT_MS, cliIt } from "../../lib/cli-process"
 import { testProviderConfig } from "../../lib/test-provider"
 
 const TaskEventPart = Schema.Struct({
@@ -1040,7 +1040,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(input).toContain(sentinel)
         expect(input).not.toContain(`file://${source}`)
       }),
-    TEST_TIMEOUT_MS,
+    TEST_TIMEOUT_MS + CLI_SERVE_READY_TIMEOUT_MS,
   )
 
   cliIt.concurrent(
