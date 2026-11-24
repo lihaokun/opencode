@@ -48,8 +48,10 @@
 
 回归使用真实 V1 请求和 SQLite：生成附件位于批次不同位置、插件删行/逆序、不同近期消息成本的用例，断言最终模型请求、原消息 ID 及原始附件；另经两次压缩核对落 marker 前晚到的附件保持可见。根因、基线与整体修订见[跨模块边界修复](runtime-fix-pr60-boundary-regressions.md)。
 
-### CLI 信号与 fork 的预算样本
+### CLI 信号、fork 样本与 2026-11-24 收敛补充
 
-fork 重映射被复制的预算样本；截在样本之前的 fork 不继承该样本。
-
-普通请求与摘要的可恢复 413 都交给恢复路径处理，最终失败才发布 Session.Error。端到端用例区分恢复成功（最终答案、退出 0、无错误事件）与恢复后再遇终局失败（一个错误事件、退出 1）。
+- fork 重映射被复制的预算样本；截在样本之前的 fork 不继承该样本。
+- 普通请求与摘要的可恢复 413 都交给恢复路径处理，最终失败才发布 `Session.Error`。端到端用例区分恢复成功（最终答案、退出 0、无错误事件）与恢复后再遇终局失败（一个错误事件、退出 1）。
+- `pendingInputStart`（`prompt.ts`）仅在非错误且终结（非 `"tool-calls"` / `"unknown"`）的普通 assistant 处停止回溯，防止未回答 `U1` 在不可见错误助手或工具调用中段被跳过。
+- provider 413 拒绝分支与 preflight 一致，创建 recovery marker 前先移除零 part 的被拒空 `handle.message`，保持 `summary.n` 精确。
+- 溢出压缩在 `optionalBudget` 中预留 `summaryReserve`，且 `prompt.ts` 在调用 `SessionRestoration.apply` 时按主模型剩余 headroom 传入 `maxBudgetTokens`，防止自动恢复块把已成功压缩的会话重新推入 `ContextOverflowError`。详见 [PR #60 独立审核收敛修复记录](runtime-fix-pr60-audit-convergence.md)。

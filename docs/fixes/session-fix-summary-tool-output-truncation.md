@@ -97,6 +97,6 @@ V1 serialize 的 completed 分支是 layer 闭包内联代码，组合行为（e
 
 **实施中发现的新问题（记录，不在本修复内）**：core V2 的模型回放（`to-llm-message.ts:46`）包含 `state.structured` 通道，但其 serialize 只序列化 `state.content` 块——V2 摘要输入丢失 `structured` 数据，与 P0-2 同族。需先核实 V2 工具状态中 structured 的填充方与 bash 的 exit 落点，单独立项处理。
 
-## 2026-11-21 · 多个内容块的全文引用
+## 2026-11-21～11-24 · Core V2 `outputPaths`、多引用与错误尾路径保护
 
-Core V2 的成功工具结果可同时包含文字与文件。先在原文字块识别截断器留下的全文引用，然后序列化正文和附件标签；保留头尾后，将尚未显示的不同路径附到摘要。额外引用区可容纳一个 32,767 字符路径及其标签。若多个路径耗尽这一区域，显式给出未列出的唯一路径数。短内容保持原样。用多份文本、长路径与数量变化的附件验证实际序列化器。
+Core V2 的成功工具结果可同时包含文字、文件附件与 `ToolStateCompleted.outputPaths`；其真实截断器 `ToolOutputStore.bound` 在中段输出 `... output truncated; full content saved to <path> ...`。`packages/core/src/session/tool-result-projection.ts` 现通过 `savedOutputPaths` 同时识别 V1 `Truncate`（兼容 CRLF）与 Core V2 `ToolOutputStore` 两种标记并提取全部不同路径，`savedOutputPath` 取最后一条匹配防止前部引用旧输出遮蔽真实尾部错误路径；`packages/core/src/session/compaction.ts` 将 `part.state.outputPaths` 传入 `serializeToolContent` 与文本内路径合并去重，并在单/复数省略提示间保持语法正确（`path` / `paths`）。详见 [PR #60 独立审核收敛修复记录](runtime-fix-pr60-audit-convergence.md)。

@@ -23,7 +23,7 @@
 | `context` | `number?`（≤10，content only）——**双侧简写**；显式 before/after 逐侧覆盖（B4 修订：`before = params.before ?? params.context ?? 0`） | 细化 §5（2026-10-18 修订段） | execute 展开 | context 简写测试 |
 | `offset` | `number?`（服务层切片；rg 无 `--offset` flag——细化 §0 实证） | 细化 §0 | search take/slice | 分页测试 |
 | `head_limit` | `number?`（默认 100，兼容现状） | 架构 G3 | execute | 分页测试 |
-| 渲染路径 | 绝对路径（三模式一致，`rowBase` 解析） | 细化 §5 | execute 渲染 | 各模式用例 |
+| 渲染路径 | 绝对路径（三模式一致，`path.resolve` 归一化单文件与目录基准） | 细化 §5 | `tool/grep.ts` | 各模式用例 |
 
 ## 3. 枚举值（机械化）
 
@@ -34,15 +34,15 @@
 
 ## 4. 流程步骤（机械化）
 
-- P1 schema 解析（新参数全 optional，缺省 = 现行为）
+- P1 schema 解析（新参数全 optional，缺省 = 现行为；参数类型由 `Schema.Schema.Type<typeof Parameters>` 推导）
 - P2 校验：before/after/context ≤10；context 行仅 content 模式
 - P3 权限 ask（patterns=[pattern]，不变）
-- P4 `context` 展开（B4：before/after 逐侧覆盖简写）
+- P4 `context` 展开（B4：before/after 逐侧覆盖简写；注：源码中展开紧随 P2 校验执行以早做数值计算，与 P3 独立无副作用交互）
 - P5 路径解析 + 外部目录断言（既有）
-- P6 按 mode 分派 rg args（content=`--json`；files=`--files-with-matches`；count=`--count-matches`；`-B/-A`、`-i`）
-- P7 解析（content 接受 match+context 记录；count 单文件裸数字回退）
-- P8 match 计数窗口切片（context 永不计数/拆分）
-- P9 渲染（绝对路径）+ 分页结局文案
+- P6 按 mode 分派 rg args（均含 `--sort=path`；content=`--json`；files=`--files-with-matches`；count=`--count-matches`；`-B/-A`、`-i`）
+- P7 流式计数跳过 offset 而不缓存前缀；content 通过 `RgText` 同时解码 UTF-8 与非 UTF-8 base64 `match`/`context` 行；`oversizedRecord` O(1) 过滤超长 context；`count` 校验非负整数
+- P8 `contentPage` 按文件与真实行号选择上下文（剥离行尾 `\r?\n`）；`hasMore` 收齐最后必需 `after` 上下文或收到 `{"type":"end"}` 立即停流
+- P9 先经 `Truncate.output` 截断单页主体再拼接分页续页提示（若同时超体积与 `hasMore` 附加单页落盘声明）；`files_with_matches` 输出 `Showing files` 头；`count` 越界使用 `files` 单位
 
 ## 5. 行为契约（语义）
 
@@ -57,11 +57,8 @@
 
 ## 7. 不变量契约（property-based）
 
-C11 第二组（`test/tool/pbt-grep-pagination.test.ts`，固定 seed）：
-任意窗口 = `matches[offset..offset+limit)`（不重不漏、顺序保持）；按 offset
-走窗覆盖全部 match 恰好一次；`total = hasMore ? offset+limit+1 : 全量`；
-锚例钉死边界 context 归属（前一页尾部 context 丢弃、下一页带自己的前导
-context）。模型与 `ripgrep.ts` content 窗口逐行对应。
+C11 第二组（`test/tool/pbt-grep-pagination.test.ts`，固定 seed，400 runs × 4 properties）：
+覆盖多文件输入与 `before`/`after` ∈ [0, 2]，断言任意窗口的 match 严格等于 `matches[offset..offset+limit)`、顺序保持、每条入页 context 行均归属于同文件已入页 match 的前后距离内；按 offset 走窗覆盖全部 match 恰好一次；`total = hasMore ? offset+limit+1 : 全量`；offset 越过最后 match 时页面为空（无幽灵 context）。
 
 ## 8. 性能契约（机械化）
 
@@ -78,9 +75,9 @@ context）。模型与 `ripgrep.ts` content 窗口逐行对应。
 - `legacy grep` 工具（filesystem/search.ts 消费者）零改动——双消费者不串扰（回归背书）
 - ZCode grep 契约为参照：mode/head_limit/offset 对齐，`-o`/`type`/`multiline`/行级分页为已记录非目标（架构 §1）
 
-## 2026-11-19 分页的文件及上下文归属
+## 2026-11-19～11-24 分页的文件、上下文与提前停流
 
-真实 rg 小目录测试生成多个文件、相隔命中、before/after 和分页；额外验证相邻命中共享前文、非 UTF-8 辅助行、深 offset、结果字节预算及下一页或全文入口。已复核 61,200 个窗口。实现 P7、P8 对应流式计数和上下文选择；固定路径排序适用于全部模式。
+真实 rg 测试覆盖多文件相隔命中、`before`/`after`、相邻命中共享前文、非 UTF-8 `match` 与 `context` 行、`hasMore` 后收齐末条 `after` / 文件 `end` 提前停流（避免被后续文件 >64 KiB 记录击穿）、1,200 短行不因行尾换行误截断、单页超体积且 `hasMore` 时保留续页提示与单页落盘声明、`files_with_matches` 页头与 `count` 越界单位。
 
 ## 2026-11-21 可观察的页计数和路径
 
@@ -88,4 +85,4 @@ context）。模型与 `ripgrep.ts` content 窗口逐行对应。
 
 ### 本轮 Step 5 的机械验证
 
-grep.test.ts、pbt-grep-pagination.test.ts、Core ripgrep.test.ts 对照实际文件和服务层窗口。独立复审与未覆盖范围见 [本轮修复记录](../../fixes/runtime-fix-pr60-boundary-regressions.md)。本地仓库没有通用 contract_audit 生成器。本子计划的功能与合并验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。
+`test/tool/grep.test.ts`、`test/tool/pbt-grep-pagination.test.ts` 与 `packages/core/test/ripgrep.test.ts` 在真实 `rg` 二进制下全量通过。收敛修复与完整核销见 [PR #60 独立审核收敛修复记录](../../fixes/runtime-fix-pr60-audit-convergence.md)。本地仓库没有通用 contract_audit 生成器。本子计划的功能与合并验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。

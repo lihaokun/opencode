@@ -279,19 +279,19 @@ P1 两项是**新能力/新契约**，走完整设计流程；本节只把"设�
 
 ## 7. 决策记录（2026-10-12 逐条拍板定案）
 
-| # | 问题 | 本文原倾向 | **最终决议** |
+| # | 问题 | 本文原倾向 | **最终决议与实施收敛** |
 |---|---|---|---|
-| 1 | B① exit 投影位置 | B2 读方投影 | **B2 读方投影**：`message-v2` completed 分支按 `metadata.exit` 字段存在性翻译状态行；`prompt.ts:684` 补记 `!cmd` 的 exitCode |
-| 2 | B② 标注范围 | 只标非零 | **只标非零**（exit 0 静默；超时/取消已有正文说明不重复标） |
-| 3 | B③ 非零语义 | 保持成功语义 | **保持成功语义**（不渲染成 error；ZCode 的语义白名单记为后续增强） |
-| 4 | C① structuredContent | 追加 + 判等去重 | **追加 + 判等去重**（`JSON.stringify(sc)` 与 content text 项严格相等则跳过；并入同一次 truncate） |
-| 5 | C③ 错误路径 | 拆独立 PR | **合并进投影 PR**（↑ 推翻倾向；catalog 与 code-mode 两处 throw 同修，修正方案文档单列小节评审） |
-| 6 | D① serialize 组织 | 抽 core helper | **抽 core helper**（头尾截断 + metadata 行进 core，两侧 import） |
-| 7 | E① 委派指导 | default 式（系统提示词） | **ZCode 式 → 2026-10-18 复审 D13 再推翻**：移入工具描述的处方与 PR #59"agent 描述只讲机件不开处方"冲突，已从 `AGENT_DESCRIPTION` 撤销；委派机件说明保留在模板与描述中，委派时机不再有独立文本资产（恢复载体应为共享段） |
-| 8 | E①' 共享段位置 | request.ts 三元后 | **provider() 内 `[template, SHARED]`**（↑ 推翻倾向：三元替换语义实为正确的 opt-out——工具型 agent 自然豁免；§5.1 分析已同步修正；自定义任务 agent 的缺口记引入条件） |
-| 9 | E② 第一步刀法 | 最小刀法 | **最小刀法**（共享段 + 删 default/trinity 三条硬冲突；其余模板软性表述保留） |
-| 10 | F① 文件恢复来源 | 磁盘重读 | **磁盘重读**（read/edit metadata 取候选 + 最近排序 top-K + 版本比对 + tail 去重 + 失效降级） |
-| 11 | F② 恢复契约 | v1 内部 | **v1 内部**（第一期只做内部恢复；插件契约记引入条件延后） |
+| 1 | B① exit 投影位置 | B2 读方投影 | **B2 读方投影**（`896e093b4e`）：`message-v2` completed 分支经 `formatExitCodeLine` 翻译状态行；`prompt.ts` 补记 `!cmd` 的 exitCode |
+| 2 | B② 标注范围 | 只标非零 | **只标非零**（`896e093b4e`：仅有限非零数字输出 `[exit code: N]`，0/`-0`/`NaN`/`Infinity`/`null` 静默） |
+| 3 | B③ 非零语义 | 保持成功语义 | **保持成功语义**（`896e093b4e`：不渲染成 error；ZCode 的语义白名单记为后续增强） |
+| 4 | C① structuredContent | 追加 + 判等去重 | **追加 + 语义判等去重**（`12bd8a704f` + PR #60 收敛：快路径串等 + JSON 归一化语义深相等含 `-0`/`0`；并入同一次 truncate；`audio` 降级为 `[MCP audio content omitted: <mime>]` 占位不含大小） |
+| 5 | C③ 错误路径 | 拆独立 PR | **合并进投影 PR**（`12bd8a704f` + PR #60 收敛：catalog 与 code-mode 共用 `callToolErrorMessage`，`McpError` 与非 `McpError` 传输异常及 CodeMode `withLogs` 失败均经有界截断；CodeMode 沙箱外还原真实 `Full output saved to:` 落盘路径避免 `<redacted-path>`） |
+| 6 | D① serialize 组织 | 抽 core helper | **抽 core helper**（`fc071384f2` + PR #60 收敛：V1/V2 均含头尾截断、`formatExitCodeLine`、长错误截断与全文指针保留；Core V2 直接读取 `part.state.outputPaths` 并识别 `ToolOutputStore` 标记，不再丢弃 V2 落盘路径） |
+| 7 | E① 委派指导 | default 式（系统提示词） | **ZCode 式 → 2026-10-18 复审 D13 再推翻**：移入工具描述的处方与 PR #59"agent 描述只讲机件不开处方"冲突，已从 `AGENT_DESCRIPTION` 撤销；委派机件说明保留在模板与描述中，委派时机不再有独立文本资产 |
+| 8 | E①' 共享段位置 | request.ts 三元后 | **`systemSections(model) = [provider(model), PROMPT_SHARED]`**（B7 修订，覆盖 9 份活跃模型模板；`request.ts:198` 三元替换保留显式 `agent.prompt` opt-out） |
+| 9 | E② 第一步刀法 | 最小刀法 | **最小刀法**（共享段 + 删 `default`/`trinity` 三条硬冲突与空 `# Code style` 标题；`gemini.txt:12,41` 残留不总结规则按 E②/D12 显式记档，留待 beta 观察后统一处理） |
+| 10 | F① 文件恢复来源 | 磁盘重读 | **磁盘重读**（`read`/`edit` 取候选 + `write` 失效缓存 + 磁盘 file/skill 读前 `stat` + 保留区 SHA-256 去重优先于 `max_files`；`Assistant.n` 持久保留计数；溢出恢复向 `SessionRestoration.apply` 传入基于剩余 headroom 的 `maxBudgetTokens` 防止假性 `ContextOverflowError`） |
+| 11 | F② 恢复契约 | v1 内部 | **v1 内部**（第一期只做内部恢复；`SessionPrompt.node` 完整接线 `Config`/`Todo`/`Skill`；插件契约记引入条件延后） |
 
 路线决议（同日）：ZCode 替换评估定为 **B——维持 fork，ZCode 作参照实现**，详见 `zcode-replacement-assessment.md` §5/§7/§8。
 

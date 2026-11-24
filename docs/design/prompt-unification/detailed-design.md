@@ -12,7 +12,7 @@
 - ~~`tool/agent.ts`：`AGENT_DESCRIPTION` 追加 "When to delegate" 行~~（2026-10-18 复审 D13 撤销：与 #59"描述只讲机件不开处方"原则冲突；wire 测试改为负向断言）
 - 测试：`system.test.ts` 新增断言（共享段全分支覆盖 + 模板删除规则 + 机件行保留）；`test/tool/__snapshots__/parameters.test.ts.snap` 若因描述变更产生 diff 则随行为变更更新（实施时核实）
 
-不覆盖：其余 8 份模板（非目标）、消息内注入通道（非目标）、`request.ts`（架构 I2/I3 保证不触碰）。
+不覆盖：其余 7 份活跃模型模板（含显式记档留待 beta 观察的 `gemini.txt:12,41`，见架构 §1 非目标）、消息内注入通道（非目标）；`request.ts` 仅触及 `:198` 三元右支调用 `SystemPrompt.systemSections(model)`（I2/I3 不变）。
 
 ## 2. 与已有代码的复用点
 
@@ -40,10 +40,10 @@
 
 > **2026-10-18 复审 B7 全文修订**：本节原方案（`template` 变量赋值 + 末尾单点 `return [template, PROMPT_SHARED]`）因违反 AGENTS.md 早返回风格已被回退，以下为修订后口径，原文本删除。
 
-- **实现思路**：`provider(model)` 保持逐分支早返回，返回**裸模板 string**（muse 分支保留 `replaceAll("{{MODEL_NAME}}", name)`）；新增 `systemSections(model)` = `[provider(model), PROMPT_SHARED]`，唯一生产 caller 是 `request.ts` 的 `preparePayload` 三元。
-- **分支覆盖**：muse/gpt-4|o1|o3/gpt(6|codex|其他)/gemini/claude/trinity/kimi/default 十路逐一早返回；无遗漏（与现分支一一对应）。
+- **实现思路**：`provider(model)` 保持逐分支早返回，返回**裸模板 string**（muse 分支保留 `replaceAll("{{MODEL_NAME}}", name)`）；新增 `systemSections(model)` = `[provider(model), PROMPT_SHARED]`，唯一生产 caller 是 `request.ts:198` 的 `preparePayload` 三元右支。
+- **分支覆盖**：`muse` (`meta.txt`) / `gpt-4|o1|o3` (`beast.txt`) / `gpt-6` (`gpt-astra.txt`) / 其他 `gpt` (`gpt.txt`) / `gemini-` (`gemini.txt`) / `claude` (`anthropic.txt`) / `trinity` (`trinity.txt`) / `kimi` (`kimi.txt`) / `default` (`default.txt`) 共 9 份活跃模板逐一早返回，无遗漏。
 - **退出覆盖**：每分支一个返回点；`systemSections` 单表达式。
-- **正确性论证**：等价性——每分支返回的模板与原实现逐一相同；`systemSections` 末元素恒为 `PROMPT_SHARED`（单一常量来源 ⇒ I1 成立，但保护点是 `systemSections` 而非 `provider`——直接调用 `provider` 拿不到 SHARED，该约定由 expectations §2"唯一 caller"行与 grep 断言维护）；既有测试改为 `systemSections` 或裸模板断言（system.test.ts:91/100/109 已随 B7 调整）。trivial + 纯文本组装理由。
+- **正确性论证**：等价性——每分支返回的模板与原实现逐一相同；`systemSections` 末元素恒为 `PROMPT_SHARED`（单一常量来源 ⇒ I1 成立，保护点在 `systemSections` 而非 `provider`——直接调用 `provider` 拿不到 SHARED，该约定由 expectations §2"唯一 caller"行与测试维护）；既有测试改为 `systemSections` 或裸模板断言。trivial + 纯文本组装理由。
 
 ### 5.2 模板修剪（删除清单，行号为当前 dev 基线核对值）
 
@@ -98,9 +98,9 @@
 
 ## 6. 完整性自检 checklist
 
-- [x] 实现思路推导连续（5.1 单返回点、5.2 逐行清单、5.3 单行追加）
-- [x] 分支覆盖（provider 十路分支逐一映射为赋值；模板删除清单正反向均列）
-- [x] 退出覆盖（provider 单返回点；文本资产无退出通道）
-- [x] callee 契约引用（`request.ts:195` 三元契约、`system.test.ts` 既有断言兼容性、快照测试的更新条件均已标注）
-- [x] 循环刻画（无循环；遍历断言为有限集合）
-- [x] 上游事实显式列出（H1 快照核实结论、行号核对值、`AGENT_DESCRIPTION` 位置均已标注行号）
+- [x] 实现思路推导连续（5.1 B7 修订版早返回 + `systemSections`、5.2 逐行删除清单含清理孤立 `# Code style` 空标题、5.3 D13 撤销记录）
+- [x] 分支覆盖（`provider` 9 份活跃模板路由逐一早返回；模板删除清单正反向均列）
+- [x] 退出覆盖（`provider` 各路由独立早返回 + `systemSections` 单表达式；文本资产无退出通道）
+- [x] callee 契约引用（`request.ts:198` 三元右支契约、`system.test.ts` 既有断言兼容性、快照回归已核对）
+- [x] 循环刻画（无循环；遍历断言为有限 9 模板集合）
+- [x] 上游事实显式列出（H1 快照核实结论、行号核对值、D13 撤销依据、`gemini.txt:12,41` 已知残留冲突均已标明）

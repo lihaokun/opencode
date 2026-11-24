@@ -1,11 +1,8 @@
-# Contract Audit Decisions — bgshell-1-background-exec（二轮修复后回填）
+# Contract Audit Decisions — `bgshell-1-background-exec`
 
-二轮审核 ⚠️ 项与处置（格式：项 → 决定 → 依据）：
+本子计划审核发现的偏离与契约收敛决策（格式：项 → 决定 → 依据）：
 
-1. **expectations 事前时序违例** → 接受偏离并记录，不追认 — 首轮已按事后补抽完成（expectations.md 顶部声明）；重写历史无意义，回归保护由测试承担。
-2. **路径 A 机械检查缺失** → N/A + 跟踪说明 — fork 无自备检查器；Step Pn 注释已补齐（grepext P1-P9 / bgshell P2-P9 / comprec P1-P8 / prompt-1 P1-P4 标注于 src），接入检查器后立即可校验。
-3. **二轮 R 项修复引发的契约口径变化** → 同步修订 expectations 对应行 — 预算例外（R4）、dedup 基线（R3）、分页顺序（R2）、后台读路径归属（R1/R5/R6）均已在本 subplan（如适用）的 expectations.md 内以"2026-11-05 修订"标注。
-
-2026-11-21：并行停止生产者和已观察的任务，等待后按已发现的属主重读任务注册表。将接受的主动脱离进程语义写入架构，修正 P7 的顺序与 variant 继承；用真实工具验证回执预算与非 BMP 字符边界。
-
-父会话的取消遍历所有已登记的 agent 委派关系，包括已结算的中间节点。只有仍在运行的所属任务会被取消；已完成的委派保留终态，其他会话的任务继续执行。
+1. **首轮 `expectations.md` 事前时序违例** → 接受历史偏离并保留声明，不追认 — 事后补抽已完成并同步至最终 HEAD。
+2. **路径 A 通用检查器未引入** → 标记 N/A 并以手工命令核验（`Step P1–P9` grep、`bun typecheck`、`git diff --check`）— 合并验收由 #46 / PR #60 跟踪。
+3. **取消级联与进程组清理收敛（2026-11-21～11-24）** → `SessionRunState.cancel` 同步中断根 runner、所有运行中归属 job 与被后台 shell/`agent_send` 唤醒的活跃后代 runner 并重读至静默；`Session.remove` 与 HTTP `DELETE /session/:id` 对齐委派树级联；`BackgroundJob.cancel` 保证先关闭 Scope 再解析 `done`；`CrossSpawnSpawner` 统一 `SIGTERM → waitGroupGone → SIGKILL` 并为取消等待加 1s 上限。
+4. **权限可见性与启动前取消（2026-11-24）** → `Permission.disabled` 将 `shell_output`/`shell_kill` 别名为 `bash`，避免 `explore` 子代理拿到指引却看不到工具或禁用 `bash` 时泄露二者；后台分支在解析/ask 前后与 `backgroundRun` 入口检查 `ctx.abort.aborted`，防止已取消调用启动孤儿进程。

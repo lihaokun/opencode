@@ -33,10 +33,10 @@ SessionRestoration.apply({ sessionID })
   ├─ materialize：按当前权限读盘，取得同一路径在保留区最近的完整可见 read 指纹，相同时去重
   ├─ render：file/token 上限裁剪 → markdown 块（Files / Skills / Todos 三节，
   │    失效与超限降级为引用行）
-  └─ 渲染非空且与上一份恢复 part 逐字节不同 → 作为 synthetic text part
-       落库到最后一条 user message（<!-- opencode:restoration --> 标记）
+  └─ 渲染非空且与上一份恢复 part 逐字节不同 → 退役旧恢复 part（就地置 ignored: true），
+       再作为 synthetic text part 落库到最后一个非未结算 marker 的 user message（<!-- opencode:restoration -->）
   ↓ 后续每一轮
-filterCompacted 重排自然携带该 part（位置在 tail_start_id 之后，不会被截断）
+filterCompacted 按已完成摘要的 Assistant.n（旧会话兼容 tail_start_id）重排，自然携带该 part
 ```
 
 ## 3. 数据结构（§3.1 格式）
@@ -65,8 +65,8 @@ filterCompacted 重排自然携带该 part（位置在 tail_start_id 之后，�
 
 **数据结构：恢复 part（持久化）**
 
-- 形状：既有 synthetic text part（对齐 roster 的落库方式），文本以 `<!-- opencode:restoration -->` 行开头（对齐 roster 的 `<!-- opencode:subagents -->` 先例），挂载于最后一条 user message。
-- 生命周期：创建于压缩后首个满足触发条件的轮次；持久化；后续轮次复用；不删除、不更新（内容变化只在下次压缩后经逐字节比对重新写入新 part——旧 part 随旧 compaction 对被 filterCompacted 自然截断）。
+- 形状：既有 synthetic text part（对齐 roster 的落库方式），文本以 `<!-- opencode:restoration -->` 行开头（对齐 roster 的 `<!-- opencode:subagents -->` 先例），带 `metadata: { kind: "compaction_restoration", markerID }`，挂载于最后一个非未结算 compaction marker 的 user message。
+- 生命周期：创建于压缩结算后的恢复步骤；持久化；后续轮次复用；新压缩生成新恢复块时，旧恢复 part 就地标记 `ignored: true`（G4 退役语义，保留审计轨迹且不进入模型投影与摘要输入），旧压缩对之后也会随 `filterCompacted` 截断。
 - 跨模块共享性：`session/restoration.ts`（生产）与 `prompt.ts`（装配）。
 
 **配置：`compaction.restoration`**（全部可选，有默认值）
@@ -121,17 +121,17 @@ collect / materialize / render 均为纯或只读函数，可独立单元测试�
 
 ### M3 装配点（`session/prompt.ts`）
 
-在 V1 压缩成功且即将继续会话时调用恢复，后续请求由持久化消息读取恢复材料。
+在 V1 compaction task arm 内、`compaction.process` 返回 `"continue"` 时调用 `SessionRestoration.apply`，并同步提供 `Session`/`Agent`/`FSUtil`/`Config`/`Todo`/`Skill` 六项服务（`SessionPrompt.node` 声明 `Todo.node` 与 `Skill.node` 依赖）。当主模型存在有限上下文窗口时，根据压缩后已投影消息与 `fixed_input_tokens` 计算剩余可用预算 `maxBudgetTokens` 传入 `apply`，确保自动恢复块不会把刚压缩的会话重新推过溢出线。
 
 ## 5. 接口规约（§3.3 格式）
 
 **接口：prompt.ts → SessionRestoration**
 
-输入数据：`{ sessionID: SessionID }`（messages 由模块自行从 Session 服务读取，保持与 reminders 的调用形态一致）。
+输入数据：`{ sessionID: SessionID; maxBudgetTokens?: number }`（messages 由模块自行从 Session 服务读取；`maxBudgetTokens` 可选，由调用方按主模型剩余 headroom 计算，用于将本次恢复的 `budget_tokens` 动态封顶）。
 输出数据：`Effect<void>`。
 协议约定：
-- 调用方责任：仅在 turn-boundary（消息装配前）调用；不保证调用频次（apply 必须幂等）。
-- 被调用方责任：内部完成触发判定、收集、物化、渲染、落库；任何读盘失败降级为引用行而非失败（G1 的可诊断降级）；绝不抛出导致 loop 中断的错误。
+- 调用方责任：在 compaction task arm 结算返回 `"continue"` 后调用（且 `apply` 必须保持幂等）；提供 `Session`/`Agent`/`FSUtil`/`Config`/`Todo`/`Skill` 依赖。
+- 被调用方责任：内部完成触发判定、收集、物化、渲染、退役旧块与落库；任何读盘失败降级为引用行而非失败（G1 的可诊断降级）；绝不抛出导致 loop 中断的错误。
 
 ## 6. 关键设计决策
 
@@ -159,20 +159,20 @@ collect / materialize / render 均为纯或只读函数，可独立单元测试�
 
 **关键假设**
 
-- **H1**：read/edit tool part 的 metadata 携带可靠路径（`read.metadata.display.path` / `edit.metadata.filepath`——确切字段名在细化阶段核实）。来源：§3.1 盘点。
+- **H1**：read/edit/write tool part 的 metadata 携带可靠路径（已核实：`read.metadata.display.path` 仅 `display.type === "file"`、`edit.metadata.filediff.file`、`write.metadata.filepath` 用于失效读缓存）。来源：§3.1 盘点与细化 §2。
 - **H2**：文件自读取后若未被修改，磁盘当前内容与模型读到的版本一致；若被修改，"当前版本"正是验收要求的版本。残余风险：模型需要的若恰是**读时旧版本**（文件被外部改坏的场景），恢复注入的是新版本——按验收口径（"所需的当前版本"）这是正确方向；旧版本仍可经全文文件或重读历史获得。来源：issue 验收第 5 条措辞。
-- **H3**：tail 保留文本可从持久化消息重建（`tail_start_id` 之后 parts 的 text 拼接），且重建成本与 tail 体量同阶（≤ 2k~15k token）。来源：§2.2 机制。
-- **H4**：恢复 part 写在最后一条 user message 上，位置必然晚于 `tail_start_id` 指向的消息 → 不会被 filterCompacted 第一阶段截断。来源：roster 既有行为。
-- **H5**：单文件读取体量受 `file_max_tokens` 截断控制，读盘本身可能读入超限内容——实现须先 stat 估算、超限不读全文（细化阶段落实）。
+- **H3**：保留区由 `filterCompacted` 依据最新已完成摘要的 `Assistant.n`（旧会话兼容 `tail_start_id`）投影得到，`retainedFileVersions` 直接扫描该保留区提取完整可见 read 的 SHA-256 指纹，并在后续 `edit`/`write` 触及同路径时失效旧指纹。
+- **H4**：恢复 part 写在最后一个非未结算 compaction marker 的 user message 上，位于压缩保留区之后，不会被 `filterCompacted` 截断，也不会被未结算的后继 marker 劫持。
+- **H5**：普通文件与磁盘 `SKILL.md` 均受 `file_max_tokens` 控制，读盘前先 `stat` 校验大小、超限直接降级 `reference` 而不读全文。
 
 **模块级不变量**
 
-- I1：任意轮次上下文中语义有效的恢复 part ≤ 1 份 — 维护方：M2 逐字节去重 + 位置判据；filterCompacted 保证旧恢复 part 随旧 compaction 对截断。
-- I2：带有正文时，哨兵、分节标题、路径、换行、围栏和正文一起计入预算 B。诊断独享有界余量，整块最多 B + max(128, min(2000, B))。
-- I3：恢复注入不改变既有消息的相对顺序 — 维护方：M2 只在 last user message 上追加 synthetic part。
+- I1：任意轮次上下文中语义有效的恢复 part ≤ 1 份 — 维护方：M2 `markerID` 触发判据 + 逐字节去重 + 写入前将旧恢复 part 标记 `ignored: true`（G4 退役）。
+- I2：带有正文时，哨兵、分节标题、路径、换行、围栏和正文一起计入有效预算 `B = min(cfg.budget_tokens, maxBudgetTokens ?? Infinity)`。诊断独享有界余量，整块最多 `B + max(128, min(2000, B))`；当剩余 headroom 极紧时 `B` 退化为 `0`（不注入），保证溢出恢复不因恢复块触发假性 `ContextOverflowError`。
+- I3：恢复注入不改变既有消息的相对顺序 — 维护方：M2 只在目标 user message 上追加 synthetic part，并在写入前就地标记旧 sentinel 为 `ignored: true`。
 - I4：重复压缩幂等 — 维护方：M2 触发判据 + 逐字节比对。
 
-**preservation 论证**：每个标记只触发一次恢复；新标记会退役旧块。任意内联项进入前检查其完整渲染长度，每个新节的标题只计算一次。引用节限制条数、路径和原因长度；发送前删除放不下的尾部引用并合并计数。空预算不产生恢复块。
+**preservation 论证**：每个标记只触发一次恢复；新标记会退役旧块。`Assistant.n` 与 `CompactionPart.protected_from`/`request_user_id`/`fixed_input_tokens` 在溢出恢复期间共同界定必保批次与剩余 headroom，`restorationBudgetCap` 将恢复块 `/3` 估值严格限制在剩余可用空间内。任意内联项进入前检查其完整渲染长度，每个新节的标题只计算一次。引用节限制条数、路径和原因长度；发送前删除放不下的尾部引用并合并计数。空预算不产生恢复块。
 
 ## 8. 细化阶段待核实清单
 

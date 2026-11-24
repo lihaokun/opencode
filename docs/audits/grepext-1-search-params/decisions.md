@@ -1,9 +1,8 @@
-# Contract Audit Decisions — grepext-1-search-params（二轮修复后回填）
+# Contract Audit Decisions — `grepext-1-search-params`
 
-二轮审核 ⚠️ 项与处置（格式：项 → 决定 → 依据）：
+本子计划审核发现的偏离与契约收敛决策（格式：项 → 决定 → 依据）：
 
-1. **expectations 事前时序违例** → 接受偏离并记录，不追认 — 首轮已按事后补抽完成（expectations.md 顶部声明）；重写历史无意义，回归保护由测试承担。
-2. **路径 A 机械检查缺失** → N/A + 跟踪说明 — fork 无自备检查器；Step Pn 注释已补齐（grepext P1-P9 / bgshell P2-P9 / comprec P1-P8 / prompt-1 P1-P4 标注于 src），接入检查器后立即可校验。
-3. **二轮 R 项修复引发的契约口径变化** → 同步修订 expectations 对应行 — 预算例外（R4）、dedup 基线（R3）、分页顺序（R2）、后台读路径归属（R1/R5/R6）均已在本 subplan（如适用）的 expectations.md 内以"2026-11-05 修订"标注。
-
-2026-11-21：保留窗口提前停止与确定排序。非末页把探测用计数对外标明为下界，末页继续给实数；单页匹配次数和搜索范围的文件数分别标识。路径只规范化宿主分隔符。
+1. **首轮 `expectations.md` 事前时序违例** → 接受历史偏离并保留声明，不追认 — 事后补抽已完成并同步至最终 HEAD。
+2. **路径 A 通用检查器未引入** → 标记 N/A 并以手工命令核验（`Step P1–P9` grep、`bun typecheck`、`git diff --check`）— 合并验收由 #46 / PR #60 跟踪。
+3. **有界计数、提前停流与非 UTF-8 兼容（2026-11-21～11-24）** → 保留 `--sort=path` 与流式跳过；非末页只报告 `total_lower_bound` 与 `"at least"`，EOF 报告精确 `total`；`contentPage` 消费 `{"type":"end"}` 并在收齐末条 `after` 后立即停流；`RgText` 同时支持 `{ text }` 与 `{ bytes }` 使 `content` 模式与 `files_with_matches`/`count` 在非 UTF-8 文本上行为一致。
+4. **单页截断与分页续页顺序（2026-11-24）** → `GrepTool` 先对单页主体执行 `Truncate.output`，再拼接分页续页提示并在单页截断时明示保存文件仅含当前页；`files_with_matches` 分页附 `Showing files` 头；`count` 越界统一用 `files` 单位。

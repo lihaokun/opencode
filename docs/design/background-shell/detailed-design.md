@@ -1,8 +1,8 @@
 # 细化设计 — 后台 shell（background-shell）
 
-> 状态：细化阶段（§4.3），待 §4.4 审查后实施。
+> 状态：细化阶段（§4.3），已随实施与复审收敛同步至 HEAD。
 > 架构依据：`docs/design/background-shell/architecture.md`（已确认，G5 维持最小形态、`shell_` 命名定案）。
-> 待核实清单核实结果：①通知管线 = `AgentInbox.deliver` → `ops.deliverAsync`（把消息作为 user prompt 注入目标会话并唤醒 loop，`lifecycle.ts:449-462` → `inbox.ts:133`）；②进程生命周期可整体放进 job scope 的 run Effect 内（spawn→累积→退出，工具返回即解耦）；③工具接线 = registry builtin 列表 + `Tool.init`，agent 系工具（agent_list/agent_stop）不 ask 权限——`shell_output/shell_kill` 照此；④权限 = 后台命令沿用 bash 的启动时 ask，无新权限键。
+> 待核实清单核实结果：①通知管线 = 经 `ctx.extra.promptOps.deliverAsync(input, "current")` 直接投递目标会话（以目标会话当下 agent/model/variant 唤醒 loop，不覆盖其身份）；②进程生命周期整体放进 job scope 的 run Effect 内（spawn→累积→退出，工具返回即解耦）；③工具接线 = registry builtin 列表 + `Tool.init`，`Permission.disabled` 将 `shell_output`/`shell_kill` 别名为 `bash`（无需单独权限键，与 `agent_status -> agent_list` 同构）；④权限 = 后台命令沿用 bash 的启动时 ask，且前后检查 `ctx.abort.aborted`。
 
 ## 1. 范围
 
@@ -18,19 +18,20 @@
 
 | 项 | 事实 | 复用方式 |
 |---|---|---|
-| `BackgroundJob` | `start({type,title,run})` 把 run fork 进 job scope；`get/list` 返回 status/output 快照；`cancel` 杀 scope（进程组随 scope 关闭终止）；settle 恰好一次（token/pending 机制） | 任务注册与生命周期 |
-| 通知管线 | `AgentInbox.deliver({message:{kind:"agent",message:{target, sender, sender_agent, body}}, ops})` → 内部 `ops.deliverAsync`（`inbox.ts:133`）——消息作为 prompt 注入目标会话并唤醒 loop | 完成通知（sender 标识为 shell 任务，见 §5.4） |
+| `BackgroundJob` | `start({type,title,run})` 把 run fork 进 job scope；`get/list` 返回 status/output 快照；`cancel` 先 `Scope.close` 再 `Deferred.succeed(done)` 保证进程清理完成后才解除 `wait`；settle 恰好一次 | 任务注册与生命周期 |
+| 通知管线 | `ops.deliverAsync(input, "current")`（`prompt.ts:183`）——fork + 实例切换 + 按目标会话当下身份唤醒 loop | 完成通知（见 §5.4） |
 | promptOps 可达 | agent 工具经 `ctx.extra` 拿 `promptOps`（`agent.ts:110` "The agent tools require promptOps in ctx.extra"） | shell 后台分支同样经 `ctx.extra` 拿 promptOps（通知用） |
 | shell spawn 管线 | `spawner.spawn(cmd(...))` + `Stream.runForEach(Stream.decodeText(handle.all))` 累积（`shell.ts:484-490`）+ `handle.exitCode` | 后台 run 的进程体 |
 | 工具注册 | registry builtin 列表 `Tool.init`（registry.ts:240-259 一带） | 两个新工具 |
 
 ## 3. 错误处理策略
 
-- **通知注入失败**：`Effect.ignore`（架构：注入失败不影响任务本身）+ `Effect.logWarning`——任务的 output/状态不受影响
-- **shell_output 查询不存在的任务**：可诊断错误（"unknown task: <id>"），不抛 defect
-- **shell_kill 对已结束任务**：幂等——返回当前快照（status: completed/error/cancelled）
-- **后台进程 spawn 失败**（如命令不存在）：run 失败 → BackgroundJob settle 为 error → 通知照发（含错误文本）——模型经通知得知，无需轮询
-- **工具返回后 loop 中断/会话删除**：deliverAsync 对已删会话 → ignore（H2 既有行为）
+- **通知注入失败**：`Effect.catchCauseIf((cause) => !Cause.hasInterrupts(cause), ...)` 记 `Effect.logWarning` 吸收非中断异常（中断仍正常传播）——任务的 output/状态不受影响
+- **启动前取消（`ctx.abort.aborted`）**：后台分支在解析/ask 前后与 `backgroundRun` 入口立即返回取消结果，绝不启动 OS 进程或注册 `BackgroundJob`；`background.start` 失败/中断时由 `Effect.onError` 清理 `shellTasks` 防泄漏
+- **shell_output 查询不存在的任务**：可诊断错误（`"unknown task: <id>"`，含 `task_id: ""`）；空会话缺省查询报 `"no background shell tasks in this session"`
+- **shell_kill 幂等与孤立运行任务**：`!entry` 且 `job.status === "running"` 时仍调用 `background.cancel` 终止任务；已结束任务经 `splitStatusOutput` 剥离内部首行状态后返回幂等快照
+- **后台进程 spawn 失败**（如命令不存在）：run 失败 → `errorPreview` 做 UTF-16 安全单行 500 字符截断 → BackgroundJob settle 为 error → 通知照发（含错误文本）
+- **工具返回后 loop 中断/会话删除**：会话取消级联终止进程；deliverAsync 对已删会话忽略（H2 既有行为）
 
 ## 4. 数据结构定义
 
@@ -58,64 +59,60 @@ shell_kill: { task_id: string }
 ### 5.1 shell.ts 后台分支
 
 - **实现思路**：
-  1. `run_in_background === true` 时走后台分支（I1：分支守卫，同步路径不动）
-  2. 生成 task_id（`Identifier.ascending("shell")` 或复用 BackgroundJob 的 id 生成）
-  3. 建 `shellTasks` 条目（buffer: ""）
-  4. 构造 run Effect（整体在 job scope 执行）：
-     - `Effect.scoped(Effect.gen(spawn 既有 cmd 构造 → Stream.runForEach 累积进 buffer 条目 → await exitCode → return buffer 全文))`
-     - run 末尾：**完成通知**——构造 body（`[shell task finished] <command> · exit <code|signal>` + buffer 尾部 tail 行）→ `AgentInbox.deliver` → `ops.deliverAsync` → `Effect.ignore` + logWarning
-  5. `BackgroundJob.start({ type: "shell", title, run })`（start 内部 fork 进 job scope——**工具调用 scope 关闭不影响**）
-  6. 工具返回：`{ title: command, metadata: { task_id, status: "running" }, output: 指引文本（task_id / "output and completion arrive via shell_output and a completion message"） }`
-- **退出覆盖**：后台分支仅两个出口（start 成功 → 返回句柄；start 失败 → 错误上抛为工具 error——注册表失败即无任务，可诊断）
-- **callee 契约引用**：BackgroundJob.start 的 post（run 进 job scope、settle 恰好一次——I2 由其 token/pending 机制保证）；deliverAsync 的语义（fork + 切换到目标会话实例）
-- **循环刻画**：无循环（流累积为既有管线）
+  1. `run_in_background === true` 时先检查 `ctx.abort.aborted`（解析/ask 前后与 `backgroundRun` 入口均守卫，已取消直接返回，绝不 spawn）；`false`/缺省走同步路径（I1）。
+  2. 生成 `taskId = "shell_" + randomUUID()`，建立 `shellTasks` 条目（`buffer: ""`，有界尾部 `BACKGROUND_BUFFER_MAX_CHARS = 200_000`，超限按块重切并跳过低代理保完整 UTF-16 标量）。
+  3. 构造 `run` Effect（整体在 job scope 执行，尾部挂 `Effect.ensuring(shellTasks.delete(taskId))`）：
+     - `Effect.scoped(Effect.gen(spawner.spawn(cmd(..., true)) → Stream.runForEach(appendCapped) → handle.exitCode))`
+     - 失败时 `entry.error = errorPreview(String(Cause.squash(exit.cause)))`（单行 + UTF-16 安全 500 字符截断）。
+     - 调度完成通知：`ops.deliverAsync({ sessionID, parts: [{ type: "text", text: backgroundPreview(body, limits, 1).output }] }, "current")`，非中断异常由 `Effect.catchCauseIf` 记警告吸收。
+     - 成功返回 `${status}\n${entry.buffer}` 作为 `BackgroundJob` 结算快照。
+  4. `background.start({ id: taskId, type: "shell", title: commandPreview(command, 80), metadata: { sessionId: ctx.sessionID }, run })`，失败时 `Effect.onError` 清理 `shellTasks`。
+  5. 工具返回有界回执（首行独立放 `taskId`，metadata 始终携带 `{ task_id, status: "running", exit: null, truncated }`）。
+- **退出覆盖**：启动前 abort 早退、start 失败清理后抛错、start 成功返回句柄三路。
+- **callee 契约引用**：`BackgroundJob.start`（job scope fork + 单次 settle）、`deliverAsync(input, "current")`（目标实例当下身份唤醒）、`CrossSpawnSpawner`（非零退出与取消均执行 `SIGTERM → waitGroupGone → SIGKILL`，取消后 `Deferred.await(signal)` 有 1 秒超时上限防脱离进程的继承 stdio 死锁）。
+- **循环刻画**：流累积沿有限进程输出流终止；取消侧新增两处有界收敛循环（见 §5.5）。
 - **正确性论证**（non-trivial）：
-  - 前置：权限已 ask；spawner/fsys 服务在 ctx
-  - 论证：run 整体 fork 进 job scope ⇒ 工具返回后进程与累积继续（G1）；buffer 挂模块 Map ⇒ shell_output 任意时刻可读（G2）；exitCode await + settle ⇒ 状态终值确定（I2）；通知在 run 内末尾执行恰一次 ⇒ I3；分支守卫 ⇒ I1
-  - 副作用论证：新增副作用 = 进程本身（有意）、buffer Map 写入、注册表写入、通知消息——全部穷尽列出且均为 feature 目的
+  - 前置：权限已 ask；`ctx.abort` 未触发；spawner/background 服务就绪。
+  - 论证：三处 `ctx.abort` 守卫 + `onError` 清理关闭了取消期间孤儿启动与 `shellTasks` 泄漏窗口；run 整体 fork 进 job scope ⇒ 工具返回后进程与累积继续（G1）；`ensuring` + `cancelSnapshot` 保证无论自然结束或取消，状态行与有界尾部都留存于 `BackgroundJob`（G2/I2）；通知在 run 唯一自然退出路径发一次（I3）；分支守卫保证同步路径零改动（I1）。
+  - 副作用论证：OS 子进程、`shellTasks` 条目、`BackgroundJob` 记录、至多一次完成通知消息。
 
 ### 5.2 shell_output 工具
 
-- **实现思路**：task_id 缺省 → 取 `shellTasks` 中本会话 startedAt 最大的条目；不存在 → "no background shell tasks in this session"；task_id 不在 Map → "unknown task"。读取：status（BackgroundJob.get）/ exit（job.info.error 或 exit code——exit code 存 buffer 条目，settle 时回填）/ 输出尾部（buffer 按 tail_lines 取尾）。渲染：
-  ```
-  [shell task <id>] <command>
-  status: running | exit <code> | cancelled | error: <msg>
-  <输出尾部 tail_lines 行>
-  (running) | (finished — completion was delivered as a message)
-  ```
-- 正确性论证：显式 ID 或按登记时间与插入次序选出的最近 ID 都走同一属主/类型校验。运行中读取有界尾缓冲，终态读取 job 快照的状态行与输出。两种读取都先按尾行数、再按 UTF-8 字节数裁剪；结果不写截断文件。
+- **实现思路**：`params.task_id !== undefined` 直接采用（含 `""`，走未知任务报错）；缺省时按 `started_at` 与插入逆序取本会话最近 `type === "shell"` 任务（同时覆盖已结算 `BackgroundJob` 与活 `shellTasks`），无任务报 `"no background shell tasks in this session"`。所有路径先校验 `job.type === "shell" && job.metadata?.sessionId === ctx.sessionID`。活任务读 `entry.buffer`，已结算任务经 `splitStatusOutput(job.output)` 拆出真实首行状态（或 `errorPreview(job.error)`）与输出正文，经 `tailOf` + `backgroundPreview` 内存内裁剪返回，不落盘。
+- **正确性论证**：显式 ID 或按登记时间与插入次序选出的最近 ID 都走同一属主/类型校验；`splitStatusOutput` 兼容无换行快照；`errorPreview` 与 `commandPreview` 保证 2 行头部单行且合法 UTF-16。
 
 ### 5.3 shell_kill 工具
 
-- **实现思路**：`BackgroundJob.cancel(task_id)` → 快照渲染（status: cancelled + 输出尾部）；任务不在本会话 Map → "unknown task"（防跨会话误杀）；已结束 → 返回现状态（幂等）
-- 正确性论证：运行中的属主任务在取消前移交当时的输出尾部。注册表只允许 running 转换一次，已完成或已取消的任务直接返回终态并检查属主和类型。
+- **实现思路**：先查 `shellTasks`；若 `!entry`，查 `background.get(task_id)` 并校验 `type === "shell"` 与属主：若 `job.status === "running"` 仍执行 `background.cancel` 并返回 `stopped (<status>)`，若已结算则经 `splitStatusOutput(job.output)` 剥离内部首行状态后返回 `already settled (<status>)`（无正文时不附多余空行）。活条目分支校验属主后携带 `cancelSnapshot(task_id)` 调用 `background.cancel`，返回 `stopped (<finalStatus>)` 与尾部 50 行。
+- **正确性论证**：消除了 `shellTasks.delete` 窗口期与无条目运行任务拒杀的缺口；已结算响应不再泄漏内部 `exit N`/`stopped` 前缀；`BackgroundJob.cancel` 先 `Scope.close` 后 `Deferred.succeed(done)` 保证返回时进程组已清理。
 
 ### 5.4 完成通知（M4，实现于 5.1 run 末尾）
 
-- body 首行 `[shell task finished]`（对齐 ZCode task-notification 惯例）+ command + exit 语义（正常 exit N / killed / error 文本）+ buffer 尾部 200 行
-- deliverAsync 字段照抄委派通知的调用形状（sessionID = 父会话、parts = 单 text part）；sender 身份 = shell 任务（task_id 作为 title 前缀——inbox 的 agent 形状字段按其实际必填集最小化填充，实施时以 inbox.ts 的类型为准）
+- body 首行 `[shell task finished] <taskId> <commandPreview(160)> · <status>` + `tailOf(entry.buffer, 200)`，经 `backgroundPreview(..., limits, 1)` 裁剪。
+- 经 `ops.deliverAsync({ sessionID: ctx.sessionID, parts: [{ type: "text", text }] }, "current")` 投递；`"current"` 模式只读目标会话当下 agent/model/variant（保留显式默认 variant），不回写会话身份。
 
-### 5.5 registry 接线
+### 5.5 registry 接线、权限与取消级联循环（`run-state.ts` / `session.ts` / `cross-spawn-spawner.ts`）
 
-`registry.ts` builtin 增 `shellOutput: Tool.init(...)`、`shellKill: Tool.init(...)`，加入 builtin 数组（`shell` 之后）；权限键跟随 agent_list/agent_stop 模式（无 ask；可见性走既有 visibleTools 规则）。
+- `registry.ts` builtin 注册 `shell_output` 与 `shell_kill`；`permission/index.ts` `Permission.disabled` 将 `shell_output`/`shell_kill` 别名为 `bash`，使允许 `bash` 的子代理（如 `explore`）可见工具、禁用 `bash` 时一并隐藏。
+- **循环与终止性论证（§4.3.1/§4.3.2）**：
+  1. `SessionRunState.cancel(sessionID)`：维护单调增长的 `owners` 集合；每轮 `stopTree` 扫描全量 `background.list()` 沿 `agent` 委派边（含已结算中间节点）扩展 `owners`，取消全部运行中归属 job，同时对 `owners` 中除根会话外的每个已登记 `data.runners.get(owner)` 调用 `child.cancel`（覆盖被后台 shell 或 `agent_send` 唤醒的后代 runner），返回 `jobs + activeRunners` 计数；经 `Effect.repeat({ while: (count) => count > 0 })` 循环直至归零。**终止性**：根 runner 与每个新发现后代 runner 一经 `cancel` 即停止新登记；已存在运行中 job 集合有限且每次 `cancel` 不可逆地从 `running` 转为 `cancelled`，故计数严格在有限步内降至 0。
+  2. `Session.cancelBackgroundJobs(background, sessionID)`（由 `Session.remove` 调用，HTTP `DELETE /session/:id` 先调 `promptSvc.cancel` 再调 `session.remove`）：沿同样委派图扩展 `owners` 并 `Effect.repeat({ while: (count) => count > 0 })`，同理由在有限步内终止。
+  3. `CrossSpawnSpawner` 进程组释放：无论非零退出或主动取消，在 `forceKillAfter` 启用时均按 `SIGTERM → waitGroupGone(轮询 kill(-pid, 0) 至 ESRCH 或超期) → SIGKILL` 收敛；主动取消的 `SIGKILL` 后对 `Deferred.await(signal)` 加 1 秒 `Effect.timeoutOption` 上限，避免 `setsid` 脱离进程继承 stdio 导致无限阻塞。
 
-### 5.6 测试（`test/tool/shell-background.test.ts`，复用 shell 测试的 toolLayer + 真进程）
+### 5.6 测试（`test/tool/shell-background.test.ts`、`test/permission/next.test.ts`、`test/session/session.test.ts`、`core/test/background-job.test.ts`）
 
-1. **后台启动立即返回**：`run_in_background: true` + `sleep` 类命令 → execute 快速返回（<1s 量级）且 output 含 task_id、metadata.status = running
-2. **输出续读**：后台 `printf` 已知文本 → 等待完成 → shell_output 读到文本与 exit 0
-3. **完成通知注入会话**：后台任务结束后，会话中出现 `[shell task finished]` 消息（经 session 消息读取断言；notify 走真实 deliverAsync——需要 promptOps 注入测试层，形态对齐 agent 工具测试的 ctx.extra 注入）
-4. **kill**：后台 sleep → shell_kill → status cancelled、进程终止
-5. **同步路径零变更**：不传 run_in_background 的既有 shell 测试全过（回归）
-6. **shell_output 未知任务** → 可诊断错误
+1. 后台启动立即返回、输出续读、真实非零退出码、完成通知注入与 variant 保持
+2. 取消与竞态：预取消 `ctx.abort` 不启动进程、并发取消+新登记交错、已结算委派下的后代 shell 与被唤醒的后代 runner 级联取消、`Session.remove` 后代级联、`BackgroundJob.cancel` 先关 Scope 后解 `wait`
+3. 边界：`shell_kill` 击杀无 `shellTasks` 条目的运行任务与剥离已结算前缀、`shell_output({ task_id: "" })` 未知任务、多行/非 BMP 误差单行截断、TERM-resistant 进程强制升级、`Permission.disabled` 别名跟随 `bash`
 
 ## 6. 完整性自检 checklist
 
-- [x] 推导连续（5.1 六步、5.2/5.3 枚举分支）
-- [x] 分支覆盖（后台/同步、running/finished、存在/不存在、kill 幂等）
-- [x] 退出覆盖（后台两出口、shell_output 三出口、shell_kill 幂等/未知）
-- [x] callee 契约引用（BackgroundJob start/cancel post、deliverAsync 语义、promptOps 通道均已标注）
-- [x] 循环刻画（无新增循环；流累积既有）
-- [x] 上游事实显式（inbox deliverAsync 形状、promptOps 通道、settle 一次保证、注册表非持久化——均标注出处）
+- [x] 推导连续（5.1–5.5 逐模块完整覆盖，含 `run-state.ts` / `session.ts` / `cross-spawn-spawner.ts`）
+- [x] 分支覆盖（后台/同步、abort 预检、running/settled、活条目/无条目、存在/不存在、kill 幂等）
+- [x] 退出覆盖（后台三出口、shell_output/shell_kill 全部返回与错误通道）
+- [x] callee 契约引用（BackgroundJob、deliverAsync("current")、CrossSpawnSpawner、Permission.disabled）
+- [x] 循环刻画（`SessionRunState.cancel`、`Session.cancelBackgroundJobs`、`CrossSpawnSpawner` 三处循环均给出单调性与有限终止论证）
+- [x] 上游事实显式（`promptOps` 通道、`deliverAsync` 语义、`BackgroundJob` 单次 settle、进程组边界）
 
 2026-11-19 修订：完成通知采用目标 Session 当下的 agent、model、variant；投递异常不改写进程结局。取消向进程组发送 TERM，并有界升级，含 shell 先退出且子进程仍存活的情况。shell_output / shell_kill 在内存内按有效行数、UTF-8 字节预算保留尾部。终端换行不占用一个额外的输出行；同毫秒启动时选后启动的任务。
 

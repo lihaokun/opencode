@@ -28,22 +28,21 @@
 
 ## 3. 枚举值（机械化）
 
-无新枚举。模板路由谓词（muse/gpt-4/gpt-6/codex/gemini/claude/trinity/kimi/
-default）为既有分支，本子计划不改判定只改返回——B7 后逐分支早返回。
+无新枚举。模板路由谓词（`muse` / `gpt-4|o1|o3` / `gpt-6` / 其他 `gpt` / `gemini-` / `claude` / `trinity` / `kimi` / `default`，共 9 份活跃模型模板）为既有分支，本子计划不改判定只改返回——B7 后逐分支早返回。
 
 ## 4. 流程步骤（机械化）
 
-- P1 模板路由（provider 早返回，返回裸模板）
+- P1 模板路由（`system.ts` `provider` 早返回，返回裸模板）
 - P2 `systemSections` 组装 `[template, PROMPT_SHARED]`（SHARED 恒末位——单一来源不变式）
-- P3 preparePayload 三元（显式 prompt 整体替换 → opt-out）
+- P3 `request.ts` `preparePayload` 三元（显式 prompt 整体替换 → opt-out）
 - P4 join 单串（SHARED 在缓存稳定前缀内）
-- P5 模板修剪：default/trinity 删三条硬规则（<4 行 / 修改后不解释 / 绝对禁注释）+ 检索优先委派句；保留异步机件说明
+- P5 模板修剪：`default.txt`/`trinity.txt` 删三条硬规则（<4 行 / 修改后不解释 / 绝对禁注释）、空 `# Code style` 标题与检索优先委派句；保留异步机件说明（注：P5 为纯 `.txt` 文本资产修剪，无法写入代码注释，由 `system.test.ts` 负向/正向断言机械核验）
 
 ## 5. 行为契约（语义）
 
-- G1：10 模板全部以同一 SHARED 段收尾（全分支单测）
-- G2（**D13 修订**）：委派时机不再有独立文本资产；机件说明（agent_list/send/stop、不轮询）保留在模板与工具描述；恢复载体若立项应为共享段而非工具描述
-- G3：default/trinity 硬规则删除由负向断言背书（`fewer than 4 lines` / `DO NOT ADD ***ANY***` / `just stop` / `One word answers are best` / `prefer to use the agent tool`）
+- G1：9 份活跃模型模板全部以同一 SHARED 段收尾（全分支单测）
+- G2（**D13 修订**）：委派时机不再有独立文本资产；机件说明（`agent_list/send/stop`、不轮询）保留在模板与工具描述；恢复载体若立项应为共享段而非工具描述
+- G3：`default`/`trinity` 硬规则删除由负向断言背书（`fewer than 4 lines` / `DO NOT ADD ***ANY***` / `just stop` / `One word answers are best` / `prefer to use the agent tool`）；**已知残留冲突**：`gemini.txt:12,41` 的不总结规则按 E② 最小刀法与 D12 决议保留不改，留待 beta 观察后统一处理
 - G4：显式 prompt agent 的替换语义不变（opt-out wire 测试）；AGENTS.md/skills/MCP/plugin transform 装配顺序不变
 
 ## 6. 时序/状态契约
@@ -76,4 +75,4 @@ C11 四组 PBT 未含本模块（无算法性输入域）。如未来模板数�
 
 ### 本轮 Step 5 的机械验证
 
-system.test.ts 的路由矩阵与 prompt.test.ts 的模型请求检验覆盖和共享段。独立复审与未覆盖范围见 [本轮修复记录](../../fixes/runtime-fix-pr60-boundary-regressions.md)。本地仓库没有通用 contract_audit 生成器。本子计划的功能与合并验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。
+`test/session/system.test.ts` 的 9 模板路由矩阵与 `test/session/prompt.test.ts` 的线上请求测试核验共享段投递与显式 prompt opt-out。收敛修复与完整核销见 [PR #60 独立审核收敛修复记录](../../fixes/runtime-fix-pr60-audit-convergence.md)。本地仓库没有通用 contract_audit 生成器。本子计划的功能与合并验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。

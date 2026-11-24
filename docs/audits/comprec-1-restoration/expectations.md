@@ -23,9 +23,10 @@
 | `compaction.restoration.enabled` | `boolean?`（缺省 true） | 细化 §4 | core config schema + restorationConfig | SDK gen types + 矩阵测试 |
 | `compaction.restoration.max_files` | `number?`（缺省 5） | 同上 | 同上 | render 单测 + PBT |
 | `compaction.restoration.file_max_tokens` | `number?`（缺省 4000） | 同上 | 同上 | materialize 单测 |
-| `compaction.restoration.budget_tokens` | `number?`（缺省 8000） | 同上 | 同上 | render 单测 + PBT |
-| `RESTORATION_SENTINEL` | `"<!-- opencode:restoration -->"`（导出常量） | 细化 §4 | restoration.ts | 测试 import |
-| synthetic part | `{ type: "text", text, synthetic: true }` | 细化 §4 | apply → updatePart | 集成测试 |
+| `compaction.restoration.budget_tokens` | `number?`（缺省 8000） | 同上 | 同上 | render 单测 + PBT + 溢出 headroom 封顶 |
+| `RESTORATION_SENTINEL` | `"<!-- opencode:restoration -->"`（导出常量） | 细化 §4 | `restoration.ts` | 测试 import |
+| synthetic part | `{ type: "text", text, synthetic: true, metadata: { kind: "compaction_restoration", markerID } }` | 细化 §4 | `apply` → `updatePart` | 集成测试 |
+| `Assistant.n` / `CompactionPart.protected_from,request_user_id,fixed_input_tokens` | 非负整数 / `MessageID?` / `number?` | 细化 §5.6 & `session-fix-summary-retained-count.md` | `packages/schema/src/v1/session.ts` | SDK gen types + prompt/compaction 测试 |
 
 ## 3. 枚举值（机械化）
 
@@ -36,14 +37,14 @@
 
 ## 4. 流程步骤（机械化）
 
-- P1 触发（**B6 修订**：compaction task arm 内、`process` 返回 `continue` 后注入恰一次；非每 step）
-- P2 全量读 messages → 找 compaction part（tail_start_id）与既有 sentinel 位置
-- P3 判定：无 compaction → 不动；sentinel 晚于 compaction → 不动
-- P4 collect：completed tool parts → read（**B5 修订**：仅 `display.type === "file"`）取 `display.path`、edit 取 `filediff.file`、skill 取 `name`；最近使用排序；todo 追加
-- P5 materialize：权限和大小检查后读取当前文件，仅以同一路径的完整可见 read 指纹判重。旧 read 无指纹时重新展示。
+- P1 触发（**B6 修订**）：`prompt.ts` compaction task arm 内、`process` 返回 `continue` 后注入恰一次，并按主模型剩余 headroom 传入 `maxBudgetTokens`，同时提供 `Session`/`Agent`/`FSUtil`/`Config`/`Todo`/`Skill` 六项服务
+- P2 全量读 messages → 收集 `settledMarkers`（`summary && finish && !error`）定位最后已结算 compaction marker 与未退役 sentinel
+- P3 判定：无已结算 marker → 不动；该 marker 已恢复 → 不动；载体取最后一个非未结算 marker 的 user message
+- P4 collect：completed tool parts → read（仅 `display.type === "file"`）取 `display.path`、edit 取 `filediff.file`、skill 取 `name`；最近使用排序；todo 置顶优先
+- P5 materialize：磁盘 file/skill 读前先 `stat`；同路径完整可见 read（且未被后续 `edit`/`write` 失效）的 SHA-256 一致则 `skipped-duplicate`（优先于 `max_files`/预算耗尽降级）
 - P6 render：max_files 逐文件上限 + 预算耗尽降级引用行 → sentinel + 三节（Files/Skills/Todos）+ Not restored
-- P7 与上一份 sentinel 逐字节比较，不同才 `updatePart` 落库
-- P8 失败吸收：候选级 catch → `missing`；apply 顶层 `Effect.exit` → logWarning，绝不断 loop
+- P7 与当前载体上未退役同 `markerID` sentinel 逐字节比较，相同则跳过
+- P8 退役全部既有未忽略 sentinel（就地置 `ignored: true`）并落库新 synthetic text part；顶层 `Effect.exit` 吸收异常绝不断 loop
 
 ## 5. 行为契约（语义）
 
@@ -95,4 +96,4 @@
 
 ### 本轮 Step 5 的机械验证
 
-summary-retention-history、compaction、restoration、pbt-render-materials 与 CLI 用例核对 SQLite 和最终请求。独立复审与未覆盖范围见 [本轮修复记录](../../fixes/runtime-fix-pr60-boundary-regressions.md)。本地仓库没有通用 contract_audit 生成器。本子计划的功能与合并验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。
+`compaction.test.ts`、`restoration.test.ts`、`pbt-render-materials.test.ts` 与 `prompt.test.ts` 核对 SQLite 落库、最终模型请求与三连续压缩契约。收敛修复与完整核销见 [PR #60 独立审核收敛修复记录](../../fixes/runtime-fix-pr60-audit-convergence.md)。本地仓库没有通用 contract_audit 生成器。本子计划的功能与合并验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。

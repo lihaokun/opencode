@@ -100,6 +100,8 @@ harness 说明：投影循环提取为纯函数 `projectMcpToolResult`（`tools.
 | `docs/devlog/` | P0-2 实施日志（含度量） | 已加: `docs/devlog/2026-10-12-session-fix-mcp-structured-content-projection.md` |
 | 无 schema/枚举/接口契约文档 | 新契约（追加格式、判等规则、占位文案、错误 message 组装）权威记录为本文第四部分 | 无（+理由） |
 
-## 2026-11-21 · 协议错误出口
+## 2026-11-21～11-24 · 协议错误出口、传输异常与 CodeMode 路径还原
 
-普通工具与 code-mode 通过同一工具调用入口处理两种失败。工具返回 isError 时提取正文和 structuredContent；JSON-RPC 拒绝时保留 message 和可选 data，再按原有工具预算生成预览与全文引用。取消信号保留原有异常。真实 SDK 内存传输产生两种合法错误；性质测试核对实际交给截断器的完整内容以及对调用者可见的预览。
+普通工具与 code-mode 通过同一工具调用入口处理失败。工具返回 `isError` 时提取正文与 `structuredContent`（语义判等先做 JSON 归一化，兼容 `-0` 与 `0`）；JSON-RPC `McpError` 保留 `message` 与非空 `data`（跳过 `null`/`undefined`，并对循环引用/BigInt 安全序列化）；非 `McpError` 传输错误（如 HTTP/SSE 500 响应体）同样经过 `truncateError` 有界截断；取消信号保留原有异常。
+
+CodeMode 侧保持 `@opencode-ai/codemode` 沙箱内部路径脱敏不变量不变，同时在 `packages/opencode/src/tool/code-mode.ts` 的宿主侧记录每次错误截断的真实 `outputPath`，于沙箱返回后将 `Full output saved to: <redacted-path>` 还原为真实落盘路径（未捕获与 `try/catch` 捕获两条路径均还原），且脚本失败时的 `withLogs(...)` 输出一并经 `truncate.output(..., { error: true })` 保护，避免日志放大导致无界异常。详见 [PR #60 独立审核收敛修复记录](runtime-fix-pr60-audit-convergence.md)。

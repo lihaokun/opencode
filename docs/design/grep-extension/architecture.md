@@ -44,14 +44,14 @@ grep tool execute
   │      count → "--count-matches"（解析 count 行）
   │      content → 现状 --json
   │      before/after/context → "-A n" / "-B n" / "-C n"（仅 content）
-  │      offset → 服务内切片（rg 无 --offset flag，已核实；取数 limit+offset+1 条后 slice）
-  ├─ 渲染（按模式）：
-  │    content   → 现格式 + 状态行 "Showing matches N–M (offset O, limit L)"
-  │    files     → 每文件一行（路径）
-  │    count     → "path:count" 行
-  │    尾部      → hasMore ? "(more matches available; increase offset)" : 无
-  │    越界      → "No matches at offset O (total T)"（与无匹配区分）
-  └─ metadata：{ matches, truncated, output_mode, offset, head_limit }（UI 用，模型正文见上）
+  │      offset → 服务内流式跳过（rg 无 --offset flag；流上只保留当前页，content 由 contentPage 在收齐末条 after 或收到 {"type":"end"} 后提前停流）
+  ├─ 渲染（按模式，先经 Truncate.output 控体积再拼分页续页提示）：
+  │    content   → 现格式 + 状态行 "Showing matches N–M (offset O, limit L)"（剥离行尾 \r?\n 防行预算翻倍）
+  │    files     → 每文件一行路径 + 分页时 "Showing files N–M (offset O, limit L)"
+  │    count     → "path:count" 行 + 状态行
+  │    尾部      → hasMore ? "(more results available; increase offset to ...)"（若本页同时被 Truncate.output 截断则附加单页文件说明）: 无
+  │    越界      → "No <matches|files> at offset O (total <matches|files>: T)"（按模式单位一致）
+  └─ metadata：{ matches, truncated, output_mode, offset, head_limit, total | total_lower_bound }
 ```
 
 ## 3. 数据结构（§3.1）
@@ -66,11 +66,11 @@ grep tool execute
 
 ### M1 `core/ripgrep.ts`（执行适配器扩展）
 
-`GrepInput` 扩展 + args 构造 + 两种新解析器（files 行、count 行，均为 rg `--json` 之外的简单文本行——**决策：files/count 模式不走 --json**，rg 的 `--files-with-matches`/`--count-matches` 原生输出是纯文本行，逐行解析即可，复用 `run` 的行解析骨架）。~~`--offset` 为 rg 原生 flag，服务内不需要 slice~~（**2026-10-20 独立审清扫**：rg 15.1.0 无 `--offset`，与细化 §0 实证矛盾；实际实现即服务层 `take(limit+offset+1)` + slice，见决策 3）。
+`SearchInput` / `GrepResult` 与 `search` 方法：按 mode 分派 args（均带 `--sort=path`），`files_with_matches` 与 `count` 走轻量纯文本行解析（`count` 校验非负整数），`content` 走 `--json` 并通过 `RgText` 同时解码 UTF-8 `{ text }` 与非 UTF-8 base64 `{ bytes }`；流式跳过 offset，不缓存前缀。
 
 ### M2 `tool/grep.ts`（工具层）
 
-schema 扩展 + 校验（context 上限 10、mode 与 context 互斥说明）+ 渲染分模式 + 状态行/越界行 + metadata 扩展。权限 ask 不变。
+schema 扩展（参数类型由 `Schema.Schema.Type<typeof Parameters>` 单一推导）+ 校验（context 上限 10、mode 与 context 互斥）+ 渲染分模式（先经 `Truncate.output` 截断单页正文，再追加续页提示与单页落盘说明；`files_with_matches` 输出 `Showing files` 头；`count` 越界使用 `files` 单位）+ metadata 区分 `total` 与 `total_lower_bound`。权限 ask 不变。
 
 ### M3 测试
 
@@ -98,7 +98,7 @@ schema 扩展 + 校验（context 上限 10、mode 与 context 互斥说明）+ �
 
 **goal → 模块映射**：G1/G4 → M1+M2；G2 → M1（-A/-B/-C）+ M2（渲染含上下文行）；G3 → M1（offset/取数探测）+ M2（状态行三分支）；G5 → M2 默认参数路径 + 单元快照。
 
-**协作论证**：G3 要求区分三种结局。M1 取数 `limit+offset+1` 条 ensures 可判定 hasMore（取得 > offset+limit ⇒ 有余量；≤ 且非空 ⇒ 恰好到底；offset ≥ 总数 ⇒ 越界）；M2 按 hasMore/空页/越界三态渲染 ensures 模型可区分 ⇒ G3。G1/G2/G4 为 rg 原生能力的参数透传 + 渲染分支，等价性由默认路径字节兼容断言兜底 ⇒ 成立。
+**协作论证**：G3 要求区分三种结局。M1 在固定 `--sort=path` 序列上流式计数跳过前 `offset` 条、仅保留 `[offset, offset+limit)` 页并多探测 1 条命中判定 `hasMore`（`files`/`count` 见第 `offset+limit+1` 条即停；`content` 经 `contentPage` 在 `hasMore` 且收齐最后一条已收录匹配的 `after` 上下文或收到该文件 `{"type":"end"}` 事件后立即停流）；M2 先经 `Truncate.output` 保护本页体积再追加续页提示（若同时超体积与 `hasMore`，明示保存文件仅含当前页并保留 `offset` 续页指令）⇒ 三态结局与翻页续行完整 ⇒ G3。G1/G2/G4 由参数透传、`RgText` 非 UTF-8 解码及分模式渲染保证。
 
 **关键假设**
 

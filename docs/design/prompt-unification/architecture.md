@@ -7,14 +7,14 @@
 
 **目标**
 
-- **G1 行为基线一致**：10 份模型模板全部以同一段共享行为段收尾——完成判据、途中纠偏（steering）、验证与真实报告、交付摘要、注释密度指导（issue 验收"不能只修某个模型的 prompt"）。
-- **G2 委派指导单一来源**：何时委派的指导移入 agent 工具描述（与工具共存亡、随注册自适应）；系统提示词只保留 fork 特有机件说明（异步 `agent_list/send/stop`、不轮询）。
-- **G3 硬冲突消除（最小刀法）**：default/trinity 的三条硬性规则移除——强制 <4 行回答、修改后不解释、绝对禁注释；其余模板的软性表述保留，冲突矩阵记档迭代。
+- **G1 行为基线一致**：9 份活跃模型模板（`anthropic` / `beast` / `default` / `gemini` / `gpt` / `gpt-astra` / `kimi` / `meta` / `trinity`）全部以同一段共享行为段收尾——完成判据、途中纠偏（steering）、验证与真实报告、交付摘要、注释密度指导（issue 验收"不能只修某个模型的 prompt"）。
+- **G2 委派机件清晰（D13 修订）**：移除 `default`/`trinity` 的检索优先委派硬指令，保留系统提示与 `tool/agent.ts` 中关于 fork 异步机件（`agent_list/send/stop`、不轮询）的客观说明；依据 PR #59 与 D13 决议，不在 `tool/agent.ts` 塞入“何时委派”的用法处方。
+- **G3 硬冲突消除（最小刀法 E② + D12）**：移除 `default`/`trinity` 的三条硬性规则——强制 <4 行回答、修改后不解释、绝对禁注释（同时清理残留空 `# Code style` 标题）；**已知残留冲突显式声明**：`gemini.txt:12,41` 存在“修改代码后除非被要求不要总结”的明文规则，按 E② 最小刀法与 D12 决议本 PR 暂不改写 `gemini.txt`，记录为已知残留冲突留待 beta 观察后统一收敛；其余模板的软性表述保留。
 - **G4 契约不破坏**：显式 prompt agent 的替换语义（opt-out）保持；`AGENTS.md`/skills/MCP instructions/plugin transform 的装配顺序与内容不变。
 
 **非目标（v1 明确不做，记录理由与引入条件）**
 
-- **全量 10 模板改写**：anthropic 的强委派（"proactively/CRITICAL"）、gpt-astra 的禁委派等方向性差异保留。理由：(a) 差异是**未定**而非错误——委派姿态横跨整个光谱，何者更优没有证据，无证据时"统一"等于把未决策伪装修完；(b) 它们不与共享段正面相撞（委派条款已移入工具描述），属"残留不一致"而非硬冲突——这正是 E② 刀法的分界线；(c) 保留差异是为将来的单变量实验保住可归因的干净基线。引入条件：行为对照实验给出姿态优劣证据后统一。
+- **全量 9 模板改写**：anthropic 的强委派（"proactively/CRITICAL"）、gpt-astra 的禁委派，以及 `gemini.txt:12,41` 的不总结规则均在本 PR 保留不改。理由：(a) E② 最小刀法将本 PR 文本修剪严格限定在 `default`/`trinity`，为 beta 观察与单变量对照保留最小可归因 diff；(b) `shared-behavior.txt` 后置追加可在指令优先级上压平部分残余冲突；(c) 引入条件：beta 观察或行为对照实验确认 `gemini.txt` 等模板冲突影响交付后，再发起专项模板收敛 PR。
 - **消息内注入通道（steering/roster/plan reminder）的语义改造**：这些是 `reminders.ts` 在 turn-boundary 注入的**运行时状态投影**（子代理实时状态、plan mode 状态机），不是静态行为规则——对象类不同，且已有 owner（agent-management，#35/#43/#48/#53 刚三轮维护）。本 feature 对它们的唯一义务：共享段文案不与消息内通道争内容（如共享段不另述子代理状态，那是 roster 的话）。
 - **default 与 trinity 合并为单副本**：合并不是删文本而是改 `system.ts:44` 的模板路由（trinity 分支指向 default）——超出"只删行 + 插共享段"的刀法边界；且调研未核实 trinity 模板的来历（OEM/内部分支定制？），草率合并可能破坏不可见下游。共享段插给两份后，重复维护的成本大头已消化。引入条件：下次新增模板时顺手合并路由。
 - **行为对照实验**：单变量对照需要评测基座（任务集、评分口径、多次运行的方差控制），fork 均不具备（issue 核验基线自述未跑过对照实验）。判定结构上不阻塞：E② 移除的三条硬规则是不依赖实验即可判定有害的明文项（<4 行强制与自包含摘要不相容），"送达与一致性"由单元断言保证——"效果好不好"另立项。最小刀法本身即为实验保留最小可归因 diff。
@@ -22,12 +22,10 @@
 ## 2. 核心装配流（现状与变化）
 
 ```
-现状：provider(model) → 10 选 1 → [模板]
-变化：provider(model) → 10 选 1 → [模板, SHARED_BEHAVIOR]
-                      （三元之后被 agent.prompt 替换的路径不变 = opt-out）
-
-request.ts:195  三元：agent.prompt 亦或 [模板, SHARED]
-request.ts:193-201  join 单串（缓存前缀：模板按模型路由，SHARED 恒定）
+现状：provider(model) → 9 选 1 → 裸模板
+变化：systemSections(model) → [provider(model), PROMPT_SHARED]
+      （request.ts:198 三元：agent.prompt ? [agent.prompt] : SystemPrompt.systemSections(model)）
+      （随后与 env/instructions/mcp/skills join 成单一缓存稳定前缀）
 ```
 
 default.txt / trinity.txt 删除三条硬规则（L18-19、L58、L68 与 trinity 对应行）；L81 的"检索优先委派"句移除（由工具描述接管），异步机件说明行保留。
@@ -113,14 +111,14 @@ default.txt / trinity.txt 删除三条硬规则（L18-19、L58、L68 与 trinity
 
 ## 7. 架构正确性论证（§4.2.1）
 
-**goal → 模块映射**：G1 → M1；G2 → M3 + M2（机件行保留）；G3 → M2；G4 → M1（不动三元）+ M2（不动机件行）。
+**goal → 模块映射**：G1 → M1；G2 → M2（移除检索委派硬指令、保留异步机件行，M3 已由 D13 撤销）；G3 → M2；G4 → M1（仅换三元右支调用 `systemSections`）+ M2（不动机件行）。
 
 **模块协作论证**
 
-- G1 要求全部模型模板带行为基线。M1 后置条件"末元素恒为 SHARED"对所有 10 个分支成立（单一常量来源），且三元之前所有模型 agent 必经 provider ⇒ 模型模板路径全覆盖；子代理 general/build/plan 无显式 prompt ⇒ 同路径覆盖 ⇒ G1。
-- G2 要求委派指导单一来源。M2 移除 default/trinity 的检索委派句后，"何时委派"唯一出现于 M3 的工具描述（anthropic/meta 的软性残留是 E② 显式保留项，见非目标）⇒ G2 在既定刀法内成立。
-- G3：M2 的删除清单逐条对应三条硬规则 ⇒ grep 可验证 ⇒ G3。
-- G4：M1 不改三元、不改 join 顺序 ⇒ opt-out（I2）与插件追加（I3）保持；M2 保留机件行 ⇒ fork 异步特性说明不丢 ⇒ G4。
+- G1 要求全部活跃模型模板带行为基线。M1 `systemSections(model)` 恒返回 `[provider(model), PROMPT_SHARED]`，覆盖 `provider` 全部 9 份活跃模板路由（单一常量来源），且 `request.ts:198` 三元右支是模型模板路径的唯一生产调用点；无显式 prompt 的 agent（`build`/`plan`/`general`）全部经此路由 ⇒ G1 成立。
+- G2（D13 修订口径）：M2 移除 `default`/`trinity` 的检索优先委派硬指令并保留异步机件行，`tool/agent.ts` 维持 PR #59 的纯机件描述（不混入用法处方），消除描述冲突 ⇒ G2 在 D13 决议范围内成立。
+- G3：M2 的删除清单逐条对应 `default`/`trinity` 的三条硬规则与孤立空标题，由负向断言背书；`gemini.txt:12,41` 作为已知残留冲突在 E②/D12 边界内显式记档，留待后续迭代 ⇒ G3 在最小刀法边界内成立。
+- G4：M1 仅将 `request.ts:198` 三元右支由 `provider` 改为 `systemSections`，不改三元位置与 join 顺序 ⇒ opt-out（I2）与插件追加（I3）保持；M2 保留机件行 ⇒ fork 异步特性说明不丢 ⇒ G4。
 
 **关键假设**
 

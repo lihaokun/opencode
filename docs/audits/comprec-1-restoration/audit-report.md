@@ -1,24 +1,24 @@
-# Contract Audit Report — comprec-1-restoration（二轮修复后回填）
+# Contract Audit Report — `comprec-1-restoration`
 
-> 状态：由 PR #60 二轮审核（2026-11-05）驱动回填。本报告按 workflow §6.5 路径 B 的产物结构记录，但**时序声明**：首轮实施未按 §6.2 事前产出 expectations（已在 expectations.md 顶部声明违例）；本报告与 decisions.md 是二轮修复后（commit 见 expectations.md 引用）整理的对照结论，不冒称事前独立审。
+> 状态：2026-11-24 独立审核并收敛修复后最终核对（§6.5 路径 B）。
+> **时序声明**：首轮实施未按 §6.2 事前产出 `expectations.md`（已在 `expectations.md` 顶部记录流程偏离，不追认）。以下核对基于最终收敛后的工作树源码与实测结果，覆盖 2026-11-19～11-24 全部变更。
 
-## 结论
+## 1. 结论（§6.6 退出标准）
 
-- 二轮审核（reviewer 实测反例 + 代码对照）发现的全部 ❌ 项已在 HEAD 修复并补回归测试；修复明细见 PR #60 二轮修复 commits 与 devlog `docs/devlog/2026-11-05-pr60-second-review-round.md`。
-- 路径 A（机械化检查）状态：**N/A**——本 fork 尚未自备 scripts/contract_audit 检查器（JSON Schema 校验 / Step 注释 grep / 共享枚举 import 检查）。Step Pn 注释已补（本轮 III.5），待检查器接入后即可 grep 校验。跟踪：暂无 issue，接入条件=首个下游项目需要。
+- **Critical / Unresolved**：**0 critical / 0 unresolved**（本轮独立审核检出的 P1-1、P1-2、P2-1～P2-4 及三连续压缩/`pbt-render-materials` Oracle 漏洞均已修复并补回归测试）。
+- **路径 A（机械检查）**：`Step P1–P8` 注释全部就位（`prompt.ts:1552`、`restoration.ts:449,484,504,529,534,538,547`）；`bun typecheck` 四包通过；`git diff --check` 零报错。通用 `scripts/contract_audit` 生成器本仓库未引入，验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。
 
-## 2026-11-19 摘要输入超限的分档恢复
+## 2. 路径 B 逐项核对表
 
-独立审核先从修复契约抽取基准、分档、尾部上限、转录及事件要求，再对照实现与测试。初审发现最后一个候选可能不足目标仍被发送，以及第二次请求准备期间取消可能留下未结算摘要。两项修复后均已独立复核，阻塞项为零。
+| 编号 | 契约项 | 判定 | 代码 / 测试证据（`file:line`） |
+|---|---|---|---|
+| C1 | 触发点与依赖注入（Step P1，B6 + P2-1） | ✅ | `packages/opencode/src/session/prompt.ts:1536-1561` 仅在 compaction task arm 返回 `continue` 时注入一次，提供 `Session`/`Agent`/`FSUtil`/`Config`/`Todo`/`Skill` 六项服务；`SessionPrompt.node`（`:2418-2450`）已声明 `Todo.node`、`Skill.node`。回归：`prompt.test.ts`（`enabled=false` 与 `Todo.Service` 两用例）。 |
+| C2 | 溢出压缩与恢复预算协调（P1-2） | ✅ | `packages/opencode/src/session/compaction.ts:426-435` 扣留 `summaryReserve`；`prompt.ts:1538-1551,2502-2509` 按主模型剩余 headroom 计算 `maxBudgetTokens`（`restorationBudgetCap`）传入 `restoration.ts:422-447` 封顶 `budget_tokens`。回归：`prompt.test.ts` 紧窗口 46k 溢出恢复用例。 |
+| C3 | 未回答批次保护边界（P1-1 + P2-2） | ✅ | `prompt.ts:2471-2500` `pendingInputStart` 仅在 `!row.info.error && row.info.finish && !["tool-calls","unknown"].includes(row.info.finish)` 中断回溯；`prompt.ts:1839-1850` 413 拒绝分支先删空 `handle.message` 再落 marker。回归：`prompt.test.ts` `finish: "error"` / `finish: "tool-calls"` / `summary.n` 精确性用例。 |
+| C4 | 载体选择与 `write` 缓存失效（P2-3） | ✅ | `packages/opencode/src/session/restoration.ts:489-493` 排除未结算 marker 作为 carrier；`restoration.ts:98-99` 在 `edit` 与 `write` 时清除 `retainedFileVersions`。回归：`restoration.test.ts` 两项专项回归。 |
+| C5 | 磁盘 skill 读前 `stat` 与去重优先（P2-4） | ✅ | `restoration.ts:218-230` 对磁盘 `SKILL.md` 先 `stat` 校验大小；`restoration.ts:190-290` 允许 `retainedVersion` 命中文件返回 `skipped-duplicate` 而不被 `max_files`/预算耗尽误标 `reference`；`restoration.ts:520-523` 与 `external-directory.ts:30-33` 统一 POSIX 分隔符。回归：`restoration.test.ts` 两项回归。 |
+| C6 | Step P2–P8 全流程与 G4 退役语义 | ✅ | `restoration.ts:449-567` 显式标注 `Step P2`～`Step P8`；写入前就地标记旧 sentinel `ignored: true`，保证每上下文语义有效恢复块 ≤ 1；`message-v2.ts:615,634` 防重复摘要覆盖。 |
+| C7 | 测试 Oracle 真实性与全量回归 | ✅ | `compaction.test.ts:2886-2980` 三连续压缩每轮均建真实 marker 并经 `filterCompactedEffect`；`pbt-render-materials.test.ts:37-73` 修正 `## Files` 精确切片、精确契约上界 `B + max(128,min(2000,B))` 与 `budget_tokens: 0 → undefined`。 |
+| C8 | 首轮事前 `expectations.md` 缺失 | ⚠️ | 历史流程偏离，已在 `expectations.md` 与 `decisions.md` 记录接受，不追认。 |
 
-- 读取数值缺口优先。无数值时用同模型成功输入（含缓存）及本地估值差；旧会话、其他模型和没有样本分别有回归。
-- 档位以首次输入为基准，整组重放成本单独受限。两组性质测试各 500 次，覆盖取整、整组跨档、候选单调且互异以及上限。
-- 在真实 Session/processor 上注入 provider 超限，检查准确的消息分组、迟到输入顺序、成功/最终失败/取消的摘要行和错误事件。普通 prompt 的成功样本通过本机 HTTP 测试服务验证。
-
-## 2026-11-19 恢复材料的最终投影
-
-本轮独立审核先将旧实现的反例固化，再从最终模型请求或真实进程状态复验。状态 PBT 逐轮验证两份文件的当前版本；包含普通压缩、重放、停止使用旧恢复块。当前授权由 agent、会话及本次工具可见性共同约束。不可访问的历史路径只影响自身，max_files 之外的正文不消耗其他材料预算。测试对照 provider 可见历史与实际磁盘版本；额外验证内建 skill、普通用户文本标记和长 missing reason。 验证与保留项汇总见 [本轮修复方案](../../fixes/runtime-fix-pr60-review.md)。
-
-## 2026-11-20 首次成功可见时的保留区
-
-独立审查使用真实 processor，在 step-finish 已写入但摘要处理尚未返回时另读数据库；旧实现为 0/3，新实现为 3/3。混合新旧格式的生成测试、不写回原库、跨页与跨多次压缩、fork 和晚到消息均核对实际 ID 和模型请求。复审发现的媒体视图回退、多个未回答用户和 usage→413 组合丢输入均有回归。见[契约与验证](../../fixes/session-fix-summary-retained-count.md)。
+完整收敛记录见 [docs/fixes/runtime-fix-pr60-audit-convergence.md](../../fixes/runtime-fix-pr60-audit-convergence.md)。

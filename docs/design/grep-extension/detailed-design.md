@@ -49,15 +49,23 @@ export interface GrepInput {
 }
 ```
 
-**core 返回**（按 mode）：
+**core 返回**（判别联合 `GrepResult`）：
 
 ```ts
-content: readonly Match[]                                     // 不变（Match 含 context 行 → 见 Row）
-files_with_matches: readonly string[]                          // 相对路径
-count: readonly { path: string; count: number }[]
+export interface GrepRow {
+  readonly path: string
+  readonly line: number
+  readonly text: string        // 已剥离行尾 \r?\n 且按 2,000 UTF-16 单元安全截断
+  readonly context: boolean
+}
+
+export type GrepResult =
+  | { readonly mode: "content"; readonly rows: readonly GrepRow[]; readonly hasMore: boolean; readonly total: number }
+  | { readonly mode: "files_with_matches"; readonly files: readonly string[]; readonly hasMore: boolean; readonly total: number }
+  | { readonly mode: "count"; readonly counts: readonly { readonly path: string; readonly count: number }[]; readonly hasMore: boolean; readonly total: number }
 ```
 
-content + context 时 `Match` 增加 `context?: boolean`（该行是否上下文行；渲染据此选 `:`/`-` 前缀）。**决策**：不引入独立的 ContextRow 类型，context 行复用 Match 形态 + 标志位（避免工具层联合类型展开；`Match.context` 为可选字段，无消费方时无害）。
+`RawMatch` 的 `path` 与 `lines` 统一使用 `RgText`（`{ text: string } | { bytes: string }`），经 `decodeRgText` 将 base64 字节做非致命 UTF-8 解码，确保非 UTF-8 `match` 与 `context` 行在 `content` 模式与 `files_with_matches`/`count` 同样可用。`content` 模式流元素类型为 `ContentStreamRow = RawRow | { readonly end: true }`。
 
 **tool schema 扩展**（全 optional，`Schema.optional` + annotate 描述）：
 
@@ -83,18 +91,23 @@ head_limit: PositiveInt（默认 100）
      - **`context` 的展开（工具层，2026-10-18 复审核复意见 B4 修正）**：`before = params.before ?? params.context ?? 0`、`after = params.after ?? params.context ?? 0`——`context` 是双侧简写，显式单侧参数逐侧覆盖简写（`{context: 3, after: 1}` ⇒ before=3, after=1）。服务层收到的已是展开后的 `before`/`after`，从不接收 `context` 本身（rg 也没有 `-C` 之外的语义需求：`-C n` ≡ `-B n -A n`）
      - 收尾：`--` + pattern + `file ?? "."`
   2. parse 按 mode 分派：
-     - content：现 RawMatch 解析扩展——接受 `type: "match" | "context"`（同一 data shape），产出 `{ ...match.data, context: type === "context" }`
-     - files：行 → 相对路径字符串（同 glob 的归一化）
-     - count：行 → `path:count`；**单文件目标时裸数字** → path 取 `input.file`，count 取数字
-  3. [已被下文 2026-11-19/21 的流式窗口替代] 窗口切片（offset）：run 的输入扩展 `offset`；`Stream.take(limit + offset + 1)` → `rows.length > limit + offset` ⇒ hasMore 且 `items = rows.slice(offset, offset + limit)`；`rows.length <= offset` ⇒ `items = []`（越界）且 hasMore=false
-  4. [已被下文按文件及行号选择的窗口替代] content + context 的窗口计数：切片计数**按 match 记录**而非原始行——实现为 parse 后的有状态 filter：维护 `matchesSeen`；match 记录使计数 +1，超过 `limit + offset` 后丢弃该记录及后续（首个被排除 match 的前导 context 一并丢弃）；context 记录在 `matchesSeen >= 1` 后保留（附着于已计入的 match）。**已知边界**（显式接受）：rg 的 context 去重可能使窗口边界处的 match 丢失一侧上下文行——match 本身永不丢失
-  5. 退出覆盖：三模式共用 run 的全部退出（正常/exit1 空/exit2 非法表达式/其他失败）
-  6. 循环刻画：流式有限处理；`matchesSeen` 单调递增 → 终止
+     - content：`parseJsonLine`（基于 `Schema.UnknownFromJsonString`）解析每行 JSON；`type === "end"` 产出 `{ end: true }`；`type === "match" | "context"` 经 `RawMatch` + `decodeRgText` 解码产出 `RawRow`（`context` 行解析失败降级丢弃，`match` 行结构损坏抛 `Ripgrep.Error`）。`oversizedRecord` 使用 O(1) `line.startsWith('{"type":"context",')` 识别超 64 KiB 的上下文行并丢弃，不在数十 MB 的 match 行上扫描正则。
+     - files：行 → 经 `normalizeEntryPath`（仅在 `win32` 替换反斜杠，POSIX 保留字面 `\`）产出相对路径。
+     - count：行 → 反向查 `:` 拆出 `path` 与 `count`，校验 `Number.isInteger(count) && count >= 0`；单文件目标时裸数字回退 `input.file`。
+  3. 流式跳过与有界窗口（Step P7 / Step P8）：
+     - `files_with_matches` / `count`：`run` 在流上计数跳过前 `offset` 条，保留最多 `limit` 条，见第 `offset + limit + 1` 条置 `hasMore = true` 并立即停止流。
+     - `content`：`contentPage(offset, limit, before, after)` 维护 `rows`、`pending`（至多 `before` 条同文件前导上下文）、`last`（最后收录的 match）、`seen` 与 `hasMore`：
+       - 行文本先剥离行尾 `\r?\n` 再截断至 2,000 字符（保 UTF-16 代理对），避免写入 `Truncate.output` 时每行被计成 2 行。
+       - 收到 `{ end: true }`：若已 `hasMore` 立即返回 `true` 停流（当前文件已完结，不再读取后续文件）；否则清空 `pending` 继续。
+       - 收到 `context` 行：若贴合 `last`（同文件且 `0 < row.line - last.line <= after`）则入 `rows`，并在 `hasMore && row.line === last.line + after` 时立即返回 `true` 停流；否则若窗口未满且 `before > 0` 则按同文件与 `before` 窗口保留到 `pending`。
+       - 收到 `match` 行：`seen++`；若 `seen <= offset` 仅过滤 `pending`；若 `seen <= offset + limit` 则把同文件 `0 < row.line - item.line <= before` 的 `pending` 与本 match 一起入 `rows` 并更新 `last`；若 `seen > offset + limit` 置 `hasMore = true`，若无需继续等后文（`!last || after === 0 || row.path !== last.path || row.line >= last.line + after`）立即返回 `true` 停流。
+  4. 退出覆盖：三模式共用 `run` 的退出处理（exit 0 正常 / exit 1 空 / exit 2 非法表达式 → `InvalidPatternError` / 提前停流中断子进程 / 其他失败）。
+  5. 循环刻画：`run` 沿有限的 `rg` 输出流消费，每条记录使已消费字节严格递增；`hasMore` 收齐最后必需 `after` 上下文或遇到文件 `end` 时提前中断子进程，终止显然。
 - **正确性论证**（non-trivial）：
-  - 前置：input 经工具层校验；rg 语义如 §2 核实
-  - [历史方案的论证，现行论证见下文 2026-11-21] args 展开守卫保证缺省参数时 args 与现状逐项一致 ⇒ I1（字节兼容）。窗口切片：`take(limit+offset+1)` 使「是否还有更多」可由行数判定（>limit+offset ⇒ 有余量）——条目级（files/count 天然条目；content 按 match 计数）⇒ 三态结局可判定 ⇒ G3。context 的有状态过滤：matchesSeen 只在 match 记录上递增 ⇒ offset/limit 语义以 match 为单位（架构决策）⇒ G2 的上下文行跟随 match 且不跨 match 计数
-  - 后置：三模式各返回声明形态；InvalidPattern 错误通道不变
-  - 副作用论证：无新副作用（进程执行既有）
+  - 前置：`input` 经工具层校验（`limit >= 1`、`offset >= 0`、`0 <= before,after <= 10`）；`rg --sort=path` 按稳定路径序输出，文件内行号严格递增。
+  - 论证：`seen` 仅在非 context 的 `match` 记录上递增，因此 `rows` 中的非 context 行严格等于 `matches[offset..offset+limit)`；每条入页的 context 行都满足同文件且与某个已入页 match 行距在 `[1, before]` 或 `[1, after]` 内；当 `offset >= matches.length` 时 `last` 恒为 `undefined`，不会收集任何尾部 context 行；当 `hasMore` 为真时，若末条已收录 match 已拿满 `after` 行或所在文件收到 `{"type":"end"}`，函数立刻返回 `true` 停流，不再读取后续文件（从而不会被后续无关文件的超 64 KiB 记录击穿）。
+  - 后置：三模式各返回声明形态；`hasMore === true` 时 `total === offset + limit + 1`（下界），EOF 时 `total` 为精确总数；`InvalidPatternError` 通道不变。
+  - 副作用论证：只读子进程执行与提前终止，无文件写入。
 
 ### 5.2 tool：schema 与校验
 
@@ -107,15 +120,17 @@ head_limit: PositiveInt（默认 100）
 
 ### 5.3 tool：渲染（分模式）
 
-- **content（无 context）**：现格式不变（`Found N matches…` / `path:` / `  Line X: text`）
-- **content（有 context）**：行内前缀按 `context` 标志选 `:`/`-`：`  Line 4: matched` / `  Line 3- context`
-- **files_with_matches**：每文件一行路径；头部 `Found N files`
-- **count**：每行 `path: count matches`；头部 `Found N files with M total matches`（总数 = Σcount）
-- **三态尾部**（三模式一致）：
-  - hasMore → `(more matches available; increase offset to N)`
-  - 越界（items 空 且 offset > 0）→ `No matches at offset ${offset} (total ${total})`——与无匹配区分
-  - 无匹配（offset=0）→ 现状 `No files found`
-- metadata：`{ matches, truncated, output_mode, offset, head_limit }`（matches 语义按模式：匹配行数/文件数/文件数）
+- **content（无 context）**：`Found N matches…` / `path:` / `  Line X: text`；有分页或 `hasMore` 时附 `Showing matches N-M (offset O, limit L)`。
+- **content（有 context）**：行内前缀按 `context` 标志选 `:`/`-`：`  Line 4: matched` / `  Line 3- context`。
+- **files_with_matches**：每文件一行绝对路径；头部 `Found N files`（`hasMore` 时标 `at least`）；`offset > 0 || hasMore` 时加 `Showing files N-M (offset O, limit L)`。
+- **count**：每行 `path: count matches`；头部 `Found N files (M matches on this page)` + 分页范围行。
+- **三态尾部与截断顺序**（三模式一致）：
+  - 先对单页主体调用 `trunc.output(body)` 保护字节/行预算，再拼接分页续页提示：
+    - `hasMore && !page.truncated` → `(more results available; increase offset to N)`
+    - `hasMore && page.truncated` → `(Note: the saved file contains only this page of results; more results available; increase offset to N)`（既不丢失翻页指引，也不误导模型以为保存文件含全量跨页结果）
+  - 越界（本页为空且 `offset > 0`）→ `No ${unit} at offset ${offset} (total ${unit}: ${total})`（`content` 用 `matches`，`files_with_matches`/`count` 用 `files`）
+  - 无匹配（`offset === 0`）→ `No files found`
+- metadata：`{ matches, truncated, output_mode, offset, head_limit, ...(hasMore ? { total_lower_bound } : { total }), ...(page.truncated ? { outputPath } : {}) }`。
 
 ### 5.4 测试（`test/tool/grep.test.ts` 扩展）
 

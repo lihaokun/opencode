@@ -1,12 +1,22 @@
-# Contract Audit Report — grepext-1-search-params（二轮修复后回填）
+# Contract Audit Report — `grepext-1-search-params`
 
-> 状态：由 PR #60 二轮审核（2026-11-05）驱动回填。本报告按 workflow §6.5 路径 B 的产物结构记录，但**时序声明**：首轮实施未按 §6.2 事前产出 expectations（已在 expectations.md 顶部声明违例）；本报告与 decisions.md 是二轮修复后（commit 见 expectations.md 引用）整理的对照结论，不冒称事前独立审。
+> 状态：2026-11-24 独立审核并收敛修复后最终核对（§6.5 路径 B）。
+> **时序声明**：首轮实施未按 §6.2 事前产出 `expectations.md`（已在 `expectations.md` 顶部记录流程偏离，不追认）。以下核对覆盖 2026-11-19～11-24 全部变更，并在真实本地 `rg` 二进制下全量运行验证。
 
-## 结论
+## 1. 结论（§6.6 退出标准）
 
-- 二轮审核（reviewer 实测反例 + 代码对照）发现的全部 ❌ 项已在 HEAD 修复并补回归测试；修复明细见 PR #60 二轮修复 commits 与 devlog `docs/devlog/2026-11-05-pr60-second-review-round.md`。
-- 路径 A（机械化检查）状态：**N/A**——本 fork 尚未自备 scripts/contract_audit 检查器（JSON Schema 校验 / Step 注释 grep / 共享枚举 import 检查）。Step Pn 注释已补（本轮 III.5），待检查器接入后即可 grep 校验。跟踪：暂无 issue，接入条件=首个下游项目需要。
+- **Critical / Unresolved**：**0 critical / 0 unresolved**（本轮独立审核检出的 P1-8、P1-9、P1-10、P2-13a～d 及 PBT Oracle 缺口均已修复并补回归测试）。
+- **路径 A（机械检查）**：`Step P1–P9` 注释全部就位（`grep.ts:12,63,65,78,90,119,136`、`ripgrep.ts:174,390`）；`bun typecheck` 四包通过；`git diff --check` 零报错。验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。
 
-## 2026-11-19 分页的文件及上下文归属
+## 2. 路径 B 逐项核对表
 
-本轮独立审核先将旧实现的反例固化，再从最终模型请求或真实进程状态复验。真实 rg 小目录测试生成多个文件、相隔命中、before/after 和分页；额外验证相邻命中共享前文、非 UTF-8 辅助行、深 offset、结果字节预算及下一页或全文入口。已复核 61,200 个窗口。实现 P7、P8 对应流式计数和上下文选择；固定路径排序适用于全部模式。 验证与保留项汇总见 [本轮修复方案](../../fixes/runtime-fix-pr60-review.md)。
+| 编号 | 契约项 | 判定 | 代码 / 测试证据（`file:line`） |
+|---|---|---|---|
+| G1 | `hasMore` 后提前停流（P1-8） | ✅ | `packages/core/src/ripgrep.ts:420,468-503` 传递 rg `{"type":"end"}` 事件，`contentPage` 在 `hasMore` 且收齐 `last.line + after` 或遇到 `{ end: true }` 时立即返回 `true` 停流。回归：`grep.test.ts` 后续文件 80 KiB 毒丸行测试。 |
+| G2 | 截断与续页提示顺序（P1-9） | ✅ | `packages/opencode/src/tool/grep.ts:154-179` 先对单页主体调用 `trunc.output(body)` 再拼接续页提示，`page.truncated && result.hasMore` 时附加单页保存声明与 `increase offset`。回归：`grep.test.ts`。 |
+| G3 | 非 UTF-8 `match` 行解码（P1-10） | ✅ | `packages/core/src/ripgrep.ts:34-65,421-435` 以 `RgText`（`{ text } \| { bytes }`）+ `decodeRgText` 统一解码 `match` 与 `context` 行，并用 `Schema.UnknownFromJsonString` 替代手写 `JSON.parse`。回归：`grep.test.ts` `0xFF` match 行测试。 |
+| G4 | 行尾换行剥离、页头、单位与 O(1) 过滤（P2-13） | ✅ | `ripgrep.ts:30` `oversizedRecord` 改为 O(1) `startsWith`；`ripgrep.ts:465` 剥离 `\r?\n` 避免行预算减半；`ripgrep.ts:360-367` 校验 `count` 非负整数；`grep.ts:172-203` 修正 `count` 越界单位为 `files` 并为 `files_with_matches` 补 `Showing files` 头。回归：`grep.test.ts`（1,200 短行、页头与越界单位用例）。 |
+| G5 | 多文件 + `before`/`after` 上下文 PBT | ✅ | `test/tool/pbt-grep-pagination.test.ts:16-103` 扩展为多文件、多 `before`/`after` 组合并断言每条入页 context 行的文件与行距归属（400 runs × 4 properties）。 |
+| G6 | 首轮事前 `expectations.md` 缺失 | ⚠️ | 历史流程偏离，已在 `expectations.md` 与 `decisions.md` 记录接受，不追认。 |
+
+完整收敛记录见 [docs/fixes/runtime-fix-pr60-audit-convergence.md](../../fixes/runtime-fix-pr60-audit-convergence.md)。

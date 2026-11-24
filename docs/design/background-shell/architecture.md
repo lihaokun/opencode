@@ -89,8 +89,8 @@ BackgroundJob settle（status: completed/error/cancelled + exit code + 输出尾
 
 ## 5. 接口规约（§3.3）
 
-**接口：bash 工具 → BackgroundJob**：start 的 `run` Effect 由 shell 进程句柄构造（等待退出 + 累计输出）；cancel/wait 语义由注册表定义。
-**接口：shell_output/shell_kill → BackgroundJob**：get/cancel 直通；会话过滤（只看本会话启动的任务）在工具层。
+**接口：bash 工具 → BackgroundJob**：start 的 `run` Effect 由 shell 进程句柄构造（等待退出 + 累计输出）；`run_in_background: true` 在解析/ask 前后与 `backgroundRun` 入口检查 `ctx.abort.aborted`，防止已取消调用启动孤儿进程；cancel/wait 语义由注册表定义（`BackgroundJob.cancel` 先完成 `Scope.close` 再解析 `done`，确保调用方/等待方返回时进程清理 finalizer 已完成）。
+**接口：shell_output/shell_kill → BackgroundJob**：get/cancel 直通；会话过滤与类型校验在工具层；`Permission.disabled` 将 `shell_output` 与 `shell_kill` 别名为 `bash`（与 `agent_status → agent_list` 同构），保证 `explore` 等允许 `bash` 的子代理可见二者，且禁用 `bash` 时一并隐藏二者。
 **调用方责任**：模型在后台任务运行期间不得假设其影响已生效（输出/退出码以通知或 shell_output 为准——写入工具描述）。
 
 ## 6. 关键设计决策
@@ -140,4 +140,4 @@ BackgroundJob settle（status: completed/error/cancelled + exit code + 输出尾
 
 与前台 bash 一样，任务跟踪启动的 shell 及其输出流。取消仍在运行的任务会向其进程组发 TERM，超期升级 KILL，包含在 TERM 之后领头 shell 已退出的情况。程序若自行启动重定向 stdio 的后台工作进程并成功退出，shell 任务可完成；其后 shell_kill 返回终态。已脱离进程组的服务也不属于此句柄。要用任务句柄观察和停止一个服务，应以前台模式启动该服务、由工具将其放入后台。
 
-Session 停止同时中断本轮 runner 和已登记任务，再在两者收尾后重读注册表，直到所属会话及已发现的子会话都无运行任务。后台启动回执在配置的字节、行数上限内首先显示 task_id；即使文本上限容不下完整 ID，metadata 始终携带它。通知只读投递目标的身份，显式默认 variant 不会触发 agent variant 回退。
+Session 停止同时中断本轮 runner、已登记任务及已被后台 shell/`agent_send` 唤醒的活跃后代会话 runner，再在每批收尾后重读注册表并迭代直至无运行任务与活跃后代 runner；`Session.remove` 与 HTTP `DELETE /session/:id` 同步走子代理树级联取消（HTTP handler 先调用 `promptSvc.cancel` 再删库）。后台启动回执在配置的字节、行数上限内首先显示 task_id；即使文本上限容不下完整 ID，metadata 始终携带它。通知只读投递目标的身份，显式默认 variant 不会触发 agent variant 回退。

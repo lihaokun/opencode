@@ -36,15 +36,15 @@
 
 ## 4. 流程步骤（机械化）
 
-- P1 权限 ask（与同步路径共用，启动时一次）
+- P1 权限 ask（与同步路径共用，启动时一次）；后台路径在解析/ask 前后与 `backgroundRun` 入口检查 `ctx.abort.aborted`
 - P2 `run_in_background === true` 分支守卫（false/缺省 → 同步路径逐字节不变）
-- P3 建 `shellTasks` 条目（buffer 空，有界尾部 200k chars）
+- P3 建 `shellTasks` 条目（buffer 空，有界尾部 200k chars）；`background.start` 失败时经 `Effect.onError` 清理条目
 - P4 `BackgroundJob.start`（job scope fork；`metadata: { sessionId }`）
-- P5 工具立即返回 task_id + 指引文本
-- P6 run 内：spawn → 流累积（appendCapped）→ exitCode await
-- P7 run 内末尾：完成通知 deliverAsync（`[shell task finished] <task_id> <command> · <status>` + 尾部）→ `Effect.ignore`
-- P8 run 结算：`shellTasks.delete`（2026-10-20 独立审 ❌-3 修复：原实现 delete 在 run body 内，中断路被跳过、条目按取消次数泄漏；已改 `Effect.ensuring` 三路均达）
-- P9 会话级 cancel 级联经 `metadata.sessionId` 命中 shell job（agent_stop / runState.cancel）
+- P5 工具立即返回有界回执（首行独立 task_id + 指引文本；metadata 始终携带 `task_id` / `status`）
+- P6 run 内：spawn → 流累积（appendCapped）→ exitCode await；失败错误经 `errorPreview` 单行/UTF-16 安全截断
+- P7 run 内末尾：完成通知经 `ops.deliverAsync(..., "current")` 投递，非中断失败由 `Effect.catchCauseIf` 记警告吸收（不吞中断）
+- P8 run 结算：`shellTasks.delete` 挂 `Effect.ensuring` 三路均达
+- P9 会话级 cancel 级联经 `metadata.sessionId` 与 `agent` 委派图（含已结算节点）循环终止所有归属后台任务及被唤醒的活跃后代 runner；`Session.remove` 与 HTTP `DELETE /session/:id` 保持一致级联
 
 ## 5. 行为契约（语义）
 
@@ -79,9 +79,10 @@
 
 ## 9. 安全/副作用契约
 
-- 权限沿用 bash 启动时 ask，无新权限键
+- 权限沿用 bash 启动时 ask，无新权限键；`Permission.disabled` 将 `shell_output`/`shell_kill` 别名为 `bash`，保证 `explore` 可见且禁用 `bash` 时一并隐藏
 - 进程为 server 子进程（非持久化；重启丢失——与 BackgroundJob 家族一致）
 - 通知只投递属主会话（`ctx.sessionID`）
+- `BackgroundJob.cancel` 先完成 `Scope.close` 再解析 `done`，保证取消返回时进程清理已完成
 
 ## 10. 跨实现一致性
 
@@ -101,6 +102,6 @@ N/A——单实现（V1 tool 层）；ZCode 契约为参照非对齐目标（架
 
 ### 本轮 Step 5 的机械验证
 
-shell-background.test.ts、run-state.test.ts 与 CLI 的真实进程测试验证启动、停止、通知和输出。独立复审与未覆盖范围见 [本轮修复记录](../../fixes/runtime-fix-pr60-boundary-regressions.md)。本地仓库没有通用 contract_audit 生成器。本子计划的功能与合并验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。
+`test/tool/shell-background.test.ts`、`test/session/session.test.ts`、`test/session/prompt.test.ts`、`test/permission/next.test.ts` 与 `packages/core/test/background-job.test.ts` 覆盖后台启动、续读、终止、取消级联、后代 runner 中断、权限别名与 Scope 清理顺序。收敛修复与完整核销见 [PR #60 独立审核收敛修复记录](../../fixes/runtime-fix-pr60-audit-convergence.md)。本地仓库没有通用 contract_audit 生成器。本子计划的功能与合并验收由 [#46](https://github.com/lihaokun/opencode/issues/46) 与 [PR #60](https://github.com/lihaokun/opencode/pull/60) 跟踪。
 
 父会话的取消遍历所有已登记的 agent 委派关系，包括已结算的中间节点。只有仍在运行的所属任务会被取消；已完成的委派保留终态，其他会话的任务继续执行。
