@@ -31,9 +31,10 @@ const oversizedRecord = (line: string): Effect.Effect<boolean, Error> => {
   return Effect.fail(failure(`Ripgrep JSON record exceeded ${MAX_RECORD_BYTES} bytes`))
 }
 
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: false })
 const RgText = Schema.Union([Schema.Struct({ text: Schema.String }), Schema.Struct({ bytes: Schema.String })])
 const decodeRgText = (value: Schema.Schema.Type<typeof RgText>) =>
-  "text" in value ? value.text : new TextDecoder("utf-8", { fatal: false }).decode(Buffer.from(value.bytes, "base64"))
+  "text" in value ? value.text : UTF8_DECODER.decode(Buffer.from(value.bytes, "base64"))
 
 const parseJsonLine = (line: string): Effect.Effect<unknown, Error> =>
   oversizedRecord(line).pipe(
@@ -356,8 +357,10 @@ const layer = Layer.effect(
               if (bare && input.file) return Effect.succeed({ path: normalizeEntryPath(input.file), count: Number(bare[1]) })
               const index = line.lastIndexOf(":")
               if (index === -1) return Effect.fail(failure(`Invalid ripgrep count output: ${line}`))
-              const count = Number(line.slice(index + 1))
-              if (!Number.isInteger(count) || count < 0) return Effect.fail(failure(`Invalid ripgrep count output: ${line}`))
+              const rawCount = line.slice(index + 1)
+              if (!/^\d+$/u.test(rawCount)) return Effect.fail(failure(`Invalid ripgrep count output: ${line}`))
+              const count = Number(rawCount)
+              if (!Number.isSafeInteger(count)) return Effect.fail(failure(`Invalid ripgrep count output: ${line}`))
               return Effect.succeed({
                 path: normalizeEntryPath(line.slice(0, index)),
                 count,

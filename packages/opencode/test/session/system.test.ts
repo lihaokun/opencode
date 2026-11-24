@@ -135,11 +135,11 @@ describe("session.system", () => {
       { model: { providerID: "moonshotai", api: { id: "k3" } }, template: PROMPT_KIMI },
       { model: { api: { id: "anything-else" } }, template: PROMPT_DEFAULT },
     ] as { model: Provider.Model; template: string }[]
-    for (const { model, template } of cases) {
-      const [routed, shared] = SystemPrompt.systemSections(model)
-      expect(routed).toBe(template)
+    for (const item of cases) {
+      const [routed, shared] = SystemPrompt.systemSections(item.model)
+      expect(routed).toBe(item.template)
       expect(shared.startsWith("# Working agreement")).toBe(true)
-      expect(template).not.toContain("# Working agreement")
+      expect(item.template).not.toContain("# Working agreement")
     }
   })
 
@@ -150,6 +150,7 @@ describe("session.system", () => {
       expect(prompt).not.toContain("just stop")
       expect(prompt).not.toContain("DO NOT ADD ***ANY***")
       expect(prompt).not.toContain("prefer to use the agent tool")
+      expect(prompt).not.toContain("# Code style")
       expect(prompt).toContain("Do not poll or ask an agent whether it has finished")
     }
   })

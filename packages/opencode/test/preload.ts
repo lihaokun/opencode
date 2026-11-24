@@ -103,6 +103,10 @@ if (startedWithProxy) {
   process.env["no_proxy"] = "*"
   process.env["NO_PROXY"] = "*"
 }
+if (!startedWithProxy) {
+  delete process.env["no_proxy"]
+  delete process.env["NO_PROXY"]
+}
 
 // Use in-memory sqlite
 process.env["OPENCODE_DB"] = ":memory:"

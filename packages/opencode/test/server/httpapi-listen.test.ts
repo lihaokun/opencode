@@ -226,7 +226,7 @@ describe("HttpApi Server.listen", () => {
     }
   })
 
-  testPty("stop(true) is safe when called concurrently and repeatedly", async () => {
+  testPtyRealListener("stop(true) is safe when called concurrently and repeatedly", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const listener = await startListener()
     let stopped = false
@@ -246,7 +246,7 @@ describe("HttpApi Server.listen", () => {
     }
   })
 
-  testPty("stop(true) can force a graceful stop already in progress", async () => {
+  testPtyRealListener("stop(true) can force a graceful stop already in progress", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const listener = await startListener()
     let stopped = false
@@ -267,7 +267,7 @@ describe("HttpApi Server.listen", () => {
     }
   })
 
-  testPty("graceful stop waits for an overlapping forced stop", async () => {
+  testPtyRealListener("graceful stop waits for an overlapping forced stop", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const listener = await startListener()
     let stopped = false
@@ -387,7 +387,7 @@ describe("HttpApi Server.listen", () => {
     }
   })
 
-  testPty("rejects unsafe PTY ticket mint and connect requests", async () => {
+  testPtyRealListener("rejects unsafe PTY ticket mint and connect requests", async () => {
     await using tmp = await tmpdir({ config: { formatter: false, lsp: false } })
     const listener = await startListener()
     try {
@@ -439,7 +439,7 @@ describe("HttpApi Server.listen", () => {
     }
   })
 
-  testPty("keeps PTY websocket tickets optional when server auth is disabled", async () => {
+  testPtyRealListener("keeps PTY websocket tickets optional when server auth is disabled", async () => {
     await using tmp = await tmpdir({ config: { formatter: false, lsp: false } })
     const listener = await startNoAuthListener()
     try {

@@ -191,11 +191,14 @@ export const GrepTool = Tool.define(
           }
 
           if (result.mode === "count") {
-            const totalMatches = result.counts.reduce((sum: number, item) => sum + item.count, 0)
+            const totalMatches = result.counts.reduce((sum, item) => sum + item.count, 0)
             const output = [
               offset > 0 || result.hasMore
                 ? `Found ${quantity} files. This page contains ${result.counts.length} files with ${totalMatches} matches`
                 : `Found ${quantity} files with ${totalMatches} matches`,
+              ...(offset > 0 || result.hasMore
+                ? [`Showing files ${offset + 1}-${offset + metadata.matches} (offset ${offset}, limit ${headLimit})`]
+                : []),
               ...(requestedFile
                 ? [`${requestedFile}: ${result.counts[0]?.count ?? 0} matches`]
                 : result.counts.map((item) => `${path.resolve(requested, item.path)}: ${item.count} matches`)),

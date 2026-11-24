@@ -772,11 +772,11 @@ it.instance("grep metadata and page headers distinguish observed lower bounds fr
               expect(result.metadata).toMatchObject({ total_lower_bound: offset + head_limit + 1 })
               expect(result.metadata).not.toHaveProperty("total")
               expect(result.output).toContain(`at least ${offset + head_limit + 1}`)
-            } else {
-              expect(result.metadata).toMatchObject({ total: 5 })
-              expect(result.metadata).not.toHaveProperty("total_lower_bound")
-              expect(result.output).not.toContain("at least")
+              return
             }
+            expect(result.metadata).toMatchObject({ total: 5 })
+            expect(result.metadata).not.toHaveProperty("total_lower_bound")
+            expect(result.output).not.toContain("at least")
           },
         ),
         {
@@ -883,6 +883,18 @@ it.instance("files_with_matches prints page header and count offset-beyond uses 
       ctx,
     )
     expect(filesPage.output).toContain("Showing files 2-3 (offset 1, limit 2)")
+
+    const countMid = yield* grep.execute(
+      { path: test.directory, pattern: "needle", output_mode: "count", offset: 1, head_limit: 2 },
+      ctx,
+    )
+    expect(countMid.output).toContain("Showing files 2-3 (offset 1, limit 2)")
+
+    const countFinal = yield* grep.execute(
+      { path: test.directory, pattern: "needle", output_mode: "count", offset: 2, head_limit: 2 },
+      ctx,
+    )
+    expect(countFinal.output).toContain("Showing files 3-4 (offset 2, limit 2)")
 
     const beyondCount = yield* grep.execute(
       { path: test.directory, pattern: "needle", output_mode: "count", offset: 10, head_limit: 2 },
