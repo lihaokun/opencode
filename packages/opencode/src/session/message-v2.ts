@@ -604,12 +604,22 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
               tail.push(stripPreviousUser || activeUntil.size ? withoutUserMedia(row) : row)
               activeUntil.delete(row.info.id)
               stripPreviousUser = false
-            } else {
+            }
+            if (row.info.role !== "user") {
               tail.push(row)
             }
-          } else if (row.info.role === "assistant" && row.info.summary && row.info.finish && !row.info.error) {
+          }
+          if (
+            !isOriginal(row) &&
+            row.info.role === "assistant" &&
+            row.info.summary &&
+            row.info.finish &&
+            !row.info.error &&
+            !completed.has(row.info.parentID)
+          ) {
             completed.set(row.info.parentID, row)
-          } else if (row.info.role === "user") {
+          }
+          if (!isOriginal(row) && row.info.role === "user") {
             const previous = completed.get(row.info.id)
             const part = row.parts.find((p): p is CompactionPart => p.type === "compaction")
             if (part && previous?.info.role === "assistant" && previous.info.n !== undefined) rememberMedia(part)
@@ -625,7 +635,7 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
         ...later.reverse().filter((row) => row !== summary && visibleSummary(row)),
       ]
     }
-    if (m.info.role === "assistant" && m.info.summary && m.info.finish && !m.info.error)
+    if (m.info.role === "assistant" && m.info.summary && m.info.finish && !m.info.error && !completed.has(m.info.parentID))
       completed.set(m.info.parentID, m)
     later.push(m)
   }

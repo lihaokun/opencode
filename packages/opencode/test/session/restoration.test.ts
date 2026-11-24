@@ -7,6 +7,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Cause, Effect, Exit, Layer, Option } from "effect"
+import { FastCheck } from "effect/testing"
 import { Config } from "@/config/config"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { TestConfig } from "../fixture/config"
@@ -951,5 +952,240 @@ it.instance("a failed todo lookup restores other materials and reports the unava
       .find((p): p is SessionV1.TextPart => p.type === "text" && isRestoration(p))
     expect(block?.text).toContain("keep this material")
     expect(block?.text).toContain("todo list unavailable")
+  }),
+)
+
+it.instance("an unsettled later compaction marker does not steal the restoration target", () =>
+  Effect.gen(function* () {
+    const sessions = yield* SessionNs.Service
+    const session = yield* sessions.create({})
+    const file = path.join((yield* TestInstance).directory, "settled.txt")
+    yield* seedRestorable(session.id, file, "settled-body")
+    const unsettled = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID: session.id,
+      agent: "build",
+      model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+      time: { created: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: unsettled.id,
+      sessionID: session.id,
+      type: "compaction",
+      auto: true,
+    })
+
+    yield* apply({ sessionID: session.id })
+    const rows = yield* sessions.messages({ sessionID: session.id })
+    const carrier = rows.find((m) => m.parts.some((p) => isRestoration(p)))
+    expect(carrier?.info.id).not.toBe(unsettled.id)
+    const block = carrier?.parts.find((p): p is SessionV1.TextPart => p.type === "text" && isRestoration(p))
+    expect(block?.text).toContain("settled-body")
+  }),
+)
+
+it.effect("write tool invalidates a prior complete read in retainedFileVersions", () =>
+  Effect.sync(() => {
+    const filePath = "/tmp/written.txt"
+    const body = "original"
+    const sha = new Bun.CryptoHasher("sha256").update(body).digest("hex")
+    const history = [
+      {
+        info: { role: "assistant" },
+        parts: [
+          {
+            type: "tool",
+            tool: "read",
+            state: {
+              status: "completed",
+              time: {},
+              output: "1: original",
+              metadata: {
+                display: {
+                  type: "file",
+                  path: filePath,
+                  truncated: false,
+                  lineStart: 1,
+                  lineEnd: 1,
+                  totalLines: 1,
+                  text: body,
+                  sha256: sha,
+                },
+              },
+            },
+          },
+          {
+            type: "tool",
+            tool: "write",
+            state: {
+              status: "completed",
+              time: {},
+              output: "wrote file",
+              metadata: { filepath: filePath },
+            },
+          },
+        ],
+      },
+    ] as unknown as SessionV1.WithParts[]
+    expect(retainedFileVersions(history).has(filePath)).toBe(false)
+  }),
+)
+
+it.effect("oversized disk skills are rejected via stat before reading file content", () =>
+  Effect.gen(function* () {
+    let readCalled = false
+    const materials = yield* materializeCandidates(
+      [{ kind: "skill", ref: "huge-skill", lastUseSeq: 1 }],
+      new Map(),
+      {
+        fs: {
+          stat: () => Effect.succeed({ type: "File", size: 500_000 }),
+          readFileStringSafe: () => {
+            readCalled = true
+            return Effect.succeed("should not be read")
+          },
+        } as unknown as FSUtil.Interface,
+        skill: Option.some({
+          get: () => Effect.succeed({ name: "huge-skill", location: "/tmp/huge/SKILL.md", content: "" }),
+        } as unknown as Skill.Interface),
+        todos: [],
+        cfg: { ...cfg, file_max_tokens: 100 },
+      },
+    )
+    expect(readCalled).toBe(false)
+    expect(materials[0]?.status).toBe("reference")
+    expect(materials[0]?.reason).toContain("500000 bytes")
+  }),
+)
+
+it.instance("retained-tail duplicates beyond max_files stay skipped-duplicate instead of degrading to reference", () =>
+  Effect.gen(function* () {
+    const fs = yield* FSUtil.Service
+    const dir = (yield* TestInstance).directory
+    const first = path.join(dir, "first.txt")
+    const dup = path.join(dir, "dup.txt")
+    yield* fs.writeWithDirs(first, "first-body")
+    yield* fs.writeWithDirs(dup, "same-body")
+    const versions = new Map([[dup, new Bun.CryptoHasher("sha256").update("same-body").digest("hex")]])
+    const materials = yield* materializeCandidates(
+      [
+        { kind: "file", ref: first, lastUseSeq: 2 },
+        { kind: "file", ref: dup, lastUseSeq: 1 },
+      ],
+      versions,
+      {
+        fs,
+        skill: Option.none(),
+        todos: [],
+        cfg: { ...cfg, max_files: 1 },
+      },
+    )
+    expect(materials.map((m) => m.status)).toEqual(["inlined", "skipped-duplicate"])
+  }),
+)
+
+it.effect("PBT: retainedFileVersions matches exact read/edit/write invalidation state machine", () =>
+  Effect.sync(() => {
+    const files = ["/tmp/a.ts", "/tmp/b.ts", "/tmp/c.ts"] as const
+    const opArb = FastCheck.record({
+      file: FastCheck.constantFrom(...files),
+      kind: FastCheck.constantFrom(
+        "read_full" as const,
+        "read_partial" as const,
+        "read_truncated" as const,
+        "read_compacted" as const,
+        "read_plugin_rewritten" as const,
+        "read_user_role" as const,
+        "read_hidden_error_assistant" as const,
+        "edit" as const,
+        "write" as const,
+      ),
+      body: FastCheck.constantFrom("v1", "v2\nline2", ""),
+    })
+    FastCheck.assert(
+      FastCheck.property(FastCheck.array(opArb, { maxLength: 30 }), (ops) => {
+        const expected = new Map<string, string>()
+        const messages: SessionV1.WithParts[] = []
+        for (const [idx, op] of ops.entries()) {
+          const lines = op.body === "" ? [] : op.body.split("\n")
+          const sha = new Bun.CryptoHasher("sha256").update(op.body).digest("hex")
+          const rendered =
+            lines.length === 0 ? "(End of file - total 0 lines)" : lines.map((l, i) => `${i + 1}: ${l}`).join("\n")
+          if (op.kind === "edit") {
+            expected.delete(op.file)
+            messages.push({
+              info: { role: "assistant" },
+              parts: [
+                {
+                  type: "tool",
+                  tool: "edit",
+                  state: { status: "completed", time: {}, output: "edited", metadata: { filediff: { file: op.file } } },
+                },
+              ],
+            } as unknown as SessionV1.WithParts)
+            continue
+          }
+          if (op.kind === "write") {
+            expected.delete(op.file)
+            messages.push({
+              info: { role: "assistant" },
+              parts: [
+                {
+                  type: "tool",
+                  tool: "write",
+                  state: { status: "completed", time: {}, output: "wrote", metadata: { filepath: op.file } },
+                },
+              ],
+            } as unknown as SessionV1.WithParts)
+            continue
+          }
+          const compacted = op.kind === "read_compacted"
+          const partial = op.kind === "read_partial"
+          const truncated = op.kind === "read_truncated"
+          const rewritten = op.kind === "read_plugin_rewritten"
+          const userRole = op.kind === "read_user_role"
+          const hiddenErr = op.kind === "read_hidden_error_assistant"
+          if (!userRole && !hiddenErr && !compacted) {
+            if (op.kind === "read_full") expected.set(op.file, sha)
+            else expected.delete(op.file)
+          }
+          messages.push({
+            info: userRole
+              ? { role: "user" }
+              : hiddenErr
+                ? { role: "assistant", finish: "error", error: { name: "UnknownError", data: { message: "x" } } }
+                : { role: "assistant" },
+            parts: [
+              {
+                type: "tool",
+                tool: "read",
+                state: {
+                  status: "completed",
+                  time: compacted ? { compacted: 1 + idx } : {},
+                  output: rewritten ? "plugin replaced output" : rendered,
+                  metadata: {
+                    truncated,
+                    display: {
+                      type: "file",
+                      path: op.file,
+                      truncated,
+                      lineStart: 1,
+                      lineEnd: partial ? Math.max(0, lines.length - 1) : lines.length,
+                      totalLines: partial ? lines.length + 1 : lines.length,
+                      text: op.body,
+                      sha256: sha,
+                    },
+                  },
+                },
+              },
+            ],
+          } as unknown as SessionV1.WithParts)
+        }
+        expect([...retainedFileVersions(messages).entries()]).toEqual([...expected.entries()])
+      }),
+      { seed: 600806, numRuns: 300 },
+    )
   }),
 )

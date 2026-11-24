@@ -74,7 +74,7 @@ const serialize = (message: SessionV1.WithParts) => {
         const preview = part.state.time.compacted
           ? "[Old tool result content cleared]"
           : summarizeToolText([part.state.output, ...attachments].join("\n"))
-        const saved = part.state.metadata.outputPath
+        const saved = part.state.metadata?.outputPath
         const text =
           !part.state.time.compacted && typeof saved === "string" && saved && !hasOutputPath(preview, saved)
             ? preview + "\nFull output saved to: " + saved
@@ -116,7 +116,7 @@ function completedCompactions(messages: SessionV1.WithParts[]) {
   })
 }
 
-function preserveRecentBudget(input: { cfg: ConfigV1.Info; model: Provider.Model }) {
+function preserveRecentBudget(input: { cfg: ConfigV1.Info; model: Provider.Model; outputTokenMax?: number }) {
   return (
     input.cfg.compaction?.preserve_recent_tokens ??
     Math.min(MAX_PRESERVE_RECENT_TOKENS, Math.max(MIN_PRESERVE_RECENT_TOKENS, Math.floor(usable(input) * 0.25)))
@@ -274,7 +274,10 @@ const layer = Layer.effect(
     }) {
       const limit = input.cfg.compaction?.tail_turns
       if (limit !== undefined && limit <= 0) return input.messages
-      const budget = Math.min(preserveRecentBudget({ cfg: input.cfg, model: input.model }), input.available ?? Infinity)
+      const budget = Math.min(
+        preserveRecentBudget({ cfg: input.cfg, model: input.model, outputTokenMax: flags.outputTokenMax }),
+        input.available ?? Infinity,
+      )
       const measure =
         input.available === undefined
           ? estimate
@@ -420,15 +423,16 @@ const layer = Layer.effect(
       const rawRequired = mandatory.map((row, index) =>
         input.overflow && index <= mediaEnd ? MessageV2.withoutUserMedia(row) : row,
       )
+      const usablePrimary = usable({ cfg, model: primary, outputTokenMax: flags.outputTokenMax })
       const room = budgeted
-        ? usable({ cfg, model: primary, outputTokenMax: flags.outputTokenMax }) -
+        ? usablePrimary -
           ((requestUser ?? anchor) === configUser.id ? (compactionPart?.fixed_input_tokens ?? 0) : 0) -
           estimateMessages(yield* MessageV2.toModelMessagesEffect(rawRequired, primary))
         : Infinity
-      const optionalBudget = Math.max(
-        0,
-        Math.min(room, Math.floor(usable({ cfg, model: primary, outputTokenMax: flags.outputTokenMax }) / 4)),
-      )
+      // Leave room for the summary text itself so optional tail retention does
+      // not pack the resumed request right up against usablePrimary.
+      const summaryReserve = input.overflow && budgeted ? Math.min(2_048, Math.floor(usablePrimary / 8)) : 0
+      const optionalBudget = Math.max(0, Math.min(room - summaryReserve, Math.floor(usablePrimary / 4)))
       let head = yield* select({
         messages: historyForSummary,
         cfg,
@@ -570,15 +574,14 @@ const layer = Layer.effect(
             const plan = recoveryBoundaries(budget, gap, candidates)
             let cursor = plan.next()
             while (!cursor.done && attempt.result === "compact") {
-              const { start, target } = cursor.value
-              const candidate = historyForSummary.slice(0, start)
+              const candidate = historyForSummary.slice(0, cursor.value.start)
               const stream = yield* prepare(candidate)
               const reduction = originalSize - (yield* Effect.promise(() => estimatePayload(stream.preparedPayload)))
-              if (reduction < target) {
+              if (reduction < cursor.value.target) {
                 cursor = plan.next(undefined)
                 continue
               }
-              if ((yield* replayCost(historyForSummary.slice(start))) > cap) break
+              if ((yield* replayCost(historyForSummary.slice(cursor.value.start))) > cap) break
               head = candidate
               attempt = yield* summarize(stream)
               cursor = plan.next(reduction)

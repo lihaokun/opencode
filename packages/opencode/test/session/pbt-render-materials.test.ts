@@ -6,6 +6,8 @@ import {
   restorationConfig,
   type RestorationMaterial,
 } from "../../src/session/restoration"
+import { restorationBudgetCap } from "../../src/session/prompt"
+import { estimateMessages } from "../../src/session/summary-budget"
 import { Token } from "../../src/util/token"
 
 /**
@@ -35,22 +37,28 @@ describe("PBT renderMaterials", () => {
     .map((m) => (m.status === "inlined" ? { ...m, content: m.content ?? "fallback-body" } : m)) as fc.Arbitrary<RestorationMaterial>
 
   it("the final rendered block honors max_files and budget on the OUTPUT itself", () => {
+    const allowance = Math.max(128, Math.min(2000, cfg.budget_tokens))
     fc.assert(
       fc.property(fc.array(materialArb, { maxLength: 20 }), (materials) => {
         const text = renderMaterials(materials, cfg)
-        if (!text) return materials.every((m) => m.status !== "inlined")
+        if (!text) return materials.every((m) => m.status === "skipped-duplicate")
         // Oracle over the final text, not the inputs: count FILE headings —
-        // inside the "## Files" section only, so a skill/todo heading that
-        // happens to reuse a /f/ ref is not miscounted — and the total must
-        // obey max_files (the old per-ref oracle could not catch many refs
-        // blowing past it).
-        const filesSection = text.slice(text.indexOf("## Files"), text.indexOf("## Skills") === -1 ? undefined : text.indexOf("## Skills"))
-        const fileHeadings = (filesSection.match(/^### /gm) ?? []).length
+        // inside the "## Files" section only (terminating at the next "## "
+        // section, whether Skills, Todos, or Not restored).
+        const filesStart = text.indexOf("## Files\n")
+        const filesBody =
+          filesStart === -1
+            ? ""
+            : (() => {
+                const rest = text.slice(filesStart + "## Files\n".length)
+                const nextSection = rest.search(/\n## /)
+                return nextSection === -1 ? rest : rest.slice(0, nextSection)
+              })()
+        const fileHeadings = (filesBody.match(/^### /gm) ?? []).length
         expect(fileHeadings).toBeLessThanOrEqual(cfg.max_files)
         // The whole block — headings, fences, reference lines, overflow
-        // summary — stays within budget plus the fixed framing allowance
-        // (sentinel + section titles + the capped not-restored list).
-        expect(Token.estimate(text)).toBeLessThanOrEqual(cfg.budget_tokens + 200)
+        // summary — stays within budget plus the contract allowance.
+        expect(Token.estimate(text)).toBeLessThanOrEqual(cfg.budget_tokens + allowance)
         expect(text).toContain(RESTORATION_SENTINEL)
         // Idempotent: the same input renders to the same output.
         expect(renderMaterials(materials, cfg)).toBe(text)
@@ -60,14 +68,11 @@ describe("PBT renderMaterials", () => {
     )
   })
 
-  it("zero budget renders no inlined bodies", () => {
+  it("zero budget renders undefined", () => {
     fc.assert(
       fc.property(fc.array(materialArb, { maxLength: 20 }), (materials) => {
         const tight = { ...cfg, budget_tokens: 0 }
-        const text = renderMaterials(materials, tight)
-        if (!text) return true
-        // Nothing is inlined: no fenced content sections at all.
-        expect(text).not.toMatch(/^### \/f\//gm)
+        expect(renderMaterials(materials, tight)).toBeUndefined()
         return true
       }),
       { seed: 0x2_026_10_18, numRuns: 100 },
@@ -185,5 +190,54 @@ it("charges each inline heading and fence for arbitrarily small skill bodies", (
       check,
     ),
     { seed: 60021, numRuns: 100 },
+  )
+})
+
+it("PBT: restorationBudgetCap bounds renderMaterials under /3 estimateMessages for any headroom and materials", () => {
+  const materialArb: fc.Arbitrary<RestorationMaterial> = fc
+    .record({
+      candidate: fc.record({
+        kind: fc.constantFrom("file" as const, "skill" as const, "todo" as const),
+        ref: fc.string({ minLength: 1, maxLength: 300 }).map((s) => `/f/${s.replace(/[\r\n]/g, "x")}`),
+        lastUseSeq: fc.nat(100),
+      }),
+      status: fc.constantFrom(
+        "inlined" as const,
+        "reference" as const,
+        "skipped-duplicate" as const,
+        "skipped-budget" as const,
+        "missing" as const,
+      ),
+      content: fc.option(fc.string({ minLength: 0, maxLength: 1_200 }), { nil: undefined }),
+      reason: fc.option(fc.string({ minLength: 1, maxLength: 300 }), { nil: undefined }),
+    })
+    .map((m) => (m.status === "inlined" ? { ...m, content: m.content ?? "body" } : m))
+
+  const baseCfg = restorationConfig(undefined)
+  fc.assert(
+    fc.property(
+      fc.integer({ min: -500, max: 30_000 }),
+      fc.integer({ min: -500, max: 30_000 }),
+      fc.array(materialArb, { maxLength: 35 }),
+      (h1, h2, materials) => {
+        const [lo, hi] = h1 <= h2 ? [h1, h2] : [h2, h1]
+        const capLo = restorationBudgetCap(lo)
+        const capHi = restorationBudgetCap(hi)
+        expect(capLo).toBeLessThanOrEqual(capHi)
+        expect(capLo).toBeGreaterThanOrEqual(0)
+
+        const text = renderMaterials(materials, { ...baseCfg, budget_tokens: capLo })
+        if (capLo === 0) {
+          expect(text).toBeUndefined()
+          return true
+        }
+        if (text !== undefined) {
+          const estimated = estimateMessages([{ role: "user", content: text }])
+          expect(estimated).toBeLessThanOrEqual(lo)
+        }
+        return true
+      },
+    ),
+    { seed: 600802, numRuns: 500 },
   )
 })

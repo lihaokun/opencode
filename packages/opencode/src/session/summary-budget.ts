@@ -15,8 +15,9 @@ export function estimateMessages(messages: readonly ModelMessage[]) {
           if (part.type === "text" || part.type === "reasoning") return length + part.text.length
           if (part.type === "tool-call")
             return length + part.toolName.length + (JSON.stringify(part.input)?.length ?? 0)
-          if (part.type === "tool-result") return length + part.toolName.length + JSON.stringify(part.output).length
-          return length + JSON.stringify(part).length
+          if (part.type === "tool-result")
+            return length + part.toolName.length + (JSON.stringify(part.output)?.length ?? 0)
+          return length + (JSON.stringify(part)?.length ?? 0)
         }, 0),
       )
     )

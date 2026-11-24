@@ -2885,7 +2885,7 @@ itCompaction.instance(
   () => {
     const stub = llm()
     let captured = ""
-    stub.push(reply("summary-1", (input) => (captured = JSON.stringify(input.messages))))
+    stub.push(reply("summary-1: always use pnpm", (input) => (captured = JSON.stringify(input.messages))))
     return Effect.gen(function* () {
       const test = yield* TestInstance
       const fs = yield* FSUtil.Service
@@ -2929,21 +2929,26 @@ itCompaction.instance(
           time: { start: 0, end: 1 },
         },
       })
-      yield* createSummaryCompaction(session.id)
 
-      const runCompaction = (label: string) =>
+      const runCompaction = () =>
         Effect.gen(function* () {
-          const msgs = yield* ssn.messages({ sessionID: session.id })
-          const parent = msgs.at(-1)?.info.id
-          expect(parent).toBeTruthy()
+          yield* createSummaryCompaction(session.id)
+          const msgs = yield* MessageV2.filterCompactedEffect(session.id)
+          const marker = msgs.findLast((m) => m.parts.some((p) => p.type === "compaction"))
+          expect(marker).toBeDefined()
           const procExit = yield* Effect.exit(
-            SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false }),
+            SessionCompaction.use.process({
+              parentID: marker!.info.id,
+              messages: msgs,
+              sessionID: session.id,
+              auto: false,
+            }),
           )
           expect(Exit.isFailure(procExit)).toBe(false)
           return captured
         })
 
-      const c1 = yield* runCompaction("c1")
+      const c1 = yield* runCompaction()
       expect(c1).toContain("always use pnpm")
       // the tool OUTPUT is "read spec.md"; the on-disk body (SPEC_MARKER) is
       // restored later from disk — deliberately different strings so the
@@ -2951,24 +2956,25 @@ itCompaction.instance(
       expect(c1).toContain("read spec.md")
       expect(c1).toContain("[exit code: 7]")
 
-      // Turns 2-3 + compactions: with the tiny preserve budget every
-      // compaction falls back to a full summary — the constraint re-appears in
-      // every payload, which is exactly the acceptance target (it survives
-      // three consecutive compactions). Rounds 2-3 run the REAL
-      // compaction.process (2026-11-05 III.3): the old version only wrote
-      // markers via create() and re-asserted round 1's stale capture — the
-      // stub replies were never consumed.
-      stub.push(reply("summary-2", (input) => (captured = JSON.stringify(input.messages))))
-      const u2 = yield* createUserMessage(session.id, "continue")
-      const c2 = yield* runCompaction("c2")
-      expect(c2).toContain("always use pnpm")
+      // Rounds 2-3 create real compaction markers and feed filterCompacted
+      // history into compaction.process so each round carries forward the
+      // prior summary instead of re-reading raw pre-compaction history.
+      stub.push(reply("summary-2: always use pnpm", (input) => (captured = JSON.stringify(input.messages))))
+      yield* createUserMessage(session.id, "continue")
+      const c2 = yield* runCompaction()
+      expect(c2).toContain("<prior-summary>")
+      expect(c2).toContain("summary-1: always use pnpm")
       expect(c2).toContain("continue")
+      expect(c2).not.toContain("deploy failed")
       expect(c2).not.toBe(c1)
 
-      stub.push(reply("summary-3", (input) => (captured = JSON.stringify(input.messages))))
-      const u3 = yield* createUserMessage(session.id, "wrap up")
-      const c3 = yield* runCompaction("c3")
-      expect(c3).toContain("always use pnpm")
+      stub.push(reply("summary-3: always use pnpm", (input) => (captured = JSON.stringify(input.messages))))
+      yield* createUserMessage(session.id, "wrap up")
+      const c3 = yield* runCompaction()
+      expect(c3).toContain("<prior-summary>")
+      expect(c3).toContain("summary-2: always use pnpm")
+      expect(c3).toContain("wrap up")
+      expect(c3).not.toContain("deploy failed")
       expect(c3).not.toBe(c2)
 
       // Restoration after the third compaction: the spec is re-read from disk

@@ -10,6 +10,8 @@ import { estimateMessages, estimatePayload } from "./summary-budget"
 import { SessionRestoration } from "./restoration"
 import { SessionRevert } from "./revert"
 import { Session } from "./session"
+import { Todo } from "./todo"
+import { Skill } from "@/skill"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
 
@@ -124,7 +126,7 @@ export interface Interface {
    * reading and writing in the wrong project. Both callers — the HTTP handler
    * and agent_send — go through here so neither can take half again.
    */
-  readonly deliverAsync: (input: PromptInput) => Effect.Effect<void>
+  readonly deliverAsync: (input: PromptInput, identity?: "current") => Effect.Effect<void>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -146,6 +148,8 @@ const layer = Layer.effect(
     const plugin = yield* Plugin.Service
     const commands = yield* Command.Service
     const config = yield* Config.Service
+    const todos = yield* Todo.Service
+    const skills = yield* Skill.Service
     const permission = yield* Permission.Service
     const fsys = yield* FSUtil.Service
     const mcp = yield* MCP.Service
@@ -1531,12 +1535,29 @@ const layer = Layer.effect(
             // compaction; it is not re-run per model step.
             if (result === "continue") {
               if (task.part.overflow) compactionToken = "compacted"
+              const fixedInputTokens = task.part.fixed_input_tokens ?? 0
+              const cfg = yield* config.get()
+              const usablePrimary = usable({ cfg, model, outputTokenMax: flags.outputTokenMax })
+              const maxBudgetTokens =
+                model.limit.context > 0 && usablePrimary > 0
+                  ? yield* Effect.gen(function* () {
+                      const projected = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+                        Effect.provideService(Database.Service, database),
+                      )
+                      const messagesTokens = estimateMessages(yield* MessageV2.toModelMessagesEffect(projected, model))
+                      const headroom = usablePrimary - fixedInputTokens - messagesTokens - 256
+                      return restorationBudgetCap(headroom)
+                    })
+                  : undefined
               // Step P1 (comprec-1): trigger — inject exactly once inside the
               // compaction task arm after process returns continue (B6).
-              yield* SessionRestoration.apply({ sessionID }).pipe(
+              yield* SessionRestoration.apply({ sessionID, maxBudgetTokens }).pipe(
                 Effect.provideService(Session.Service, sessions),
                 Effect.provideService(Agent.Service, agents),
                 Effect.provideService(FSUtil.Service, fsys),
+                Effect.provideService(Config.Service, config),
+                Effect.provideService(Todo.Service, todos),
+                Effect.provideService(Skill.Service, skills),
               )
             }
             if (result === "stop") break
@@ -1818,26 +1839,26 @@ const layer = Layer.effect(
             if (result === "stop") return "break" as const
             // The provider rejected the request as too long: no response finished.
             const rejected = result === "compact" && !handle.message.finish
-            if (result === "compact") {
-              if (rejected) {
-                const marker = yield* recoveryMarker()
-                if (!marker) return yield* stopForInput()
-                compactionToken = "compacted"
-                yield* compaction.create(marker)
-              } else {
-                yield* compaction.create({
-                  sessionID,
-                  agent: lastUser.agent,
-                  model: lastUser.model,
-                  auto: true,
-                  overflow: false,
-                })
-              }
+            if (rejected) {
+              const marker = yield* recoveryMarker()
+              if (!marker) return yield* stopForInput()
+              compactionToken = "compacted"
+              yield* sessions.removeMessage({ sessionID, messageID: handle.message.id })
+              yield* compaction.create(marker)
+              // Only a step whose response finished counts. One withdrawn above for
+              // compaction before sending, or rejected by the provider as too long, is
+              // not a step (fix doc session-fix-step-tail-repeat-and-agents §3.2).
+              return "continue" as const
             }
-            // Only a step whose response finished counts. One withdrawn above for
-            // compaction before sending, or rejected by the provider as too long, is
-            // not a step (fix doc session-fix-step-tail-repeat-and-agents §3.2).
-            if (rejected) return "continue" as const
+            if (result === "compact") {
+              yield* compaction.create({
+                sessionID,
+                agent: lastUser.agent,
+                model: lastUser.model,
+                auto: true,
+                overflow: false,
+              })
+            }
             const current = StepTail.signature(
               yield* MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database)),
             )
@@ -2422,6 +2443,8 @@ export const node = LayerNode.make({
     Plugin.node,
     Command.node,
     Config.node,
+    Todo.node,
+    Skill.node,
     Permission.node,
     FSUtil.node,
     MCP.node,
@@ -2446,24 +2469,43 @@ export const node = LayerNode.make({
 // An ordinary user can steer while another is waiting. Preserve the whole
 // unanswered batch; a synthetic continue can also be working for an input
 // retained by an earlier compaction. Resolve those original IDs in this view.
-function pendingInputStart(messages: SessionV1.WithParts[], current: number) {
+export function pendingInputStart(messages: SessionV1.WithParts[], current: number) {
   const marker = messages[0]?.parts.some((p) => p.type === "compaction") ? messages[0] : undefined
   const inherited = new Set<string>()
   let start = current
   for (let i = current; i >= 0; i--) {
     const row = messages[i]!
-    if (row.info.role === "assistant" && !row.info.summary && row.info.finish) break
+    if (
+      row.info.role === "assistant" &&
+      !row.info.summary &&
+      !row.info.error &&
+      row.info.finish &&
+      !["tool-calls", "unknown"].includes(row.info.finish)
+    )
+      break
     if (marker && MessageV2.compareChronology(row.info, marker.info) <= 0) break
     if (row.info.role !== "user" || !MessageV2.isOriginal(row)) continue
     const control = row.parts.find((p) => p.type === "text" && p.synthetic && p.metadata?.compaction_continue)
     if (control?.type === "text") {
       if (typeof control.metadata?.protected_from === "string") inherited.add(control.metadata.protected_from)
-    } else start = i
+      continue
+    }
+    start = i
   }
   const original = inherited.size
     ? messages.findIndex((row) => row.info.role === "user" && inherited.has(row.info.id))
     : -1
   return original >= 0 ? Math.min(start, original) : start
+}
+
+// Convert remaining /3-estimated token headroom into the largest /4 restoration
+// budget B whose rendered ceiling (B + max(128, min(2000, B))) * 4 / 3 fits.
+export function restorationBudgetCap(headroom: number) {
+  const cap4 = Math.floor((headroom * 3) / 4)
+  if (cap4 <= 128) return 0
+  if (cap4 <= 256) return cap4 - 128
+  if (cap4 <= 4000) return Math.floor(cap4 / 2)
+  return cap4 - 2000
 }
 
 /**

@@ -1179,12 +1179,10 @@ withMcpTool.instance("loop replays an MCP structuredContent into the next model 
     const replay = bodies.filter((body) => JSON.stringify(body).includes('"role":"tool"')).at(-1)
     expect(replay).toBeDefined()
     const wire = JSON.stringify(replay)
-    // The text item AND the appended structuredContent both ride the replay;
-    // "src/a.ts" appears twice — once in the appended JSON payload, once in
-    // the text item's own copy through the projection's \n\n append.
+    // Both the text item and the appended structuredContent ride the replay;
+    // "src/a.ts" appears once inside the structured JSON payload.
     expect(wire).toContain("src/a.ts")
     expect(wire).toContain("查询完成")
-    // 2 = one in the text item's replay, one in the appended structured JSON
     expect(wire.split("src/a.ts")).toHaveLength(2)
   }),
 )
@@ -6141,7 +6139,7 @@ it.instance("a child with a running background shell does not report until the s
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
-    const parent = yield* (yield* Session.Service).create({ title: "root", permission: allowAll })
+    const parent = yield* sessions.create({ title: "root", permission: allowAll })
     const child = yield* subagent(parent.id)
     yield* user(child.id, "start the watcher")
     // The child starts a background shell that outlives its run, then the run
@@ -8323,4 +8321,273 @@ withFilePlugin.instance(
       )
     }),
   30_000,
+)
+
+it.instance(
+  "overflow recovery preserves unanswered user turns across assistant finish error and tool-calls",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        compaction: { tail_turns: 0 },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const dir = (yield* TestInstance).directory
+
+      // Case 1: failed assistant (finish: "error") between two unanswered user messages.
+      const chat1 = yield* sessions.create({ title: "Error between pending users" })
+      yield* seed(chat1.id, { finish: "stop", userText: "old completed work" })
+      const u1 = yield* user(chat1.id, "first-unanswered-before-error")
+      yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        parentID: u1.id,
+        role: "assistant",
+        sessionID: chat1.id,
+        mode: "build",
+        agent: "build",
+        path: { cwd: dir, root: dir },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make("test-model"),
+        providerID: ProviderV2.ID.make("test"),
+        finish: "error",
+        error: new NamedError.Unknown({ message: "provider failed" }).toObject(),
+        time: { created: Date.now(), completed: Date.now() },
+      })
+      const u2 = yield* user(chat1.id, "second-user-after-error")
+      yield* llm.error(413, { error: { message: "request entity too large" } })
+      yield* llm.text("Summary of old completed work")
+      yield* llm.text("Recovered both pending inputs")
+
+      const res1 = yield* prompt.loop({ sessionID: chat1.id })
+      expect(res1.info).toMatchObject({ finish: "stop" })
+      const view1 = yield* MessageV2.filterCompactedEffect(chat1.id)
+      expect(view1[0]?.parts[0]).toMatchObject({
+        type: "compaction",
+        protected_from: u1.id,
+        request_user_id: u2.id,
+      })
+      const hits1 = yield* llm.hits
+      expect(JSON.stringify(hits1.at(-1)?.body)).toContain("first-unanswered-before-error")
+      expect(JSON.stringify(hits1.at(-1)?.body)).toContain("second-user-after-error")
+
+      // Case 2: reactive 413 removes the zero-part rejected assistant placeholder and keeps summary.n exact.
+      const rows1 = yield* sessions.messages({ sessionID: chat1.id })
+      const summaryRow = rows1.find((r) => r.info.role === "assistant" && r.info.summary)
+      expect(summaryRow?.info.role === "assistant" && summaryRow.info.n).toBe(3)
+      const orphanAssistants = rows1.filter(
+        (r) => r.info.role === "assistant" && !r.info.summary && !r.info.finish && r.parts.length === 0,
+      )
+      expect(orphanAssistants).toHaveLength(0)
+
+      // Case 3: intermediate tool-calls step followed by steering user before 413.
+      const chat2 = yield* sessions.create({ title: "Tool-calls before steer" })
+      yield* seed(chat2.id, { finish: "stop", userText: "ancient work" })
+      const t1 = yield* user(chat2.id, "original-task-before-tool-call")
+      const toolAssistant = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        parentID: t1.id,
+        role: "assistant",
+        sessionID: chat2.id,
+        mode: "build",
+        agent: "build",
+        path: { cwd: dir, root: dir },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make("test-model"),
+        providerID: ProviderV2.ID.make("test"),
+        finish: "tool-calls",
+        time: { created: Date.now(), completed: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: toolAssistant.id,
+        sessionID: chat2.id,
+        type: "tool",
+        callID: "call_mid_turn",
+        tool: "read",
+        state: {
+          status: "completed",
+          input: { filePath: path.join(dir, "mid.txt") },
+          output: "mid-tool-output",
+          title: "mid.txt",
+          metadata: {},
+          time: { start: 1, end: 2 },
+        },
+      })
+      const t2 = yield* user(chat2.id, "steering-input-mid-turn")
+      const before2 = yield* llm.calls
+      yield* llm.error(413, { error: { message: "request entity too large" } })
+      yield* llm.text("Summary of ancient work")
+      yield* llm.text("Recovered full tool turn")
+
+      const res2 = yield* prompt.loop({ sessionID: chat2.id })
+      expect(res2.info).toMatchObject({ finish: "stop" })
+      const view2 = yield* MessageV2.filterCompactedEffect(chat2.id)
+      expect(view2[0]?.parts[0]).toMatchObject({
+        type: "compaction",
+        protected_from: t1.id,
+        request_user_id: t2.id,
+      })
+      const hits2 = (yield* llm.hits).slice(before2)
+      expect(JSON.stringify(hits2.at(-1)?.body)).toContain("original-task-before-tool-call")
+      expect(JSON.stringify(hits2.at(-1)?.body)).toContain("steering-input-mid-turn")
+    }),
+  20_000,
+)
+
+it.instance(
+  "overflow compaction caps post-compaction restoration to remaining headroom on tight context windows",
+  () =>
+    Effect.gen(function* () {
+      const { llm, dir } = yield* useServerConfig((url) => {
+        const cfg = providerCfg(url)
+        const test = cfg.provider.test
+        return {
+          ...cfg,
+          provider: {
+            ...cfg.provider,
+            test: {
+              ...test,
+              models: {
+                "test-model": {
+                  ...test.models["test-model"],
+                  limit: { context: 46_000, output: 10_000 },
+                },
+              },
+            },
+          },
+        }
+      })
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Tight context overflow" })
+
+      // Write three ~12 KiB files that would consume ~9k tokens if restored uncapped.
+      const files = ["a.txt", "b.txt", "c.txt"].map((name) => path.join(dir, name))
+      for (const file of files) yield* writeText(file, `${path.basename(file)} ` + "z".repeat(12_000))
+
+      const oldUser = yield* user(chat.id, "older history " + "h".repeat(120_000))
+      const oldAssistant = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        parentID: oldUser.id,
+        role: "assistant",
+        sessionID: chat.id,
+        mode: "build",
+        agent: "build",
+        path: { cwd: dir, root: dir },
+        cost: 0,
+        tokens: { input: 5_000, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make("test-model"),
+        providerID: ProviderV2.ID.make("test"),
+        finish: "stop",
+        time: { created: Date.now(), completed: Date.now() },
+      })
+      for (const [idx, file] of files.entries()) {
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: oldAssistant.id,
+          sessionID: chat.id,
+          type: "tool",
+          callID: `call_tight_${idx}`,
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { filePath: file },
+            output: `read ${path.basename(file)}`,
+            title: path.basename(file),
+            metadata: { display: { type: "file", path: file } },
+            time: { start: 1, end: 2 },
+          },
+        })
+      }
+      // Large current turn plus default tool schemas leaves <8k headroom after compaction.
+      yield* user(chat.id, "current tight turn " + "q".repeat(12_000))
+
+      yield* llm.text("compact summary of older history")
+      yield* llm.text("answered within tight window")
+
+      const result = yield* awaitWithTimeout(
+        prompt.loop({ sessionID: chat.id }),
+        "tight overflow loop did not terminate",
+        "10 seconds",
+      )
+      expect(yield* llm.calls).toBe(2)
+      expect(result.info).toMatchObject({ role: "assistant", finish: "stop" })
+      expect(result.info.role === "assistant" && result.info.error).toBeUndefined()
+      expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "answered within tight window" }))
+    }),
+  20_000,
+)
+
+it.instance(
+  "SessionPrompt respects compaction.restoration.enabled=false",
+  () =>
+    Effect.gen(function* () {
+      const { llm, dir } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        compaction: { restoration: { enabled: false } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      const disabledChat = yield* sessions.create({ title: "Restoration disabled" })
+      const disabledFile = path.join(dir, "disabled-restore.md")
+      yield* writeText(disabledFile, "DISABLED-SHOULD-NOT-APPEAR")
+      yield* seed(disabledChat.id, { finish: "stop" })
+      const uDisabled = yield* user(disabledChat.id, "trigger overflow")
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: uDisabled.id,
+        sessionID: disabledChat.id,
+        type: "tool",
+        callID: "call_disabled_read",
+        tool: "read",
+        state: {
+          status: "completed",
+          input: { filePath: disabledFile },
+          output: "read file",
+          title: "disabled-restore.md",
+          metadata: { display: { type: "file", path: disabledFile } },
+          time: { start: 1, end: 2 },
+        },
+      })
+      yield* llm.error(400, { error: { message: "Prompt exceeds max length" } })
+      yield* llm.text("summary-disabled")
+      yield* llm.text("done-disabled")
+
+      yield* prompt.loop({ sessionID: disabledChat.id })
+      const disabledBody = JSON.stringify((yield* llm.hits).at(-1)?.body)
+      expect(disabledBody).not.toContain("DISABLED-SHOULD-NOT-APPEAR")
+      expect(disabledBody).not.toContain("opencode:restoration")
+    }),
+  20_000,
+)
+
+it.instance(
+  "SessionPrompt wires Todo.Service into post-compaction restoration when enabled",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const todos = yield* Todo.Service
+
+      const enabledChat = yield* sessions.create({ title: "Restoration todos" })
+      yield* todos.update({
+        sessionID: enabledChat.id,
+        todos: [{ content: "TODO-WIRED-IN-PROMPT", status: "in_progress", priority: "high" }],
+      })
+      yield* seed(enabledChat.id, { finish: "stop" })
+      yield* user(enabledChat.id, "trigger todo restoration")
+      yield* llm.error(400, { error: { message: "Prompt exceeds max length" } })
+      yield* llm.text("summary-todos")
+      yield* llm.text("done-todos")
+
+      yield* prompt.loop({ sessionID: enabledChat.id })
+      const enabledBody = JSON.stringify((yield* llm.hits).at(-1)?.body)
+      expect(enabledBody).toContain("TODO-WIRED-IN-PROMPT")
+    }),
+  20_000,
 )

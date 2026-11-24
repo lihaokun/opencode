@@ -8,6 +8,9 @@ import {
   recoveryBoundaries,
   estimatePayload,
 } from "../../src/session/summary-budget"
+import { pendingInputStart } from "../../src/session/prompt"
+import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import { MessageID, PartID, SessionID } from "../../src/session/schema"
 
 test("7% starts at 10%, with explicit provider counts taking priority", () => {
   expect(providerGap("Prompt exceeds max length")).toBeUndefined()
@@ -126,5 +129,164 @@ test("PBT: transformed payloads reach increasing targets or skip the provider ca
       },
     ),
     { numRuns: 250 },
+  )
+})
+
+test("PBT: pendingInputStart preserves all unanswered users across error, tool-calls, unknown, and inherited continues", () => {
+  const sessionID = SessionID.make("ses_pbt_pending")
+  const itemKind = FastCheck.constantFrom(
+    "user" as const,
+    "continue" as const,
+    "assistant_stop" as const,
+    "assistant_length" as const,
+    "assistant_error" as const,
+    "assistant_tool_calls" as const,
+    "assistant_unknown" as const,
+    "assistant_summary" as const,
+  )
+  const makeMsg = (
+    seq: number,
+    kind:
+      | "marker"
+      | "user"
+      | "continue"
+      | "assistant_stop"
+      | "assistant_length"
+      | "assistant_error"
+      | "assistant_tool_calls"
+      | "assistant_unknown"
+      | "assistant_summary",
+    protectedFrom?: MessageID,
+  ): SessionV1.WithParts => {
+    const id = MessageID.make(`msg_${String(seq).padStart(4, "0")}`)
+    const time = { created: 1000 + seq }
+    if (kind === "marker") {
+      return {
+        info: {
+          id,
+          role: "user",
+          sessionID,
+          agent: "build",
+          model: { providerID: "test", modelID: "test" },
+          time,
+        },
+        parts: [{ id: PartID.make(`prt_${seq}`), messageID: id, sessionID, type: "compaction", auto: true }],
+      } as unknown as SessionV1.WithParts
+    }
+    if (kind === "user" || kind === "continue") {
+      return {
+        info: {
+          id,
+          role: "user",
+          sessionID,
+          agent: "build",
+          model: { providerID: "test", modelID: "test" },
+          time,
+        },
+        parts: [
+          {
+            id: PartID.make(`prt_${seq}`),
+            messageID: id,
+            sessionID,
+            type: "text",
+            text: kind === "continue" ? "continue" : `user-${seq}`,
+            ...(kind === "continue"
+              ? {
+                  synthetic: true,
+                  metadata: { compaction_continue: true, ...(protectedFrom ? { protected_from: protectedFrom } : {}) },
+                }
+              : {}),
+          },
+        ],
+      } as unknown as SessionV1.WithParts
+    }
+    const finish =
+      kind === "assistant_stop" || kind === "assistant_summary"
+        ? "stop"
+        : kind === "assistant_length"
+          ? "length"
+          : kind === "assistant_error"
+            ? "error"
+            : kind === "assistant_tool_calls"
+              ? "tool-calls"
+              : "unknown"
+    return {
+      info: {
+        id,
+        parentID: id,
+        role: "assistant",
+        sessionID,
+        agent: "build",
+        mode: "build",
+        finish,
+        ...(kind === "assistant_summary" ? { summary: true } : {}),
+        ...(kind === "assistant_error" ? { error: { name: "UnknownError", data: { message: "boom" } } } : {}),
+        time,
+      },
+      parts: [],
+    } as unknown as SessionV1.WithParts
+  }
+
+  FastCheck.assert(
+    FastCheck.property(
+      FastCheck.boolean(),
+      FastCheck.array(FastCheck.tuple(itemKind, FastCheck.nat(10)), { minLength: 0, maxLength: 20 }),
+      (hasMarker, entries) => {
+        const messages: SessionV1.WithParts[] = []
+        const userIndices: number[] = []
+        let seq = 1
+        if (hasMarker) {
+          messages.push(makeMsg(seq++, "marker"))
+          messages.push(makeMsg(seq++, "assistant_summary"))
+        }
+        for (const [kind, pick] of entries) {
+          const inherited =
+            kind === "continue" && userIndices.length > 0
+              ? messages[userIndices[pick % userIndices.length]!]!.info.id
+              : undefined
+          const msg = makeMsg(seq++, kind, inherited)
+          if (kind === "user") userIndices.push(messages.length)
+          messages.push(msg)
+        }
+        const current = messages.length
+        messages.push(makeMsg(seq++, "user"))
+
+        // Independent oracle: scan back to the last terminal non-error non-summary assistant or compaction marker.
+        let barrier = hasMarker ? 0 : -1
+        for (let i = current - 1; i > barrier; i--) {
+          const info = messages[i]!.info
+          if (
+            info.role === "assistant" &&
+            !info.summary &&
+            !info.error &&
+            (info.finish === "stop" || info.finish === "length")
+          ) {
+            barrier = i
+            break
+          }
+        }
+        let expected = current
+        const inheritedIDs = new Set<string>()
+        for (let i = barrier + 1; i <= current; i++) {
+          const row = messages[i]!
+          if (row.info.role !== "user") continue
+          const ctrl = row.parts.find((p) => p.type === "text" && p.synthetic && p.metadata?.compaction_continue)
+          if (ctrl?.type === "text") {
+            if (typeof ctrl.metadata?.protected_from === "string") inheritedIDs.add(ctrl.metadata.protected_from)
+            continue
+          }
+          expected = Math.min(expected, i)
+        }
+        for (let i = 0; i < messages.length; i++) {
+          if (messages[i]!.info.role === "user" && inheritedIDs.has(messages[i]!.info.id)) {
+            expected = Math.min(expected, i)
+            break
+          }
+        }
+
+        expect(pendingInputStart(messages, current)).toBe(expected)
+      },
+    ),
+    { seed: 600801, numRuns: 500 },
   )
 })

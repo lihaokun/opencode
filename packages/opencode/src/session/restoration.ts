@@ -96,6 +96,7 @@ export function retainedFileVersions(messages: SessionV1.WithParts[]) {
       if (part.type !== "tool" || part.state.status !== "completed" || part.state.time.compacted) continue
       const metadata = part.state.metadata
       if (part.tool === "edit" && typeof metadata.filediff?.file === "string") versions.delete(metadata.filediff.file)
+      if (part.tool === "write" && typeof metadata.filepath === "string") versions.delete(metadata.filepath)
       const display = metadata.display
       if (part.tool !== "read" || display?.type !== "file" || typeof display.path !== "string") continue
       versions.delete(display.path)
@@ -149,8 +150,13 @@ export function collectCandidates(
       }
       if (part.tool === "read") {
         if (meta.display?.type === "file") touch("file", meta.display.path)
-      } else if (part.tool === "edit") touch("file", meta.filediff?.file)
-      else if (part.tool === "skill") touch("skill", meta.name)
+        continue
+      }
+      if (part.tool === "edit") {
+        touch("file", meta.filediff?.file)
+        continue
+      }
+      if (part.tool === "skill") touch("skill", meta.name)
     }
   }
   const candidates = [...byRef.values()].toSorted((a, b) => b.lastUseSeq - a.lastUseSeq)
@@ -178,13 +184,21 @@ export function materializeCandidates(
   const include = (candidate: RestorationCandidate, content: string): RestorationMaterial =>
     budget.admit(candidate, content)
       ? { candidate, status: "inlined", content }
-      : { candidate, status: "reference", reason: "restoration budget exhausted" }
+      : {
+          candidate,
+          status: "reference",
+          reason:
+            candidate.kind === "todo"
+              ? "restoration budget exhausted; the todo list was not re-inlined"
+              : "restoration budget exhausted",
+        }
   return Effect.forEach(candidates, (candidate) =>
     Effect.gen(function* () {
       if (candidate.kind === "todo" && !deps.todos) {
         return { candidate, status: "missing" as const, reason: "todo list unavailable" }
       }
-      if (budget.exhausted()) {
+      const retainedVersion = candidate.kind === "file" ? versions.get(candidate.ref) : undefined
+      if (budget.exhausted() && !retainedVersion) {
         // Kind-specific honest guidance: skills and files are reloadable
         // with their tools, but there is no todo-reading tool — pointing
         // the model at "the read tool" for a todo list is a dead end.
@@ -209,6 +223,19 @@ export function materializeCandidates(
         if (Option.isNone(info) || info.value === undefined) {
           return { candidate, status: "missing" as const, reason: `skill "${candidate.ref}" not found` }
         }
+        if (info.value.location !== "<built-in>") {
+          const stat = yield* deps.fs.stat(info.value.location).pipe(Effect.option)
+          if (Option.isNone(stat) || stat.value.type !== "File") {
+            return { candidate, status: "missing" as const, reason: `skill file missing: ${info.value.location}` }
+          }
+          if (stat.value.size > deps.cfg.file_max_tokens * TOKEN_BYTES) {
+            return {
+              candidate,
+              status: "reference" as const,
+              reason: `skill file is ${stat.value.size} bytes (over the ${deps.cfg.file_max_tokens} token cap); reload it with the skill tool if needed`,
+            }
+          }
+        }
         const content =
           info.value.location === "<built-in>"
             ? info.value.content
@@ -225,7 +252,7 @@ export function materializeCandidates(
         }
         return include(candidate, content)
       }
-      if (budget.fileLimit())
+      if (budget.fileLimit() && !retainedVersion)
         return { candidate, status: "reference" as const, reason: `beyond max_files=${deps.cfg.max_files}` }
       if (deps.readable && !deps.readable(candidate.ref))
         return { candidate, status: "reference" as const, reason: "read permission required" }
@@ -259,9 +286,14 @@ export function materializeCandidates(
           reason: `file is ~${Token.estimate(content)} tokens (over the ${deps.cfg.file_max_tokens} cap); read it with the read tool if needed`,
         }
       }
-      const version = versions.get(candidate.ref)
-      if (version && Bun.SHA256.hash(bytes.value, "hex") === version) {
+      if (retainedVersion && Bun.SHA256.hash(bytes.value, "hex") === retainedVersion) {
         return { candidate, status: "skipped-duplicate" as const, reason: "already intact in the retained tail" }
+      }
+      if (budget.exhausted()) {
+        return { candidate, status: "reference" as const, reason: "restoration budget exhausted" }
+      }
+      if (budget.fileLimit()) {
+        return { candidate, status: "reference" as const, reason: `beyond max_files=${deps.cfg.max_files}` }
       }
       return include(candidate, content)
     }).pipe(
@@ -387,14 +419,17 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
   }
 }
 
-export const apply = Effect.fn("SessionRestoration.apply")(function* (input: { sessionID: SessionID }) {
-  const exit = yield* Effect.exit(restore(input.sessionID))
+export const apply = Effect.fn("SessionRestoration.apply")(function* (input: {
+  sessionID: SessionID
+  maxBudgetTokens?: number
+}) {
+  const exit = yield* Effect.exit(restore(input.sessionID, input.maxBudgetTokens))
   if (Exit.isFailure(exit)) {
     yield* Effect.logWarning("session restoration skipped")
   }
 })
 
-const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: SessionID) {
+const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: SessionID, maxBudgetTokens?: number) {
   const sessions = yield* Session.Service
   const fs = yield* FSUtil.Service
   const configOpt = yield* Effect.serviceOption(Config.Service)
@@ -404,8 +439,12 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
   const rawConfig = Option.isSome(configOpt)
     ? yield* configOpt.value.get().pipe(Effect.orElseSucceed(() => undefined))
     : undefined
-  const cfg = restorationConfig(rawConfig as ConfigV1Lite | undefined)
-  if (!cfg.enabled) return
+  const baseCfg = restorationConfig(rawConfig as ConfigV1Lite | undefined)
+  if (!baseCfg.enabled) return
+  const cfg =
+    maxBudgetTokens === undefined
+      ? baseCfg
+      : { ...baseCfg, budget_tokens: Math.min(baseCfg.budget_tokens, Math.max(0, maxBudgetTokens)) }
 
   // Step P2: full message read → locate the settled compaction marker
   // and any existing sentinel.
@@ -447,7 +486,10 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
   if (compactionIdx === -1) return
   if (restoredMarker ? restoredMarker === messages[compactionIdx]!.info.id : restorationIdx > compactionIdx) return
 
-  const userMessage = messages.findLast((msg) => msg.info.role === "user")
+  const userMessage = messages.findLast(
+    (msg) =>
+      msg.info.role === "user" && (!msg.parts.some((p) => p.type === "compaction") || settledMarkers.has(msg.info.id)),
+  )
   if (userMessage?.info.role !== "user") return
 
   const todos = Option.isSome(todoOpt)
@@ -459,10 +501,8 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
       )
     : []
 
-  // Step P4/P5: collect candidates (B5: read only display.type === "file";
-  // edit via filediff.file; skill via name; most-recent-first; todo appended),
-  // then materialize (stat File-guard → byte/token caps → disk read →
-  // compare complete retained versions, then apply the rendered budget).
+  // Step P4: collect candidates (B5: read only display.type === "file";
+  // edit via filediff.file; skill via name; most-recent-first; todo prioritized).
   const current = yield* sessions.get(sessionID)
   const agents = yield* Agent.Service
   const agent = yield* agents.get(userMessage.info.agent)
@@ -478,11 +518,16 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
     tools?.[permission] !== false &&
     Permission.evaluate(permission, pattern, rules).action === "allow" &&
     Permission.evaluate(permission, pattern, selectedRules).action === "allow"
+  const externalGlob = (file: string) =>
+    process.platform === "win32"
+      ? FSUtil.normalizePathPattern(path.join(path.dirname(file), "*"))
+      : path.join(path.dirname(file), "*").replaceAll("\\", "/")
   const readable = (file: string) =>
     allowed("read", path.relative(instance.worktree, file)) &&
-    (containsPath(file, instance) ||
-      allowed("external_directory", FSUtil.normalizePathPattern(path.join(path.dirname(file), "*"))))
+    (containsPath(file, instance) || allowed("external_directory", externalGlob(file)))
   const candidates = collectCandidates(messages, todos).filter((c) => c.kind !== "skill" || allowed("skill", c.ref))
+  // Step P5: materialize candidates (stat File-guard → byte/token caps → disk
+  // read → compare complete retained versions, then apply the rendered budget).
   const projected = MessageV2.filterCompacted(messages.toReversed())
   const versions = retainedFileVersions(projected.slice(2))
   const materials = yield* materializeCandidates(candidates, versions, { fs, skill: skillOpt, todos, cfg, readable })
@@ -499,16 +544,12 @@ const restore = Effect.fn("SessionRestoration.restore")(function* (sessionID: Se
   )
   if (text && previous?.text === text && previous.metadata?.markerID === messages[compactionIdx]!.info.id) return
 
-  // G4 ("at most one restoration block per context"): every prior sentinel —
-  // on any message — is retired the moment a fresh one is written. Without
-  // this, a second compaction whose retained tail still holds the first
-  // block's carrier message would leave two full "Context restored" blocks
-  // (each up to budget_tokens) model-visible at once, both claiming to be the
-  // current restoration. Retirement reuses each part's own id: updatePart
-  // upserts the same PartTable row (projector onConflictDoUpdate), so this is
-  // an in-place flag flip, not an append — the transcript keeps the audit
-  // trail while toModelMessagesEffect and the compaction serializer both skip
-  // ignored text parts.
+  // Step P8: retire prior sentinels (G4: at most one restoration block per
+  // context) and persist the fresh synthetic part on the carrier user message.
+  // Retirement reuses each part's own id: updatePart upserts the same PartTable
+  // row (projector onConflictDoUpdate), so this is an in-place flag flip, not
+  // an append — the transcript keeps the audit trail while toModelMessagesEffect
+  // and the compaction serializer both skip ignored text parts.
   for (const msg of messages) {
     for (const part of msg.parts) {
       if (part.type !== "text" || part.ignored || !isRestoration(part)) continue
