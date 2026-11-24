@@ -128,15 +128,27 @@ export function formatAssistantFailure(
   return formatSubagentFailure(`${error.name}: ${message}`, sessionID, limits)
 }
 
+/**
+ * `run` and `ended` name the run this report closes (subplan
+ * agentmgmt-2-run-state §4.6); `ended` is already formatted, the run record
+ * owns the format. Both are left out when the record is missing or still
+ * open, rather than guessed.
+ */
 export function renderOutput(input: {
   sessionID: SessionID
   state: "running" | "completed" | "error" | "cancelled"
   summary?: string
   text: string
+  run?: number
+  ended?: string
 }) {
   const tag = input.state === "error" || input.state === "cancelled" ? "agent_error" : "agent_result"
+  const run =
+    input.run === undefined || input.ended === undefined
+      ? ""
+      : ` run="${input.run}" ended="${escapeMarkup(input.ended)}"`
   return [
-    `<agent id="${escapeMarkup(input.sessionID)}" state="${escapeMarkup(input.state)}">`,
+    `<agent id="${escapeMarkup(input.sessionID)}" state="${escapeMarkup(input.state)}"${run}>`,
     ...(input.summary ? [`<summary>${escapeMarkup(input.summary)}</summary>`] : []),
     `<${tag}>`,
     escapeMarkup(input.text),

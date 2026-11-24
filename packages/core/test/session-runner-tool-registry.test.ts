@@ -67,7 +67,6 @@ describe("ToolRegistry", () => {
         bash: make(),
         edit: make("edit"),
         write: make("edit"),
-        apply_patch: make("edit"),
       })
       const names = (rules: Parameters<ToolRegistry.Interface["materialize"]>[0]) =>
         toolDefinitions(service, rules).pipe(Effect.map((definitions) => definitions.map((tool) => tool.name)))
@@ -76,7 +75,6 @@ describe("ToolRegistry", () => {
         "bash",
         "edit",
         "write",
-        "apply_patch",
       ])
       expect(
         yield* names([

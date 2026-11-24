@@ -17,7 +17,12 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import path from "path"
-import { cliIt } from "../../lib/cli-process"
+import { CLI_PROCESS_TIMEOUT_MS, cliIt } from "../../lib/cli-process"
+
+// Windows CI needs more room for real CLI startup. Keep the outer deadline
+// above the child deadline so fixture setup and timeout cleanup can finish.
+const timeoutMs = process.platform === "win32" ? 120_000 : CLI_PROCESS_TIMEOUT_MS
+const testTimeoutMs = timeoutMs + 60_000
 
 describe("opencode read-only commands (smoke)", () => {
   // `mcp list` reads MCP server config and pings each one. With the empty
@@ -27,10 +32,10 @@ describe("opencode read-only commands (smoke)", () => {
     "mcp list: exits 0",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const r = yield* opencode.spawn(["mcp", "list"])
+        const r = yield* opencode.spawn(["mcp", "list"], { timeoutMs })
         opencode.expectExit(r, 0, "mcp list")
       }),
-    60_000,
+    testTimeoutMs,
   )
 
   // `providers list` enumerates credentials + env-resolved providers.
@@ -43,11 +48,11 @@ describe("opencode read-only commands (smoke)", () => {
     "providers list: exits 0 and prints the credentials section",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const r = yield* opencode.spawn(["providers", "list"])
+        const r = yield* opencode.spawn(["providers", "list"], { timeoutMs })
         opencode.expectExit(r, 0, "providers list")
         expect(r.stdout).toContain("Credentials")
       }),
-    60_000,
+    testTimeoutMs,
   )
 
   // `models` lists models from configured providers. Our test/test-model
@@ -56,11 +61,11 @@ describe("opencode read-only commands (smoke)", () => {
     "models: exits 0 and lists the test model",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const r = yield* opencode.spawn(["models"])
+        const r = yield* opencode.spawn(["models"], { timeoutMs })
         opencode.expectExit(r, 0, "models")
         expect(r.stdout).toContain("test/test-model")
       }),
-    60_000,
+    testTimeoutMs,
   )
 
   // `agent list` walks the agent config. Empty config means no agents
@@ -70,10 +75,10 @@ describe("opencode read-only commands (smoke)", () => {
     "agent list: exits 0",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const r = yield* opencode.spawn(["agent", "list"])
+        const r = yield* opencode.spawn(["agent", "list"], { timeoutMs })
         opencode.expectExit(r, 0, "agent list")
       }),
-    60_000,
+    testTimeoutMs,
   )
 
   // `session list` reads the session DB. Fresh OPENCODE_TEST_HOME means
@@ -82,10 +87,10 @@ describe("opencode read-only commands (smoke)", () => {
     "session list: exits 0",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const r = yield* opencode.spawn(["session", "list"])
+        const r = yield* opencode.spawn(["session", "list"], { timeoutMs })
         opencode.expectExit(r, 0, "session list")
       }),
-    60_000,
+    testTimeoutMs,
   )
 
   // `stats` aggregates token usage from the session DB. Empty DB → all zeros.
@@ -93,10 +98,10 @@ describe("opencode read-only commands (smoke)", () => {
     "stats: exits 0",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const r = yield* opencode.spawn(["stats"])
+        const r = yield* opencode.spawn(["stats"], { timeoutMs })
         opencode.expectExit(r, 0, "stats")
       }),
-    60_000,
+    testTimeoutMs,
   )
 
   // `db path` prints either SQLite's `:memory:` or the isolated fixture's
@@ -105,13 +110,13 @@ describe("opencode read-only commands (smoke)", () => {
     "db path: exits 0 and prints a path or :memory:",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const r = yield* opencode.spawn(["db", "path"])
+        const r = yield* opencode.spawn(["db", "path"], { timeoutMs })
         opencode.expectExit(r, 0, "db path")
         const output = r.stdout.trim()
         if (output === ":memory:") return
         expect(path.isAbsolute(output)).toBe(true)
         expect([".db", ".sqlite", ".sqlite3"]).toContain(path.extname(output).toLowerCase())
       }),
-    60_000,
+    testTimeoutMs,
   )
 })

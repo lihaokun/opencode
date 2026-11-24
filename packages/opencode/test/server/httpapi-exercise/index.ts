@@ -436,6 +436,7 @@ const scenarios: Scenario[] = [
   http.protected
     .post("/pty", "pty.create")
     .mutating()
+    .probe({ path: "/pty", body: { command: 1 }, status: 400 })
     .at((ctx) => ({ path: "/pty", headers: ctx.headers(), body: controlledPtyInput("HTTP API PTY") }))
     .json(
       200,
@@ -449,6 +450,7 @@ const scenarios: Scenario[] = [
     ),
   http.protected
     .post("/pty", "pty.create.invalid")
+    .probe({ path: "/pty", body: { command: 1 }, status: 400 })
     .at((ctx) => ({ path: "/pty", headers: ctx.headers(), body: { command: 1 } }))
     .status(400),
   http.protected
@@ -536,6 +538,7 @@ const scenarios: Scenario[] = [
   http.protected
     .post("/experimental/worktree", "worktree.create")
     .mutating()
+    .probe({ path: "/experimental/worktree", body: { name: 1 }, status: 400 })
     .seeded((ctx) => ctx.watchWorktreeReady({ name: "api-dsl" }))
     .at((ctx) => ({ path: "/experimental/worktree", headers: ctx.headers(), body: { name: "api-dsl" } }))
     .jsonEffect(
@@ -551,6 +554,7 @@ const scenarios: Scenario[] = [
     ),
   http.protected
     .post("/experimental/worktree", "worktree.create.invalid")
+    .probe({ path: "/experimental/worktree", body: { name: 1 }, status: 400 })
     .at((ctx) => ({ path: "/experimental/worktree", headers: ctx.headers(), body: { name: 1 } }))
     .status(400),
   http.protected
@@ -755,6 +759,7 @@ const scenarios: Scenario[] = [
   http.protected
     .post("/api/pty", "v2.pty.create")
     .mutating()
+    .probe({ path: "/api/pty", body: { command: 1 }, status: 400 })
     .at((ctx) => ({ path: "/api/pty", headers: ctx.headers(), body: controlledPtyInput("HTTP API V2 PTY") }))
     .json(200, locationData(object)),
   http.protected
@@ -1762,7 +1767,7 @@ const scenarios: Scenario[] = [
   http.protected
     .post("/global/upgrade", "global.upgrade")
     .global()
-    .probe({ path: "/global/upgrade", body: { target: 1 } })
+    .probe({ path: "/global/upgrade", body: { target: 1 }, status: 400 })
     .at(() => ({ path: "/global/upgrade", body: { target: 1 } }))
     .status(400),
 ]

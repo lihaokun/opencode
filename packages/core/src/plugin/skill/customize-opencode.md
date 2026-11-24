@@ -286,7 +286,7 @@ Worth knowing before configuring them, because several settings only make sense
 against this.
 
 A model launches one with the `agent` tool and manages it with `agent_list`,
-`agent_send` and `agent_stop`. Launching is **always asynchronous**: the tool
+`agent_status`, `agent_send` and `agent_stop`. Launching is **always asynchronous**: the tool
 returns once the subagent has started, and the result arrives later as a message
 in the parent's conversation. There is no foreground mode and nothing to poll.
 
@@ -393,6 +393,8 @@ Hook surface (mutate `output` in place; return `void`):
 - `permission.ask`
 - `experimental.chat.messages.transform`, `experimental.chat.system.transform`,
   `experimental.session.compacting`, `experimental.compaction.autocontinue`,
+  `experimental.session.stop` (block a run from ending; the reason becomes
+  the next user message, capped by `stop_hook_block_cap`),
   `experimental.text.complete`
 
 Special object-shaped (not callbacks): `tool: { my_tool: { ... } }`,
@@ -459,7 +461,8 @@ action, not a per-pattern object.
 names**, not paths: `{"agent": {"*": "allow", "general": "deny"}}` allows every
 type except `general`. It defaults to allow, so launching a subagent does not
 prompt. `agent_list`, `agent_send` and `agent_stop` are ordinary tool keys with
-no patterns worth writing.
+no patterns worth writing; `agent_status` follows `agent_list` — denying one
+hides and refuses both.
 
 `task` was this key's old name. Config still accepts it and renames it to
 `agent` on read, so an existing `task: deny` keeps working — silently ignoring

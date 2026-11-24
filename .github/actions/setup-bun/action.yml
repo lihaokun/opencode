@@ -53,6 +53,15 @@ runs:
       run: python3 -m pip install setuptools || pip install setuptools || true
       shell: bash
 
+    # tree-sitter-powershell's install script (node-gyp-build) has no prebuilds
+    # for this package, so it falls back to compiling — first via
+    # require.resolve('node-gyp'), then by spawning `node-gyp` from PATH. Bun's
+    # isolated linker gives that fallback no resolution path, so make the
+    # binary available on PATH.
+    - name: Install node-gyp for native install scripts
+      run: npm install -g node-gyp
+      shell: bash
+
     - name: Install dependencies
       run: |
         # Workaround for patched peer variants

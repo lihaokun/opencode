@@ -22,6 +22,7 @@ import { EffectBridge } from "@/effect/bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { isRecord } from "@/util/record"
+import { DoomLoop } from "./doom-loop"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 
 const MCP_RESOURCE_TOOLS = {
@@ -196,7 +197,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 ),
               )
             const content = JSON.stringify({ resources: filtered.map(formatMcpResource) }, null, 2)
-            const truncated = yield* truncate.output(content, {}, input.agent)
+            const truncated = yield* truncate.output(content)
             const output = {
               title: parsed.server ? `MCP resources: ${parsed.server}` : "MCP resources",
               metadata: {
@@ -279,7 +280,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 ),
               )
             const content = JSON.stringify({ resourceTemplates: filtered.map(formatMcpResourceTemplate) }, null, 2)
-            const truncated = yield* truncate.output(content, {}, input.agent)
+            const truncated = yield* truncate.output(content)
             const output = {
               title: parsed.server ? `MCP resource templates: ${parsed.server}` : "MCP resource templates",
               metadata: {
@@ -354,7 +355,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             if (!content) throw new Error(`Failed to read MCP resource: ${parsed.server}/${parsed.uri}`)
 
             const formatted = formatMcpResourceContent(parsed.server, parsed.uri, content)
-            const truncated = yield* truncate.output(formatted.text, {}, input.agent)
+            const truncated = yield* truncate.output(formatted.text)
             const output = {
               title: `MCP resource: ${parsed.uri}`,
               metadata: {
@@ -464,7 +465,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
           }
 
-          const truncated = yield* truncate.output(textParts.join("\n\n"), {}, input.agent)
+          const truncated = yield* truncate.output(textParts.join("\n\n"))
           const metadata = {
             ...result.metadata,
             truncated: truncated.truncated,
@@ -494,6 +495,30 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
 
   return tools
 })
+
+// The tool table is rebuilt for every provider step, so one detector sees exactly
+// the calls of one model response, in the order they start. A response that
+// repeats the same calls three times in a row is a storm: the repeat is refused
+// instead of run, unless a doom_loop allow rule opts out. Call it on the step's
+// final table, after every tool the model may call has been added.
+export function refuseRepeats(tools: Record<string, AITool>, input: { agent: Agent.Info; session: Session.Info }) {
+  const repeats = DoomLoop.create()
+  const rules = Permission.merge(input.agent.permission, input.session.permission ?? [])
+  for (const [key, item] of Object.entries(tools)) {
+    const execute = item.execute
+    if (!execute) continue
+    item.execute = (args, options) => {
+      if (!repeats.check(key, isRecord(args) ? args : { value: args })) return execute(args, options)
+      if (Permission.evaluate("doom_loop", key, rules).action === "allow") return execute(args, options)
+      return Promise.reject(
+        new Error(
+          "Not run: within this one response, the same tool calls have now been repeated three times in a row.",
+        ),
+      )
+    }
+  }
+  return tools
+}
 
 function toRecord(value: unknown) {
   if (isRecord(value)) return value

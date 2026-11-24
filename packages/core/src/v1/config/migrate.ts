@@ -91,7 +91,7 @@ function permissions(info?: ConfigPermissionV1.Info, tools?: Readonly<Record<str
 }
 
 function normalizeAction(action: string) {
-  return action === "write" || action === "patch" ? "edit" : action
+  return action === "write" ? "edit" : action
 }
 
 function agents(info: typeof ConfigV1.Info.Type) {
