@@ -1190,7 +1190,7 @@ test("disabled - agent_status follows agent_list", () => {
   ).toEqual(new Set())
 })
 
-test("disabled - shell_output and shell_kill follow bash", () => {
+test("disabled - shell_output and shell_kill follow bash and honor explicit shell rules", () => {
   const tools = ["bash", "shell_output", "shell_kill"]
   expect(Permission.disabled(tools, [{ permission: "bash", pattern: "*", action: "deny" }])).toEqual(new Set(tools))
   expect(Permission.disabled(tools, [{ permission: "bash", pattern: "rm *", action: "deny" }])).toEqual(new Set())
@@ -1200,4 +1200,22 @@ test("disabled - shell_output and shell_kill follow bash", () => {
       { permission: "bash", pattern: "*", action: "allow" },
     ]),
   ).toEqual(new Set())
+  expect(
+    Permission.disabled(tools, [
+      { permission: "*", pattern: "*", action: "allow" },
+      { permission: "shell_output", pattern: "*", action: "deny" },
+    ]),
+  ).toEqual(new Set(["shell_output"]))
+  expect(
+    Permission.disabled(tools, [
+      { permission: "bash", pattern: "*", action: "allow" },
+      { permission: "shell_*", pattern: "*", action: "deny" },
+    ]),
+  ).toEqual(new Set(["shell_output", "shell_kill"]))
+  expect(
+    Permission.disabled(tools, [
+      { permission: "bash", pattern: "*", action: "deny" },
+      { permission: "shell_output", pattern: "*", action: "allow" },
+    ]),
+  ).toEqual(new Set(["bash", "shell_kill"]))
 })

@@ -11,6 +11,8 @@ import { Plugin } from "../../src/plugin"
 import { Truncate } from "../../src/tool/truncate"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { Session } from "@/session/session"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { ShellOutputTool, ShellKillTool, ShellTool } from "../../src/tool/shell"
@@ -31,6 +33,8 @@ const shellLayer = Layer.mergeAll(
       Agent.node,
       RuntimeFlags.node,
       BackgroundJob.node,
+      Session.node,
+      SessionProjector.node,
       SessionStatus.node,
       SessionRunState.node,
     ]),
@@ -589,15 +593,17 @@ unix(
       // The finite timer also cleans up an unmodified implementation after the red test.
       const started = yield* tools.shell.execute(
         {
-          command: `exec bun -e "process.on('SIGTERM', () => {}); console.log(4321); await Bun.sleep(8000); await Bun.write('natural-exit', 'finished')"`,
+          command: `exec bun -e "process.on('SIGTERM', () => {}); console.log(4321); await Bun.sleep(4000); await Bun.write('natural-exit', 'finished')"`,
           run_in_background: true,
         },
         ctx,
       )
       const id = startedTaskID(started)
       yield* waitUntilOutput(tools.output, ctx, id, "4321")
+      const until = Date.now() + 4500
       const result = yield* tools.kill.execute({ task_id: id }, ctx)
       expect(result.metadata.status).toBe("cancelled")
+      yield* Effect.sleep(Math.max(0, until - Date.now()))
       expect(yield* Effect.promise(() => Bun.file(path.join(directory, "natural-exit")).exists())).toBe(false)
     }),
   20_000,
@@ -1006,14 +1012,136 @@ it.instance("shell_output treats empty string task_id as unknown task and keeps 
     const failed = yield* jobs.start({
       id: "shell_multiline_err",
       type: "shell",
-      title: "multiline",
+      title: "multiline\ntitle",
       metadata: { sessionId: sessionID },
-      run: Effect.fail(new Error("line-one\nline-two\n" + "😀".repeat(260))),
+      // 19-char odd prefix so 500 - 19 = 481 splits a 2-unit emoji surrogate pair,
+      // genuinely exercising the trailing high-surrogate trim in commandPreview.
+      run: Effect.fail(new Error("line-one\nline-two!\n" + "😀".repeat(260))),
     })
     yield* jobs.wait({ id: failed.id })
     const view = yield* tools.output.execute({ task_id: failed.id }, ctx)
     const lines = view.output.split("\n")
-    expect(lines[1]).toStartWith("status: error: line-one line-two")
+    expect(lines[0]).toBe("[shell task shell_multiline_err] multiline title")
+    expect(lines[1]).toStartWith("status: error: line-one line-two!")
     expect(lines[1]!.isWellFormed()).toBe(true)
+  }),
+)
+
+it.instance("SessionRunState.cancel re-cancels root Runner when woken by a background job finalizer", () =>
+  Effect.gen(function* () {
+    const jobs = yield* BackgroundJob.Service
+    const state = yield* SessionRunState.Service
+    const rootSession = SessionID.make("ses_root_rewake")
+    const jobStarted = yield* Deferred.make<void>()
+    const rootWoken = yield* Deferred.make<void>()
+    const rootInterrupted = yield* Deferred.make<void>()
+
+    // Simulate a background shell job whose teardown/delivery races to wake the root
+    // session's Runner after root was initially Idle (like deliverAsync forked outside the job scope).
+    yield* jobs.start({
+      id: "shell_rewakes_root",
+      type: "shell",
+      title: "rewake",
+      metadata: { sessionId: rootSession },
+      run: Effect.scoped(
+        Effect.gen(function* () {
+          yield* Effect.addFinalizer(() =>
+            state
+              .ensureRunning(
+                rootSession,
+                Effect.succeed({} as never),
+                Deferred.succeed(rootWoken, undefined).pipe(
+                  Effect.andThen(Effect.never),
+                  Effect.onInterrupt(() => Deferred.succeed(rootInterrupted, undefined)),
+                ),
+              )
+              .pipe(Effect.forkDetach, Effect.andThen(Deferred.await(rootWoken)), Effect.ignore),
+          )
+          yield* Deferred.succeed(jobStarted, undefined)
+          return yield* Effect.never
+        }),
+      ),
+    })
+    yield* Deferred.await(jobStarted)
+
+    yield* state.cancel(rootSession)
+    yield* Deferred.await(rootInterrupted).pipe(Effect.timeout("2 seconds"))
+  }),
+)
+
+it.instance("SessionRunState.cancel reaches persisted DB child runners and shells without an agent BackgroundJob", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const jobs = yield* BackgroundJob.Service
+    const state = yield* SessionRunState.Service
+    const parent = yield* sessions.create({ title: "parent" })
+    const child = yield* sessions.create({ parentID: parent.id, title: "child" })
+
+    const runnerStarted = yield* Deferred.make<void>()
+    const runnerInterrupted = yield* Deferred.make<void>()
+    yield* state
+      .ensureRunning(
+        child.id,
+        Effect.succeed({} as never),
+        Deferred.succeed(runnerStarted, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.onInterrupt(() => Deferred.succeed(runnerInterrupted, undefined)),
+        ),
+      )
+      .pipe(Effect.exit, Effect.forkScoped)
+    yield* Deferred.await(runnerStarted)
+
+    const shellJob = yield* jobs.start({
+      id: "shell_persisted_child",
+      type: "shell",
+      title: "child shell",
+      metadata: { sessionId: child.id },
+      run: Effect.never,
+    })
+
+    yield* state.cancel(parent.id)
+    yield* Deferred.await(runnerInterrupted).pipe(Effect.timeout("2 seconds"))
+    expect((yield* jobs.get(shellJob.id))?.status).toBe("cancelled")
+  }),
+)
+
+it.instance("run_in_background skips permission prompt when aborted before ask and cancels job if aborted during start", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const jobs = yield* BackgroundJob.Service
+
+    // 1. Abort fires during ask/permission setup: ask must not be called when already aborted.
+    let askCount = 0
+    const ctrl1 = new AbortController()
+    const baseCtx1 = makeCtx({ abort: ctrl1.signal })
+    ctrl1.abort()
+    const res1 = yield* tools.shell.execute(
+      { command: "echo hi", run_in_background: true },
+      {
+        ...baseCtx1,
+        ask: () =>
+          Effect.sync(() => {
+            askCount += 1
+          }),
+      },
+    )
+    expect(askCount).toBe(0)
+    expect(res1.output).toContain("cancelled before start")
+
+    // 2. Abort fires right inside ask (before backgroundRun starts): no job registered.
+    const ctrl2 = new AbortController()
+    const baseCtx2 = makeCtx({ abort: ctrl2.signal })
+    const res2 = yield* tools.shell.execute(
+      { command: "echo hi", run_in_background: true },
+      {
+        ...baseCtx2,
+        ask: () =>
+          Effect.sync(() => {
+            ctrl2.abort()
+          }),
+      },
+    )
+    expect(res2.output).toContain("cancelled before start")
+    expect((yield* jobs.list()).filter((j) => j.type === "shell" && j.status === "running")).toEqual([])
   }),
 )

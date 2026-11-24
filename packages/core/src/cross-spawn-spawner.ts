@@ -342,6 +342,27 @@ export const make = Effect.gen(function* () {
       })
     }
 
+  const waitProcessGroupGone = (
+    proc: NodeChildProcess.ChildProcess,
+    command: ChildProcess.StandardCommand,
+    enabled: boolean,
+  ) =>
+    Effect.gen(function* () {
+      if (!enabled || process.platform === "win32" || command.options.detached === false) return
+      while (true) {
+        const alive = yield* Effect.sync(() => {
+          try {
+            globalThis.process.kill(-proc.pid!, 0)
+            return true
+          } catch (error) {
+            return (error as NodeJS.ErrnoException).code !== "ESRCH"
+          }
+        })
+        if (!alive) return
+        yield* Effect.sleep("50 millis")
+      }
+    })
+
   const source = (handle: ChildProcessHandle, from: ChildProcess.PipeFromOption | undefined) => {
     const opt = from ?? "stdout"
     switch (opt) {
@@ -382,29 +403,11 @@ export const make = Effect.gen(function* () {
             Effect.fnUntraced(function* ([proc, signal]) {
               const done = yield* Deferred.isDone(signal)
               const kill = timeout(proc, command, command.options)
-              const waitGroupGone = Effect.gen(function* () {
-                if (
-                  !command.options.forceKillAfter ||
-                  process.platform === "win32" ||
-                  command.options.detached === false
-                )
-                  return
-                while (true) {
-                  const alive = yield* Effect.try({
-                    try: () => {
-                      globalThis.process.kill(-proc.pid!, 0)
-                      return true
-                    },
-                    catch: () => false,
-                  }).pipe(Effect.orElseSucceed(() => false))
-                  if (!alive) return
-                  yield* Effect.sleep("50 millis")
-                }
-              })
+              const waitGroupGone = waitProcessGroupGone(proc, command, Boolean(command.options.forceKillAfter))
               if (done) {
                 const [code] = yield* Deferred.await(signal)
                 if (process.platform === "win32") return yield* Effect.void
-                if (code !== 0 && Predicate.isNotNull(code)) {
+                if (code !== 0) {
                   const cleanup = command.options.forceKillAfter
                     ? Effect.timeoutOrElse(
                         killGroup(command, proc, command.options.killSignal ?? "SIGTERM").pipe(
@@ -472,11 +475,19 @@ export const make = Effect.gen(function* () {
               const sig = opts?.killSignal ?? "SIGTERM"
               const send = (s: NodeJS.Signals) =>
                 Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
-              const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
+              const attempt = send(sig).pipe(
+                Effect.andThen(Deferred.await(signal)),
+                Effect.andThen(waitProcessGroupGone(proc, command, Boolean(opts?.forceKillAfter))),
+                Effect.asVoid,
+              )
               if (!opts?.forceKillAfter) return attempt
               return Effect.timeoutOrElse(attempt, {
                 duration: opts.forceKillAfter,
-                orElse: () => send("SIGKILL").pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid),
+                orElse: () =>
+                  send("SIGKILL").pipe(
+                    Effect.andThen(Deferred.await(signal).pipe(Effect.timeoutOption("1 second"))),
+                    Effect.asVoid,
+                  ),
               })
             },
             unref: Effect.sync(() => {

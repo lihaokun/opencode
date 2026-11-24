@@ -26,7 +26,6 @@ import { BashArity } from "@/permission/arity"
 import { BackgroundJob } from "@/background/job"
 import { cancelSnapshot, shellTasks } from "./shell/tasks"
 import type { AgentManagement } from "@/agent-management/schema"
-import { SessionID } from "../session/schema"
 
 export { Parameters } from "./shell/prompt"
 
@@ -756,6 +755,14 @@ export const ShellTool = Tool.define(
           run,
         })
         .pipe(Effect.onError(() => Effect.sync(() => shellTasks.delete(taskId))))
+      if (ctx.abort.aborted) {
+        yield* background.cancel(info.id, { output: cancelSnapshot(info.id) })
+        return {
+          title: commandPreview(input.command, 80),
+          metadata: { output: "", exit: null, truncated: false },
+          output: "Background command cancelled before start.",
+        }
+      }
       // Step P5: the original command is already in the tool call. Keep the
       // handle on the first line when the configured preview is a single line.
       const receipt = backgroundPreview(
@@ -807,6 +814,7 @@ export const ShellTool = Tool.define(
                   )
                   const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
                   if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
+                  if (params.run_in_background === true && ctx.abort.aborted) return
                   // Step P1: foreground and background launches share the permission decision.
                   yield* ask(ctx, scan, params)
                 }),
@@ -904,7 +912,7 @@ export const ShellOutputTool = Tool.define(
                 ? "running"
                 : (parsed.statusLine ?? (job.error ? `error: ${errorPreview(job.error)}` : job.status))
             const output = [
-              `[shell task ${id}] ${job.title ?? ""}`.trim(),
+              `[shell task ${id}] ${commandPreview(job.title ?? "", 160)}`.trim(),
               `status: ${status}`,
               ...(parsed.body && status !== "running" ? [tailOf(parsed.body, params.tail_lines ?? 200)] : []),
               ...(status === "running" ? [] : job.output ? [] : [`(no output was captured before the task ended)`]),
@@ -1008,8 +1016,9 @@ export const ShellKillTool = Tool.define(
           })
           const finalStatus = info?.status ?? "cancelled"
           const tailText = tailOf(entry.buffer, 50)
+          const label = finalStatus === "cancelled" ? "stopped" : "already settled"
           const view = backgroundPreview(
-            `[shell task ${params.task_id}] stopped (${finalStatus})${tailText ? `\n${tailText}` : ""}`,
+            `[shell task ${params.task_id}] ${label} (${finalStatus})${tailText ? `\n${tailText}` : ""}`,
             yield* trunc.limits(),
             1,
           )

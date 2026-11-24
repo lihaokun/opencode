@@ -5,7 +5,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import path from "path"
 import { BackgroundJob } from "@/background/job"
-import { cancelSnapshot } from "@/tool/shell/tasks"
+import { cancelBackgroundJobsPass } from "@/tool/shell/tasks"
 import { Decimal } from "decimal.js"
 import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
@@ -1139,43 +1139,7 @@ const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function*
   sessionID: SessionID,
 ) {
   const owners = new Set<string>([sessionID])
-  const pass = Effect.gen(function* () {
-    const all = yield* background.list()
-    const children = new Map<string, string[]>()
-    for (const job of all) {
-      const parent = job.metadata?.parentSessionId
-      if (job.type !== "agent" || typeof parent !== "string") continue
-      const child = typeof job.metadata?.sessionId === "string" ? job.metadata.sessionId : job.id
-      const siblings = children.get(parent)
-      if (!siblings) {
-        children.set(parent, [child])
-        continue
-      }
-      siblings.push(child)
-    }
-    for (const owner of owners) {
-      for (const child of children.get(owner) ?? []) owners.add(child)
-    }
-    const jobs = all.filter((job) => {
-      if (job.status !== "running") return false
-      if (owners.has(job.id)) return true
-      if (typeof job.metadata?.sessionId === "string" && owners.has(job.metadata.sessionId)) return true
-      return typeof job.metadata?.parentSessionId === "string" && owners.has(job.metadata.parentSessionId)
-    })
-    yield* Effect.forEach(
-      jobs,
-      (job) => {
-        owners.add(job.id)
-        if (typeof job.metadata?.sessionId === "string") owners.add(job.metadata.sessionId)
-        // R6 parity: session removal interrupts the run fiber before settle —
-        // pass the shell buffer snapshot so the tail survives in the job output.
-        return background.cancel(job.id, { output: cancelSnapshot(job.id) })
-      },
-      { concurrency: "unbounded", discard: true },
-    )
-    return jobs.length
-  })
-  yield* pass.pipe(Effect.repeat({ while: (count) => count > 0 }))
+  yield* cancelBackgroundJobsPass(background, owners).pipe(Effect.repeat({ while: (count) => count > 0 }))
 })
 
 function listByProject(

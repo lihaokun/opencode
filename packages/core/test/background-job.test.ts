@@ -142,17 +142,20 @@ describe("BackgroundJob", () => {
     }).pipe(Effect.provide(jobsLayer)),
   )
 
-  it.live("cancel closes the job scope before wait resolves", () =>
+  it.live("cancel closes the job scope before wait and concurrent cancel resolve, even if caller is interrupted", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       let finalized = false
       const started = yield* Deferred.make<void>()
+      const closing = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
       const job = yield* jobs.start({
         type: "test",
         run: Effect.scoped(
           Effect.gen(function* () {
             yield* Effect.addFinalizer(() =>
-              Effect.sleep("40 millis").pipe(
+              Deferred.succeed(closing, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
                 Effect.andThen(
                   Effect.sync(() => {
                     finalized = true
@@ -166,11 +169,39 @@ describe("BackgroundJob", () => {
         ),
       })
       yield* Deferred.await(started)
-      const waiter = yield* jobs.wait({ id: job.id }).pipe(Effect.forkChild)
-      yield* jobs.cancel(job.id)
-      const awaited = yield* Fiber.await(waiter)
-      expect(Exit.isSuccess(awaited)).toBe(true)
-      expect(finalized).toBe(true)
+
+      // Waiter registered before cancel must observe finalized === true at the moment wait resolves.
+      const beforeWait = yield* jobs
+        .wait({ id: job.id })
+        .pipe(Effect.map((result) => ({ ...result, finalized })), Effect.forkChild)
+
+      // Start first cancel and wait until Scope.close has actually entered the finalizer.
+      const firstCancel = yield* jobs.cancel(job.id).pipe(Effect.forkChild)
+      yield* Deferred.await(closing)
+
+      // Concurrent wait and second cancel entering DURING Scope.close must also wait until finalization finishes.
+      const duringWait = yield* jobs
+        .wait({ id: job.id })
+        .pipe(Effect.map((result) => ({ ...result, finalized })), Effect.forkChild)
+      const secondCancel = yield* jobs
+        .cancel(job.id)
+        .pipe(Effect.map((info) => ({ info, finalized })), Effect.forkChild)
+
+      // Interrupt the first cancel caller while Scope.close is in flight: cancel must remain uninterruptible.
+      const interruptFirst = yield* Fiber.interrupt(firstCancel).pipe(Effect.forkChild)
+      yield* Effect.sleep("20 millis")
+      expect(finalized).toBe(false)
+
+      // Release the finalizer: every waiter and concurrent cancel must see finalized === true.
+      yield* Deferred.succeed(release, undefined)
+      const [w1, w2, c2] = yield* Effect.all([Fiber.join(beforeWait), Fiber.join(duringWait), Fiber.join(secondCancel)])
+      yield* Fiber.await(interruptFirst)
+      expect(w1.finalized).toBe(true)
+      expect(w2.finalized).toBe(true)
+      expect(c2.finalized).toBe(true)
+      expect(w1.info?.status).toBe("cancelled")
+      expect(w2.info?.status).toBe("cancelled")
+      expect(c2.info?.status).toBe("cancelled")
     }).pipe(Effect.provide(jobsLayer)),
   )
 })
