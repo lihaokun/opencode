@@ -45,16 +45,19 @@ export function calibratedInput(current: number, baseline?: { actual: number; es
 }
 
 export function providerGap(message: string) {
+  const parse = (actualText: string | undefined, limitText: string | undefined) => {
+    const actual = Number(actualText?.replaceAll(",", ""))
+    const limit = Number(limitText?.replaceAll(",", ""))
+    if (Number.isSafeInteger(actual) && Number.isSafeInteger(limit) && actual > limit && limit > 0) return actual - limit
+  }
   const direct = /([\d,]+)\s*tokens?\s*>\s*([\d,]+)/i.exec(message)
+  const fromDirect = direct ? parse(direct[1], direct[2]) : undefined
+  if (fromDirect !== undefined) return fromDirect
   const total =
     /maximum context length (?:of|is)\s*([\d,]+)\s*tokens?[^\n]{0,200}?requested (?:a total of )?([\d,]+)\s*tokens?/i.exec(
       message,
     )
-  const pair = direct ? [direct[1], direct[2]] : total ? [total[2], total[1]] : undefined
-  if (!pair) return
-  const [actual, limit] = pair.map((n) => Number(n?.replaceAll(",", "")))
-  if (Number.isSafeInteger(actual) && Number.isSafeInteger(limit) && actual! > limit! && limit! > 0)
-    return actual! - limit!
+  if (total) return parse(total[2], total[1])
 }
 
 export function firstStage(gap: number, budget: number) {

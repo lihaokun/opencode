@@ -35,6 +35,15 @@ export function isRestoration(part: SessionV1.Part): boolean {
   )
 }
 
+export function withoutRestoration(message: SessionV1.WithParts): SessionV1.WithParts {
+  const active = (part: SessionV1.Part) => part.type === "text" && !part.ignored && isRestoration(part)
+  if (!message.parts.some(active)) return message
+  return {
+    ...message,
+    parts: message.parts.filter((part) => !active(part)),
+  }
+}
+
 export type RestorationCandidate = {
   kind: "file" | "skill" | "todo"
   ref: string
@@ -65,6 +74,10 @@ const DEFAULTS: RestorationConfig = {
 }
 
 const TOKEN_BYTES = 4
+// ReadTool computes sha256 for complete reads up to 50 KiB; allow retained-tail
+// dedup up to 64 KiB before rejecting files over file_max_tokens (default 16 KB)
+// so unmodified retained files in [16 KB, 50 KB] resolve to skipped-duplicate.
+const MAX_RETAINED_DEDUP_BYTES = 64 * 1024
 
 export function restorationConfig(config: ConfigV1Lite | undefined): RestorationConfig {
   const r = config?.compaction?.restoration
@@ -267,7 +280,9 @@ export function materializeCandidates(
       if (Option.isNone(stat) || stat.value.type !== "File") {
         return { candidate, status: "missing" as const, reason: `file not found on disk: ${candidate.ref}` }
       }
-      if (stat.value.size > deps.cfg.file_max_tokens * TOKEN_BYTES) {
+      const maxInlineBytes = deps.cfg.file_max_tokens * TOKEN_BYTES
+      const canCheckRetained = retainedVersion !== undefined && stat.value.size <= MAX_RETAINED_DEDUP_BYTES
+      if (stat.value.size > maxInlineBytes && !canCheckRetained) {
         return {
           candidate,
           status: "reference" as const,
@@ -278,6 +293,16 @@ export function materializeCandidates(
       if (Option.isNone(bytes)) {
         return { candidate, status: "missing" as const, reason: `file unreadable: ${candidate.ref}` }
       }
+      if (retainedVersion && Bun.SHA256.hash(bytes.value, "hex") === retainedVersion) {
+        return { candidate, status: "skipped-duplicate" as const, reason: "already intact in the retained tail" }
+      }
+      if (stat.value.size > maxInlineBytes) {
+        return {
+          candidate,
+          status: "reference" as const,
+          reason: `file is ${stat.value.size} bytes (over the ${deps.cfg.file_max_tokens} token cap); read it with the read tool if needed`,
+        }
+      }
       const content = new TextDecoder().decode(bytes.value)
       if (Token.estimate(content) > deps.cfg.file_max_tokens) {
         return {
@@ -285,9 +310,6 @@ export function materializeCandidates(
           status: "reference" as const,
           reason: `file is ~${Token.estimate(content)} tokens (over the ${deps.cfg.file_max_tokens} cap); read it with the read tool if needed`,
         }
-      }
-      if (retainedVersion && Bun.SHA256.hash(bytes.value, "hex") === retainedVersion) {
-        return { candidate, status: "skipped-duplicate" as const, reason: "already intact in the retained tail" }
       }
       if (budget.exhausted()) {
         return { candidate, status: "reference" as const, reason: "restoration budget exhausted" }
@@ -324,21 +346,28 @@ const SECTION = { file: "## Files", skill: "## Skills", todo: "## Todos" }
 const clipRef = (ref: string) =>
   ref.length > MAX_REF_CHARS ? ref.slice(0, MAX_REF_CHARS).replace(/[\uD800-\uDBFF]$/u, "") + "…" : ref
 
-// Charge the actual markdown in code units, including every separating newline. The
-// token estimator rounds length / 4; using at most 4 * budget units is conservative.
+const jsonEscapedLength = (value: string) => JSON.stringify(value).length - 2
+
+// Charge both raw UTF-16 code units (for /3 estimateMessages) and JSON-escaped
+// length (for /4 willOverflow) so quote/backslash/control-char-heavy content
+// cannot blow past the serialized payload budget.
 function inlineBudget(cfg: RestorationConfig) {
   const seen = new Set<RestorationCandidate["kind"]>()
-  let remaining = cfg.budget_tokens * TOKEN_BYTES - HEADER.length
+  const maxRaw = cfg.budget_tokens * TOKEN_BYTES
+  let remaining = maxRaw - HEADER.length
+  let remainingJson = Math.floor((maxRaw * 4) / 3) - 2 - jsonEscapedLength(HEADER)
   let files = 0
   return {
-    exhausted: () => remaining <= 0,
+    exhausted: () => remaining <= 0 || remainingJson <= 0,
     fileLimit: () => files >= cfg.max_files,
     admit(candidate: RestorationCandidate, content: string) {
       const kind = candidate.kind
       const block = `### ${clipRef(candidate.ref)}\n\`\`\`\n${content}\n\`\`\``
       const cost = block.length + 1 + (seen.has(kind) ? 0 : SECTION[kind].length + 1)
-      if (cost > remaining) return
+      const jsonCost = jsonEscapedLength(block) + 2 + (seen.has(kind) ? 0 : jsonEscapedLength(SECTION[kind]) + 2)
+      if (cost > remaining || jsonCost > remainingJson) return
       remaining -= cost
+      remainingJson -= jsonCost
       seen.add(kind)
       if (kind === "file") files++
       return block
@@ -405,7 +434,8 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
   const inline = [HEADER, ...sections].join("\n")
   if (lines.length === 0) return inline
   const allowance = Math.max(128, Math.min(2000, cfg.budget_tokens))
-  const available = (cfg.budget_tokens + allowance) * TOKEN_BYTES - inline.length
+  const maxRaw = (cfg.budget_tokens + allowance) * TOKEN_BYTES
+  const maxJson = Math.floor((maxRaw * 4) / 3)
   for (;;) {
     const diagnostics = [
       "",
@@ -413,7 +443,10 @@ export function renderMaterials(materials: RestorationMaterial[], cfg: Restorati
       ...lines,
       ...(overflowLines > 0 ? [`- ...and ${overflowLines} more (use the read/glob tools if needed)`] : []),
     ].join("\n")
-    if (diagnostics.length <= available || lines.length === 0) return inline + diagnostics
+    const candidate = inline + diagnostics
+    if ((candidate.length <= maxRaw && JSON.stringify(candidate).length <= maxJson) || lines.length === 0) {
+      return candidate
+    }
     lines.pop()
     overflowLines++
   }

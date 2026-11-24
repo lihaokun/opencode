@@ -17,7 +17,7 @@ import { Command } from "../../src/command"
 import { Config } from "@/config/config"
 import { LSP } from "@/lsp/lsp"
 import { MCP } from "../../src/mcp"
-import type { Client as MCPClient } from "@modelcontextprotocol/sdk/client/index.js"
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { Permission } from "../../src/permission"
 import { Plugin } from "../../src/plugin"
 import type { Hooks } from "@opencode-ai/plugin"
@@ -433,7 +433,7 @@ const withMcpTool = testEffect(
               isError: false,
             }
           },
-        } as unknown as MCPClient,
+        } as unknown as Client,
       },
     },
   }),
@@ -8464,9 +8464,9 @@ it.instance(
       const sessions = yield* Session.Service
       const chat = yield* sessions.create({ title: "Tight context overflow" })
 
-      // Write three ~12 KiB files that would consume ~9k tokens if restored uncapped.
+      // Write three ~12 KiB quote/newline-heavy JSON files that would blow both /3 and /4 willOverflow if uncapped.
       const files = ["a.txt", "b.txt", "c.txt"].map((name) => path.join(dir, name))
-      for (const file of files) yield* writeText(file, `${path.basename(file)} ` + "z".repeat(12_000))
+      for (const file of files) yield* writeText(file, `${path.basename(file)}\n` + '{"k":"v","p":"\\\\"}\n'.repeat(600))
 
       const oldUser = yield* user(chat.id, "older history " + "h".repeat(120_000))
       const oldAssistant = yield* sessions.updateMessage({
@@ -8481,7 +8481,7 @@ it.instance(
         tokens: { input: 5_000, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
         modelID: ModelV2.ID.make("test-model"),
         providerID: ProviderV2.ID.make("test"),
-        finish: "stop",
+        finish: "tool-calls",
         time: { created: Date.now(), completed: Date.now() },
       })
       for (const [idx, file] of files.entries()) {
@@ -8502,6 +8502,28 @@ it.instance(
           },
         })
       }
+      const oldReply = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        parentID: oldUser.id,
+        role: "assistant",
+        sessionID: chat.id,
+        mode: "build",
+        agent: "build",
+        path: { cwd: dir, root: dir },
+        cost: 0,
+        tokens: { input: 5_000, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make("test-model"),
+        providerID: ProviderV2.ID.make("test"),
+        finish: "stop",
+        time: { created: Date.now(), completed: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: oldReply.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "finished reading files",
+      })
       // Large current turn plus default tool schemas leaves <8k headroom after compaction.
       yield* user(chat.id, "current tight turn " + "q".repeat(12_000))
 
@@ -8535,11 +8557,10 @@ it.instance(
       const disabledChat = yield* sessions.create({ title: "Restoration disabled" })
       const disabledFile = path.join(dir, "disabled-restore.md")
       yield* writeText(disabledFile, "DISABLED-SHOULD-NOT-APPEAR")
-      yield* seed(disabledChat.id, { finish: "stop" })
-      const uDisabled = yield* user(disabledChat.id, "trigger overflow")
+      const seeded = yield* seed(disabledChat.id, { finish: "stop" })
       yield* sessions.updatePart({
         id: PartID.ascending(),
-        messageID: uDisabled.id,
+        messageID: seeded.assistant.id,
         sessionID: disabledChat.id,
         type: "tool",
         callID: "call_disabled_read",
@@ -8553,6 +8574,7 @@ it.instance(
           time: { start: 1, end: 2 },
         },
       })
+      yield* user(disabledChat.id, "trigger overflow")
       yield* llm.error(400, { error: { message: "Prompt exceeds max length" } })
       yield* llm.text("summary-disabled")
       yield* llm.text("done-disabled")

@@ -1152,12 +1152,12 @@ describe("session.compaction.process", () => {
               .filter((m) => m.info.role === "user")
               .map((m) => m.info.id),
           ).toEqual([...users.slice(generic ? nextHead : 12).map((u) => u.id), late.id])
-        } else {
-          expect(seen).not.toContain(SessionCompaction.Event.Compacted.type)
-          expect(
-            stored.find((m) => m.info.id === marker.info.id)?.parts.find((p) => p.type === "compaction")?.tail_start_id,
-          ).toBeUndefined()
+          return
         }
+        expect(seen).not.toContain(SessionCompaction.Event.Compacted.type)
+        expect(
+          stored.find((m) => m.info.id === marker.info.id)?.parts.find((p) => p.type === "compaction")?.tail_start_id,
+        ).toBeUndefined()
       }).pipe(
         withCompaction({
           llm: stub.llmLayer,
@@ -2948,6 +2948,18 @@ itCompaction.instance(
           return captured
         })
 
+      const activeRestorations = () =>
+        ssn.messages({ sessionID: session.id }).pipe(
+          Effect.map((list) =>
+            list
+              .flatMap((m) => m.parts)
+              .filter(
+                (p): p is SessionV1.TextPart =>
+                  p.type === "text" && p.text.startsWith(RESTORATION_SENTINEL) && !p.ignored,
+              ),
+          ),
+        )
+
       const c1 = yield* runCompaction()
       expect(c1).toContain("always use pnpm")
       // the tool OUTPUT is "read spec.md"; the on-disk body (SPEC_MARKER) is
@@ -2955,6 +2967,8 @@ itCompaction.instance(
       // restoration proves it re-read the current file version.
       expect(c1).toContain("read spec.md")
       expect(c1).toContain("[exit code: 7]")
+      yield* SessionRestoration.apply({ sessionID: session.id })
+      expect(yield* activeRestorations()).toHaveLength(1)
 
       // Rounds 2-3 create real compaction markers and feed filterCompacted
       // history into compaction.process so each round carries forward the
@@ -2967,6 +2981,8 @@ itCompaction.instance(
       expect(c2).toContain("continue")
       expect(c2).not.toContain("deploy failed")
       expect(c2).not.toBe(c1)
+      yield* SessionRestoration.apply({ sessionID: session.id })
+      expect(yield* activeRestorations()).toHaveLength(1)
 
       stub.push(reply("summary-3: always use pnpm", (input) => (captured = JSON.stringify(input.messages))))
       yield* createUserMessage(session.id, "wrap up")
@@ -2977,21 +2993,15 @@ itCompaction.instance(
       expect(c3).not.toContain("deploy failed")
       expect(c3).not.toBe(c2)
 
-      // Restoration after the third compaction: the spec is re-read from disk
-      // (current version) and the restoration part is idempotent.
+      // Restoration after the third compaction: prior rounds are retired (G4),
+      // the spec is re-read from disk (current version), and apply is idempotent.
       yield* SessionRestoration.apply({ sessionID: session.id })
-      let msgs = yield* ssn.messages({ sessionID: session.id })
-      let restored = msgs
-        .flatMap((m) => m.parts)
-        .filter((p): p is SessionV1.TextPart => p.type === "text" && p.text.startsWith(RESTORATION_SENTINEL))
+      let restored = yield* activeRestorations()
       expect(restored).toHaveLength(1)
       expect(restored[0].text).toContain("SPEC_MARKER pnpm only")
 
       yield* SessionRestoration.apply({ sessionID: session.id })
-      msgs = yield* ssn.messages({ sessionID: session.id })
-      restored = msgs
-        .flatMap((m) => m.parts)
-        .filter((p): p is SessionV1.TextPart => p.type === "text" && p.text.startsWith(RESTORATION_SENTINEL))
+      restored = yield* activeRestorations()
       expect(restored).toHaveLength(1)
     }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 20 }) }))
   },
@@ -3690,11 +3700,59 @@ itCompaction.instance(
           const row = active.find((m) => m.info.id === item.msg.id)
           const part = row?.parts.find((p) => p.id === item.part.id)
           if (item === late) expect(part).toMatchObject({ type: "file", url: item.part.url })
-          else expect(part).toMatchObject({ type: "text", text: "[Attached image/png: " + item.part.filename + "]" })
-          const saved = yield* MessageV2.get({ sessionID: chat.id, messageID: item.msg.id })
+          if (item !== late) expect(part).toMatchObject({ type: "text", text: "[Attached image/png: " + item.part.filename + "]" })
+      const saved = yield* MessageV2.get({ sessionID: chat.id, messageID: item.msg.id })
           expect(saved.parts.find((p) => p.id === item.part.id)).toMatchObject({ type: "file", url: item.part.url })
         }
       }
     }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 4, preserve_recent_tokens: 1500 }) }))
+  },
+)
+
+itCompaction.instance(
+  "preserves embedded truncated artifact hints from completed tool outputs even without metadata.outputPath",
+  () => {
+    const stub = llm()
+    let captured = ""
+    stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
+    return Effect.gen(function* () {
+      const test = yield* TestInstance
+      const ssn = yield* SessionNs.Service
+      const session = yield* ssn.create({})
+      const u1 = yield* createUserMessage(session.id, "run codemode")
+      const a1 = yield* createAssistantMessage(session.id, u1.id, test.directory)
+      const artifact = "/tmp/opencode/embedded-codemode-err.txt"
+      const output =
+        "lead ".repeat(400) +
+        `\nThe tool call failed; error output was truncated. Full output saved to: ${artifact}\n` +
+        "Use Grep to search the full content or Read with offset/limit to view specific sections.\n" +
+        "tail ".repeat(400)
+      yield* ssn.updatePart({
+        id: PartID.ascending(),
+        messageID: a1.id,
+        sessionID: session.id,
+        type: "tool",
+        tool: "execute",
+        callID: "c_exec",
+        state: {
+          status: "completed",
+          input: { code: "try { await tools.a.b() } catch (e) { return e.message }" },
+          output,
+          title: "execute",
+          metadata: {},
+          time: { start: 0, end: 1 },
+        },
+      })
+      yield* createSummaryCompaction(session.id)
+      const msgs = yield* MessageV2.filterCompactedEffect(session.id)
+      const marker = msgs.findLast((m) => m.parts.some((p) => p.type === "compaction"))
+      yield* SessionCompaction.use.process({
+        parentID: marker!.info.id,
+        messages: msgs,
+        sessionID: session.id,
+        auto: false,
+      })
+      expect(captured).toContain(`Full output saved to: ${artifact}`)
+    }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 0 }) }))
   },
 )

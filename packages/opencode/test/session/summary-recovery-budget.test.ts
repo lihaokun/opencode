@@ -16,6 +16,11 @@ test("7% starts at 10%, with explicit provider counts taking priority", () => {
   expect(providerGap("Prompt exceeds max length")).toBeUndefined()
   expect(providerGap("prompt is too long: 107,000 tokens > 100,000 maximum")).toBe(7000)
   expect(providerGap("maximum context length of 100000 tokens. You requested a total of 107000 tokens")).toBe(7000)
+  expect(
+    providerGap(
+      "warning: 50 tokens > 100; maximum context length of 100000 tokens. You requested a total of 107000 tokens",
+    ),
+  ).toBe(7000)
   expect(firstStage(7000, 100000)).toBe(10)
   expect(calibratedInput(108000, { actual: 90000, estimate: 91000 })).toBe(107000)
   expect(calibratedInput(108000)).toBe(108000)
@@ -49,9 +54,9 @@ test("PBT: candidates actually sent are whole groups and the earliest boundary c
         let cursor = plan.next()
         const sent: number[] = []
         while (!cursor.done) {
-          const { start, target } = cursor.value
-          const candidate = groups.find((g) => g.start === start)!
-          if (candidate.reduction < target) {
+          const step = cursor.value
+          const candidate = groups.find((g) => g.start === step.start)!
+          if (candidate.reduction < step.target) {
             cursor = plan.next(undefined)
             continue
           }
@@ -112,15 +117,15 @@ test("PBT: transformed payloads reach increasing targets or skip the provider ca
         let last = 0
         const calls: number[] = []
         while (!cursor.done) {
-          const { start, target } = cursor.value
-          const actual = groups[data.length - start]!.actual
-          expect(target).toBe(5 * (Math.floor(last / 5) + 1))
-          if (actual < target) {
+          const step = cursor.value
+          const actual = groups[data.length - step.start]!.actual
+          expect(step.target).toBe(5 * (Math.floor(last / 5) + 1))
+          if (actual < step.target) {
             cursor = plan.next(undefined)
             continue
           }
           expect(actual).toBeGreaterThan(last)
-          calls.push(start)
+          calls.push(step.start)
           last = actual
           cursor = plan.next(actual)
         }
@@ -132,34 +137,34 @@ test("PBT: transformed payloads reach increasing targets or skip the provider ca
   )
 })
 
-test("PBT: pendingInputStart preserves all unanswered users across error, tool-calls, unknown, and inherited continues", () => {
+test("PBT: pendingInputStart preserves unanswered users across tool-bearing stop, retained-tail timestamps, and continues", () => {
   const sessionID = SessionID.make("ses_pbt_pending")
   const itemKind = FastCheck.constantFrom(
     "user" as const,
     "continue" as const,
     "assistant_stop" as const,
+    "assistant_stop_with_tool" as const,
     "assistant_length" as const,
     "assistant_error" as const,
     "assistant_tool_calls" as const,
     "assistant_unknown" as const,
     "assistant_summary" as const,
   )
-  const makeMsg = (
-    seq: number,
-    kind:
-      | "marker"
-      | "user"
-      | "continue"
-      | "assistant_stop"
-      | "assistant_length"
-      | "assistant_error"
-      | "assistant_tool_calls"
-      | "assistant_unknown"
-      | "assistant_summary",
-    protectedFrom?: MessageID,
-  ): SessionV1.WithParts => {
+  type Kind =
+    | "marker"
+    | "user"
+    | "continue"
+    | "assistant_stop"
+    | "assistant_stop_with_tool"
+    | "assistant_length"
+    | "assistant_error"
+    | "assistant_tool_calls"
+    | "assistant_unknown"
+    | "assistant_summary"
+
+  const makeMsg = (seq: number, kind: Kind, created: number, protectedFrom?: MessageID): SessionV1.WithParts => {
     const id = MessageID.make(`msg_${String(seq).padStart(4, "0")}`)
-    const time = { created: 1000 + seq }
+    const time = { created }
     if (kind === "marker") {
       return {
         info: {
@@ -201,7 +206,7 @@ test("PBT: pendingInputStart preserves all unanswered users across error, tool-c
       } as unknown as SessionV1.WithParts
     }
     const finish =
-      kind === "assistant_stop" || kind === "assistant_summary"
+      kind === "assistant_stop" || kind === "assistant_stop_with_tool" || kind === "assistant_summary"
         ? "stop"
         : kind === "assistant_length"
           ? "length"
@@ -223,44 +228,90 @@ test("PBT: pendingInputStart preserves all unanswered users across error, tool-c
         ...(kind === "assistant_error" ? { error: { name: "UnknownError", data: { message: "boom" } } } : {}),
         time,
       },
-      parts: [],
+      parts:
+        kind === "assistant_stop_with_tool"
+          ? [
+              {
+                id: PartID.make(`prt_${seq}`),
+                messageID: id,
+                sessionID,
+                type: "tool",
+                tool: "bash",
+                callID: `call_${seq}`,
+                state: { status: "completed", input: {}, output: "ok", title: "bash", metadata: {}, time: { start: 0, end: 1 } },
+              },
+            ]
+          : [],
     } as unknown as SessionV1.WithParts
   }
+
+  // Anchor: provider returns finish:"stop" alongside tool call, followed by steering user.
+  const u1 = makeMsg(1, "user", 1001)
+  const aToolStop = makeMsg(2, "assistant_stop_with_tool", 1002)
+  const u2 = makeMsg(3, "user", 1003)
+  expect(pendingInputStart([u1, aToolStop, u2], 2)).toBe(0)
+
+  // Anchor: real filterCompacted layout where retained-tail rows appear after [marker, summary] with timestamps <= marker.
+  const marker = makeMsg(10, "marker", 2000)
+  const summary = makeMsg(11, "assistant_summary", 2001)
+  const retainedOld = makeMsg(1, "user", 1500)
+  const postContinue = makeMsg(12, "continue", 2002, retainedOld.info.id)
+  expect(pendingInputStart([marker, summary, retainedOld, postContinue], 3)).toBe(2)
 
   FastCheck.assert(
     FastCheck.property(
       FastCheck.boolean(),
+      FastCheck.nat(3),
       FastCheck.array(FastCheck.tuple(itemKind, FastCheck.nat(10)), { minLength: 0, maxLength: 20 }),
-      (hasMarker, entries) => {
+      FastCheck.boolean(),
+      (hasMarker, retainedCount, entries, currentIsContinue) => {
         const messages: SessionV1.WithParts[] = []
         const userIndices: number[] = []
         let seq = 1
+        const markerTime = 2000
         if (hasMarker) {
-          messages.push(makeMsg(seq++, "marker"))
-          messages.push(makeMsg(seq++, "assistant_summary"))
+          messages.push(makeMsg(100, "marker", markerTime))
+          messages.push(makeMsg(101, "assistant_summary", markerTime + 1))
+          // Real filterCompacted places retained-tail rows after [marker, summary] with timestamps <= marker.
+          for (let r = 0; r < retainedCount; r++) {
+            const msg = makeMsg(seq++, "user", 1000 + r)
+            userIndices.push(messages.length)
+            messages.push(msg)
+          }
         }
+        let postSeq = 200
         for (const [kind, pick] of entries) {
           const inherited =
             kind === "continue" && userIndices.length > 0
               ? messages[userIndices[pick % userIndices.length]!]!.info.id
               : undefined
-          const msg = makeMsg(seq++, kind, inherited)
+          const msg = makeMsg(postSeq++, kind, markerTime + 10 + postSeq, inherited)
           if (kind === "user") userIndices.push(messages.length)
           messages.push(msg)
         }
         const current = messages.length
-        messages.push(makeMsg(seq++, "user"))
+        const inheritedAtCurrent =
+          currentIsContinue && userIndices.length > 0 ? messages[userIndices[0]!]!.info.id : undefined
+        messages.push(
+          makeMsg(postSeq++, currentIsContinue ? "continue" : "user", markerTime + 10 + postSeq, inheritedAtCurrent),
+        )
 
-        // Independent oracle: scan back to the last terminal non-error non-summary assistant or compaction marker.
-        let barrier = hasMarker ? 0 : -1
-        for (let i = current - 1; i > barrier; i--) {
-          const info = messages[i]!.info
-          if (
-            info.role === "assistant" &&
-            !info.summary &&
-            !info.error &&
-            (info.finish === "stop" || info.finish === "length")
-          ) {
+        const markerRow = hasMarker ? messages[0]! : undefined
+        const isTerminalAssistant = (row: SessionV1.WithParts) =>
+          row.info.role === "assistant" &&
+          !row.info.summary &&
+          !row.info.error &&
+          (row.info.finish === "stop" || row.info.finish === "length") &&
+          !row.parts.some((p) => p.type === "tool")
+
+        let barrier = -1
+        for (let i = current; i >= 0; i--) {
+          const row = messages[i]!
+          if (isTerminalAssistant(row)) {
+            barrier = i
+            break
+          }
+          if (markerRow && (row.info.time.created < markerRow.info.time.created || row.info.id <= markerRow.info.id)) {
             barrier = i
             break
           }

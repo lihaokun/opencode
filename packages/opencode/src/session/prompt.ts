@@ -7,6 +7,7 @@ import { SessionID, MessageID, PartID } from "./schema"
 import { MessageV2 } from "./message-v2"
 import { usable } from "./overflow"
 import { estimateMessages, estimatePayload } from "./summary-budget"
+import { Token } from "@/util/token"
 import { SessionRestoration } from "./restoration"
 import { SessionRevert } from "./revert"
 import { Session } from "./session"
@@ -1535,16 +1536,33 @@ const layer = Layer.effect(
             // compaction; it is not re-run per model step.
             if (result === "continue") {
               if (task.part.overflow) compactionToken = "compacted"
-              const fixedInputTokens = task.part.fixed_input_tokens ?? 0
+              const latest = yield* sessions.findMessage(sessionID, (m) => m.info.role === "user").pipe(Effect.orDie)
+              const activeUser = Option.isSome(latest) && latest.value.info.role === "user" ? latest.value.info : lastUser
+              const activeModel =
+                activeUser.model.providerID === model.providerID && activeUser.model.modelID === model.id
+                  ? model
+                  : yield* getModel(activeUser.model.providerID, activeUser.model.modelID, sessionID)
+              const anchorUser = task.part.request_user_id ?? task.part.protected_from
+              const fixedInputTokens =
+                !anchorUser || anchorUser === activeUser.id ? (task.part.fixed_input_tokens ?? 0) : 0
               const cfg = yield* config.get()
-              const usablePrimary = usable({ cfg, model, outputTokenMax: flags.outputTokenMax })
+              const usablePrimary = usable({ cfg, model: activeModel, outputTokenMax: flags.outputTokenMax })
               const maxBudgetTokens =
-                model.limit.context > 0 && usablePrimary > 0
+                activeModel.limit.context > 0 && usablePrimary > 0
                   ? yield* Effect.gen(function* () {
                       const projected = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
                         Effect.provideService(Database.Service, database),
                       )
-                      const messagesTokens = estimateMessages(yield* MessageV2.toModelMessagesEffect(projected, model))
+                      // Step P8 retires prior active restoration parts before writing the new
+                      // block, so exclude them when measuring post-compaction headroom.
+                      const modelMessages = yield* MessageV2.toModelMessagesEffect(
+                        projected.map(SessionRestoration.withoutRestoration),
+                        activeModel,
+                      )
+                      const messagesTokens = Math.max(
+                        estimateMessages(modelMessages),
+                        Token.estimate(JSON.stringify(modelMessages)),
+                      )
                       const headroom = usablePrimary - fixedInputTokens - messagesTokens - 256
                       return restorationBudgetCap(headroom)
                     })
@@ -1734,11 +1752,18 @@ const layer = Layer.effect(
               const durable = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
                 Effect.provideService(Database.Service, database),
               )
-              const required = durable.filter((row) => selected.has(row.info.id)).map(MessageV2.withoutUserMedia)
+              const cfg = yield* config.get()
+              const stripRestoration = SessionRestoration.restorationConfig(cfg).enabled
+              const required = durable
+                .filter((row) => selected.has(row.info.id))
+                .map((row) => {
+                  const stripped = MessageV2.withoutUserMedia(row)
+                  return stripRestoration ? SessionRestoration.withoutRestoration(stripped) : stripped
+                })
               const size = estimateMessages(yield* MessageV2.toModelMessagesEffect(required, model))
               if (
                 model.limit.context > 0 &&
-                size + (fixed ?? 0) >= usable({ cfg: yield* config.get(), model, outputTokenMax: flags.outputTokenMax })
+                size + (fixed ?? 0) >= usable({ cfg, model, outputTokenMax: flags.outputTokenMax })
               ) {
                 // Steering may have replaced the system/tools while this request was
                 // in flight. Its old overhead cannot rule out the new user's request.
@@ -1851,12 +1876,17 @@ const layer = Layer.effect(
               return "continue" as const
             }
             if (result === "compact") {
+              const fixedInputTokens = yield* Effect.tryPromise(() =>
+                estimatePayload({ ...preparedPayload, messages: [] }),
+              ).pipe(Effect.orElseSucceed(() => undefined))
               yield* compaction.create({
                 sessionID,
                 agent: lastUser.agent,
                 model: lastUser.model,
                 auto: true,
                 overflow: false,
+                requestUserID,
+                fixedInputTokens,
               })
             }
             const current = StepTail.signature(
@@ -2475,12 +2505,18 @@ export function pendingInputStart(messages: SessionV1.WithParts[], current: numb
   let start = current
   for (let i = current; i >= 0; i--) {
     const row = messages[i]!
+    const hasToolCalls =
+      row.info.role === "assistant" &&
+      row.parts.some(
+        (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
+      )
     if (
       row.info.role === "assistant" &&
       !row.info.summary &&
       !row.info.error &&
       row.info.finish &&
-      !["tool-calls", "unknown"].includes(row.info.finish)
+      !["tool-calls", "unknown"].includes(row.info.finish) &&
+      !hasToolCalls
     )
       break
     if (marker && MessageV2.compareChronology(row.info, marker.info) <= 0) break
@@ -2498,10 +2534,10 @@ export function pendingInputStart(messages: SessionV1.WithParts[], current: numb
   return original >= 0 ? Math.min(start, original) : start
 }
 
-// Convert remaining /3-estimated token headroom into the largest /4 restoration
-// budget B whose rendered ceiling (B + max(128, min(2000, B))) * 4 / 3 fits.
+// Convert remaining token headroom into the largest /4 restoration budget B
+// whose rendered ceiling fits both /3 estimateMessages and /4 JSON willOverflow.
 export function restorationBudgetCap(headroom: number) {
-  const cap4 = Math.floor((headroom * 3) / 4)
+  const cap4 = Math.floor((Math.floor(headroom) * 3) / 4)
   if (cap4 <= 128) return 0
   if (cap4 <= 256) return cap4 - 128
   if (cap4 <= 4000) return Math.floor(cap4 / 2)

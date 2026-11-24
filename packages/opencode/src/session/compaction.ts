@@ -24,11 +24,13 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import {
+  appendMissingOutputPaths,
   formatExitCodeLine,
-  hasOutputPath,
+  savedOutputPaths,
   summarizeToolText,
   summarizeToolError,
 } from "@opencode-ai/core/session/tool-result-projection"
+import { SessionRestoration } from "./restoration"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 
 export const Event = SessionCompactionEvent
@@ -71,14 +73,16 @@ const serialize = (message: SessionV1.WithParts) => {
         const attachments = (part.state.attachments ?? []).map(
           (item) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`,
         )
-        const preview = part.state.time.compacted
-          ? "[Old tool result content cleared]"
-          : summarizeToolText([part.state.output, ...attachments].join("\n"))
+        const raw = [part.state.output, ...attachments].join("\n")
+        const preview = part.state.time.compacted ? "[Old tool result content cleared]" : summarizeToolText(raw)
         const saved = part.state.metadata?.outputPath
-        const text =
-          !part.state.time.compacted && typeof saved === "string" && saved && !hasOutputPath(preview, saved)
-            ? preview + "\nFull output saved to: " + saved
-            : preview
+        const paths = part.state.time.compacted
+          ? []
+          : [
+              ...(typeof saved === "string" && saved ? [saved] : []),
+              ...(preview !== raw ? savedOutputPaths(part.state.output) : []),
+            ]
+        const text = appendMissingOutputPaths(preview, paths)
         const exit = part.state.time.compacted ? undefined : formatExitCodeLine(part.state.metadata)
         return [call, `[Tool result]: ${exit ? `${text}\n${exit}` : text}`]
       }
@@ -420,9 +424,11 @@ const layer = Layer.effect(
       // outside the rejected request must reach the next model unchanged.
       const requestUser = compactionPart?.request_user_id
       const mediaEnd = requestUser ? mandatory.findIndex((row) => row.info.id === requestUser) : 0
-      const rawRequired = mandatory.map((row, index) =>
-        input.overflow && index <= mediaEnd ? MessageV2.withoutUserMedia(row) : row,
-      )
+      const stripRestoration = SessionRestoration.restorationConfig(cfg).enabled
+      const rawRequired = mandatory.map((row, index) => {
+        const stripped = input.overflow && index <= mediaEnd ? MessageV2.withoutUserMedia(row) : row
+        return stripRestoration ? SessionRestoration.withoutRestoration(stripped) : stripped
+      })
       const usablePrimary = usable({ cfg, model: primary, outputTokenMax: flags.outputTokenMax })
       const room = budgeted
         ? usablePrimary -
@@ -431,7 +437,7 @@ const layer = Layer.effect(
         : Infinity
       // Leave room for the summary text itself so optional tail retention does
       // not pack the resumed request right up against usablePrimary.
-      const summaryReserve = input.overflow && budgeted ? Math.min(2_048, Math.floor(usablePrimary / 8)) : 0
+      const summaryReserve = budgeted ? Math.min(2_048, Math.floor(usablePrimary / 8)) : 0
       const optionalBudget = Math.max(0, Math.min(room - summaryReserve, Math.floor(usablePrimary / 4)))
       let head = yield* select({
         messages: historyForSummary,
@@ -524,7 +530,10 @@ const layer = Layer.effect(
         let attempt = yield* summarize(original)
         if (attempt.result === "compact" && compactionPart && head.length > 1 && cfg.compaction?.tail_turns !== 0) {
           const budget = usable({ cfg, model, outputTokenMax: flags.outputTokenMax })
-          const cap = Math.min(optionalBudget, cfg.compaction?.preserve_recent_tokens ?? Infinity)
+          const cap =
+            primary.limit.context > 0
+              ? Math.min(optionalBudget, cfg.compaction?.preserve_recent_tokens ?? Infinity)
+              : (cfg.compaction?.preserve_recent_tokens ?? Infinity)
           if (budget > 0 && cap > 0) {
             const originalSize = yield* Effect.promise(() => estimatePayload(original.preparedPayload))
             const sample = (yield* session.get(input.sessionID).pipe(Effect.orDie)).metadata?.summaryBudgetSample

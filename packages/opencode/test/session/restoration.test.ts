@@ -11,7 +11,7 @@ import { FastCheck } from "effect/testing"
 import { Config } from "@/config/config"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { TestConfig } from "../fixture/config"
-import { Session as SessionNs } from "@/session/session"
+import { Session } from "@/session/session"
 import { Todo } from "../../src/session/todo"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -40,7 +40,7 @@ const env = AppNodeBuilder.build(
   LayerNode.group([
     Agent.node,
     Skill.node,
-    SessionNs.node,
+    Session.node,
     SessionProjector.node,
     Database.node,
     EventV2Bridge.node,
@@ -57,7 +57,7 @@ const seedRestorable = Effect.fn("test.seedRestorable")(function* (
   filePath: string,
   fileBody: string,
 ) {
-  const ssn = yield* SessionNs.Service
+  const ssn = yield* Session.Service
   const fs = yield* FSUtil.Service
   yield* fs.writeWithDirs(filePath, fileBody)
   const user = yield* ssn.updateMessage({
@@ -312,7 +312,7 @@ it.effect("renderMaterials applies budget, max_files and the sentinel", () =>
 it.instance("apply writes one restoration part and stays idempotent", () =>
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
-    const ssn = yield* SessionNs.Service
+    const ssn = yield* Session.Service
     const dir = (yield* TestInstance).directory
     const session = yield* ssn.create({})
     const sessionID = session.id
@@ -402,7 +402,7 @@ it.instance("apply writes one restoration part and stays idempotent", () =>
 
 it.instance("restored part reaches the model messages", () =>
   Effect.gen(function* () {
-    const ssn = yield* SessionNs.Service
+    const ssn = yield* Session.Service
     const session = yield* ssn.create({})
     const sessionID = session.id
     const user = yield* ssn.updateMessage({
@@ -457,11 +457,11 @@ it.instance("restored part reaches the model messages", () =>
 itDisabled.instance("apply respects restoration.enabled = false", () =>
   Effect.gen(function* () {
     const test = yield* TestInstance
-    const session = yield* SessionNs.Service.use((ssn) => ssn.create({}))
+    const session = yield* Session.Service.use((ssn) => ssn.create({}))
     yield* seedRestorable(session.id, path.join(test.directory, "body.txt"), "body text\n")
     yield* apply({ sessionID: session.id })
     yield* apply({ sessionID: session.id })
-    const parts = yield* SessionNs.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
+    const parts = yield* Session.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
       Effect.map((msgs) => msgs.flatMap((m) => m.parts)),
     )
     const sentinels = parts.filter(
@@ -474,11 +474,11 @@ itDisabled.instance("apply respects restoration.enabled = false", () =>
 itTight.instance("apply degrades to a reference under a tight budget", () =>
   Effect.gen(function* () {
     const test = yield* TestInstance
-    const session = yield* SessionNs.Service.use((ssn) => ssn.create({}))
+    const session = yield* Session.Service.use((ssn) => ssn.create({}))
     const body = "y".repeat(200)
     yield* seedRestorable(session.id, path.join(test.directory, "body.txt"), body)
     yield* apply({ sessionID: session.id })
-    const parts = yield* SessionNs.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
+    const parts = yield* Session.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
       Effect.map((msgs) => msgs.flatMap((m) => m.parts)),
     )
     const sentinels = parts.filter(
@@ -499,9 +499,9 @@ itTight.instance("apply degrades to a reference under a tight budget", () =>
 it.instance("apply skips an unsettled compaction marker, accepts a full-summary one", () =>
   Effect.gen(function* () {
     const test = yield* TestInstance
-    const session = yield* SessionNs.Service.use((ssn) => ssn.create({}))
+    const session = yield* Session.Service.use((ssn) => ssn.create({}))
     yield* seedRestorable(session.id, path.join(test.directory, "body.txt"), "body text\n")
-    const ssn = yield* SessionNs.Service
+    const ssn = yield* Session.Service
     const unset = (field: "tail_start_id" | "finish") =>
       Effect.gen(function* () {
         const msgs = yield* ssn.messages({ sessionID: session.id })
@@ -510,11 +510,11 @@ it.instance("apply skips an unsettled compaction marker, accepts a full-summary 
             for (const part of msg.parts) {
               if (part.type === "compaction") yield* ssn.updatePart({ ...part, tail_start_id: undefined })
             }
-          } else {
-            for (const m of msgs) {
-              if (m.info.role === "assistant" && m.info.summary) {
-                yield* ssn.updateMessage({ ...m.info, finish: undefined })
-              }
+            continue
+          }
+          for (const m of msgs) {
+            if (m.info.role === "assistant" && m.info.summary) {
+              yield* ssn.updateMessage({ ...m.info, finish: undefined })
             }
           }
         }
@@ -523,7 +523,7 @@ it.instance("apply skips an unsettled compaction marker, accepts a full-summary 
     // No completed summary pointing at the marker → not settled → no restore.
     yield* unset("finish")
     yield* apply({ sessionID: session.id })
-    const before = yield* SessionNs.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
+    const before = yield* Session.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
       Effect.map((all) => all.flatMap((m) => m.parts)),
     )
     expect(
@@ -531,7 +531,7 @@ it.instance("apply skips an unsettled compaction marker, accepts a full-summary 
     ).toHaveLength(0)
 
     // Summary completed (finish restored) → settled → the restoration lands.
-    const ssn2 = yield* SessionNs.Service
+    const ssn2 = yield* Session.Service
     const msgs2 = yield* ssn2.messages({ sessionID: session.id })
     for (const m of msgs2) {
       if (m.info.role === "assistant" && m.info.summary) {
@@ -539,7 +539,7 @@ it.instance("apply skips an unsettled compaction marker, accepts a full-summary 
       }
     }
     yield* apply({ sessionID: session.id })
-    const after = yield* SessionNs.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
+    const after = yield* Session.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
       Effect.map((all) => all.flatMap((m) => m.parts)),
     )
     const sentinels = after.filter(
@@ -557,9 +557,9 @@ it.instance("apply skips an unsettled compaction marker, accepts a full-summary 
 it.instance("apply accepts a full-summary marker (tail_start_id undefined)", () =>
   Effect.gen(function* () {
     const test = yield* TestInstance
-    const session = yield* SessionNs.Service.use((ssn) => ssn.create({}))
+    const session = yield* Session.Service.use((ssn) => ssn.create({}))
     yield* seedRestorable(session.id, path.join(test.directory, "body.txt"), "full summary body\n")
-    const ssn = yield* SessionNs.Service
+    const ssn = yield* Session.Service
     // Strip tail_start_id from the marker: full-summary fallback shape.
     const msgs = yield* ssn.messages({ sessionID: session.id })
     for (const msg of msgs) {
@@ -568,7 +568,7 @@ it.instance("apply accepts a full-summary marker (tail_start_id undefined)", () 
       }
     }
     yield* apply({ sessionID: session.id })
-    const parts = yield* SessionNs.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
+    const parts = yield* Session.Service.use((ssn) => ssn.messages({ sessionID: session.id })).pipe(
       Effect.map((all) => all.flatMap((m) => m.parts)),
     )
     const sentinels = parts.filter(
@@ -640,7 +640,7 @@ it.effect("renderMaterials collapses the not-restored list beyond the cap", () =
 it.instance("restored body reaches the model when the only prior copy was compacted", () =>
   Effect.gen(function* () {
     const test = yield* TestInstance
-    const session = yield* SessionNs.Service.use((ssn) => ssn.create({}))
+    const session = yield* Session.Service.use((ssn) => ssn.create({}))
     const sessionID = session.id
     const body = "COMPACTED-ONLY-BODY\n"
     const spec = path.join(test.directory, "spec.md")
@@ -649,7 +649,7 @@ it.instance("restored body reaches the model when the only prior copy was compac
     // A real read tool's output IS the file body — make the stored output
     // match the disk body byte-for-byte (this is what makes the old, buggy
     // dedup matter: tailText.includes(content) would hit the cleared output).
-    const ssn0 = yield* SessionNs.Service
+    const ssn0 = yield* Session.Service
     const raw = yield* ssn0.messages({ sessionID })
     for (const msg of raw) {
       for (const part of msg.parts) {
@@ -664,7 +664,7 @@ it.instance("restored body reaches the model when the only prior copy was compac
 
     // Then mark it compacted like a later prune would: storage keeps the
     // output, the projection shows the placeholder instead.
-    const ssn = yield* SessionNs.Service
+    const ssn = yield* Session.Service
     const seeded = yield* ssn.messages({ sessionID })
     for (const msg of seeded) {
       for (const part of msg.parts) {
@@ -719,7 +719,7 @@ it.instance("restored body reaches the model when the only prior copy was compac
 it.instance("a second compaction retires the previous restoration block", () =>
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
-    const ssn = yield* SessionNs.Service
+    const ssn = yield* Session.Service
     const dir = (yield* TestInstance).directory
     const session = yield* ssn.create({})
     const sessionID = session.id
@@ -934,7 +934,7 @@ it.instance("only a complete visible read of the same file version suppresses re
 
 it.instance("a failed todo lookup restores other materials and reports the unavailable list", () =>
   Effect.gen(function* () {
-    const sessions = yield* SessionNs.Service
+    const sessions = yield* Session.Service
     const session = yield* sessions.create({})
     yield* seedRestorable(session.id, path.join((yield* TestInstance).directory, "keep.txt"), "keep this material")
     yield* apply({ sessionID: session.id }).pipe(
@@ -957,7 +957,7 @@ it.instance("a failed todo lookup restores other materials and reports the unava
 
 it.instance("an unsettled later compaction marker does not steal the restoration target", () =>
   Effect.gen(function* () {
-    const sessions = yield* SessionNs.Service
+    const sessions = yield* Session.Service
     const session = yield* sessions.create({})
     const file = path.join((yield* TestInstance).directory, "settled.txt")
     yield* seedRestorable(session.id, file, "settled-body")
@@ -1041,7 +1041,7 @@ it.effect("oversized disk skills are rejected via stat before reading file conte
       new Map(),
       {
         fs: {
-          stat: () => Effect.succeed({ type: "File", size: 500_000 }),
+          stat: () => Effect.succeed({ type: "File", size: 500_000n }),
           readFileStringSafe: () => {
             readCalled = true
             return Effect.succeed("should not be read")
@@ -1083,6 +1083,36 @@ it.instance("retained-tail duplicates beyond max_files stay skipped-duplicate in
       },
     )
     expect(materials.map((m) => m.status)).toEqual(["inlined", "skipped-duplicate"])
+  }),
+)
+
+it.instance("unmodified retained-tail files in [file_max_tokens*4, 50 KiB] resolve to skipped-duplicate instead of reference", () =>
+  Effect.gen(function* () {
+    const fs = yield* FSUtil.Service
+    const dir = (yield* TestInstance).directory
+    const retained = path.join(dir, "retained-24k.txt")
+    const modified = path.join(dir, "modified-24k.txt")
+    const body = "a".repeat(24_000)
+    yield* fs.writeWithDirs(retained, body)
+    yield* fs.writeWithDirs(modified, body + "!")
+    const sha = new Bun.CryptoHasher("sha256").update(body).digest("hex")
+    const materials = yield* materializeCandidates(
+      [
+        { kind: "file", ref: retained, lastUseSeq: 2 },
+        { kind: "file", ref: modified, lastUseSeq: 1 },
+      ],
+      new Map([
+        [retained, sha],
+        [modified, sha],
+      ]),
+      {
+        fs,
+        skill: Option.none(),
+        todos: [],
+        cfg: { ...cfg, file_max_tokens: 4_000 },
+      },
+    )
+    expect(materials.map((m) => m.status)).toEqual(["skipped-duplicate", "reference"])
   }),
 )
 
@@ -1149,7 +1179,7 @@ it.effect("PBT: retainedFileVersions matches exact read/edit/write invalidation 
           const hiddenErr = op.kind === "read_hidden_error_assistant"
           if (!userRole && !hiddenErr && !compacted) {
             if (op.kind === "read_full") expected.set(op.file, sha)
-            else expected.delete(op.file)
+            if (op.kind !== "read_full") expected.delete(op.file)
           }
           messages.push({
             info: userRole

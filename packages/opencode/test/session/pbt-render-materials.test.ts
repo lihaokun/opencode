@@ -37,10 +37,11 @@ describe("PBT renderMaterials", () => {
     .map((m) => (m.status === "inlined" ? { ...m, content: m.content ?? "fallback-body" } : m)) as fc.Arbitrary<RestorationMaterial>
 
   it("the final rendered block honors max_files and budget on the OUTPUT itself", () => {
-    const allowance = Math.max(128, Math.min(2000, cfg.budget_tokens))
+    const budgetCfg = { ...cfg, budget_tokens: 500 }
+    const allowance = Math.max(128, Math.min(2000, budgetCfg.budget_tokens))
     fc.assert(
       fc.property(fc.array(materialArb, { maxLength: 20 }), (materials) => {
-        const text = renderMaterials(materials, cfg)
+        const text = renderMaterials(materials, budgetCfg)
         if (!text) return materials.every((m) => m.status === "skipped-duplicate")
         // Oracle over the final text, not the inputs: count FILE headings —
         // inside the "## Files" section only (terminating at the next "## "
@@ -55,13 +56,13 @@ describe("PBT renderMaterials", () => {
                 return nextSection === -1 ? rest : rest.slice(0, nextSection)
               })()
         const fileHeadings = (filesBody.match(/^### /gm) ?? []).length
-        expect(fileHeadings).toBeLessThanOrEqual(cfg.max_files)
+        expect(fileHeadings).toBeLessThanOrEqual(budgetCfg.max_files)
         // The whole block — headings, fences, reference lines, overflow
         // summary — stays within budget plus the contract allowance.
-        expect(Token.estimate(text)).toBeLessThanOrEqual(cfg.budget_tokens + allowance)
+        expect(Token.estimate(text)).toBeLessThanOrEqual(budgetCfg.budget_tokens + allowance)
         expect(text).toContain(RESTORATION_SENTINEL)
         // Idempotent: the same input renders to the same output.
-        expect(renderMaterials(materials, cfg)).toBe(text)
+        expect(renderMaterials(materials, budgetCfg)).toBe(text)
         return true
       }),
       { seed: 0x2_026_10_18, numRuns: 300 },
@@ -193,7 +194,13 @@ it("charges each inline heading and fence for arbitrarily small skill bodies", (
   )
 })
 
-it("PBT: restorationBudgetCap bounds renderMaterials under /3 estimateMessages for any headroom and materials", () => {
+it("PBT: restorationBudgetCap bounds renderMaterials under both /3 estimateMessages and /4 JSON willOverflow", () => {
+  const escapeHeavyArb = fc
+    .array(fc.constantFrom('{"a":"b","c":"d"}\n', '"\\\n\t', "\u0000\u001b[31m", "plain "), {
+      minLength: 1,
+      maxLength: 120,
+    })
+    .map((parts) => parts.join(""))
   const materialArb: fc.Arbitrary<RestorationMaterial> = fc
     .record({
       candidate: fc.record({
@@ -208,16 +215,40 @@ it("PBT: restorationBudgetCap bounds renderMaterials under /3 estimateMessages f
         "skipped-budget" as const,
         "missing" as const,
       ),
-      content: fc.option(fc.string({ minLength: 0, maxLength: 1_200 }), { nil: undefined }),
+      content: fc.option(fc.oneof(fc.string({ minLength: 0, maxLength: 1_200 }), escapeHeavyArb), { nil: undefined }),
       reason: fc.option(fc.string({ minLength: 1, maxLength: 300 }), { nil: undefined }),
     })
     .map((m) => (m.status === "inlined" ? { ...m, content: m.content ?? "body" } : m))
 
   const baseCfg = restorationConfig(undefined)
+  // Anchor: quote/backslash/newline-heavy content and fractional headroom must stay within both estimators.
+  for (const headroom of [173.4, 10_000, 12_000]) {
+    const cap = restorationBudgetCap(headroom)
+    const heavy = renderMaterials(
+      [
+        {
+          candidate: { kind: "file", ref: "/f/heavy.json", lastUseSeq: 1 },
+          status: "inlined",
+          content: '{"a":"b","c":"d"}\n'.repeat(1_500),
+        },
+        {
+          candidate: { kind: "file", ref: "/f/escapes.txt", lastUseSeq: 2 },
+          status: "inlined",
+          content: '"\\\n\t\u0000'.repeat(4_000),
+        },
+      ],
+      { ...baseCfg, budget_tokens: cap },
+    )
+    if (heavy !== undefined) {
+      expect(estimateMessages([{ role: "user", content: heavy }])).toBeLessThanOrEqual(headroom)
+      expect(Token.estimate(JSON.stringify(heavy))).toBeLessThanOrEqual(headroom)
+    }
+  }
+
   fc.assert(
     fc.property(
-      fc.integer({ min: -500, max: 30_000 }),
-      fc.integer({ min: -500, max: 30_000 }),
+      fc.double({ min: -500, max: 30_000, noNaN: true, noDefaultInfinity: true }),
+      fc.double({ min: -500, max: 30_000, noNaN: true, noDefaultInfinity: true }),
       fc.array(materialArb, { maxLength: 35 }),
       (h1, h2, materials) => {
         const [lo, hi] = h1 <= h2 ? [h1, h2] : [h2, h1]
@@ -232,8 +263,8 @@ it("PBT: restorationBudgetCap bounds renderMaterials under /3 estimateMessages f
           return true
         }
         if (text !== undefined) {
-          const estimated = estimateMessages([{ role: "user", content: text }])
-          expect(estimated).toBeLessThanOrEqual(lo)
+          expect(estimateMessages([{ role: "user", content: text }])).toBeLessThanOrEqual(lo)
+          expect(Token.estimate(JSON.stringify(text))).toBeLessThanOrEqual(lo)
         }
         return true
       },
