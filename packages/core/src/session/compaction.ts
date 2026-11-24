@@ -7,7 +7,7 @@ import type { EventV2 } from "../event"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
-import { hasOutputPath, savedOutputPath, summarizeToolText, summarizeToolError } from "./tool-result-projection"
+import { hasOutputPath, savedOutputPaths, summarizeToolText, summarizeToolError } from "./tool-result-projection"
 import { Token } from "../util/token"
 
 const DEFAULT_BUFFER = 20_000
@@ -82,21 +82,29 @@ type Input = {
 
 const estimate = (value: unknown) => Token.estimate(JSON.stringify(value))
 
-export function serializeToolContent(content: SessionMessage.ToolStateCompleted["content"]) {
+export function serializeToolContent(
+  content: SessionMessage.ToolStateCompleted["content"],
+  outputPaths?: readonly string[],
+) {
   const text = content
     .map((item) =>
       item.type === "text" ? item.text : `[Attached ${item.mime}${item.name === undefined ? "" : `: ${item.name}`}]`,
     )
     .join("\n")
   const preview = summarizeToolText(text)
-  if (preview === text) return text
   const paths = new Set<string>()
-  for (const item of content) {
-    if (item.type === "text") {
-      const file = savedOutputPath(item.text)
-      if (file && !hasOutputPath(preview, file)) paths.add(file)
+  for (const file of outputPaths ?? []) {
+    if (file && !hasOutputPath(preview, file)) paths.add(file)
+  }
+  if (preview !== text) {
+    for (const item of content) {
+      if (item.type !== "text") continue
+      for (const file of savedOutputPaths(item.text)) {
+        if (!hasOutputPath(preview, file)) paths.add(file)
+      }
     }
   }
+  if (paths.size === 0) return preview
   // Leave room for a maximum-length artifact path even when the text preview
   // is full. A result with many artifacts cannot make the summary unbounded.
   const references: string[] = []
@@ -108,9 +116,11 @@ export function serializeToolContent(content: SessionMessage.ToolStateCompleted[
     remaining -= line.length
   }
   const omitted = paths.size - references.length
-  return (
-    preview + references.join("") + (omitted ? `\n[${omitted} more artifact paths in the original tool result]` : "")
-  )
+  const body =
+    preview +
+    references.join("") +
+    (omitted ? `\n[${omitted} more artifact ${omitted === 1 ? "path" : "paths"} in the original tool result]` : "")
+  return preview ? body : body.replace(/^\n/, "")
 }
 
 const serialize = (message: SessionMessage.Message) => {
@@ -127,7 +137,7 @@ const serialize = (message: SessionMessage.Message) => {
         if (part.state.status === "completed")
           return [
             `[Assistant tool call]: ${part.name}(${input})`,
-            `[Tool result]: ${serializeToolContent(part.state.content)}`,
+            `[Tool result]: ${serializeToolContent(part.state.content, part.state.outputPaths)}`,
           ]
         if (part.state.status === "error")
           return [

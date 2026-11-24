@@ -2,6 +2,7 @@ import fc from "fast-check"
 import { describe, expect, it } from "bun:test"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { projectMcpToolResult } from "../../src/session/tools"
+import { McpCatalog } from "@/mcp/catalog"
 
 /**
  * §5.3 第三层随机测试（C11 第四组）：任意 content/structuredContent 组合下，
@@ -37,5 +38,29 @@ describe("PBT projectMcpToolResult", () => {
     const structured = { a: 1 }
     expect(project([{ type: "text", text: "prose" }], structured).text).toBe(`prose\n\n${JSON.stringify(structured)}`)
     expect(project([{ type: "text", text: `{"a":1}` }], structured).text).toBe(`{"a":1}`)
+  })
+
+  it("both projectMcpToolResult and callToolErrorMessage deduplicate semantic JSON including -0", () => {
+    fc.assert(
+      fc.property(
+        fc.oneof(fc.jsonValue(), fc.constant(-0), fc.constant({ z: -0, nested: [-0, 0] })),
+        fc.string(),
+        fc.constantFrom("append" as const, "echo" as const),
+        (value, key, kind) => {
+          const structured = { first: value, key }
+          const prose = "err: " + key
+          const echo = JSON.stringify({ key, first: value }, null, 2)
+          const texts = kind === "echo" ? [prose, echo] : [prose]
+          const content = texts.map((text) => ({ type: "text" as const, text }))
+          const expected = (kind === "append" ? [...texts, JSON.stringify(structured)] : texts).join("\n\n")
+
+          expect(project(content, structured).text).toBe(expected)
+          expect(
+            McpCatalog.callToolErrorMessage({ isError: true, content, structuredContent: structured } as CallToolResult),
+          ).toBe(expected)
+        },
+      ),
+      { seed: 600808, numRuns: 200 },
+    )
   })
 })

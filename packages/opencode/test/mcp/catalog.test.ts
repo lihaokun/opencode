@@ -1,13 +1,25 @@
 import { describe, expect, test } from "bun:test"
+import type { ToolExecutionOptions } from "ai"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
-import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from "@modelcontextprotocol/sdk/types.js"
+import {
+  CallToolRequestSchema,
+  type CallToolResult,
+  ErrorCode,
+  ListToolsRequestSchema,
+  McpError,
+  type Tool as MCPTool,
+} from "@modelcontextprotocol/sdk/types.js"
 import { McpCatalog } from "@/mcp/catalog"
 import { Effect } from "effect"
 import { FastCheck } from "effect/testing"
 
-const options = { toolCallId: "call_mcp", abortSignal: new AbortController().signal } as any
+const options: ToolExecutionOptions = {
+  toolCallId: "call_mcp",
+  messages: [],
+  abortSignal: new AbortController().signal,
+}
 
 function clientReturning(result: unknown) {
   return {
@@ -15,7 +27,7 @@ function clientReturning(result: unknown) {
   } as unknown as Client
 }
 
-function mcpTool() {
+function mcpTool(): MCPTool {
   return {
     name: "screenshot",
     description: "Take a screenshot",
@@ -24,7 +36,7 @@ function mcpTool() {
       properties: {},
       additionalProperties: false,
     },
-  } as any
+  }
 }
 
 describe("McpCatalog.convertTool", () => {
@@ -65,7 +77,7 @@ describe("McpCatalog.callToolErrorMessage", () => {
   test("structuredContent-only error carries the JSON", () => {
     const structuredContent = { code: 3007, detail: "quota exceeded" }
     expect(
-      McpCatalog.callToolErrorMessage({ isError: true, content: [], structuredContent } as any),
+      McpCatalog.callToolErrorMessage({ isError: true, content: [], structuredContent } as CallToolResult),
     ).toBe(JSON.stringify(structuredContent))
   })
 
@@ -76,14 +88,25 @@ describe("McpCatalog.callToolErrorMessage", () => {
         isError: true,
         content: [{ type: "text", text: "write failed" }],
         structuredContent,
-      } as any),
+      } as CallToolResult),
     ).toBe(`write failed\n\n${JSON.stringify(structuredContent)}`)
   })
 
   test("neither text nor structuredContent keeps the stable fallback", () => {
-    expect(McpCatalog.callToolErrorMessage({ isError: true, content: [] } as any)).toBe(
+    expect(McpCatalog.callToolErrorMessage({ isError: true, content: [] } as CallToolResult)).toBe(
       "MCP tool returned an error",
     )
+  })
+
+  test("deduplicates semantically equivalent JSON including negative zero", () => {
+    const structuredContent = { value: -0, ok: true }
+    expect(
+      McpCatalog.callToolErrorMessage({
+        isError: true,
+        content: [{ type: "text", text: '{"ok": true, "value": 0}' }],
+        structuredContent,
+      } as CallToolResult),
+    ).toBe('{"ok": true, "value": 0}')
   })
 })
 
@@ -209,4 +232,72 @@ test("cancellation retains the original signal error", async () => {
   })
   await expect(tool.execute?.({}, { ...options, abortSignal: controller.signal })).rejects.toBe(abort)
   expect(calls).toBe(0)
+})
+
+test("bounds non-McpError transport failures and omits null McpError data", async () => {
+  const saved: string[] = []
+  const transportClient = {
+    callTool: async () => {
+      throw new Error("HTTP 500: " + "z".repeat(10_000))
+    },
+  } as unknown as Client
+  const transportTool = McpCatalog.convertTool(mcpTool(), transportClient, undefined, async (text) => {
+    saved.push(text)
+    return "bounded transport error"
+  })
+  await expect(transportTool.execute?.({}, options)).rejects.toThrow("bounded transport error")
+  expect(saved).toHaveLength(1)
+  expect(saved[0]).toContain("HTTP 500:")
+
+  const nullDataSeen: string[] = []
+  const nullDataClient = {
+    callTool: async () => {
+      throw new McpError(ErrorCode.InternalError, "server failed", null)
+    },
+  } as unknown as Client
+  const nullDataTool = McpCatalog.convertTool(mcpTool(), nullDataClient, undefined, async (text) => {
+    nullDataSeen.push(text)
+    return text
+  })
+  await expect(nullDataTool.execute?.({}, options)).rejects.toThrow("server failed")
+  expect(nullDataSeen[0]).not.toContain("\n\nnull")
+})
+
+test("PBT: all MCP failure kinds (isError, McpError with/without/null data, transport Error) stay bounded", async () => {
+  await FastCheck.assert(
+    FastCheck.asyncProperty(
+      FastCheck.constantFrom(
+        "isError" as const,
+        "rpcMessage" as const,
+        "rpcData" as const,
+        "rpcNullData" as const,
+        "transportError" as const,
+      ),
+      FastCheck.string({ minLength: 1, maxLength: 20 }),
+      async (kind, word) => {
+        const detail = word.repeat(500)
+        const saved: string[] = []
+        const client = {
+          callTool: async () => {
+            if (kind === "isError") return { isError: true, content: [], structuredContent: { detail } }
+            if (kind === "rpcMessage") throw new McpError(ErrorCode.InternalError, detail)
+            if (kind === "rpcData") throw new McpError(ErrorCode.InternalError, "rpc err", { detail })
+            if (kind === "rpcNullData") throw new McpError(ErrorCode.InternalError, detail, null)
+            throw new Error(`HTTP 500: ${detail}`)
+          },
+        } as unknown as Client
+        const tool = McpCatalog.convertTool(mcpTool(), client, undefined, async (text) => {
+          saved.push(text)
+          return "bounded-preview"
+        })
+        await expect(tool.execute?.({}, options)).rejects.toThrow("bounded-preview")
+        expect(saved).toHaveLength(1)
+        if (kind === "isError") expect(JSON.parse(saved[0]!)).toEqual({ detail })
+        else if (kind === "rpcData") expect(JSON.parse(saved[0]!.split("\n\n").at(-1)!)).toEqual({ detail })
+        else expect(saved[0]).toContain(detail)
+        if (kind === "rpcNullData") expect(saved[0]).not.toContain("\n\nnull")
+      },
+    ),
+    { seed: 600807, numRuns: 100 },
+  )
 })

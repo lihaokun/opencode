@@ -36,9 +36,19 @@ export function callToolErrorMessage(result: CallToolResult): string {
 
 export function parsesTo(text: string, value: unknown) {
   try {
-    return Bun.deepEquals(JSON.parse(text), value)
+    const normalized = JSON.stringify(value)
+    if (normalized === undefined) return false
+    return Bun.deepEquals(JSON.parse(JSON.stringify(JSON.parse(text))), JSON.parse(normalized))
   } catch {
     return false
+  }
+}
+
+function formatErrorData(data: unknown) {
+  try {
+    return JSON.stringify(data) ?? String(data)
+  } catch {
+    return String(data)
   }
 }
 
@@ -84,11 +94,21 @@ export async function callTool(
       onprogress: () => {},
     })
     .catch(async (error: unknown) => {
-      if (signal?.aborted || !(error instanceof McpError)) throw error
-      const diagnostic = error.data === undefined ? error.message : error.message + "\n\n" + JSON.stringify(error.data)
-      const bounded = await truncateError(diagnostic)
-      if (bounded === error.message) throw error
-      throw new Error(bounded)
+      if (signal?.aborted) throw error
+      if (error instanceof McpError) {
+        const diagnostic =
+          error.data === undefined || error.data === null
+            ? error.message
+            : error.message + "\n\n" + formatErrorData(error.data)
+        const bounded = await truncateError(diagnostic)
+        if (bounded === error.message) throw error
+        throw new Error(bounded)
+      }
+      if (error instanceof Error && error.message) {
+        const bounded = await truncateError(error.message)
+        if (bounded !== error.message) throw new Error(bounded)
+      }
+      throw error
     })
   if (result.isError) throw new Error(await truncateError(callToolErrorMessage(result)))
   return result

@@ -481,15 +481,20 @@ export function projectMcpToolResult(result: CallToolResult): {
   const textParts: string[] = []
   const attachments: Omit<SessionV1.FilePart, "id" | "sessionID" | "messageID">[] = []
   for (const contentItem of result.content) {
-    if (contentItem.type === "text") textParts.push(contentItem.text)
-    else if (contentItem.type === "image") {
+    if (contentItem.type === "text") {
+      textParts.push(contentItem.text)
+      continue
+    }
+    if (contentItem.type === "image") {
       attachments.push({
         type: "file",
         mime: contentItem.mimeType,
         url: `data:${contentItem.mimeType};base64,${contentItem.data}`,
       })
-    } else if (contentItem.type === "resource") {
-      const { resource } = contentItem
+      continue
+    }
+    if (contentItem.type === "resource") {
+      const resource = contentItem.resource
       if ("text" in resource && resource.text) textParts.push(resource.text)
       if ("blob" in resource && resource.blob) {
         const mime = resource.mimeType ?? "application/octet-stream"
@@ -513,9 +518,13 @@ export function projectMcpToolResult(result: CallToolResult): {
           filename: resource.uri,
         })
       }
-    } else if (contentItem.type === "resource_link") {
+      continue
+    }
+    if (contentItem.type === "resource_link") {
       textParts.push(`${contentItem.name}: ${contentItem.uri}`)
-    } else if (contentItem.type === "audio") {
+      continue
+    }
+    if (contentItem.type === "audio") {
       textParts.push(`[MCP audio content omitted: ${contentItem.mimeType}]`)
     }
   }

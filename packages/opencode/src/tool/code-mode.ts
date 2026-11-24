@@ -134,6 +134,7 @@ function toolTree(catalog: readonly CatalogEntry[], run: (entry: CatalogEntry) =
 
 const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: {
   truncate: Truncate.Interface
+  onTruncatedErrorPath?: (file: string) => void
   plugin: Plugin.Interface
   entry: CatalogEntry
   args: Record<string, unknown>
@@ -155,7 +156,17 @@ const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: 
         input.args,
         input.ctx.abort,
         input.entry.tool.timeout,
-        (text) => run(input.truncate.output(text, { error: true }).pipe(Effect.map((out) => out.content))),
+        (text) =>
+          run(
+            input.truncate.output(text, { error: true }).pipe(
+              Effect.tap((out) =>
+                out.truncated && input.onTruncatedErrorPath
+                  ? Effect.sync(() => input.onTruncatedErrorPath!(out.outputPath))
+                  : Effect.void,
+              ),
+              Effect.map((out) => out.content),
+            ),
+          ),
       ),
     )
   }).pipe(
@@ -205,6 +216,7 @@ export const CodeModeTool = Tool.define(
 
         const calls: CallEntry[] = []
         const attachments: Attachment[] = []
+        const errorOutputPaths: string[] = []
         const publish = () =>
           ctx.metadata({ title: CODE_MODE_TOOL, metadata: { toolCalls: calls.map((c) => ({ ...c })) } })
 
@@ -214,6 +226,7 @@ export const CodeModeTool = Tool.define(
             childCalls += 1
             const result = yield* invokeChildTool({
               truncate,
+              onTruncatedErrorPath: (file) => void errorOutputPaths.push(file),
               plugin,
               entry,
               args: (input ?? {}) as Record<string, unknown>,
@@ -271,6 +284,23 @@ export const CodeModeTool = Tool.define(
           return text.length > 0 ? `${text}\n\nLogs:\n${logs.join("\n")}` : `Logs:\n${logs.join("\n")}`
         }
 
+        // Restore host-managed tool-output artifact pointers outside the sandbox:
+        // the interpreter intentionally redacts filesystem paths inside guest code,
+        // while the model still needs the saved-output path produced by Truncate.
+        const restoreArtifactPaths = (text: string, appendMissing: boolean) => {
+          let index = 0
+          const restored = text.replaceAll("Full output saved to: <redacted-path>", () => {
+            const file = errorOutputPaths[index]
+            if (!file) return "Full output saved to: <redacted-path>"
+            index += 1
+            return `Full output saved to: ${file}`
+          })
+          if (!appendMissing) return restored
+          const missing = [...new Set(errorOutputPaths)].filter((file) => !restored.includes(file))
+          if (missing.length === 0) return restored
+          return restored + missing.map((file) => `\nFull output saved to: ${file}`).join("")
+        }
+
         if (!result.ok) {
           if (ctx.abort.aborted) {
             return {
@@ -280,7 +310,9 @@ export const CodeModeTool = Tool.define(
             } satisfies Tool.ExecuteResult<Metadata>
           }
           const hints = (result.error.suggestions ?? []).filter((hint) => !result.error.message.includes(hint))
-          return yield* Effect.fail(new Error(withLogs([result.error.message, ...hints].join("\n"))))
+          const raw = restoreArtifactPaths(withLogs([result.error.message, ...hints].join("\n")), true)
+          const bounded = yield* truncate.output(raw, { error: true })
+          return yield* Effect.fail(new Error(bounded.content))
         }
 
         // The interpreter validates returned values as plain JSON, so stringify cannot throw;
@@ -293,7 +325,7 @@ export const CodeModeTool = Tool.define(
         return {
           title: CODE_MODE_TOOL,
           metadata: { toolCalls: calls },
-          output: withLogs(output),
+          output: restoreArtifactPaths(withLogs(output), false),
           ...(attachments.length > 0 ? { attachments } : {}),
         } satisfies Tool.ExecuteResult<Metadata>
       }, Effect.orDie),

@@ -395,6 +395,76 @@ describe("code mode execute", () => {
     expect(result.output).toBe("diagnostic saved")
   })
 
+  test("restores the real truncated artifact path outside the sandbox for caught and uncaught MCP errors", async () => {
+    const detail = "server diagnostic ".repeat(6000)
+    const artifact = "/tmp/opencode-real-mcp-artifact.txt"
+    const tool = await Effect.runPromise(
+      CodeModeTool.pipe(
+        Effect.flatMap(Tool.init),
+        Effect.provide(
+          harness({
+            mcpTools: {
+              bad_tool: mcpTool("tool", () => {
+                throw new McpError(ErrorCode.InternalError, detail)
+              }),
+            },
+            servers: ["bad"],
+            truncate: (text, options) => {
+              if (!options?.error) return Effect.succeed({ content: text, truncated: false as const })
+              return Effect.succeed({
+                content:
+                  `preview\n\n...100 lines truncated...\n\nThe tool call failed and the error output was truncated. Full output saved to: ${artifact}\nUse Read to inspect.`,
+                truncated: true as const,
+                outputPath: artifact,
+              })
+            },
+          }),
+        ),
+      ),
+    )
+
+    const caught = await Effect.runPromise(
+      tool.execute({ code: "try { await tools.bad.tool({}) } catch (e) { return e.message }" }, ctx),
+    )
+    expect(caught.output).toContain(`Full output saved to: ${artifact}`)
+    expect(caught.output).not.toContain("<redacted-path>")
+
+    const uncaught = await failure(tool.execute({ code: "await tools.bad.tool({})" }, ctx))
+    expect(uncaught.message).toContain(`Full output saved to: ${artifact}`)
+    expect(uncaught.message).not.toContain("<redacted-path>")
+  })
+
+  test("bounds oversized console logs attached to a failed program execution", async () => {
+    const truncatedCalls: string[] = []
+    const tool = await Effect.runPromise(
+      CodeModeTool.pipe(
+        Effect.flatMap(Tool.init),
+        Effect.provide(
+          harness({
+            mcpTools: {},
+            servers: [],
+            truncate: (text, options) => {
+              if (!options?.error) return Effect.succeed({ content: text, truncated: false as const })
+              truncatedCalls.push(text)
+              return Effect.succeed({
+                content: "bounded failure output\nFull output saved to: /tmp/console-failure.txt",
+                truncated: true as const,
+                outputPath: "/tmp/console-failure.txt",
+              })
+            },
+          }),
+        ),
+      ),
+    )
+
+    const err = await failure(
+      tool.execute({ code: `console.log("x".repeat(80000)); throw new Error("boom")` }, ctx),
+    )
+    expect(truncatedCalls).toHaveLength(1)
+    expect(truncatedCalls[0]).toContain("Uncaught: boom")
+    expect(err.message).toContain("Full output saved to: /tmp/console-failure.txt")
+  })
+
   test("an MCP error carrying only structuredContent surfaces the JSON in the message", async () => {
     const structuredContent = { code: 3007, detail: "quota exceeded" }
     const tool = await build({

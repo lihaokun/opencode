@@ -42,16 +42,36 @@ export function summarizeToolText(text: string): string {
   return `${prefix}\n[... ${text.length - prefix.length - suffix.length} chars truncated ...]\n${suffix}`
 }
 
-// V2 stores the truncator's artifact reference in text, including on errors.
+// Matches both V1 Truncate hints and Core V2 ToolOutputStore markers.
+const V1_SAVED_OUTPUT_RE =
+  /(?:^|\r?\n)The tool call (?:failed; error output was truncated|succeeded but the output was truncated)\. Full output saved to: ([^\r\n]{1,32767})\r?\nUse Grep to search the full content or Read with offset\/limit to view specific sections\.(?=\r?\n|$)/g
+
+const V2_SAVED_OUTPUT_RE =
+  /(?:^|\r?\n)\.\.\. output truncated; full content saved to ([^\r\n]{1,32767}) \.\.\.(?=\r?\n|$)/g
+
+// Extract every artifact pointer emitted by V1 Truncate or Core V2 ToolOutputStore.
+export function savedOutputPaths(text: string): string[] {
+  const found: Array<{ index: number; file: string }> = []
+  for (const match of text.matchAll(V1_SAVED_OUTPUT_RE)) {
+    if (match[1]) found.push({ index: match.index ?? 0, file: match[1] })
+  }
+  for (const match of text.matchAll(V2_SAVED_OUTPUT_RE)) {
+    if (match[1]) found.push({ index: match.index ?? 0, file: match[1] })
+  }
+  found.sort((a, b) => a.index - b.index)
+  return found.map((item) => item.file)
+}
+
+// Prefer the trailing pointer when text quotes an earlier truncated tool output.
 export function savedOutputPath(text: string) {
-  return /(?:^|\n)The tool call (?:failed; error output was truncated|succeeded but the output was truncated)\. Full output saved to: ([^\r\n]{1,32767})\nUse Grep to search the full content or Read with offset\/limit to view specific sections\.(?:\n|$)/.exec(
-    text,
-  )?.[1]
+  return savedOutputPaths(text).at(-1)
 }
 
 export function hasOutputPath(preview: string, file: string) {
-  const pointer = "Full output saved to: " + file
-  return preview.endsWith(pointer) || preview.includes(pointer + "\n")
+  const v1 = "Full output saved to: " + file
+  if (preview.endsWith(v1) || preview.includes(v1 + "\n") || preview.includes(v1 + "\r\n")) return true
+  const v2 = "... output truncated; full content saved to " + file + " ..."
+  return preview.endsWith(v2) || preview.includes(v2 + "\n") || preview.includes(v2 + "\r\n")
 }
 
 export function summarizeToolError(text: string) {
