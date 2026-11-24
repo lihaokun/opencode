@@ -44,7 +44,7 @@
 1. **`session/tools.ts` 投影循环（:429-465）**：
    - 新增 `resource_link` 分支：`textParts.push(`${contentItem.name}: ${contentItem.uri}`)`
    - 新增 `audio` 分支：`textParts.push(`[MCP audio content omitted: ${contentItem.mimeType}]`)`
-   - 循环后、`truncate.output` 之前：若 `result.structuredContent != null` → `serialized = JSON.stringify(sc)`；当 `textParts` 中**没有一项与 sc 语义相等**时 `textParts.push(serialized)`。语义判等 = `item === serialized`（快路径）或 `parsesTo(item, sc)`：`try { return Bun.deepEquals(JSON.parse(item), sc) } catch { return false }`——非 JSON 的 prose 项解析即失败、按不等处理；深相等键序不敏感。裸 JSON 追加（**与 catalog 空 content 兜底的裸 stringify 格式一致**）。合并文本继续走既有 `truncate.output` 单次调用（决议：不单独设预算）。`parsesTo` 为 `tools.ts` 模块局部函数（单一消费点，不进 core）。
+   - 循环后、`truncate.output` 之前：若 `result.structuredContent != null` → `serialized = JSON.stringify(sc)`；当 `textParts` 中**没有一项与 sc 语义相等**时 `textParts.push(serialized)`。语义判等 = `item === serialized`（快路径）或 `McpCatalog.parsesTo(item, sc)`（已上提至 `mcp/catalog.ts:37` 供 `tools.ts` 与 `catalog.ts` 共用，双侧经 `JSON.parse(JSON.stringify(...))` 归一化兼容 `-0` 与 `0`）——非 JSON 的 prose 项解析即失败、按不等处理；深相等键序不敏感。裸 JSON 追加（**与 catalog 空 content 兜底的裸 stringify 格式一致**）。合并文本继续走既有 `truncate.output` 单次调用（决议：不单独设预算）。
 2. **`mcp/catalog.ts`（:68-74）**：抽导出小函数 `callToolErrorMessage(result: CallToolResult): string` — `[...contentTextItems, structuredContent?.stringify].filter(非空).join("\n\n") || "MCP tool returned an error"`；isError 分支改用它。兜底文案与现状一致。
 3. **`tool/code-mode.ts`（:161-167）**：镜像 throw 改调 `McpCatalog.callToolErrorMessage`（`code-mode.ts:148` "Deliberately mirrors" 注释同步更新为指向共享函数）。
 4. **`tools.ts` 的 `output.metadata` 不复制 sc**——sc 已进正文，避免持久化双份。
@@ -87,7 +87,7 @@ harness 说明：投影循环提取为纯函数 `projectMcpToolResult`（`tools.
 
 | 文件 | 函数 / 位置 | 改动概述 | 状态（修复后回填） |
 |------|------------|---------|------|
-| `packages/opencode/src/session/tools.ts` | 投影循环 → 纯函数 `projectMcpToolResult` + `parsesTo` | resource_link / audio 分支 + sc 追加语义判等 | 已改: `12bd8a704f` |
+| `packages/opencode/src/session/tools.ts` | 投影循环 → 纯函数 `projectMcpToolResult`（复用 `McpCatalog.parsesTo`） | resource_link / audio 分支 + sc 追加语义判等 | 已改: `12bd8a704f`、`70d4638991` |
 | `packages/opencode/src/mcp/catalog.ts` | isError 分支（:68-74） | 抽 `callToolErrorMessage`（含 sc 通道）并改用 | 已改: `12bd8a704f` |
 | `packages/opencode/src/tool/code-mode.ts` | 镜像 throw（:161-167） | 改调共享函数，更新镜像注释 | 已改: `12bd8a704f` |
 | `packages/opencode/test/*` | `mcp-projection.test.ts`（新）+ catalog/code-mode 用例 | 第六部分清单落地 | 已加: `12bd8a704f` |
@@ -100,8 +100,8 @@ harness 说明：投影循环提取为纯函数 `projectMcpToolResult`（`tools.
 | `docs/devlog/` | P0-2 实施日志（含度量） | 已加: `docs/devlog/2026-10-12-session-fix-mcp-structured-content-projection.md` |
 | 无 schema/枚举/接口契约文档 | 新契约（追加格式、判等规则、占位文案、错误 message 组装）权威记录为本文第四部分 | 无（+理由） |
 
-## 2026-11-21～11-24 · 协议错误出口、传输异常与 CodeMode 路径还原
+## 2026-11-21～11-24 · 协议错误出口、传输异常与 CodeMode 不透明令牌路径还原
 
-普通工具与 code-mode 通过同一工具调用入口处理失败。工具返回 `isError` 时提取正文与 `structuredContent`（语义判等先做 JSON 归一化，兼容 `-0` 与 `0`）；JSON-RPC `McpError` 保留 `message` 与非空 `data`（跳过 `null`/`undefined`，并对循环引用/BigInt 安全序列化）；非 `McpError` 传输错误（如 HTTP/SSE 500 响应体）同样经过 `truncateError` 有界截断；取消信号保留原有异常。
+普通工具与 code-mode 通过同一工具调用入口处理失败。工具返回 `isError` 时提取正文与 `structuredContent`（语义判等由 `McpCatalog.parsesTo` 共享，经双侧 JSON 归一化兼容 `-0` 与 `0`）；JSON-RPC `McpError` 保留 `message` 与非空 `data`（跳过 `null`/`undefined`，并对循环引用、无原型对象与 BigInt 安全序列化）；非 `McpError` 传输错误与非 `Error` 原始 reject 值均经过 `truncateError` 有界截断；取消信号与内部 `DOMException("AbortError")` 保留原有异常类型。
 
-CodeMode 侧保持 `@opencode-ai/codemode` 沙箱内部路径脱敏不变量不变，同时在 `packages/opencode/src/tool/code-mode.ts` 的宿主侧记录每次错误截断的真实 `outputPath`，于沙箱返回后将 `Full output saved to: <redacted-path>` 还原为真实落盘路径（未捕获与 `try/catch` 捕获两条路径均还原），且脚本失败时的 `withLogs(...)` 输出一并经 `truncate.output(..., { error: true })` 保护，避免日志放大导致无界异常。详见 [PR #60 独立审核收敛修复记录](runtime-fix-pr60-audit-convergence.md)。
+CodeMode 侧保持 `@opencode-ai/codemode` 沙箱内部路径隔离边界不变：在 `packages/opencode/src/tool/code-mode.ts` 的 `truncate` 回调进入沙箱前，将每次真实截断的 `outputPath` 替换为单次执行不可预测的不透明 token（`__opencode_artifact_<nonce>_<id>__`），出沙箱后按 `Map` 精确 1:1 还原（非字符串返回值在 `JSON.stringify` 之前递归还原，`logs` 独立还原），彻底避免含空格/引号/Windows 反斜杠路径损坏、JSON 转义破坏、捕获忽略错误错配或客体伪造 `<redacted-path>`；脚本失败时的 `withLogs(...)` 输出一并经 `truncate.output(..., { error: true })` 保护。详见 [PR #60 独立审核收敛修复记录](runtime-fix-pr60-audit-convergence.md)。

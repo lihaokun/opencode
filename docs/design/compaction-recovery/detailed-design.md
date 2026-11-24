@@ -1,6 +1,6 @@
 # 细化设计 — 压缩后恢复（compaction-recovery）
 
-> 状态：细化阶段（§4.3），待 §4.4 审查后实施。
+> 状态：已实施并随二轮独立复审收敛同步至 HEAD（§4.3–§4.4）。
 > 架构依据：`docs/design/compaction-recovery/architecture.md`（已确认）。
 > 待核实清单已全部核实（见 §2 复用点，标注 ★）。
 
@@ -18,13 +18,13 @@
 
 | 项 | 核实结果 | 复用方式 |
 |---|---|---|
-| H1 路径字段 ★（2026-10-20 独立审 B5 同步修订） | read → `metadata.display.path` 且仅 `display.type === "file"`（`read.ts:288-298` 目录读取同形 type:"directory"，须过滤）；edit → **`metadata.filediff.file`**（`edit.ts:181-211`——初稿的 `metadata.filepath` 是 permission request 的 metadata 形状，edit **result** metadata 从未含 filepath，按初稿实现 edit 候选恒空） | collect 的候选提取 |
-| H3 tail 重建 ★ | `Session.messages({sessionID})` 返回全量 `WithParts[]`（`session.ts:536`）；tail 体量受 preserve_recent 预算（2k~15k token）约束，全量读取后切片成本同阶 | `retainedFileVersions` |
+| H1 路径字段 ★（2026-10-20 独立审 B5 同步修订） | read → `metadata.display.path` 且仅 `display.type === "file"`（`read.ts:282-316` 目录读取同形 type:"directory"，须过滤）；edit → **`metadata.filediff.file`**（`edit.ts:181-211`——初稿的 `metadata.filepath` 是 permission request 的 metadata 形状，edit **result** metadata 从未含 filepath，按初稿实现 edit 候选恒空） | collect 的候选提取 |
+| H3 tail 重建 ★ | `Session.messages({sessionID})` 返回全量 `WithParts[]`（`session.ts:549`）；tail 体量受 preserve_recent 预算（2k~15k token）约束，全量读取后切片成本同阶 | `retainedFileVersions` |
 | skill 定位 ★ | skill tool part `metadata: { name, dir }`（`skill.ts:62-65`）；`Skill.Service` 可按 name 解析 `info.location` | materialize 的 skill 正文重读 |
-| synthetic part ★ | `{ id, messageID, sessionID, type: "text", text, synthetic: true }` 经 `sessions.updatePart` + push 入 `userMessage.parts`（`reminders.ts:138-151`）；哨兵前缀 + `findLast` + 逐字节比较的去重先例 | apply 的写入与去重 |
-| config ★ | `compaction` struct（`config.ts:150-161`，含 auto/prune/tail_turns/preserve_recent_tokens） | 新增 `restoration` 子结构 |
+| synthetic part ★ | `{ id, messageID, sessionID, type: "text", text, synthetic: true, metadata }` 经 `sessions.updatePart` + push 入 `userMessage.parts`（`reminders.ts` 在 `agentmgmt-2-run-state` 已退场，本模块独立维护 `RESTORATION_SENTINEL` 与 `markerID` 退役语义） | apply 的写入与去重 |
+| config ★ | `compaction` struct（`config.ts:154-185`，含 auto/prune/tail_turns/preserve_recent_tokens） | 新增 `restoration` 子结构 |
 | token 估算 | `Token.estimate`（core util，compaction 同款） | materialize/render 的 token 上限 |
-| 哨兵常量先例 | `AGENT_ROSTER_SENTINEL`（reminders.ts） | `RESTORATION_SENTINEL = "<!-- opencode:restoration -->"` |
+| 哨兵常量 | `RESTORATION_SENTINEL = "<!-- opencode:restoration -->"`（`restoration.ts:28`） | 持久化恢复块识别与 G4 退役 |
 
 ## 3. 错误处理策略
 
@@ -89,27 +89,27 @@ restoration: Schema.optional(Schema.Struct({
 
 ### 5.2 collectCandidates
 
-- **签名**：`collectCandidates(messages: SessionV1.WithParts[], todos: Todo.Info[]): RestorationCandidate[]`
+- **签名**：`collectCandidates(messages: SessionV1.WithParts[], todos: Todo.Info[] | undefined): RestorationCandidate[]`
 - **功能描述**：线性扫描产出候选。
 - **调用关系**：callers: apply；callees: 无。
 - **实现思路**：
   1. 正向遍历全部 parts，维护 `Map<(kind,ref), lastUseSeq>`（seq 用 PartID/单调序号——取 part 的持久化顺序，实现用遍历计数器）
   2. tool completed part 且 `tool === "read"` → `display.type === "file"` 时取 `metadata.display.path`（目录读取过滤掉）；`tool === "edit"` → `metadata.filediff.file`（2026-10-20 B5 同步修订，理由见 §2 H1 行）；`tool === "skill"` → `metadata.name` → skill 候选
-  3. `todos.length > 0` → push todo 候选（固定 ref `"todo"`，lastUseSeq = 最大遍历计数）
+  3. `todos === undefined || todos.length > 0` → push todo 候选（固定 ref `"todo"`，lastUseSeq = 最大遍历计数；`undefined` 表示 todo 查询失败以输出 missing 诊断）
   4. Map → 数组，按 lastUseSeq 降序
 - **退出覆盖**：纯函数，仅正常返回；metadata 缺字段（如 `display` undefined）→ 跳过该 part（不产生候选）。
 - **循环刻画**：线性扫描有限数组，终止显然。
-- **正确性论证**：前置：messages 完整、todos 为现状。每个 read/edit/skill completed part 恰产生至多一个候选（同 ref 后者覆盖前者，保留最近）⇒ 唯一性后置成立；排序键单调 ⇒ "按最近使用排序"后置成立。
+- **正确性论证**：前置：messages 完整、todos 为现状或 `undefined`。每个 read/edit/skill completed part 恰产生至多一个候选（同 ref 后者覆盖前者，保留最近）⇒ 唯一性后置成立；排序键单调 ⇒ "按最近使用排序"后置成立。
 
 ### 5.3 materializeCandidates
 
-- **签名**：`materializeCandidates(candidates, versions: ReadonlyMap<string, string>, deps: { fs; skill; todo; cfg }): Effect.Effect<RestorationMaterial[]>`（deps 以参数传入便于单测）
+- **签名**：`materializeCandidates(candidates, versions: ReadonlyMap<string, string>, deps: { fs; skill; todos; cfg; readable? }): Effect.Effect<RestorationMaterial[]>`（deps 以参数传入便于单测）
 - **功能描述**：逐候选物化。
 - **调用关系**：callers: apply；callees: FSUtil（读盘/stat）、Skill.Service（按 name 定位 location）、Token.estimate。
 - **实现思路**（分支全覆盖）：
   1. `todo` 候选 → 若 `deps.todos === undefined` 返回 `missing("todo list unavailable")`；否则 JSON 序列化后经 `include` 申请预算，放不下时返回 todo 专用降级理由（不指向不存在的 todo 读取工具）。
   2. `skill` 候选 → `Skill.Service` 解析 `name` → 失败返回 `missing`；非 `<built-in>` 磁盘技能先 `fs.stat(info.location)`，非文件返 `missing`、字节超 `file_max_tokens * 4` 返 `reference`（不读全文，落实 H5）；再读正文并复核 `Token.estimate`，合格后经 `include` 申请预算（无 tail 比对）。
-  3. `file` 候选 → 先查询 `retainedVersion = versions.get(candidate.ref)`；对非保留文件在预算耗尽或达到 `max_files` 时短路返回 `reference`（省去磁盘 IO）；对权限允许且存在的普通文件执行 `stat` 字节上限 → `readFile` → token 上限 → SHA-256 比对：命中 `retainedVersion` 返回 `skipped-duplicate`（即便已达 `max_files` 或预算耗尽也不误报 `Not restored`），否则检查 `budget.exhausted()` / `budget.fileLimit()` 后经 `include` 申请预算。
+  3. `file` 候选 → 先查询 `retainedVersion = versions.get(candidate.ref)`；对非保留文件在预算耗尽或达到 `max_files` 时短路返回 `reference`（省去磁盘 IO）；对权限允许且存在的普通文件先 `stat`：若在保留尾且 `size <= MAX_RETAINED_DEDUP_BYTES`（64 KiB，覆盖 `ReadTool` 50 KiB 上限）先读字节比对 SHA-256，命中直接返回 `skipped-duplicate`（早于 `file_max_tokens`/`max_files`/预算耗尽降级）；否则再检查 `file_max_tokens` 字节/token 上限及 `budget.exhausted()` / `budget.fileLimit()` 后经 `include` 申请预算。
   4. 顺序执行，单候选失败被 `Effect.catch` 吸收为 `missing`（错误处理策略 §3）。
 - **callee 契约引用**：`FSUtil` read/stat 的错误语义按平台错误处理；`Skill.Service` 解析失败为类型化错误（catch 转 missing）。
 - **提前停止**：预算耗尽或达到 `max_files` 后，不再对无保留指纹的剩余候选做 `stat`/`read`，直接标记 `reference`；有保留指纹的候选仍完成哈希去重以避免误报 `Not restored`。
@@ -123,18 +123,18 @@ restoration: Schema.optional(Schema.Struct({
 
 - **签名**：`renderMaterials(materials: RestorationMaterial[], cfg: RestorationConfig): string | undefined`
 - **功能描述**：预算内合成最终文本。
-- **调用关系**：callers: apply；callees: Token.estimate。
+- **调用关系**：callers: apply；callees: `inlineBudget`（直接计 UTF-16 长度与 `JSON.stringify` 转义长度）。
 - **实现思路**：
   1. 过滤：`max_files` 对 file 类 `inlined` 候选取前 N（排序已在 collect 保证按最近）
-  2. 组装三节：Files（inlined 的 `### file: path` + content 围栏）/ Skills / Todos；reference/missing/skipped-budget 以单行引用形式集中列入 **`## Not restored` 节**（2026-10-20 独立审同步：初稿"列入对应节"，实现为独立降级节——展示形状以实现为准）
-  3. 每个内联项先计入实际 markdown 长度（含头部、分节、路径、换行、围栏）。放不下的项成为诊断，后续较小材料仍可装入。令 B=budget_tokens，D=max(128,min(2000,B))；诊断最多 20 条，路径和原因最多各 160 个 UTF-16 单元，超限或总长不足时合并尾部条数。整块最多 B+D tokens，B=0 直接返回 undefined。
+  2. 组装三节：Files（inlined 的 `### ${clipRef(ref)}` + content 围栏）/ Skills / Todos；reference/missing/skipped-budget 以单行引用形式集中列入 **`## Not restored` 节**
+  3. 每个内联项先同时计入原始 UTF-16 长度与 `JSON.stringify` 转义长度（含头部、分节、路径、换行、围栏）。放不下的项成为诊断，后续较小材料仍可装入。令 `B = budget_tokens`、`D = max(128, min(2000, B))`、`maxRaw = (B + D) * 4`、`maxJson = floor(maxRaw * 4 / 3)`；诊断最多 20 条，路径和原因最多各 160 个 UTF-16 单元，超限或超出 `maxRaw`/`maxJson` 时折叠尾部条数。`B <= 0` 直接返回 `undefined`。
   4. 整体无任何节有内容 → 返回 `undefined`
   5. 输出 = `RESTORATION_SENTINEL` 行 + 三节 markdown
-- **退出覆盖**：`undefined`（无材料）与文本两种返回。
-- **循环刻画**：材料有限，逐个累加，token 计数单调不减 → 终止。
+- **退出覆盖**：`undefined`（无材料或 `B <= 0`）与文本两种返回。
+- **循环刻画**：材料有限，逐个累加，双预算余量单调不增；诊断折叠最多弹出 20 条 → 终止。
 - **正确性论证**（non-trivial）：
   - 前置：materials 来自 5.3，状态语义成立。
-  - 论证：初始扣除固定头部，各节首次内联时扣除节标题，每次内联再扣除整项的实际长度和分隔换行；剩余长度始终非负。诊断折叠最多遍历 20 条，单调删除尾部引用，合并计数和固定头部能放入最小 128 tokens 余量。
+  - 论证：初始扣除固定头部原始/JSON 长度，各节首次内联时扣除节标题，每次内联再扣除整项原始与 JSON 转义长度，余量始终非负；结合 `restorationBudgetCap(headroom)`（先对 `headroom` 取 `Math.floor`），保证 `text.length <= 3 * floor(headroom)` 且 `JSON.stringify(text).length <= 4 * floor(headroom)`，同时覆盖 `/3` `estimateMessages` 与 `/4` JSON `willOverflow`。
   - 副作用论证：纯函数。
 
 ### 5.5 apply（M2 编排）
@@ -162,35 +162,13 @@ restoration: Schema.optional(Schema.Struct({
 
 在 `packages/opencode/src/session/prompt.ts` 的 `task?.part.type === "compaction"` 分支内、`compaction.process(...)` 返回 `"continue"` 后调用（Step P1）：
 
-```ts
-if (result === "continue") {
-  if (task.part.overflow) compactionToken = "compacted"
-  const fixedInputTokens = task.part.fixed_input_tokens ?? 0
-  const cfg = yield* config.get()
-  const usablePrimary = usable({ cfg, model, outputTokenMax: flags.outputTokenMax })
-  const maxBudgetTokens =
-    model.limit.context > 0 && usablePrimary > 0
-      ? yield* Effect.gen(function* () {
-          const projected = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
-          const messagesTokens = estimateMessages(yield* MessageV2.toModelMessagesEffect(projected, model))
-          const headroom = usablePrimary - fixedInputTokens - messagesTokens - 256
-          return restorationBudgetCap(headroom)
-        })
-      : undefined
-  yield* SessionRestoration.apply({ sessionID, maxBudgetTokens }).pipe(
-    Effect.provideService(Session.Service, sessions),
-    Effect.provideService(Agent.Service, agents),
-    Effect.provideService(FSUtil.Service, fsys),
-    Effect.provideService(Config.Service, config),
-    Effect.provideService(Todo.Service, todos),
-    Effect.provideService(Skill.Service, skills),
-  )
-}
-```
-
-`SessionPrompt.node` 的 `deps` 同步包含 `Config.node`、`Todo.node`、`Skill.node`，确保独立编译 `SessionPrompt.node` 时所有恢复依赖就绪。溢出压缩（`compaction.ts`）同时从 `optionalBudget` 中扣除 `summaryReserve = min(2048, floor(usablePrimary / 8))`，为摘要正文和恢复块预留空间；provider 413 拒绝分支在创建 recovery marker 前先删除零 part 的被拒空 `handle.message`（与 preflight 一致），保持 `summary.n` 准确；`pendingInputStart` 仅在非错误且终结（非 `"tool-calls"` / `"unknown"`）的普通 assistant 处停止回溯，防止未回答 `U1` 在错误助手或工具调用中段被丢弃。
+1. 重新读取当前最新 user 及其模型 `activeModel`（防摘要期间 steering 切换模型/用户），仅当 `!anchorUser || anchorUser === activeUser.id` 时采用 `task.part.fixed_input_tokens`。
+2. 经 `MessageV2.filterCompactedEffect(sessionID)` 取投影历史后，以 `SessionRestoration.withoutRestoration` 排除即将由 Step P8 退役的旧恢复块，避免连续压缩双重计费。
+3. 以 `messagesTokens = Math.max(estimateMessages(modelMessages), Token.estimate(JSON.stringify(modelMessages)))` 计算 `headroom = usablePrimary - fixedInputTokens - messagesTokens - 256`，经 `restorationBudgetCap(headroom)` 得到 `maxBudgetTokens` 传入 `SessionRestoration.apply`（同时提供 `Session`/`Agent`/`FSUtil`/`Config`/`Todo`/`Skill` 六项服务，`SessionPrompt.node` 声明全部依赖）。
+4. **正确性论证（§4.3.2）**：
+   - `restorationBudgetCap(headroom)` 先取 `H = Math.floor(headroom)`、令 `cap4 = Math.floor(H * 3 / 4)` 并求解满足 `B + max(128, min(2000, B)) <= cap4` 的最大 `B`。结合 `renderMaterials` 同时约束 `text.length <= (B + D) * 4` 与 `JSON.stringify(text).length <= floor((B + D) * 4 * 4 / 3)`，无论内容含多少转义字符或 `headroom` 是否为小数，均满足 `Math.ceil(text.length / 3) <= H` 且 `Token.estimate(JSON.stringify(text)) <= H`。
+   - `pendingInputStart(messages, current)` 与 `runLoop` 保持同一终止谓词：仅在非摘要、非错误、非 `"tool-calls"`/`"unknown"` 且 `!hasToolCalls` 的 assistant 或 `<= marker` 时间线处停止回溯，确保含 tool calls 的 `finish: "stop"` 轮次不会丢弃 `U1` 及其在途工具结果。
+   - `compaction.ts` 在 `budgeted` 时统一扣除 `summaryReserve = min(2048, floor(usablePrimary / 8))`，并在 `rawRequired` 中排除启用恢复时即将退役的旧恢复块；`prompt.ts:1878` 的用量触发压缩同样传递 `fixedInputTokens` 与 `requestUserID`；provider 413 拒绝分支先删除零 part 占位 `handle.message` 再落 marker，保持 `summary.n` 准确。
 
 ### 5.7 测试设计
 

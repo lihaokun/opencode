@@ -1,8 +1,8 @@
 # 细化设计 — 提示词统一（prompt-unification）
 
-> 状态：细化阶段（§4.3），待 §4.4 审查后实施。
-> 架构依据：`docs/design/prompt-unification/architecture.md`（已确认，含共享段与委派指导草稿文案）。
-> 待核实清单已全部核实：模板无快照固化（H1）；trinity/default 删除行号逐一核对（本文 §5.2）；agent 工具描述位置为 `tool/agent.ts:63-75` 的 `AGENT_DESCRIPTION` 行数组常量；`system.test.ts` 断言风格原为 `provider(...)[0]` + `toContain`（2026-10-18 复审 B7 后改为裸模板断言 + `systemSections` 解构，见 §5.1 修订段）。
+> 状态：已实施并随二轮独立复审收敛同步至 HEAD（§4.3–§4.4）。
+> 架构依据：`docs/design/prompt-unification/architecture.md`（已确认，含共享段终稿文案）。
+> 待核实清单已全部核实：模板无快照固化（H1）；trinity/default 删除行号逐一核对（本文 §5.2）；agent 工具描述位置为 `tool/agent.ts:100-112` 的 `AGENT_DESCRIPTION` 行数组常量（D13 决议后保持 #59 基线不改）；`system.test.ts` 断言风格经 B7 改为裸模板断言 + `systemSections` 断言（见 §5.1 修订段）。
 
 ## 1. 范围
 
@@ -12,15 +12,15 @@
 - ~~`tool/agent.ts`：`AGENT_DESCRIPTION` 追加 "When to delegate" 行~~（2026-10-18 复审 D13 撤销：与 #59"描述只讲机件不开处方"原则冲突；wire 测试改为负向断言）
 - 测试：`system.test.ts` 新增断言（共享段全分支覆盖 + 模板删除规则 + 机件行保留）；`test/tool/__snapshots__/parameters.test.ts.snap` 若因描述变更产生 diff 则随行为变更更新（实施时核实）
 
-不覆盖：其余 7 份活跃模型模板（含显式记档留待 beta 观察的 `gemini.txt:12,41`，见架构 §1 非目标）、消息内注入通道（非目标）；`request.ts` 仅触及 `:198` 三元右支调用 `SystemPrompt.systemSections(model)`（I2/I3 不变）。
+不覆盖：其余 7 份活跃模型模板（含显式记档留待 beta 观察的 `gemini.txt:12,43`，见架构 §1 非目标）、消息内注入通道（非目标）；`request.ts` 仅触及 `:198` 三元右支调用 `SystemPrompt.systemSections(model)`（I2/I3 不变）。
 
 ## 2. 与已有代码的复用点
 
 | 项 | 事实 | 复用方式 |
 |---|---|---|
-| 模板 `.txt` import 惯例 | 全部模板经 `import PROMPT_X from "./prompt/x.txt"` 引入（`system.ts:6-16`） | `shared-behavior.txt` 同构 |
-| `system.test.ts` 断言风格 | `provider(...)[0]` + `toContain`（`:89,98,107`），无数组精确断言 | 共享段放 `[1]`，既有断言零改动 |
-| `AGENT_DESCRIPTION` 行数组 | `tool/agent.ts:63-75`，`.join("\n")`，fork 异步语义已在其内 | 追加指导行，格式同构 |
+| 模板 `.txt` import 惯例 | 全部模板经 `import PROMPT_X from "./prompt/x.txt"` 引入（`system.ts:6-15`） | `shared-behavior.txt` 同构 |
+| `system.test.ts` 断言风格 | `provider(...)` 裸模板断言 + `systemSections(...)` 末元素断言（`:98,107,116,139`） | 共享段放 `systemSections` 末位 |
+| `AGENT_DESCRIPTION` 行数组 | `tool/agent.ts:100-112`，`.join("\n")`，fork 异步语义已在其内 | ~~追加指导行~~（D13 撤销，保持 #59 基线零改动） |
 | 哨兵词 | 三条硬规则字串唯一（grep 验证：`fewer than 4 lines` / `DO NOT ADD ***ANY***` / `just stop`） | 删除后作为测试的负向断言词 |
 
 ## 3. 错误处理策略
@@ -32,7 +32,7 @@
 无新类型。新增文本资产：
 
 - `shared-behavior.txt`：内容 = 架构 §3 草稿终稿（五条规则，`# Working agreement` 标题）
-- `AGENT_DESCRIPTION` 追加 1 行（委派指导，见 §5.3）
+- ~~`AGENT_DESCRIPTION` 追加 1 行~~（D13 撤销，见 §5.3）
 
 ## 5. 模块细化
 
@@ -84,16 +84,16 @@
 
 `system.test.ts` 追加：
 
-1. `appends the shared working agreement to every model template`：遍历分支模型 id（muse-spark / gpt-4 / gpt-6 / codex / gemini / claude / trinity / kimi / default）→ `SystemPrompt.systemSections(m)` → 末元素以 `# Working agreement` 开头；`[0]` 不含三条硬规则字串。
-2. `drops the hard brevity, no-explanation and no-comment rules from default and trinity`：import 两份 `.txt` → 逐条 `not.toContain`（`fewer than 4 lines` / `One word answers are best` / `just stop` / `DO NOT ADD ***ANY***` / `prefer to use the agent tool`）+ 正向 `toContain`（异步机件句 `Do not poll or ask an agent whether it has finished`）——负向证明删除、正向证明机件未误删。
-3. 快照核实：`test/tool/__snapshots__/parameters.test.ts.snap` 若含 agent 工具描述则随更新（D13 后应回到 #59 基线）。
+1. `appends the shared working agreement to every distinct model template`：遍历全部 9 分支模型 id（`meta/muse-spark-preview` / `gpt-4` / `gpt-6` / `gpt-5.5` / `gemini-2` / `claude-x` / `trinity` / `k3` / `anything-else`）→ `SystemPrompt.systemSections(m)` → 末元素以 `# Working agreement` 开头；裸模板不含 `# Working agreement`。
+2. `drops the hard brevity, no-explanation and no-comment rules from default and trinity`：import 两份 `.txt` → 逐条 `not.toContain`（`fewer than 4 lines` / `One word answers are best` / `just stop` / `DO NOT ADD ***ANY***` / `prefer to use the agent tool` / `# Code style`）+ 正向 `toContain`（异步机件句 `Do not poll or ask an agent whether it has finished`）——负向证明删除、正向证明机件未误删。
+3. 快照核实：`test/tool/__snapshots__/parameters.test.ts.snap` 经 D13 后保持 #59 基线。
 4. 端到端（`prompt.test.ts`，wire 级）：捕获 `llm.inputs` 请求体——default agent 断言共享段在线上、被删规则与委派处方均不在；显式 `agent.prompt`（config 注入 marker prompt）断言整体替换后共享段与模型模板均不在载荷（I2 的线上背书）。
 
 ### 5.5 实施顺序
 
 1. `shared-behavior.txt` 新增 + `system.ts` 重构 + system.test 新断言（一次原子提交可先行验证 I1）
 2. default/trinity 修剪 + 负向断言
-3. agent.ts 追加 + 快照核实
+3. ~~agent.ts 追加~~（D13 撤销）+ 快照核实
 4. 全量回归 + 行为场景人工抽查清单（issue §五口径：行动请求 / 纯问答 / 工具失败 / 已有授权——以 default 模板跑一轮真实会话抽查，记录于 devlog，不作为通过门槛）
 
 ## 6. 完整性自检 checklist
@@ -103,4 +103,4 @@
 - [x] 退出覆盖（`provider` 各路由独立早返回 + `systemSections` 单表达式；文本资产无退出通道）
 - [x] callee 契约引用（`request.ts:198` 三元右支契约、`system.test.ts` 既有断言兼容性、快照回归已核对）
 - [x] 循环刻画（无循环；遍历断言为有限 9 模板集合）
-- [x] 上游事实显式列出（H1 快照核实结论、行号核对值、D13 撤销依据、`gemini.txt:12,41` 已知残留冲突均已标明）
+- [x] 上游事实显式列出（H1 快照核实结论、行号核对值、D13 撤销依据、`gemini.txt:12,43` 已知残留冲突均已标明）

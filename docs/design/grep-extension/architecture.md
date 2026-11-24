@@ -1,6 +1,6 @@
 # 架构 — grep 扩展（search modes / pagination）（issue #46 P2-item-1）
 
-> 状态：调研 + 架构合并稿（小 feature，两阶段合一，待确认后进细化）。
+> 状态：已实施并随二轮独立复审收敛同步至 HEAD（§4.1–§4.4）。
 > 关联：issue #46 §三.4（"搜索工具的可控性有实际差距"）与 §五验收第 8 条；参照 `docs/research/zcode-replacement-assessment.md` §4.1（ZCode Grep 契约）。
 
 ## 0. 调研结论（§4.1 合并）
@@ -37,18 +37,18 @@
 grep tool execute
   ├─ schema 解析（新参数全 optional，缺省 = 现行为）
   ├─ permission ask（不变，patterns=[pattern]）
-  ├─ Ripgrep.Service.grep（GrepInput 扩展）：
+  ├─ Ripgrep.Service.search（GrepInput 扩展）：
   │    args 追加：
   │      insensitive → "-i"
   │      files_with_matches → "--files-with-matches"（解析 Entry 行，无行号/文本）
-  │      count → "--count-matches"（解析 count 行）
+  │      count → "--count-matches"（解析 count 行，严格 `/^\d+$/u`）
   │      content → 现状 --json
-  │      before/after/context → "-A n" / "-B n" / "-C n"（仅 content）
+  │      before/after（context 已在工具层展开）→ "-B n" / "-A n"（仅 content）
   │      offset → 服务内流式跳过（rg 无 --offset flag；流上只保留当前页，content 由 contentPage 在收齐末条 after 或收到 {"type":"end"} 后提前停流）
   ├─ 渲染（按模式，先经 Truncate.output 控体积再拼分页续页提示）：
   │    content   → 现格式 + 状态行 "Showing matches N–M (offset O, limit L)"（剥离行尾 \r?\n 防行预算翻倍）
   │    files     → 每文件一行路径 + 分页时 "Showing files N–M (offset O, limit L)"
-  │    count     → "path:count" 行 + 状态行
+  │    count     → "path: N matches" 行 + 分页时 "Showing files N–M (offset O, limit L)"
   │    尾部      → hasMore ? "(more results available; increase offset to ...)"（若本页同时被 Truncate.output 截断则附加单页文件说明）: 无
   │    越界      → "No <matches|files> at offset O (total <matches|files>: T)"（按模式单位一致）
   └─ metadata：{ matches, truncated, output_mode, offset, head_limit, total | total_lower_bound }
@@ -66,7 +66,7 @@ grep tool execute
 
 ### M1 `core/ripgrep.ts`（执行适配器扩展）
 
-`SearchInput` / `GrepResult` 与 `search` 方法：按 mode 分派 args（均带 `--sort=path`），`files_with_matches` 与 `count` 走轻量纯文本行解析（`count` 校验非负整数），`content` 走 `--json` 并通过 `RgText` 同时解码 UTF-8 `{ text }` 与非 UTF-8 base64 `{ bytes }`；流式跳过 offset，不缓存前缀。
+`GrepInput` / `GrepResult` 与 `search` 方法：按 mode 分派 args（均带 `--sort=path`），`files_with_matches` 与 `count` 走轻量纯文本行解析（`count` 经 `/^\d+$/u` 校验安全非负整数），`content` 走 `--json` 并通过 `RgText` 同时解码 UTF-8 `{ text }` 与非 UTF-8 base64 `{ bytes }`；流式跳过 offset，不缓存前缀。
 
 ### M2 `tool/grep.ts`（工具层）
 

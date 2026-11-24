@@ -1,6 +1,6 @@
 # 架构 — 压缩后恢复（compaction-recovery）
 
-> 状态：架构阶段（§4.2），待确认后进入细化（§4.3）。
+> 状态：已实施并随二轮独立复审收敛同步至 HEAD（§4.2–§4.4）。
 > 关联：issue #46；调研依据 `docs/research/runtime-alignment-research.md` §5.2 与 §7 决议 #10-11（磁盘重读、v1 内部契约）；对照 `docs/research/zcode-replacement-assessment.md` §4.1。
 
 ## 1. 目标与非目标
@@ -8,15 +8,14 @@
 **目标**
 
 - **G1 文件恢复**：压缩后，模型重新获得当前任务所需文件的**当前版本**（磁盘重读）；与 tail 保留原文同版本时去重；文件已删除/移动、过大或读取失败时降级为可诊断的引用行（issue 验收第 5 条）。
-- **G2 状态恢复**：todo 列表与已加载 skill 正文在压缩后重新可见；运行中子代理由既有 roster 机制覆盖（引用，不在本 feature 重复建设）。
-- **G3 预算**：恢复材料总量受预算约束——回填不会把刚压小的上下文重新撑满（issue 验收第 7 条）。
-- **G4 多次压缩一致性**：恢复幂等——每轮上下文至多一份恢复材料、内容不变不重复写入、重复压缩后不丢不重（issue 验收第 4 条）。
+- **G2 状态恢复**：todo 列表与已加载 skill 正文在压缩后重新可见；运行中子代理由既有 subagent 视图与 `agent_list` 覆盖（不在本 feature 重复建设）。
+- **G3 预算**：恢复材料总量受预算约束（同时约束原始 UTF-16 与 JSON 转义长度）——回填不会把刚压小的上下文重新撑满（issue 验收第 7 条）。
+- **G4 多次压缩一致性**：恢复幂等——每轮上下文语义有效恢复块至多一份（同一 marker 重复触发不重写，跨 marker 时 Step P8 退役旧块再写入新块）、重复压缩后不丢不重（issue 验收第 4 条）。
 
 **非目标（v1 明确不做，记录引入条件）**
 
 - 插件恢复扩展契约：出现第一个真实插件消费者时，基于 `session.compacted` 事件与注入挂点（均为既有设施）设计契约。
-- 后台任务恢复：三层理由。(a) fork 当前唯一的后台任务形态是子代理委派（`BackgroundJob` 的全部消费方），其压缩后恢复已由 roster 机制覆盖（compacted 触发 + 只列 running + 持久化去重），本 feature 在 G2 引用而不重建；(b) `BackgroundJob` 有意非持久化（`core/background-job.ts` "intentionally not durable"），进程内句柄本身不可恢复，可恢复的存在性/liveness 信息正是 roster 的输出；(c) 后台 shell 尚不存在（P2 立项候选），为其建恢复通道是无消费者的 seam——**引入条件**：P2 后台 shell 落地并建立持久化任务注册表时，本模块新增 `"task"` 候选类别，以该注册表为状态源。
-  - 残余缺口（显式声明，v1 接受）：roster 恢复"谁在跑"（名字/状态/可查询），不恢复"委派任务的内容"——后者依赖摘要 Active 节的记载。验收第 6 条的"不重复启动"由可见性 + `agent_list` 查询覆盖；若将来需要恢复委派内容，涉及读取子会话历史的边界设计（读到哪、多大），单独立项。
+- 后台任务恢复：`BackgroundJob` 有意非持久化（`core/background-job.ts` "intentionally not durable"），运行中子代理与后台 shell 的可见性由子代理视图、`agent_list` 与 `shell_output` 覆盖；引入条件：后台任务建立持久化状态源时再新增 `"task"` 候选类别。
 - 缓存回填路径：磁盘重读已定（决议 F①），缓存投影只作对照参考。
 
 ## 2. 核心流程
@@ -115,9 +114,9 @@ collect / materialize / render 均为纯或只读函数，可独立单元测试�
 
 功能描述：V1 压缩成功后的幂等入口。
 前置条件：`messages` 为本轮全量消息。
-后置条件：满足触发条件且渲染非空、与最近一份恢复 part 不同 → 写入新的恢复 part；否则零写入。
+后置条件：满足触发条件（当前最新已结算 marker 尚未恢复）→ 退役既有未忽略恢复块（就地置 `ignored: true`），若渲染非空再写入新恢复 part；同一 marker 重复调用零写入。
 不变式：任意时刻上下文中语义有效的恢复 part 至多一份（I1）；触发判定不依赖 wall-clock。
-副作用：至多一次 part 写入。
+副作用：退役旧恢复 part（就地 `updatePart` 置 `ignored: true`）与至多一次新 part 写入。
 
 ### M3 装配点（`session/prompt.ts`）
 
@@ -155,24 +154,24 @@ collect / materialize / render 均为纯或只读函数，可独立单元测试�
 - G1 要求"当前版本文件回到模型上下文"。M1.collect 从本会话 read/edit parts 产出候选（来源可信，pre：路径由工具写入且经权限门禁）；M1.materialize 读盘 ensures 内容为**当前**版本（假设 H2）；与 tail 比对 ensures 同版本不重复注入（不变量 I1 的来源）；render ensures 输出在预算内（I2）。三者串联 ⇒ 压缩后首轮模型请求即含当前版本文件（或可诊断降级）⇒ G1 成立。
 - G2：todo 先申请预算，失败产生可定位的引用；skill 依据当前授权和预算重读。
 - G3：render 的预算裁剪 ensures I2 ⇒ G3 成立。
-- G4：apply 幂等 + 触发判据只依赖持久化位置 ⇒ 重复压缩后新 compaction part 位置晚于旧恢复 part → 判定再次成立 → 重新收集注入；内容未变则逐字节相同跳过 ⇒ I1/I4 ⇒ G4 成立。
+- G4：apply 幂等 + 触发判据只依赖持久化位置与 `markerID` ⇒ 同一 marker 重复触发零写入；新压缩产生新 marker 时 Step P8 先退役旧块再写入新块 ⇒ I1/I4 ⇒ G4 成立。
 
 **关键假设**
 
 - **H1**：read/edit/write tool part 的 metadata 携带可靠路径（已核实：`read.metadata.display.path` 仅 `display.type === "file"`、`edit.metadata.filediff.file`、`write.metadata.filepath` 用于失效读缓存）。来源：§3.1 盘点与细化 §2。
 - **H2**：文件自读取后若未被修改，磁盘当前内容与模型读到的版本一致；若被修改，"当前版本"正是验收要求的版本。残余风险：模型需要的若恰是**读时旧版本**（文件被外部改坏的场景），恢复注入的是新版本——按验收口径（"所需的当前版本"）这是正确方向；旧版本仍可经全文文件或重读历史获得。来源：issue 验收第 5 条措辞。
 - **H3**：保留区由 `filterCompacted` 依据最新已完成摘要的 `Assistant.n`（旧会话兼容 `tail_start_id`）投影得到，`retainedFileVersions` 直接扫描该保留区提取完整可见 read 的 SHA-256 指纹，并在后续 `edit`/`write` 触及同路径时失效旧指纹。
-- **H4**：恢复 part 写在最后一个非未结算 compaction marker 的 user message 上，位于压缩保留区之后，不会被 `filterCompacted` 截断，也不会被未结算的后继 marker 劫持。
-- **H5**：普通文件与磁盘 `SKILL.md` 均受 `file_max_tokens` 控制，读盘前先 `stat` 校验大小、超限直接降级 `reference` 而不读全文。
+- **H4**：恢复 part 写在最后一个非未结算 compaction marker 的 user message 上（自动续行场景位于压缩保留区之后；手动/无续行场景挂载于已结算 marker 自身），确保始终落在 `filterCompacted` 可见区间内且不被未结算后继 marker 劫持。
+- **H5**：普通文件与磁盘 `SKILL.md` 均受 `file_max_tokens` 控制，读盘前先 `stat` 校验大小；对处于保留尾中的文件（≤64 KiB，覆盖 `ReadTool` 50 KiB 上限）优先做 SHA-256 去重返回 `skipped-duplicate`，避免误标 `reference`。
 
 **模块级不变量**
 
 - I1：任意轮次上下文中语义有效的恢复 part ≤ 1 份 — 维护方：M2 `markerID` 触发判据 + 逐字节去重 + 写入前将旧恢复 part 标记 `ignored: true`（G4 退役）。
-- I2：带有正文时，哨兵、分节标题、路径、换行、围栏和正文一起计入有效预算 `B = min(cfg.budget_tokens, maxBudgetTokens ?? Infinity)`。诊断独享有界余量，整块最多 `B + max(128, min(2000, B))`；当剩余 headroom 极紧时 `B` 退化为 `0`（不注入），保证溢出恢复不因恢复块触发假性 `ContextOverflowError`。
+- I2：带有正文时，哨兵、分节标题、路径、换行、围栏和正文同时计入原始 UTF-16 预算与 JSON 转义预算（有效预算 `B = min(cfg.budget_tokens, maxBudgetTokens ?? Infinity)`）。诊断独享有界余量，整块同时满足 `text.length <= (B + D) * 4` 且 `JSON.stringify(text).length <= floor((B + D) * 4 * 4 / 3)`；当剩余 headroom 极紧时 `B` 退化为 `0`（不注入），保证溢出恢复在 `/3`（`estimatePayload`）与 `/4`（`willOverflow`）双口径下均不因恢复块触发假性 `ContextOverflowError`。
 - I3：恢复注入不改变既有消息的相对顺序 — 维护方：M2 只在目标 user message 上追加 synthetic part，并在写入前就地标记旧 sentinel 为 `ignored: true`。
-- I4：重复压缩幂等 — 维护方：M2 触发判据 + 逐字节比对。
+- I4：重复压缩幂等 — 维护方：M2 `markerID` 触发判据 + G4 退役机制。
 
-**preservation 论证**：每个标记只触发一次恢复；新标记会退役旧块。`Assistant.n` 与 `CompactionPart.protected_from`/`request_user_id`/`fixed_input_tokens` 在溢出恢复期间共同界定必保批次与剩余 headroom，`restorationBudgetCap` 将恢复块 `/3` 估值严格限制在剩余可用空间内。任意内联项进入前检查其完整渲染长度，每个新节的标题只计算一次。引用节限制条数、路径和原因长度；发送前删除放不下的尾部引用并合并计数。空预算不产生恢复块。
+**preservation 论证**：每个标记只触发一次恢复；新标记会退役旧块，且 headroom 核算通过 `SessionRestoration.withoutRestoration` 排除即将退役的旧块以避免连续压缩双重计费。`Assistant.n` 与 `CompactionPart.protected_from`/`request_user_id`/`fixed_input_tokens` 在溢出恢复期间共同界定必保批次与剩余 headroom，`restorationBudgetCap`（对 `headroom` 取 `Math.floor`）与 `renderMaterials` 双预算上限共同保证恢复块在 `/3` 与 `/4` JSON 双口径下均不超过可用空间。任意内联项进入前同时检查原始长度与 JSON 转义长度，引用节限制条数、路径和原因长度并按双预算折叠尾部引用。空预算不产生恢复块。
 
 ## 8. 细化阶段待核实清单
 

@@ -40,9 +40,9 @@
 - P4 `context` 展开（B4：before/after 逐侧覆盖简写；注：源码中展开紧随 P2 校验执行以早做数值计算，与 P3 独立无副作用交互）
 - P5 路径解析 + 外部目录断言（既有）
 - P6 按 mode 分派 rg args（均含 `--sort=path`；content=`--json`；files=`--files-with-matches`；count=`--count-matches`；`-B/-A`、`-i`）
-- P7 流式计数跳过 offset 而不缓存前缀；content 通过 `RgText` 同时解码 UTF-8 与非 UTF-8 base64 `match`/`context` 行；`oversizedRecord` O(1) 过滤超长 context；`count` 校验非负整数
+- P7 流式计数跳过 offset 而不缓存前缀；content 通过 `RgText` 同时解码 UTF-8 与非 UTF-8 base64 `match`/`context` 行；`oversizedRecord` O(1) 过滤超长 context；`count` 用 `/^\d+$/u` 严格校验非负安全整数
 - P8 `contentPage` 按文件与真实行号选择上下文（剥离行尾 `\r?\n`）；`hasMore` 收齐最后必需 `after` 上下文或收到 `{"type":"end"}` 立即停流
-- P9 先经 `Truncate.output` 截断单页主体再拼接分页续页提示（若同时超体积与 `hasMore` 附加单页落盘声明）；`files_with_matches` 输出 `Showing files` 头；`count` 越界使用 `files` 单位
+- P9 先经 `Truncate.output` 截断单页主体再拼接分页续页提示（若同时超体积与 `hasMore` 附加单页落盘声明）；`files_with_matches` 与 `count` 分页均输出 `Showing files` 范围行；`count` 越界使用 `files` 单位
 
 ## 5. 行为契约（语义）
 
@@ -57,7 +57,7 @@
 
 ## 7. 不变量契约（property-based）
 
-C11 第二组（`test/tool/pbt-grep-pagination.test.ts`，固定 seed，400 runs × 4 properties）：
+C11 第二组（`test/tool/pbt-grep-pagination.test.ts`，固定 seed，400 runs × 5 properties）：
 覆盖多文件输入与 `before`/`after` ∈ [0, 2]，断言任意窗口的 match 严格等于 `matches[offset..offset+limit)`、顺序保持、每条入页 context 行均归属于同文件已入页 match 的前后距离内；按 offset 走窗覆盖全部 match 恰好一次；`total = hasMore ? offset+limit+1 : 全量`；offset 越过最后 match 时页面为空（无幽灵 context）。
 
 ## 8. 性能契约（机械化）

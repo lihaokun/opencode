@@ -2,7 +2,7 @@
 
 > 状态：细化阶段（§4.3），已随实施与复审收敛同步至 HEAD。
 > 架构依据：`docs/design/background-shell/architecture.md`（已确认，G5 维持最小形态、`shell_` 命名定案）。
-> 待核实清单核实结果：①通知管线 = 经 `ctx.extra.promptOps.deliverAsync(input, "current")` 直接投递目标会话（以目标会话当下 agent/model/variant 唤醒 loop，不覆盖其身份）；②进程生命周期整体放进 job scope 的 run Effect 内（spawn→累积→退出，工具返回即解耦）；③工具接线 = registry builtin 列表 + `Tool.init`，`Permission.disabled` 将 `shell_output`/`shell_kill` 别名为 `bash`（无需单独权限键，与 `agent_status -> agent_list` 同构）；④权限 = 后台命令沿用 bash 的启动时 ask，且前后检查 `ctx.abort.aborted`。
+> 待核实清单核实结果：①通知管线 = 经 `ctx.extra.promptOps.deliverAsync(input, "current")` 直接投递目标会话（以目标会话当下 agent/model/variant 唤醒 loop，不覆盖其身份）；②进程生命周期整体放进 job scope 的 run Effect 内（spawn→累积→退出，工具返回即解耦）；③工具接线 = registry builtin 列表 + `Tool.init`，`Permission.disabled` 让 `shell_output`/`shell_kill` 继承 `bash` 规则同时尊重显式 `shell_output`/`shell_kill`/`shell_*` 规则；④权限 = 后台命令沿用 bash 的启动时 ask，且在入口、`ask` 前、`backgroundRun` 入口与 `background.start` 后均守卫 `ctx.abort.aborted`。
 
 ## 1. 范围
 
@@ -18,11 +18,11 @@
 
 | 项 | 事实 | 复用方式 |
 |---|---|---|
-| `BackgroundJob` | `start({type,title,run})` 把 run fork 进 job scope；`get/list` 返回 status/output 快照；`cancel` 先 `Scope.close` 再 `Deferred.succeed(done)` 保证进程清理完成后才解除 `wait`；settle 恰好一次 | 任务注册与生命周期 |
-| 通知管线 | `ops.deliverAsync(input, "current")`（`prompt.ts:183`）——fork + 实例切换 + 按目标会话当下身份唤醒 loop | 完成通知（见 §5.4） |
-| promptOps 可达 | agent 工具经 `ctx.extra` 拿 `promptOps`（`agent.ts:110` "The agent tools require promptOps in ctx.extra"） | shell 后台分支同样经 `ctx.extra` 拿 promptOps（通知用） |
-| shell spawn 管线 | `spawner.spawn(cmd(...))` + `Stream.runForEach(Stream.decodeText(handle.all))` 累积（`shell.ts:484-490`）+ `handle.exitCode` | 后台 run 的进程体 |
-| 工具注册 | registry builtin 列表 `Tool.init`（registry.ts:240-259 一带） | 两个新工具 |
+| `BackgroundJob` | `start({type,title,run})` 把 run fork 进 job scope；`get/list` 返回 status/output 快照；`cancel` 经 `Effect.uninterruptible` 保护并先 `Scope.close` 再 `Deferred.succeed(done)`，并发 `wait`/二次 `cancel` 均等待 `job.done` 后返回；settle 恰好一次 | 任务注册与生命周期 |
+| 通知管线 | `ops.deliverAsync(input, "current")`（`prompt.ts:187`）——fork + 实例切换 + 按目标会话当下身份唤醒 loop | 完成通知（见 §5.4） |
+| promptOps 可达 | agent 工具经 `ctx.extra` 拿 `promptOps`（`agent.ts:156`） | shell 后台分支同样经 `ctx.extra` 拿 promptOps（通知用） |
+| shell spawn 管线 | `spawner.spawn(cmd(...))` + `Stream.runForEach(Stream.decodeText(handle.all))` 累积（`shell.ts:549-552`）+ `handle.exitCode` | 后台 run 的进程体 |
+| 工具注册 | registry builtin 列表 `Tool.init`（`registry.ts:235-285`） | 两个新工具 |
 
 ## 3. 错误处理策略
 
@@ -37,15 +37,23 @@
 
 **bash schema 扩展**：`run_in_background: Schema.optional(Schema.Boolean)`（缺省 false；同步路径零改动——I1）。
 
-**会话级任务缓冲**（模块私有，`shell.ts` 内 Map）：
+**会话级任务缓冲**（独立模块 `packages/opencode/src/tool/shell/tasks.ts` 导出 `shellTasks`、`cancelSnapshot` 与共享 `cancelBackgroundJobsPass`，避免 `session → tool/shell → plugin → session` 循环依赖）：
 
 ```ts
-const shellTasks = new Map<string, { command: string; sessionID: SessionID; buffer: string; startedAt: number }>()
+export type ShellTaskEntry = {
+  command: string
+  sessionID: SessionID
+  buffer: string
+  exit: number | undefined
+  error: string | undefined
+  startedAt: number
+}
+export const shellTasks = new Map<string, ShellTaskEntry>()
 ```
 
-生命周期：后台启动时建；buffer 为**有界尾部**（`BACKGROUND_BUFFER_MAX_CHARS = 200_000`，超限从头丢弃——所有读者都只读尾部，保留更多纯属内存泄漏面）；run 结算（成功/失败/中断三路——delete 挂 `Effect.ensuring`，中断路也必达；2026-10-20 独立审 ❌-3 修复）后从 Map 删除。**settle 输出以 status 行打头**（`exit N` / `error: …` / `terminated`），`job.info.output` 因此携带真实退出码——shell_output 的结算后回退分支解析该行报告真实 code，不猜测（2026-10-20 独立审 ❌-1 修复：原实现把 completed 一律渲染成 "exit 0"）。shell_kill 对已结算任务经快照幂等应答（❌-2）。。复审修订（2026-10-18，PR #60 审核意见 A3）：初版"不删 + 无界 buffer"会在长 run 中累积超长输出与每任务一条的残留条目，已按有界尾部 + 结算清理修正。
+生命周期：后台启动时建；buffer 为**有界尾部**（`BACKGROUND_BUFFER_MAX_CHARS = 200_000`，超限从头丢弃并跳过孤立低代理）；run 结算（成功/失败/中断三路——delete 挂 `Effect.ensuring`，中断路也必达）后从 Map 删除。**settle 输出以 status 行打头**（`${status}\n${entry.buffer}`，其中 `status` 为 `exit N` / `error: …` / `terminated`，取消时由 `cancelSnapshot` 写入 `stopped\n${entry.buffer}`），`job.info.output` 因此携带真实退出码与有界输出尾部，供 `shell_output` 与 `shell_kill` 结算后读取。
 
-**BackgroundJob 注册**：`type: "shell"`、`title: command 前 80 字符`、`metadata: { sessionId: ctx.sessionID }`（与 agent 委派同形——cancelBackgroundJobs 的会话级联经此匹配，agent_stop/中断可达后台进程；复审修订 A2）、run 返回**全量累计输出**（settle 后进 `job.info.output`）。
+**BackgroundJob 注册**：`type: "shell"`、`title: commandPreview(command, 80)`、`metadata: { sessionId: ctx.sessionID }`（与 agent 委派同形——`cancelBackgroundJobsPass` 的会话级联经此匹配，agent_stop/中断可达后台进程），run 返回有界 `${status}\n${entry.buffer}`（200k 字符上限）。
 
 **新工具 schema**：
 
@@ -91,13 +99,13 @@ shell_kill: { task_id: string }
 - body 首行 `[shell task finished] <taskId> <commandPreview(160)> · <status>` + `tailOf(entry.buffer, 200)`，经 `backgroundPreview(..., limits, 1)` 裁剪。
 - 经 `ops.deliverAsync({ sessionID: ctx.sessionID, parts: [{ type: "text", text }] }, "current")` 投递；`"current"` 模式只读目标会话当下 agent/model/variant（保留显式默认 variant），不回写会话身份。
 
-### 5.5 registry 接线、权限与取消级联循环（`run-state.ts` / `session.ts` / `cross-spawn-spawner.ts`）
+### 5.5 registry 接线、权限与取消级联循环（`run-state.ts` / `session.ts` / `shell/tasks.ts` / `cross-spawn-spawner.ts`）
 
-- `registry.ts` builtin 注册 `shell_output` 与 `shell_kill`；`permission/index.ts` `Permission.disabled` 将 `shell_output`/`shell_kill` 别名为 `bash`，使允许 `bash` 的子代理（如 `explore`）可见工具、禁用 `bash` 时一并隐藏。
+- `registry.ts` builtin 注册 `shell_output` 与 `shell_kill`；`permission/index.ts` `Permission.disabled` 使 `shell_output`/`shell_kill` 继承 `bash` 规则同时尊重显式 `shell_output`/`shell_kill`/`shell_*` 规则（末匹配生效）。
 - **循环与终止性论证（§4.3.1/§4.3.2）**：
-  1. `SessionRunState.cancel(sessionID)`：维护单调增长的 `owners` 集合；每轮 `stopTree` 扫描全量 `background.list()` 沿 `agent` 委派边（含已结算中间节点）扩展 `owners`，取消全部运行中归属 job，同时对 `owners` 中除根会话外的每个已登记 `data.runners.get(owner)` 调用 `child.cancel`（覆盖被后台 shell 或 `agent_send` 唤醒的后代 runner），返回 `jobs + activeRunners` 计数；经 `Effect.repeat({ while: (count) => count > 0 })` 循环直至归零。**终止性**：根 runner 与每个新发现后代 runner 一经 `cancel` 即停止新登记；已存在运行中 job 集合有限且每次 `cancel` 不可逆地从 `running` 转为 `cancelled`，故计数严格在有限步内降至 0。
-  2. `Session.cancelBackgroundJobs(background, sessionID)`（由 `Session.remove` 调用，HTTP `DELETE /session/:id` 先调 `promptSvc.cancel` 再调 `session.remove`）：沿同样委派图扩展 `owners` 并 `Effect.repeat({ while: (count) => count > 0 })`，同理由在有限步内终止。
-  3. `CrossSpawnSpawner` 进程组释放：无论非零退出或主动取消，在 `forceKillAfter` 启用时均按 `SIGTERM → waitGroupGone(轮询 kill(-pid, 0) 至 ESRCH 或超期) → SIGKILL` 收敛；主动取消的 `SIGKILL` 后对 `Deferred.await(signal)` 加 1 秒 `Effect.timeoutOption` 上限，避免 `setsid` 脱离进程继承 stdio 导致无限阻塞。
+  1. `SessionRunState.cancel(sessionID)`：维护单调增长的 `owners` 集合；每轮 `stopTree(includeRoot)` 先沿持久化 SQLite `Session.children` 扩展后代（覆盖重启后由 `agent_send` 恢复的无 `agent` job 子会话），再调用共享 `cancelBackgroundJobsPass(background, owners)` 沿 `agent` 委派边扩展 `owners` 并取消全部运行中归属 job，同时取消 `owners` 中活跃的 `data.runners`——静默循环中传入 `includeRoot = true`，确保即使后台 shell 完成通知通过 `deliverAsync` 重新唤醒根会话自身的 `Runner`，也会一并取消直至单轮静默计数 `jobs + activeRunners === 0`。**终止性**：会话图与运行中 job 集合有限；每轮取消不可逆地中止目标 `Runner` 并将运行中 job 转为 `cancelled`，有限步内归零。
+  2. `Session.cancelBackgroundJobs(background, sessionID)`（由 `Session.remove` 调用，HTTP `DELETE /session/:id` 先调 `promptSvc.cancel` 再调 `session.remove`）：复用同一 `cancelBackgroundJobsPass` 并 `Effect.repeat({ while: (count) => count > 0 })`，同理由在有限步内终止。
+  3. `CrossSpawnSpawner` 进程组释放与 `handle.kill`：非零退出及外部信号致死（`code !== 0`，含 `code === null`）、主动取消和 `handle.kill` 在 `forceKillAfter` 启用时统一按 `SIGTERM → waitProcessGroupGone(检查 kill(-pid, 0) 直至 ESRCH，不把 EPERM 误判为死亡) → SIGKILL` 收敛，并在 `SIGKILL` 后对 `Deferred.await(signal)` 加 1 秒 `Effect.timeoutOption` 上限，避免 `setsid` 脱离进程继承 stdio 导致无限阻塞。
 
 ### 5.6 测试（`test/tool/shell-background.test.ts`、`test/permission/next.test.ts`、`test/session/session.test.ts`、`core/test/background-job.test.ts`）
 

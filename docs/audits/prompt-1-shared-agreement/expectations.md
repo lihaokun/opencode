@@ -42,7 +42,7 @@
 
 - G1：9 份活跃模型模板全部以同一 SHARED 段收尾（全分支单测）
 - G2（**D13 修订**）：委派时机不再有独立文本资产；机件说明（`agent_list/send/stop`、不轮询）保留在模板与工具描述；恢复载体若立项应为共享段而非工具描述
-- G3：`default`/`trinity` 硬规则删除由负向断言背书（`fewer than 4 lines` / `DO NOT ADD ***ANY***` / `just stop` / `One word answers are best` / `prefer to use the agent tool`）；**已知残留冲突**：`gemini.txt:12,41` 的不总结规则按 E② 最小刀法与 D12 决议保留不改，留待 beta 观察后统一处理
+- G3：`default`/`trinity` 硬规则删除由负向断言背书（`fewer than 4 lines` / `DO NOT ADD ***ANY***` / `just stop` / `One word answers are best` / `prefer to use the agent tool`）；**已知残留冲突**：`gemini.txt:12,43` 的不总结规则按 E② 最小刀法与 D12 决议保留不改，留待 beta 观察后统一处理
 - G4：显式 prompt agent 的替换语义不变（opt-out wire 测试）；AGENTS.md/skills/MCP/plugin transform 装配顺序不变
 
 ## 6. 时序/状态契约

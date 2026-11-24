@@ -59,7 +59,7 @@ ZCode 摘要输入**无字符截断**（完整 provider messages 直接进摘要
 ## 第五部分：正确性论证
 
 - **根因消除**：单侧头切改为双侧保留，"头部上下文或尾部定位至少丢一个"的结构性缺口关闭；exit 经既有 helper 进入摘要文本。两套 runtime 共用同一 helper，漂移源消除。
-- **不变量保持**：≤2,000 时字节级不变（含无 exit 的负例）；error/pending 分支不变；`[Old tool result content cleared]` 不变；摘要请求的下游（buildPrompt 模板、token 估算）输入形状不变，仅长度分布变化。
+- **不变量保持**：≤2,000 时字节级不变（含无 exit 的负例）；pending 分支不变（error 分支已按 §4.4 修订纳入头尾摘要与全文指针保留）；`[Old tool result content cleared]` 不变；摘要请求的下游（buildPrompt 模板、token 估算）输入形状不变，仅长度分布变化。
 - **无回归**：core 的格式固化测试 `session-compaction.test.ts:45` 断言 `serializeToolContent` 的**内容块拼接格式**（媒体行 `[Attached image/png: ...]`），本修复不动 `serializeToolContent`，仅其外层截断函数替换——短文本用例预期不变，复跑确认；`session-runner.test.ts` 的压缩集成测试不锁定截断长度（§3.3 已核实）。opencode 侧 `compaction.test.ts` 测 usable/isOverflow/buildPrompt，不触 serialize 内部分支；helper 以新增单元测试覆盖。
 - **副作用论证**：纯函数级变更，无共享状态、无外部资源；唯一输出变化发生在摘要请求的输入文本。
 
@@ -97,6 +97,6 @@ V1 serialize 的 completed 分支是 layer 闭包内联代码，组合行为（e
 
 **实施中发现的新问题（记录，不在本修复内）**：core V2 的模型回放（`to-llm-message.ts:46`）包含 `state.structured` 通道，但其 serialize 只序列化 `state.content` 块——V2 摘要输入丢失 `structured` 数据，与 P0-2 同族。需先核实 V2 工具状态中 structured 的填充方与 bash 的 exit 落点，单独立项处理。
 
-## 2026-11-21～11-24 · Core V2 `outputPaths`、多引用与错误尾路径保护
+## 2026-11-21～11-24 · Core V2 `outputPaths`、Shell/V1 嵌入指针与多错误路径保护
 
-Core V2 的成功工具结果可同时包含文字、文件附件与 `ToolStateCompleted.outputPaths`；其真实截断器 `ToolOutputStore.bound` 在中段输出 `... output truncated; full content saved to <path> ...`。`packages/core/src/session/tool-result-projection.ts` 现通过 `savedOutputPaths` 同时识别 V1 `Truncate`（兼容 CRLF）与 Core V2 `ToolOutputStore` 两种标记并提取全部不同路径，`savedOutputPath` 取最后一条匹配防止前部引用旧输出遮蔽真实尾部错误路径；`packages/core/src/session/compaction.ts` 将 `part.state.outputPaths` 传入 `serializeToolContent` 与文本内路径合并去重，并在单/复数省略提示间保持语法正确（`path` / `paths`）。详见 [PR #60 独立审核收敛修复记录](runtime-fix-pr60-audit-convergence.md)。
+Core V2 的成功工具结果可同时包含文字、文件附件与 `ToolStateCompleted.outputPaths`；其真实截断器 `ToolOutputStore.bound` 在中段输出 `... output truncated; full content saved to <path> ...`。`packages/core/src/session/tool-result-projection.ts` 现通过 `savedOutputPaths` 同时识别 V1 `Truncate`（兼容 CRLF）、V1 `ShellTool`（`...output truncated...\n\nFull output saved to: <path>`）与 Core V2 `ToolOutputStore` 三种标记，并通过共享的 `appendMissingOutputPaths` 去重、校验非截断边界伪命中（`hasOutputPath`）及按 32 KiB 限流保留全部缺失路径（单/复数提示 `path`/`paths` 准确）。`summarizeToolError`、Core V2 `serializeToolContent`/`shell` 序列化与 V1 `opencode/src/session/compaction.ts`（含无 `metadata.outputPath` 的内嵌子错误路径）均统一走该路径保留逻辑。详见 [PR #60 独立审核收敛修复记录](runtime-fix-pr60-audit-convergence.md)。

@@ -11,7 +11,7 @@
 | 文档 | 用途 | 相关节 |
 |---|---|---|
 | `docs/design/compaction-recovery/architecture.md` | 主契约（G1-G4/非目标/流程） | §1-§3 |
-| `docs/design/compaction-recovery/detailed-design.md` | 细化契约（含 2026-10-18 B5/B6 复审修订） | §1-§7 |
+| `docs/design/compaction-recovery/detailed-design.md` | 细化契约（含 2026-10-18 B5/B6 复审修订） | §1-§6 |
 | issue #46 §五.4/5/7 | 需求源（多次压缩一致性、文件恢复、预算验收） | 正文 |
 | 调研决议 | `runtime-alignment-research.md` §7 #10-11（磁盘重读、v1 内部契约） | — |
 | 既有契约（引用不改） | `filterCompacted` 重排（注入位置保证可见）、roster synthetic part 先例、`Token.estimate` | — |
@@ -41,8 +41,8 @@
 - P2 全量读 messages → 收集 `settledMarkers`（`summary && finish && !error`）定位最后已结算 compaction marker 与未退役 sentinel
 - P3 判定：无已结算 marker → 不动；该 marker 已恢复 → 不动；载体取最后一个非未结算 marker 的 user message
 - P4 collect：completed tool parts → read（仅 `display.type === "file"`）取 `display.path`、edit 取 `filediff.file`、skill 取 `name`；最近使用排序；todo 置顶优先
-- P5 materialize：磁盘 file/skill 读前先 `stat`；同路径完整可见 read（且未被后续 `edit`/`write` 失效）的 SHA-256 一致则 `skipped-duplicate`（优先于 `max_files`/预算耗尽降级）
-- P6 render：max_files 逐文件上限 + 预算耗尽降级引用行 → sentinel + 三节（Files/Skills/Todos）+ Not restored
+- P5 materialize：磁盘 file/skill 读前先 `stat`；对保留尾完整可见 read（≤64 KiB 覆盖 `ReadTool` 50 KiB 上限且未被后续 `edit`/`write` 失效）优先做 SHA-256 去重返回 `skipped-duplicate`（早于 `file_max_tokens`/`max_files`/预算耗尽降级）
+- P6 render：max_files 逐文件上限 + 同时约束原始 UTF-16 与 JSON 转义长度（覆盖 `/3` `estimateMessages` 与 `/4` `willOverflow`）→ sentinel + 三节（Files/Skills/Todos）+ Not restored
 - P7 与当前载体上未退役同 `markerID` sentinel 逐字节比较，相同则跳过
 - P8 退役全部既有未忽略 sentinel（就地置 `ignored: true`）并落库新 synthetic text part；顶层 `Effect.exit` 吸收异常绝不断 loop
 
@@ -73,7 +73,7 @@
 
 ## 9. 安全/副作用契约
 
-- 唯一副作用 = 写入一个 synthetic text part（updatePart）
+- 唯一持久化副作用 = 退役旧恢复块（就地 `updatePart` 置 `ignored: true`）并至多写入一个新 synthetic text part（`updatePart`）
 - 失败绝不打断 loop（顶层 absorb）；读盘/服务失败降级 `missing`
 - v1 内部契约（决议 F②）：无插件扩展面、无跨包导出（测试外无 import）
 

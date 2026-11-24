@@ -36,7 +36,7 @@
 
 ## 4. 流程步骤（机械化）
 
-- P1 权限 ask（与同步路径共用，启动时一次）；后台路径在解析/ask 前后与 `backgroundRun` 入口检查 `ctx.abort.aborted`
+- P1 权限 ask（与同步路径共用，启动时一次）；后台路径在解析/ask 前后、`backgroundRun` 入口与 `background.start` 后检查 `ctx.abort.aborted`（若启动竞态中被取消则立即 `background.cancel` 回收）
 - P2 `run_in_background === true` 分支守卫（false/缺省 → 同步路径逐字节不变）
 - P3 建 `shellTasks` 条目（buffer 空，有界尾部 200k chars）；`background.start` 失败时经 `Effect.onError` 清理条目
 - P4 `BackgroundJob.start`（job scope fork；`metadata: { sessionId }`）
@@ -44,13 +44,13 @@
 - P6 run 内：spawn → 流累积（appendCapped）→ exitCode await；失败错误经 `errorPreview` 单行/UTF-16 安全截断
 - P7 run 内末尾：完成通知经 `ops.deliverAsync(..., "current")` 投递，非中断失败由 `Effect.catchCauseIf` 记警告吸收（不吞中断）
 - P8 run 结算：`shellTasks.delete` 挂 `Effect.ensuring` 三路均达
-- P9 会话级 cancel 级联经 `metadata.sessionId` 与 `agent` 委派图（含已结算节点）循环终止所有归属后台任务及被唤醒的活跃后代 runner；`Session.remove` 与 HTTP `DELETE /session/:id` 保持一致级联
+- P9 会话级 cancel 级联经 `metadata.sessionId`、持久化 SQLite 子会话及 `agent` 委派图（含已结算节点）循环终止所有归属后台任务及活跃 runner（含重唤醒的根会话与后代 runner）；`Session.remove` 与 HTTP `DELETE /session/:id` 共用单 Pass 级联 helper
 
 ## 5. 行为契约（语义）
 
 - 同步路径在 `run_in_background` 缺省时零变更（I1——shell.test 全量回归背书）
 - 后台任务完成**投递消息唤醒**，模型不轮询（G4）
-- 通知投递失败不影响任务状态（`Effect.ignore`）
+- 通知投递失败不影响任务状态（`Effect.catchCauseIf` 记警告吸收非中断异常、不吞中断）
 - 取消的会话不再收到完成通知（A2 修订语义）
 - **结算后 shell_output 报告真实退出码**（2026-10-20 独立审 ❌-1 修复：settle 输出以 status 行打头，回退分支解析之——原实现把 completed 一律渲染成 "exit 0"，非零退出被伪造为成功；已补非零退出回归）
 - **shell_kill 幂等**（2026-10-20 独立审 ❌-2 修复：已结算任务经 BackgroundJob 快照应答 "already settled"，不再抛 unknown task；属主校验经 metadata.sessionId）
@@ -79,10 +79,10 @@
 
 ## 9. 安全/副作用契约
 
-- 权限沿用 bash 启动时 ask，无新权限键；`Permission.disabled` 将 `shell_output`/`shell_kill` 别名为 `bash`，保证 `explore` 可见且禁用 `bash` 时一并隐藏
+- 权限沿用 bash 启动时 ask，无新权限键；`Permission.disabled` 让 `shell_output`/`shell_kill` 继承 `bash` 规则同时尊重显式 `shell_output`/`shell_kill`/`shell_*` 规则，保证 `explore` 可见、禁用 `bash` 时一并隐藏、显式禁用单工具仍生效
 - 进程为 server 子进程（非持久化；重启丢失——与 BackgroundJob 家族一致）
 - 通知只投递属主会话（`ctx.sessionID`）
-- `BackgroundJob.cancel` 先完成 `Scope.close` 再解析 `done`，保证取消返回时进程清理已完成
+- `BackgroundJob.cancel` 经 `Effect.uninterruptible` 保护并先完成 `Scope.close` 再解析 `done`，并发 `wait` 与二次 `cancel` 均等待 `job.done` 后返回，保证取消返回时进程清理已完成
 
 ## 10. 跨实现一致性
 
