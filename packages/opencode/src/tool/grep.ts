@@ -54,21 +54,7 @@ export const GrepTool = Tool.define(
     return {
       description: DESCRIPTION,
       parameters: Parameters,
-      execute: (
-        params: {
-          pattern: string
-          path?: string
-          include?: string
-          output_mode?: "content" | "files_with_matches" | "count"
-          insensitive?: boolean
-          before?: number
-          after?: number
-          context?: number
-          offset?: number
-          head_limit?: number
-        },
-        ctx: Tool.Context,
-      ) =>
+      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           if (!params.pattern) {
             throw new Error("pattern is required")
@@ -152,8 +138,7 @@ export const GrepTool = Tool.define(
           // like the legacy projection did, in every mode. #107: FSUtil.resolve
           // follows symlinks, so a File target must render back to the
           // REQUESTED path, not the realpath rg reported under.
-          const rowBase = requested
-          const requestedFile = info.type === "File" ? requested : undefined
+          const requestedFile = info.type === "File" ? path.resolve(requested) : undefined
 
           // Only EOF proves an exact total. An early page observes one extra
           // entry beyond its window; context lines never count as entries.
@@ -166,8 +151,13 @@ export const GrepTool = Tool.define(
             offset,
             head_limit: headLimit,
           }
-          const render = Effect.fnUntraced(function* (output: string) {
-            const page = yield* trunc.output(output)
+          const render = Effect.fnUntraced(function* (body: string) {
+            const page = yield* trunc.output(body)
+            const continuation = result.hasMore
+              ? page.truncated
+                ? `\n\n(Note: the saved file contains only this page of results; more results available; increase offset to ${offset + headLimit})`
+                : `\n\n(more results available; increase offset to ${offset + headLimit})`
+              : ""
             return {
               title: params.pattern,
               metadata: {
@@ -175,27 +165,27 @@ export const GrepTool = Tool.define(
                 truncated: result.hasMore || page.truncated,
                 ...(page.truncated ? { outputPath: page.outputPath } : {}),
               },
-              output: page.content,
+              output: page.content + continuation,
             }
           })
-          const tail = result.hasMore ? [``, `(more results available; increase offset to ${offset + headLimit})`] : []
 
           if (metadata.matches === 0) {
             if (offset === 0) return yield* render("No files found")
             const unit = mode === "content" ? "matches" : "files"
-            const label = mode === "files_with_matches" ? "files" : "matches"
-            return yield* render(`No ${label} at offset ${offset} (total ${unit}: ${result.total})`)
+            return yield* render(`No ${unit} at offset ${offset} (total ${unit}: ${result.total})`)
           }
 
           if (result.mode === "files_with_matches") {
             const output = [
               `Found ${quantity} files`,
+              ...(offset > 0 || result.hasMore
+                ? [`Showing files ${offset + 1}-${offset + metadata.matches} (offset ${offset}, limit ${headLimit})`]
+                : []),
               // #107: a File target renders back as the requested path even
               // when rg matched through a symlink (FSUtil.resolve realpaths).
               ...(requestedFile
                 ? [requestedFile]
-                : result.files.map((file) => path.resolve(rowBase, file))),
-              ...tail,
+                : result.files.map((file) => path.resolve(requested, file))),
             ]
             return yield* render(output.join("\n"))
           }
@@ -208,8 +198,7 @@ export const GrepTool = Tool.define(
                 : `Found ${quantity} files with ${totalMatches} matches`,
               ...(requestedFile
                 ? [`${requestedFile}: ${result.counts[0]?.count ?? 0} matches`]
-                : result.counts.map((item) => `${path.resolve(rowBase, item.path)}: ${item.count} matches`)),
-              ...tail,
+                : result.counts.map((item) => `${path.resolve(requested, item.path)}: ${item.count} matches`)),
             ]
             return yield* render(output.join("\n"))
           }
@@ -219,7 +208,7 @@ export const GrepTool = Tool.define(
           // requested path (symlink name preserved).
           const rows = result.rows.map((row) => ({
             ...row,
-            path: requestedFile ?? path.resolve(rowBase, row.path),
+            path: requestedFile ?? path.resolve(requested, row.path),
           }))
 
           const output = [`Found ${quantity} matches`]
@@ -239,7 +228,6 @@ export const GrepTool = Tool.define(
             }
             output.push(`  Line ${row.line}${row.context ? "-" : ":"} ${row.text}`)
           }
-          output.push(...tail)
 
           return yield* render(output.join("\n"))
         }).pipe(Effect.orDie),

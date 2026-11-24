@@ -811,3 +811,83 @@ if (process.platform !== "win32") {
     }),
   )
 }
+
+it.instance("content mode with after-context stops at file end before reading later oversized matches", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "a.txt"), "hit-1\nhit-2\nafter-2\n"))
+    yield* Effect.promise(() => Bun.write(path.join(test.directory, "b.txt"), "hit-huge-" + "x".repeat(80_000) + "\n"))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const result = yield* grep.execute({ path: test.directory, pattern: "^hit-", head_limit: 1, after: 5 }, ctx)
+    expect(result.output).toContain("hit-1")
+    expect(result.output).toContain("after-2")
+    expect(result.output).not.toContain("hit-2")
+    expect(result.metadata.matches).toBe(1)
+    expect(result.metadata.truncated).toBe(true)
+  }),
+)
+
+it.instance("a non-UTF-8 match line in content mode decodes cleanly without failing ripgrep", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const file = path.join(test.directory, "nonutf8-match.txt")
+    yield* Effect.promise(() => Bun.write(file, Uint8Array.of(104, 105, 116, 32, 255, 10)))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const result = yield* grep.execute({ path: file, pattern: "hit" }, ctx)
+    expect(result.output).toContain("Line 1: hit ")
+    expect(result.metadata.matches).toBe(1)
+  }),
+)
+
+it.instance("a byte-truncated page with more results preserves the offset continuation and single-page note", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const file = path.join(test.directory, "paged-large.txt")
+    const lines = Array.from({ length: 40 }, (_, i) => `hit-${i} ${"x".repeat(1_800)}\n`).join("")
+    yield* Effect.promise(() => Bun.write(file, lines))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const result = yield* grep.execute({ path: file, pattern: "^hit-", head_limit: 35, offset: 0 }, ctx)
+    expect(result.metadata.truncated).toBe(true)
+    expect(result.output).toContain("Full output saved to:")
+    expect(result.output).toContain("saved file contains only this page of results")
+    expect(result.output).toContain("increase offset to 35")
+  }),
+)
+
+it.instance("1,200 short matches stay intact without premature line-limit truncation from trailing newlines", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const file = path.join(test.directory, "many-short.txt")
+    yield* Effect.promise(() => Bun.write(file, Array.from({ length: 1_200 }, (_, i) => `hit-${i}\n`).join("")))
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const result = yield* grep.execute({ path: file, pattern: "^hit-", head_limit: 1_200 }, ctx)
+    expect(result.metadata.truncated).toBe(false)
+    expect(result.output).toContain("hit-1199")
+  }),
+)
+
+it.instance("files_with_matches prints page header and count offset-beyond uses files unit", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    for (let i = 0; i < 4; i++) {
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, `u${i}.txt`), "needle\n"))
+    }
+    const info = yield* GrepTool
+    const grep = yield* info.init()
+    const filesPage = yield* grep.execute(
+      { path: test.directory, pattern: "needle", output_mode: "files_with_matches", offset: 1, head_limit: 2 },
+      ctx,
+    )
+    expect(filesPage.output).toContain("Showing files 2-3 (offset 1, limit 2)")
+
+    const beyondCount = yield* grep.execute(
+      { path: test.directory, pattern: "needle", output_mode: "count", offset: 10, head_limit: 2 },
+      ctx,
+    )
+    expect(beyondCount.output).toBe("No files at offset 10 (total files: 4)")
+  }),
+)

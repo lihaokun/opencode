@@ -27,20 +27,35 @@ const MAX_SUBMATCHES = 100
  */
 const oversizedRecord = (line: string): Effect.Effect<boolean, Error> => {
   if (Buffer.byteLength(line, "utf8") <= MAX_RECORD_BYTES) return Effect.succeed(false)
-  if (/"type":"context"/.test(line)) return Effect.succeed(true)
+  if (line.startsWith('{"type":"context",')) return Effect.succeed(true)
   return Effect.fail(failure(`Ripgrep JSON record exceeded ${MAX_RECORD_BYTES} bytes`))
 }
+
+const RgText = Schema.Union([Schema.Struct({ text: Schema.String }), Schema.Struct({ bytes: Schema.String })])
+const decodeRgText = (value: Schema.Schema.Type<typeof RgText>) =>
+  "text" in value ? value.text : new TextDecoder("utf-8", { fatal: false }).decode(Buffer.from(value.bytes, "base64"))
+
+const parseJsonLine = (line: string): Effect.Effect<unknown, Error> =>
+  oversizedRecord(line).pipe(
+    Effect.flatMap((dropped) =>
+      dropped
+        ? Effect.succeed(undefined)
+        : Schema.decodeUnknownEffect(Schema.UnknownFromJsonString)(line).pipe(
+            Effect.mapError((cause) => failure("Invalid ripgrep JSON output", cause)),
+          ),
+    ),
+  )
 
 const RawMatch = Schema.Struct({
   type: Schema.Literals(["match", "context"]),
   data: Schema.Struct({
-    path: Schema.Struct({ text: Schema.String }),
-    lines: Schema.Struct({ text: Schema.String }),
+    path: RgText,
+    lines: RgText,
     line_number: PositiveInt,
     absolute_offset: NonNegativeInt,
     submatches: Schema.Array(
       Schema.Struct({
-        match: Schema.Struct({ text: Schema.String }),
+        match: RgText,
         start: NonNegativeInt,
         end: NonNegativeInt,
       }),
@@ -273,16 +288,7 @@ const layer = Layer.effect(
             input.file ?? ".",
           ],
           parse: (line) =>
-            oversizedRecord(line).pipe(
-              Effect.flatMap((dropped) =>
-                dropped
-                  ? Effect.succeed(undefined)
-                  : Effect.try({
-                      try: () => JSON.parse(line) as unknown,
-                      catch: (cause) => failure("Invalid ripgrep JSON output", cause),
-                    }),
-              ),
-            ).pipe(
+            parseJsonLine(line).pipe(
               Effect.flatMap((json) => {
                 if (!json || typeof json !== "object" || !("type" in json) || json.type !== "match")
                   return Effect.succeed(undefined)
@@ -298,19 +304,17 @@ const layer = Layer.effect(
         }).pipe(
           Effect.map((result) =>
             result.items.map((match) => {
+              const text = decodeRgText(match.lines)
               return Match.make({
                 entry: Entry.make({
-                  path: RelativePath.make(normalizeEntryPath(match.path.text)),
+                  path: RelativePath.make(normalizeEntryPath(decodeRgText(match.path))),
                   type: "file",
                 }),
                 line: match.line_number,
                 offset: match.absolute_offset,
-                text:
-                  match.lines.text.length > 2_000
-                    ? match.lines.text.slice(0, 2_000).replace(/[\uD800-\uDBFF]$/, "") + "..."
-                    : match.lines.text,
+                text: text.length > 2_000 ? text.slice(0, 2_000).replace(/[\uD800-\uDBFF]$/, "") + "..." : text,
                 submatches: match.submatches.map((submatch) => ({
-                  text: submatch.match.text,
+                  text: decodeRgText(submatch.match),
                   start: submatch.start,
                   end: submatch.end,
                 })),
@@ -352,9 +356,11 @@ const layer = Layer.effect(
               if (bare && input.file) return Effect.succeed({ path: normalizeEntryPath(input.file), count: Number(bare[1]) })
               const index = line.lastIndexOf(":")
               if (index === -1) return Effect.fail(failure(`Invalid ripgrep count output: ${line}`))
+              const count = Number(line.slice(index + 1))
+              if (!Number.isInteger(count) || count < 0) return Effect.fail(failure(`Invalid ripgrep count output: ${line}`))
               return Effect.succeed({
                 path: normalizeEntryPath(line.slice(0, index)),
-                count: Number(line.slice(index + 1)),
+                count,
               })
             },
           }).pipe(
@@ -383,7 +389,7 @@ const layer = Layer.effect(
         const after = input.after ?? 0
         // Step P8: select context by file and line relative to admitted matches.
         const page = contentPage(input.offset ?? 0, input.limit, before, after)
-        return run<RawRow>({
+        return run<ContentStreamRow>({
           cwd: input.cwd,
           limit: input.limit,
           consume: page.add,
@@ -408,34 +414,25 @@ const layer = Layer.effect(
             input.file ?? ".",
           ],
           parse: (line) =>
-            oversizedRecord(line).pipe(
-              Effect.flatMap((dropped) =>
-                dropped
-                  ? Effect.succeed(undefined)
-                  : Effect.try({
-                      try: () => JSON.parse(line) as unknown,
-                      catch: (cause) => failure("Invalid ripgrep JSON output", cause),
-                    }),
-              ),
-            ).pipe(
-              Effect.flatMap((json) => {
-                if (
-                  !json ||
-                  typeof json !== "object" ||
-                  !("type" in json) ||
-                  (json.type !== "match" && json.type !== "context")
-                )
-                  return Effect.succeed(undefined)
+            parseJsonLine(line).pipe(
+              Effect.flatMap((json): Effect.Effect<ContentStreamRow | undefined, Error> => {
+                if (!json || typeof json !== "object" || !("type" in json)) return Effect.succeed(undefined)
+                if (json.type === "end") return Effect.succeed({ end: true } as const)
+                if (json.type !== "match" && json.type !== "context") return Effect.succeed(undefined)
                 return Schema.decodeUnknownEffect(RawMatch)(json).pipe(
-                  Effect.map((match) => ({
-                    path: match.data.path,
+                  Effect.map((match): ContentStreamRow => ({
+                    path: { text: decodeRgText(match.data.path) },
                     line_number: match.data.line_number,
                     absolute_offset: match.data.absolute_offset,
-                    lines: match.data.lines,
+                    lines: { text: decodeRgText(match.data.lines) },
                     submatches: match.data.submatches.slice(0, MAX_SUBMATCHES),
                     context: match.type === "context",
                   })),
-                  Effect.catch((cause) => json.type === "context" ? Effect.succeed(undefined) : Effect.fail(failure("Invalid ripgrep match output", cause))),
+                  Effect.catch((cause) =>
+                    json.type === "context"
+                      ? Effect.succeed(undefined)
+                      : Effect.fail(failure("Invalid ripgrep match output", cause)),
+                  ),
                 )
               }),
             ),
@@ -447,6 +444,8 @@ const layer = Layer.effect(
   }),
 )
 
+export type ContentStreamRow = RawRow | { readonly end: true }
+
 // Keep only the requested page, plus at most "before" rows of lookbehind.
 function contentPage(offset: number, limit: number, before: number, after: number) {
   const rows: GrepRow[] = []
@@ -455,21 +454,23 @@ function contentPage(offset: number, limit: number, before: number, after: numbe
   let seen = 0
   let hasMore = false
   return {
-    add(raw: RawRow) {
+    add(raw: ContentStreamRow) {
+      if ("end" in raw) return hasMore
+      const clean = raw.lines.text.replace(/\r?\n$/, "")
       const row = {
         path: normalizeEntryPath(raw.path.text),
         line: raw.line_number,
-        text:
-          raw.lines.text.length > 2000
-            ? raw.lines.text.slice(0, 2000).replace(/[\uD800-\uDBFF]$/, "") + "..."
-            : raw.lines.text,
+        text: clean.length > 2000 ? clean.slice(0, 2000).replace(/[\uD800-\uDBFF]$/, "") + "..." : clean,
         context: raw.context,
       }
       const following = last?.path === row.path && row.line <= last.line + after
       if (hasMore && !following) return true
       if (row.context) {
-        if (following) rows.push(row)
-        else if (before > 0 && !hasMore) {
+        if (following) {
+          rows.push(row)
+          return hasMore && row.line === last!.line + after
+        }
+        if (before > 0 && !hasMore) {
           if (pending.at(-1)?.path !== row.path) pending = []
           pending.push(row)
           if (pending.length > before) pending.shift()
@@ -482,19 +483,24 @@ function contentPage(offset: number, limit: number, before: number, after: numbe
         return !following || row.line === last!.line + after
       }
       if (seen > offset) {
-        for (const previous of pending)
-          if (previous.path === row.path && previous.line >= row.line - before) rows.push(previous)
+        rows.push(...pending.filter((previous) => previous.path === row.path && previous.line >= row.line - before))
         rows.push(row)
         last = row
+        pending = []
       }
-      if (seen > offset) pending = []
       return false
     },
     result: () => ({ mode: "content" as const, rows, total: seen, hasMore }),
   }
 }
 
-export function windowContentRows(rows: readonly RawRow[], offset: number, limit: number, before = 10, after = 0) {
+export function windowContentRows(
+  rows: Iterable<ContentStreamRow>,
+  offset: number,
+  limit: number,
+  before = 10,
+  after = 0,
+) {
   const page = contentPage(offset, limit, before, after)
   for (const row of rows) if (page.add(row)) break
   return page.result()

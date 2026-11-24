@@ -90,24 +90,19 @@ delete process.env["OTEL_RESOURCE_ATTRIBUTES"]
 // a proxy to reach the outside cannot reach it in tests anyway.
 delete process.env["ANTHROPIC_BASE_URL"]
 delete process.env["OPENAI_BASE_URL"]
-process.env.OPENCODE_TEST_STARTED_WITH_PROXY = [
-  "http_proxy",
-  "https_proxy",
-  "all_proxy",
-  "HTTP_PROXY",
-  "HTTPS_PROXY",
-  "ALL_PROXY",
-].some((key) => !!process.env[key])
-  ? "1"
-  : "0"
-for (const key of ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]) {
+const PROXY_VARS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] as const
+const startedWithProxy = PROXY_VARS.some((key) => !!process.env[key])
+process.env.OPENCODE_TEST_STARTED_WITH_PROXY = startedWithProxy ? "1" : "0"
+for (const key of PROXY_VARS) {
   delete process.env[key]
 }
 // Bun's fetch may capture proxy settings before the preload runs, so deleting
-// the vars is not always enough. A wildcard no_proxy excludes every target
-// (including loopback server tests) even when the proxy itself was cached.
-process.env["no_proxy"] = "*"
-process.env["NO_PROXY"] = "*"
+// the vars is not always enough. Only set wildcard no_proxy when an ambient
+// proxy was present so ProxyEnv unit tests on clean environments still work.
+if (startedWithProxy) {
+  process.env["no_proxy"] = "*"
+  process.env["NO_PROXY"] = "*"
+}
 
 // Use in-memory sqlite
 process.env["OPENCODE_DB"] = ":memory:"
