@@ -28,7 +28,7 @@ export function callToolErrorMessage(result: CallToolResult): string {
     .filter((text) => text.trim())
   if (result.structuredContent !== undefined && result.structuredContent !== null) {
     const structured = result.structuredContent
-    const serialized = JSON.stringify(structured)
+    const serialized = formatErrorData(structured)
     if (!parts.some((part) => part === serialized || parsesTo(part, structured))) parts.push(serialized)
   }
   return parts.join("\n\n") || "MCP tool returned an error"
@@ -46,9 +46,13 @@ export function parsesTo(text: string, value: unknown) {
 
 function formatErrorData(data: unknown) {
   try {
-    return JSON.stringify(data) ?? String(data)
-  } catch {
+    const serialized = JSON.stringify(data)
+    if (serialized !== undefined) return serialized
+  } catch {}
+  try {
     return String(data)
+  } catch {
+    return Object.prototype.toString.call(data)
   }
 }
 
@@ -95,6 +99,7 @@ export async function callTool(
     })
     .catch(async (error: unknown) => {
       if (signal?.aborted) throw error
+      if (error instanceof DOMException && error.name === "AbortError") throw error
       if (error instanceof McpError) {
         const diagnostic =
           error.data === undefined || error.data === null
@@ -104,10 +109,15 @@ export async function callTool(
         if (bounded === error.message) throw error
         throw new Error(bounded)
       }
-      if (error instanceof Error && error.message) {
+      if (error instanceof Error) {
+        if (!error.message) throw error
         const bounded = await truncateError(error.message)
         if (bounded !== error.message) throw new Error(bounded)
+        throw error
       }
+      const text = typeof error === "string" ? error : formatErrorData(error)
+      const bounded = await truncateError(text)
+      if (bounded !== text) throw new Error(bounded)
       throw error
     })
   if (result.isError) throw new Error(await truncateError(callToolErrorMessage(result)))
@@ -143,7 +153,7 @@ export function convertTool(
         return result
       return {
         ...result,
-        content: [{ type: "text" as const, text: JSON.stringify(result.structuredContent) }],
+        content: [{ type: "text" as const, text: formatErrorData(result.structuredContent) }],
       }
     },
   })

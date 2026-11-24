@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto"
 import { Truncate } from "./truncate"
 import * as Tool from "./tool"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
@@ -134,7 +135,7 @@ function toolTree(catalog: readonly CatalogEntry[], run: (entry: CatalogEntry) =
 
 const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: {
   truncate: Truncate.Interface
-  onTruncatedErrorPath?: (file: string) => void
+  redactErrorPath?: (file: string) => string
   plugin: Plugin.Interface
   entry: CatalogEntry
   args: Record<string, unknown>
@@ -159,12 +160,11 @@ const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: 
         (text) =>
           run(
             input.truncate.output(text, { error: true }).pipe(
-              Effect.tap((out) =>
-                out.truncated && input.onTruncatedErrorPath
-                  ? Effect.sync(() => input.onTruncatedErrorPath!(out.outputPath))
-                  : Effect.void,
+              Effect.map((out) =>
+                out.truncated && input.redactErrorPath
+                  ? out.content.replaceAll(out.outputPath, input.redactErrorPath(out.outputPath))
+                  : out.content,
               ),
-              Effect.map((out) => out.content),
             ),
           ),
       ),
@@ -216,7 +216,18 @@ export const CodeModeTool = Tool.define(
 
         const calls: CallEntry[] = []
         const attachments: Attachment[] = []
-        const errorOutputPaths: string[] = []
+        // Replace each truncated artifact path with an unguessable per-execution
+        // opaque token before it enters the sandbox so host paths never leak to
+        // guest code (including Windows/non-standard paths), and exact 1:1
+        // restoration survives spaces, quotes, caught-and-ignored errors,
+        // repeated logs, and concurrent tool calls.
+        const artifactNonce = randomUUID().replaceAll("-", "")
+        const artifactTokens = new Map<string, string>()
+        const redactErrorPath = (file: string) => {
+          const token = `__opencode_artifact_${artifactNonce}_${artifactTokens.size + 1}__`
+          artifactTokens.set(token, file)
+          return token
+        }
         const publish = () =>
           ctx.metadata({ title: CODE_MODE_TOOL, metadata: { toolCalls: calls.map((c) => ({ ...c })) } })
 
@@ -226,7 +237,7 @@ export const CodeModeTool = Tool.define(
             childCalls += 1
             const result = yield* invokeChildTool({
               truncate,
-              onTruncatedErrorPath: (file) => void errorOutputPaths.push(file),
+              redactErrorPath,
               plugin,
               entry,
               args: (input ?? {}) as Record<string, unknown>,
@@ -278,27 +289,27 @@ export const CodeModeTool = Tool.define(
         })
 
         const result = yield* Effect.raceFirst(runtime.execute(params.code), abort.pipe(Effect.map(cancelled)))
-        const logs = result.logs ?? []
+        const restoreText = (text: string) => {
+          if (artifactTokens.size === 0) return text
+          let next = text
+          for (const [token, file] of artifactTokens) {
+            next = next.replaceAll(token, file)
+          }
+          return next
+        }
+        const restoreValue = (value: unknown): unknown => {
+          if (artifactTokens.size === 0) return value
+          if (typeof value === "string") return restoreText(value)
+          if (Array.isArray(value)) return value.map(restoreValue)
+          if (value && typeof value === "object") {
+            return Object.fromEntries(Object.entries(value).map(([key, item]) => [restoreText(key), restoreValue(item)]))
+          }
+          return value
+        }
+        const logs = (result.logs ?? []).map(restoreText)
         const withLogs = (text: string) => {
           if (logs.length === 0) return text
           return text.length > 0 ? `${text}\n\nLogs:\n${logs.join("\n")}` : `Logs:\n${logs.join("\n")}`
-        }
-
-        // Restore host-managed tool-output artifact pointers outside the sandbox:
-        // the interpreter intentionally redacts filesystem paths inside guest code,
-        // while the model still needs the saved-output path produced by Truncate.
-        const restoreArtifactPaths = (text: string, appendMissing: boolean) => {
-          let index = 0
-          const restored = text.replaceAll("Full output saved to: <redacted-path>", () => {
-            const file = errorOutputPaths[index]
-            if (!file) return "Full output saved to: <redacted-path>"
-            index += 1
-            return `Full output saved to: ${file}`
-          })
-          if (!appendMissing) return restored
-          const missing = [...new Set(errorOutputPaths)].filter((file) => !restored.includes(file))
-          if (missing.length === 0) return restored
-          return restored + missing.map((file) => `\nFull output saved to: ${file}`).join("")
         }
 
         if (!result.ok) {
@@ -310,22 +321,33 @@ export const CodeModeTool = Tool.define(
             } satisfies Tool.ExecuteResult<Metadata>
           }
           const hints = (result.error.suggestions ?? []).filter((hint) => !result.error.message.includes(hint))
-          const raw = restoreArtifactPaths(withLogs([result.error.message, ...hints].join("\n")), true)
+          const restored = withLogs(restoreText([result.error.message, ...hints].join("\n")))
+          const anyRestored = [...artifactTokens.values()].some((file) => restored.includes(file))
+          const raw =
+            artifactTokens.size > 0 && !anyRestored
+              ? restored +
+                [...new Set(artifactTokens.values())]
+                  .map(
+                    (file) =>
+                      `\nThe tool call failed; error output was truncated. Full output saved to: ${file}\nUse Grep to search the full content or Read with offset/limit to view specific sections.`,
+                  )
+                  .join("")
+              : restored
           const bounded = yield* truncate.output(raw, { error: true })
           return yield* Effect.fail(new Error(bounded.content))
         }
 
+        // Restore tokens before JSON.stringify so paths containing `\` or `"`
+        // are properly JSON-escaped rather than corrupting serialized output.
+        const value = restoreValue(result.value)
         // The interpreter validates returned values as plain JSON, so stringify cannot throw;
         // it yields undefined only for a program that returns undefined.
-        const output =
-          typeof result.value === "string"
-            ? result.value
-            : (JSON.stringify(result.value, null, 2) ?? String(result.value))
+        const output = typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? String(value))
 
         return {
           title: CODE_MODE_TOOL,
           metadata: { toolCalls: calls },
-          output: restoreArtifactPaths(withLogs(output), false),
+          output: withLogs(output),
           ...(attachments.length > 0 ? { attachments } : {}),
         } satisfies Tool.ExecuteResult<Metadata>
       }, Effect.orDie),

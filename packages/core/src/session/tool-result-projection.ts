@@ -42,21 +42,25 @@ export function summarizeToolText(text: string): string {
   return `${prefix}\n[... ${text.length - prefix.length - suffix.length} chars truncated ...]\n${suffix}`
 }
 
-// Matches both V1 Truncate hints and Core V2 ToolOutputStore markers.
+// Matches V1 Truncate hints, V1 ShellTool truncation headers, and Core V2 ToolOutputStore markers.
 const V1_SAVED_OUTPUT_RE =
   /(?:^|\r?\n)The tool call (?:failed; error output was truncated|succeeded but the output was truncated)\. Full output saved to: ([^\r\n]{1,32767})\r?\nUse Grep to search the full content or Read with offset\/limit to view specific sections\.(?=\r?\n|$)/g
+
+const SHELL_SAVED_OUTPUT_RE =
+  /(?:^|\r?\n)\.\.\.output truncated\.\.\.\r?\n\r?\nFull output saved to: ([^\r\n]{1,32767})(?=\r?\n|$)/g
 
 const V2_SAVED_OUTPUT_RE =
   /(?:^|\r?\n)\.\.\. output truncated; full content saved to ([^\r\n]{1,32767}) \.\.\.(?=\r?\n|$)/g
 
-// Extract every artifact pointer emitted by V1 Truncate or Core V2 ToolOutputStore.
+const TRUNCATION_BOUNDARY_RE = /^\r?\n\[\.\.\. \d+ chars truncated \.\.\.\]\r?\n/
+
+// Extract every artifact pointer emitted by V1 Truncate, V1 ShellTool, or Core V2 ToolOutputStore.
 export function savedOutputPaths(text: string): string[] {
   const found: Array<{ index: number; file: string }> = []
-  for (const match of text.matchAll(V1_SAVED_OUTPUT_RE)) {
-    if (match[1]) found.push({ index: match.index ?? 0, file: match[1] })
-  }
-  for (const match of text.matchAll(V2_SAVED_OUTPUT_RE)) {
-    if (match[1]) found.push({ index: match.index ?? 0, file: match[1] })
+  for (const regex of [V1_SAVED_OUTPUT_RE, SHELL_SAVED_OUTPUT_RE, V2_SAVED_OUTPUT_RE]) {
+    for (const match of text.matchAll(regex)) {
+      if (match[1]) found.push({ index: match.index ?? 0, file: match[1] })
+    }
   }
   found.sort((a, b) => a.index - b.index)
   return found.map((item) => item.file)
@@ -67,16 +71,53 @@ export function savedOutputPath(text: string) {
   return savedOutputPaths(text).at(-1)
 }
 
+function containsCompletePointer(preview: string, needle: string) {
+  let from = 0
+  while (from <= preview.length) {
+    const idx = preview.indexOf(needle, from)
+    if (idx === -1) return false
+    const rest = preview.slice(idx + needle.length)
+    if (rest === "" || ((rest.startsWith("\n") || rest.startsWith("\r\n")) && !TRUNCATION_BOUNDARY_RE.test(rest))) {
+      return true
+    }
+    from = idx + 1
+  }
+  return false
+}
+
 export function hasOutputPath(preview: string, file: string) {
-  const v1 = "Full output saved to: " + file
-  if (preview.endsWith(v1) || preview.includes(v1 + "\n") || preview.includes(v1 + "\r\n")) return true
-  const v2 = "... output truncated; full content saved to " + file + " ..."
-  return preview.endsWith(v2) || preview.includes(v2 + "\n") || preview.includes(v2 + "\r\n")
+  return (
+    containsCompletePointer(preview, "Full output saved to: " + file) ||
+    containsCompletePointer(preview, "... output truncated; full content saved to " + file + " ...")
+  )
+}
+
+export function appendMissingOutputPaths(preview: string, files: Iterable<string>) {
+  const missing = new Set<string>()
+  for (const file of files) {
+    if (file && !hasOutputPath(preview, file)) missing.add(file)
+  }
+  if (missing.size === 0) return preview
+  // Leave room for a maximum-length artifact path even when the text preview
+  // is full. A result with many artifacts cannot make the summary unbounded.
+  const references: string[] = []
+  let remaining = 32_767 + "\nFull output saved to: ".length
+  for (const file of missing) {
+    const line = "\nFull output saved to: " + file
+    if (line.length > remaining) continue
+    references.push(line)
+    remaining -= line.length
+  }
+  const omitted = missing.size - references.length
+  const body =
+    preview +
+    references.join("") +
+    (omitted ? `\n[${omitted} more artifact ${omitted === 1 ? "path" : "paths"} in the original tool result]` : "")
+  return preview ? body : body.replace(/^\n/, "")
 }
 
 export function summarizeToolError(text: string) {
   const preview = summarizeToolText(text)
   if (preview === text) return preview
-  const saved = savedOutputPath(text)
-  return saved && !hasOutputPath(preview, saved) ? preview + "\nFull output saved to: " + saved : preview
+  return appendMissingOutputPaths(preview, savedOutputPaths(text))
 }

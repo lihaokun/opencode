@@ -263,7 +263,59 @@ test("bounds non-McpError transport failures and omits null McpError data", asyn
   expect(nullDataSeen[0]).not.toContain("\n\nnull")
 })
 
-test("PBT: all MCP failure kinds (isError, McpError with/without/null data, transport Error) stay bounded", async () => {
+test("bounds non-Error rejections, preserves DOMException AbortError, and formats circular/BigInt/primitive McpError data", async () => {
+  const seen: string[] = []
+  const rawStringClient = {
+    callTool: async () => {
+      throw "RAW 502 BODY: " + "x".repeat(10_000)
+    },
+  } as unknown as Client
+  const rawStringTool = McpCatalog.convertTool(mcpTool(), rawStringClient, undefined, async (text) => {
+    seen.push(text)
+    return "bounded raw rejection"
+  })
+  await expect(rawStringTool.execute?.({}, options)).rejects.toThrow("bounded raw rejection")
+  expect(seen[0]).toContain("RAW 502 BODY:")
+
+  const abortErr = new DOMException("aborted internally", "AbortError")
+  let abortTruncateCalls = 0
+  const abortClient = {
+    callTool: async () => {
+      throw abortErr
+    },
+  } as unknown as Client
+  const abortTool = McpCatalog.convertTool(mcpTool(), abortClient, undefined, async (text) => {
+    abortTruncateCalls++
+    return "wrapped-" + text
+  })
+  await expect(abortTool.execute?.({}, options)).rejects.toBe(abortErr)
+  expect(abortTruncateCalls).toBe(0)
+
+  const circularNullProto: Record<string, unknown> = Object.create(null)
+  circularNullProto.self = circularNullProto
+  for (const [label, data] of [
+    ["circular-null-proto", circularNullProto],
+    ["bigint", { n: 42n }],
+    ["zero", 0],
+    ["false", false],
+    ["empty-string", ""],
+  ] as const) {
+    const captured: string[] = []
+    const client = {
+      callTool: async () => {
+        throw new McpError(ErrorCode.InternalError, `err-${label}`, data)
+      },
+    } as unknown as Client
+    const tool = McpCatalog.convertTool(mcpTool(), client, undefined, async (text) => {
+      captured.push(text)
+      return text
+    })
+    await expect(tool.execute?.({}, options)).rejects.toThrow(`err-${label}`)
+    expect(captured[0]).toContain(`err-${label}\n\n`)
+  }
+})
+
+test("PBT: all MCP failure kinds (isError, McpError with/without/null data, transport Error, non-Error) stay bounded", async () => {
   await FastCheck.assert(
     FastCheck.asyncProperty(
       FastCheck.constantFrom(
@@ -272,6 +324,7 @@ test("PBT: all MCP failure kinds (isError, McpError with/without/null data, tran
         "rpcData" as const,
         "rpcNullData" as const,
         "transportError" as const,
+        "rawString" as const,
       ),
       FastCheck.string({ minLength: 1, maxLength: 20 }),
       async (kind, word) => {
@@ -283,6 +336,7 @@ test("PBT: all MCP failure kinds (isError, McpError with/without/null data, tran
             if (kind === "rpcMessage") throw new McpError(ErrorCode.InternalError, detail)
             if (kind === "rpcData") throw new McpError(ErrorCode.InternalError, "rpc err", { detail })
             if (kind === "rpcNullData") throw new McpError(ErrorCode.InternalError, detail, null)
+            if (kind === "rawString") throw `RAW: ${detail}`
             throw new Error(`HTTP 500: ${detail}`)
           },
         } as unknown as Client
@@ -292,9 +346,15 @@ test("PBT: all MCP failure kinds (isError, McpError with/without/null data, tran
         })
         await expect(tool.execute?.({}, options)).rejects.toThrow("bounded-preview")
         expect(saved).toHaveLength(1)
-        if (kind === "isError") expect(JSON.parse(saved[0]!)).toEqual({ detail })
-        else if (kind === "rpcData") expect(JSON.parse(saved[0]!.split("\n\n").at(-1)!)).toEqual({ detail })
-        else expect(saved[0]).toContain(detail)
+        if (kind === "isError") {
+          expect(JSON.parse(saved[0]!)).toEqual({ detail })
+          return
+        }
+        if (kind === "rpcData") {
+          expect(JSON.parse(saved[0]!.split("\n\n").at(-1)!)).toEqual({ detail })
+          return
+        }
+        expect(saved[0]).toContain(detail)
         if (kind === "rpcNullData") expect(saved[0]).not.toContain("\n\nnull")
       },
     ),

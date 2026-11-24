@@ -395,43 +395,90 @@ describe("code mode execute", () => {
     expect(result.output).toBe("diagnostic saved")
   })
 
-  test("restores the real truncated artifact path outside the sandbox for caught and uncaught MCP errors", async () => {
+  test("restores exact truncated artifact paths across spaces, quotes, caught/ignored errors, repeated logs, and JSON returns", async () => {
     const detail = "server diagnostic ".repeat(6000)
-    const artifact = "/tmp/opencode-real-mcp-artifact.txt"
+    const spacedPath = '/Users/Jane Doe/Application Support/tool_"a".txt'
+    const winPath = 'C:\\Users\\Jane "O\'Connor"\\tool_b.txt'
+    const makeHint = (artifact: string) =>
+      `preview\n\n...100 lines truncated...\n\nThe tool call failed; error output was truncated. Full output saved to: ${artifact}\nUse Grep to search the full content or Read with offset/limit to view specific sections.`
+
+    let callIndex = 0
     const tool = await Effect.runPromise(
       CodeModeTool.pipe(
         Effect.flatMap(Tool.init),
         Effect.provide(
           harness({
             mcpTools: {
-              bad_tool: mcpTool("tool", () => {
-                throw new McpError(ErrorCode.InternalError, detail)
+              bad_a: mcpTool("a", () => {
+                throw new McpError(ErrorCode.InternalError, "err-a " + detail)
+              }),
+              bad_b: mcpTool("b", () => {
+                throw new McpError(ErrorCode.InternalError, "err-b " + detail)
               }),
             },
             servers: ["bad"],
             truncate: (text, options) => {
               if (!options?.error) return Effect.succeed({ content: text, truncated: false as const })
-              return Effect.succeed({
-                content:
-                  `preview\n\n...100 lines truncated...\n\nThe tool call failed and the error output was truncated. Full output saved to: ${artifact}\nUse Read to inspect.`,
-                truncated: true as const,
-                outputPath: artifact,
-              })
+              if (text.includes("err-a")) {
+                return Effect.succeed({ content: makeHint(spacedPath), truncated: true as const, outputPath: spacedPath })
+              }
+              if (text.includes("err-b")) {
+                return Effect.succeed({ content: makeHint(winPath), truncated: true as const, outputPath: winPath })
+              }
+              callIndex += 1
+              return Effect.succeed({ content: text, truncated: false as const })
             },
           }),
         ),
       ),
     )
 
-    const caught = await Effect.runPromise(
-      tool.execute({ code: "try { await tools.bad.tool({}) } catch (e) { return e.message }" }, ctx),
+    // 1. Caught-and-ignored A followed by surfaced B in a JSON object: B gets its exact Windows+quote
+    // path properly JSON-escaped, A never misattributes or leaks, and forged <redacted-path> stays literal.
+    const objResult = await Effect.runPromise(
+      tool.execute(
+        {
+          code: `
+            try { await tools.bad.a({}) } catch {}
+            try { await tools.bad.b({}) } catch (e) {
+              return { err: e.message, forged: "Full output saved to: <redacted-path>" }
+            }
+          `,
+        },
+        ctx,
+      ),
     )
-    expect(caught.output).toContain(`Full output saved to: ${artifact}`)
-    expect(caught.output).not.toContain("<redacted-path>")
+    const parsed = JSON.parse(objResult.output) as { err: string; forged: string }
+    expect(parsed.err).toContain(`Full output saved to: ${winPath}`)
+    expect(parsed.err).not.toContain(spacedPath)
+    expect(parsed.forged).toBe("Full output saved to: <redacted-path>")
 
-    const uncaught = await failure(tool.execute({ code: "await tools.bad.tool({})" }, ctx))
-    expect(uncaught.message).toContain(`Full output saved to: ${artifact}`)
-    expect(uncaught.message).not.toContain("<redacted-path>")
+    // 2. Spaced path logged AND thrown: BOTH occurrences restore cleanly without suffix doubling.
+    const repeatedErr = await failure(
+      tool.execute(
+        {
+          code: `
+            try { await tools.bad.a({}) } catch (e) {
+              console.error(e.message)
+              throw e
+            }
+          `,
+        },
+        ctx,
+      ),
+    )
+    const matches = repeatedErr.message.matchAll(new RegExp(spacedPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"))
+    expect([...matches].length).toBe(2)
+    expect(repeatedErr.message).not.toContain("<redacted-path>")
+    expect(repeatedErr.message).not.toContain("Doe/Application Support/tool_\"a\".txt Doe/")
+
+    // 3. Caught-and-ignored A followed by uncaught B: only B is restored, A is not misattributed.
+    const uncaughtB = await failure(
+      tool.execute({ code: "try { await tools.bad.a({}) } catch {}; await tools.bad.b({})" }, ctx),
+    )
+    expect(uncaughtB.message).toContain(`Full output saved to: ${winPath}`)
+    expect(uncaughtB.message).not.toContain(spacedPath)
+    expect(callIndex).toBeGreaterThanOrEqual(0)
   })
 
   test("bounds oversized console logs attached to a failed program execution", async () => {

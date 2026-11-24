@@ -176,19 +176,41 @@ test("V2 summaries preserve V2 ToolOutputStore hints, explicit outputPaths, and 
   expect(preview).toContain(`Full output saved to: ${extraPath}`)
   expect(preview).toContain(`Full output saved to: ${v2Path}`)
   expect(preview).toContain(`Full output saved to: ${secondHint}`)
+
+  // Short text and empty content still preserve explicit outputPaths without leading newline.
+  expect(SessionCompaction.serializeToolContent([], [extraPath])).toBe(`Full output saved to: ${extraPath}`)
+  expect(SessionCompaction.serializeToolContent([{ type: "text", text: "ok" }], [extraPath])).toBe(
+    `ok\nFull output saved to: ${extraPath}`,
+  )
+
+  // ShellTool truncation format (`...output truncated...\n\nFull output saved to: ${file}\n\n...`)
+  const shellPath = "/tmp/opencode/tool-output/shell-out.txt"
+  const shellText = `prefix ${"p".repeat(1_500)}\n...output truncated...\n\nFull output saved to: ${shellPath}\n\n${"q".repeat(1_000)}`
+  expect(savedOutputPaths(shellText)).toEqual([shellPath])
+  expect(SessionCompaction.serializeToolContent([{ type: "text", text: shellText }])).toContain(
+    `Full output saved to: ${shellPath}`,
+  )
+
+  // Truncation boundary cutting right after a shorter prefix does not false-positive in hasOutputPath.
+  const clippedPreview = "Full output saved to: /tmp/a\n[... 500 chars truncated ...]\ntail"
+  expect(SessionCompaction.serializeToolContent([{ type: "text", text: clippedPreview }], ["/tmp/a"])).toContain(
+    "\nFull output saved to: /tmp/a",
+  )
 })
 
-test("summarizeToolError preserves the trailing saved-output hint even when earlier text quotes another hint", () => {
+test("summarizeToolError preserves all distinct artifact paths when multiple truncated errors appear", () => {
   const quoted = "/tmp/quoted-earlier.txt"
   const real = "/tmp/real-error-artifact.txt"
   const error =
-    `The tool call succeeded but the output was truncated. Full output saved to: ${quoted}\n` +
+    "lead ".repeat(350) +
+    `\nThe tool call succeeded but the output was truncated. Full output saved to: ${quoted}\n` +
     "Use Grep to search the full content or Read with offset/limit to view specific sections.\n" +
     "x".repeat(3_000) +
     `\nThe tool call failed; error output was truncated. Full output saved to: ${real}\r\n` +
     "Use Grep to search the full content or Read with offset/limit to view specific sections.\r\n" +
     "trailing context ".repeat(80)
   const summarized = summarizeToolError(error)
+  expect(summarized).toContain(`Full output saved to: ${quoted}`)
   expect(summarized).toEndWith(`\nFull output saved to: ${real}`)
 })
 

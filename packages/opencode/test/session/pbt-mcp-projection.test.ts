@@ -40,17 +40,30 @@ describe("PBT projectMcpToolResult", () => {
     expect(project([{ type: "text", text: `{"a":1}` }], structured).text).toBe(`{"a":1}`)
   })
 
-  it("both projectMcpToolResult and callToolErrorMessage deduplicate semantic JSON including -0", () => {
+  it("both projectMcpToolResult and callToolErrorMessage deduplicate semantic JSON including -0 on either side", () => {
+    // Explicit left-hand "-0" text vs right-hand 0 structuredContent (JSON.stringify never emits "-0").
+    const rawNegZero = [{ type: "text" as const, text: '{"z": -0, "nested": [-0, 0]}' }]
+    expect(project(rawNegZero, { nested: [0, -0], z: 0 }).text).toBe('{"z": -0, "nested": [-0, 0]}')
+    expect(
+      McpCatalog.callToolErrorMessage({
+        isError: true,
+        content: rawNegZero,
+        structuredContent: { nested: [0, -0], z: 0 },
+      } as CallToolResult),
+    ).toBe('{"z": -0, "nested": [-0, 0]}')
+
     fc.assert(
       fc.property(
         fc.oneof(fc.jsonValue(), fc.constant(-0), fc.constant({ z: -0, nested: [-0, 0] })),
         fc.string(),
-        fc.constantFrom("append" as const, "echo" as const),
+        fc.constantFrom("append" as const, "echo" as const, "echoNegZero" as const),
         (value, key, kind) => {
           const structured = { first: value, key }
           const prose = "err: " + key
-          const echo = JSON.stringify({ key, first: value }, null, 2)
-          const texts = kind === "echo" ? [prose, echo] : [prose]
+          const rawEcho = JSON.stringify({ key, first: value }, null, 2)
+          const echo =
+            kind === "echoNegZero" ? rawEcho.replace(/(:\s*|\[|, )0(?=[,\n\]}])/g, "$1-0") : rawEcho
+          const texts = kind === "append" ? [prose] : [prose, echo]
           const content = texts.map((text) => ({ type: "text" as const, text }))
           const expected = (kind === "append" ? [...texts, JSON.stringify(structured)] : texts).join("\n\n")
 

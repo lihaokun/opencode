@@ -7,7 +7,12 @@ import type { EventV2 } from "../event"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
-import { hasOutputPath, savedOutputPaths, summarizeToolText, summarizeToolError } from "./tool-result-projection"
+import {
+  appendMissingOutputPaths,
+  savedOutputPaths,
+  summarizeToolError,
+  summarizeToolText,
+} from "./tool-result-projection"
 import { Token } from "../util/token"
 
 const DEFAULT_BUFFER = 20_000
@@ -92,35 +97,14 @@ export function serializeToolContent(
     )
     .join("\n")
   const preview = summarizeToolText(text)
-  const paths = new Set<string>()
-  for (const file of outputPaths ?? []) {
-    if (file && !hasOutputPath(preview, file)) paths.add(file)
-  }
+  const paths = [...(outputPaths ?? [])]
   if (preview !== text) {
     for (const item of content) {
       if (item.type !== "text") continue
-      for (const file of savedOutputPaths(item.text)) {
-        if (!hasOutputPath(preview, file)) paths.add(file)
-      }
+      paths.push(...savedOutputPaths(item.text))
     }
   }
-  if (paths.size === 0) return preview
-  // Leave room for a maximum-length artifact path even when the text preview
-  // is full. A result with many artifacts cannot make the summary unbounded.
-  const references: string[] = []
-  let remaining = 32_767 + "\nFull output saved to: ".length
-  for (const file of paths) {
-    const line = "\nFull output saved to: " + file
-    if (line.length > remaining) continue
-    references.push(line)
-    remaining -= line.length
-  }
-  const omitted = paths.size - references.length
-  const body =
-    preview +
-    references.join("") +
-    (omitted ? `\n[${omitted} more artifact ${omitted === 1 ? "path" : "paths"} in the original tool result]` : "")
-  return preview ? body : body.replace(/^\n/, "")
+  return appendMissingOutputPaths(preview, paths)
 }
 
 const serialize = (message: SessionMessage.Message) => {
@@ -150,7 +134,11 @@ const serialize = (message: SessionMessage.Message) => {
   }
   if (message.type === "system") return `[System update]: ${message.text}`
   if (message.type === "synthetic") return `[Synthetic context]: ${message.text}`
-  if (message.type === "shell") return `[Shell]: ${message.command}\n${summarizeToolText(message.output)}`
+  if (message.type === "shell") {
+    const preview = summarizeToolText(message.output)
+    const body = preview === message.output ? preview : appendMissingOutputPaths(preview, savedOutputPaths(message.output))
+    return `[Shell]: ${message.command}\n${body}`
+  }
   return ""
 }
 
