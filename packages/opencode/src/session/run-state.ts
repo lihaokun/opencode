@@ -89,19 +89,30 @@ const layer = Layer.effect(
       const owners = new Set<string>([sessionID])
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
-      const stopJobs = cancelBackgroundJobs(background, owners)
-      // Stop both the producer and jobs that could wake it. An admission
-      // already committed by the producer may miss the first job snapshot.
+      const stopTree = Effect.gen(function* () {
+        const jobs = yield* cancelBackgroundJobs(background, owners)
+        // A descendant session woken after its delegation job settled (for
+        // example by a background shell completion notice or agent_send) has a
+        // live Runner even without a running agent BackgroundJob.
+        const descendantRunners = [...owners]
+          .filter((owner) => owner !== sessionID)
+          .map((owner) => data.runners.get(owner as SessionID))
+          .filter((runner): runner is Runner.Runner<SessionV1.WithParts> => runner !== undefined)
+        const tags = yield* Effect.forEach(descendantRunners, (child) => child.cancel, { concurrency: "unbounded" })
+        return jobs + tags.filter((tag) => tag !== "Idle").length
+      })
+      // Stop both the producer and jobs/descendants that could wake it. An
+      // admission already committed by the producer may miss the first snapshot.
       const [stopped] = yield* Effect.all(
         [
           existing ? existing.cancel : status.set(sessionID, { type: "idle" }).pipe(Effect.as("Idle" as const)),
-          stopJobs,
+          stopTree,
         ],
         { concurrency: "unbounded" },
       )
       // The producer has quiesced. Follow newly discovered descendant owners
       // and take a fresh snapshot after each batch of cancellation finalizers.
-      yield* stopJobs.pipe(Effect.repeat({ while: (count) => count > 0 }))
+      yield* stopTree.pipe(Effect.repeat({ while: (count) => count > 0 }))
       return stopped
     })
 

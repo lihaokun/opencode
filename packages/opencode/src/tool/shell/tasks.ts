@@ -1,3 +1,5 @@
+import type { SessionID } from "@/session/schema"
+
 // Live registry of background shell tasks, keyed by task id. Kept in its own
 // module so the cancel cascades (run-state.ts, session.ts) can read the
 // cancel snapshot without importing tool/shell.ts — that import is a module
@@ -7,12 +9,12 @@
 //
 // Process-local and intentionally non-durable, mirroring the BackgroundJob
 // registry semantics: a restart loses both the process and its buffer.
-// Entries are removed once the run settles — output lives with the tool
-// parts from then on, and an entry left behind would accumulate one per
-// background call for the life of the process.
+// Entries are removed once the run settles — the bounded status+output snapshot
+// stays on the BackgroundJob record and completion message, and an entry left
+// behind would accumulate one per background call for the life of the process.
 export type ShellTaskEntry = {
   command: string
-  sessionID: import("../../session/schema").SessionID
+  sessionID: SessionID
   buffer: string
   exit: number | undefined
   error: string | undefined

@@ -310,8 +310,8 @@ export const make = Effect.gen(function* () {
       }
       return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
     })
-    if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
     if (result.scope) yield* Scope.close(result.scope, Exit.void)
+    if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
     return result.info
   })
 

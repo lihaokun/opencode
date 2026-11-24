@@ -382,10 +382,42 @@ export const make = Effect.gen(function* () {
             Effect.fnUntraced(function* ([proc, signal]) {
               const done = yield* Deferred.isDone(signal)
               const kill = timeout(proc, command, command.options)
+              const waitGroupGone = Effect.gen(function* () {
+                if (
+                  !command.options.forceKillAfter ||
+                  process.platform === "win32" ||
+                  command.options.detached === false
+                )
+                  return
+                while (true) {
+                  const alive = yield* Effect.try({
+                    try: () => {
+                      globalThis.process.kill(-proc.pid!, 0)
+                      return true
+                    },
+                    catch: () => false,
+                  }).pipe(Effect.orElseSucceed(() => false))
+                  if (!alive) return
+                  yield* Effect.sleep("50 millis")
+                }
+              })
               if (done) {
                 const [code] = yield* Deferred.await(signal)
                 if (process.platform === "win32") return yield* Effect.void
-                if (code !== 0 && Predicate.isNotNull(code)) return yield* Effect.ignore(kill(killGroup))
+                if (code !== 0 && Predicate.isNotNull(code)) {
+                  const cleanup = command.options.forceKillAfter
+                    ? Effect.timeoutOrElse(
+                        killGroup(command, proc, command.options.killSignal ?? "SIGTERM").pipe(
+                          Effect.andThen(waitGroupGone),
+                        ),
+                        {
+                          duration: command.options.forceKillAfter,
+                          orElse: () => killGroup(command, proc, "SIGKILL"),
+                        },
+                      )
+                    : kill(killGroup)
+                  return yield* Effect.ignore(cleanup)
+                }
                 return yield* Effect.void
               }
               const send = (s: NodeJS.Signals) =>
@@ -396,25 +428,18 @@ export const make = Effect.gen(function* () {
                 yield* Deferred.await(signal)
                 // A shell may exit on TERM while its detached process group still
                 // owns children. Give those children the same bounded grace period.
-                if (
-                  command.options.forceKillAfter &&
-                  process.platform !== "win32" &&
-                  command.options.detached !== false
-                ) {
-                  while (true) {
-                    try {
-                      globalThis.process.kill(-proc.pid!, 0)
-                    } catch {
-                      return
-                    }
-                    yield* Effect.sleep("50 millis")
-                  }
-                }
+                yield* waitGroupGone
               })
               const escalated = command.options.forceKillAfter
                 ? Effect.timeoutOrElse(attempt, {
                     duration: command.options.forceKillAfter,
-                    orElse: () => send("SIGKILL").pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid),
+                    // Bound close wait after SIGKILL: a setsid grandchild inheriting stdio
+                    // keeps pipe fds open even after the process group is dead.
+                    orElse: () =>
+                      send("SIGKILL").pipe(
+                        Effect.andThen(Deferred.await(signal).pipe(Effect.timeoutOption("1 second"))),
+                        Effect.asVoid,
+                      ),
                   })
                 : attempt
               return yield* Effect.ignore(escalated)

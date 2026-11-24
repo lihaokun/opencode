@@ -40,9 +40,8 @@ const MAX_METADATA_LENGTH = 30_000
  */
 const BACKGROUND_BUFFER_MAX_CHARS = 200_000
 
-// Keeps the buffer at or under the cap by dropping from the front. Amortized
-// O(1) per chunk once over the cap: the trim re-slices once per chunk, not
-// once per byte.
+// Keeps the buffer at or under the cap by dropping from the front. Re-slices
+// once per chunk (O(cap) per over-cap chunk, avoiding per-byte copies).
 const appendCapped = (buffer: string, chunk: string) => {
   const next = buffer + chunk
   const start = next.length - BACKGROUND_BUFFER_MAX_CHARS
@@ -53,6 +52,17 @@ const appendCapped = (buffer: string, chunk: string) => {
 
 function commandPreview(command: string, length: number) {
   return command.slice(0, length).replace(/[\uD800-\uDBFF]$/, "").replace(/[\r\n]+/g, " ")
+}
+
+function errorPreview(error: string) {
+  return commandPreview(error, 500)
+}
+
+function splitStatusOutput(output: string | undefined) {
+  if (!output) return { statusLine: undefined, body: undefined }
+  const nl = output.indexOf("\n")
+  if (nl < 0) return { statusLine: output, body: undefined }
+  return { statusLine: output.slice(0, nl), body: output.slice(nl + 1) }
 }
 
 const tailOf = (text: string, lines: number) => {
@@ -657,6 +667,13 @@ export const ShellTool = Tool.define(
       ctx: Tool.Context,
     ) {
       const ops = (ctx.extra as { promptOps?: AgentManagement.AgentPromptOps } | undefined)?.promptOps
+      if (ctx.abort.aborted) {
+        return {
+          title: commandPreview(input.command, 80),
+          metadata: { output: "", exit: null, truncated: false },
+          output: "Background command cancelled before start.",
+        }
+      }
       // Step P3: registry entry (buffer empty, bounded tail 200k chars).
       const taskId = `shell_${randomUUID()}`
       const entry = {
@@ -685,7 +702,7 @@ export const ShellTool = Tool.define(
             }),
           ),
         )
-        if (Exit.isFailure(exit)) entry.error = String(Cause.squash(exit.cause)).slice(0, 500)
+        if (Exit.isFailure(exit)) entry.error = errorPreview(String(Cause.squash(exit.cause)))
         // Step P7: completion notice via deliverAsync, failure-isolated.
         // Completion notification, delivered like agent delegation results: the
         // message wakes the session so the model never polls. Delivery failures
@@ -726,17 +743,19 @@ export const ShellTool = Tool.define(
 
       // Step P4: BackgroundJob.start (job-scope fork; metadata carries the
       // owning session for the cancel cascade, P9).
-      const info = yield* background.start({
-        id: taskId,
-        type: "shell",
-        title: commandPreview(input.command, 80),
-        // Same shape agent delegation uses: cancelBackgroundJobs walks the
-        // session graph through this, so agent_stop and interrupt reach the
-        // process, and a stopped session is never woken by the completion
-        // notification.
-        metadata: { sessionId: ctx.sessionID },
-        run,
-      })
+      const info = yield* background
+        .start({
+          id: taskId,
+          type: "shell",
+          title: commandPreview(input.command, 80),
+          // Same shape agent delegation uses: cancelBackgroundJobs walks the
+          // session graph through this, so agent_stop and interrupt reach the
+          // process, and a stopped session is never woken by the completion
+          // notification.
+          metadata: { sessionId: ctx.sessionID },
+          run,
+        })
+        .pipe(Effect.onError(() => Effect.sync(() => shellTasks.delete(taskId))))
       // Step P5: the original command is already in the tool call. Keep the
       // handle on the first line when the configured preview is a single line.
       const receipt = backgroundPreview(
@@ -766,6 +785,13 @@ export const ShellTool = Tool.define(
           execute: (params: Parameters, ctx: Tool.Context) =>
             Effect.gen(function* () {
               const instanceCtx = yield* InstanceState.context
+              if (params.run_in_background === true && ctx.abort.aborted) {
+                return {
+                  title: commandPreview(params.command, 80),
+                  metadata: { output: "", exit: null, truncated: false },
+                  output: "Background command cancelled before start.",
+                }
+              }
               const cwd = params.workdir
                 ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
                 : instanceCtx.directory
@@ -789,6 +815,13 @@ export const ShellTool = Tool.define(
               // Step P2: background branch guard (false/absent → the sync
               // path, byte-identical to the pre-feature behavior).
               if (params.run_in_background === true) {
+                if (ctx.abort.aborted) {
+                  return {
+                    title: commandPreview(params.command, 80),
+                    metadata: { output: "", exit: null, truncated: false },
+                    output: "Background command cancelled before start.",
+                  }
+                }
                 return yield* backgroundRun(
                   { shell, command: params.command, cwd, env: yield* shellEnv(ctx, cwd) },
                   ctx,
@@ -837,18 +870,19 @@ export const ShellOutputTool = Tool.define(
           // finished would otherwise answer "no background shell tasks" while
           // an explicit task_id still works.
           const id =
-            params.task_id ??
-            (yield* background.list())
-              .toReversed()
-              .filter((job) => job.type === "shell" && job.metadata?.sessionId === ctx.sessionID)
-              .toSorted((a, b) => b.started_at - a.started_at)
-              .at(0)?.id ??
-            [...shellTasks.entries()]
-              .reverse()
-              .filter(([, entry]) => entry.sessionID === ctx.sessionID)
-              .toSorted((a, b) => b[1].startedAt - a[1].startedAt)
-              .at(0)?.[0]
-          if (!id) throw new Error("no background shell tasks in this session")
+            params.task_id !== undefined
+              ? params.task_id
+              : ((yield* background.list())
+                  .toReversed()
+                  .filter((job) => job.type === "shell" && job.metadata?.sessionId === ctx.sessionID)
+                  .toSorted((a, b) => b.started_at - a.started_at)
+                  .at(0)?.id ??
+                [...shellTasks.entries()]
+                  .reverse()
+                  .filter(([, entry]) => entry.sessionID === ctx.sessionID)
+                  .toSorted((a, b) => b[1].startedAt - a[1].startedAt)
+                  .at(0)?.[0])
+          if (id === undefined) throw new Error("no background shell tasks in this session")
           const entry = shellTasks.get(id)
           const job = yield* background.get(id).pipe(Effect.orElseSucceed(() => undefined))
           // R1: ownership and type are checked on EVERY path, settled or live —
@@ -858,28 +892,26 @@ export const ShellOutputTool = Tool.define(
           if (job && (job.type !== "shell" || job.metadata?.sessionId !== ctx.sessionID)) {
             throw new Error(`unknown task: ${id}`)
           }
-          // Settled runs drop their registry entry; the job snapshot still has
-          // the status, and the output tail lives in the delivered message and
-          // the tool part from then on. For cancelled runs the tail comes from
-          // the snapshot the kill path recorded (same status-line format).
+          // Settled runs drop their registry entry; the BackgroundJob snapshot
+          // keeps the status line and bounded output tail (`status\nbuffer`),
+          // including cancelled runs whose buffer came from cancelSnapshot.
           if (!entry && job) {
             // The settle output leads with the status line, so the exit code
             // reported here is the real one — never a guessed exit 0.
-            const settled = job.output?.split("\n", 1)[0]
+            const parsed = splitStatusOutput(job.output)
             const status =
               job.status === "running"
                 ? "running"
-                : (settled ?? (job.error ? `error: ${job.error.slice(0, 500)}` : job.status))
-            const outputTail = job.output ? job.output.slice(job.output.indexOf("\n") + 1) : undefined
+                : (parsed.statusLine ?? (job.error ? `error: ${errorPreview(job.error)}` : job.status))
             const output = [
               `[shell task ${id}] ${job.title ?? ""}`.trim(),
               `status: ${status}`,
-              ...(outputTail && status !== "running" ? [tailOf(outputTail, params.tail_lines ?? 200)] : []),
+              ...(parsed.body && status !== "running" ? [tailOf(parsed.body, params.tail_lines ?? 200)] : []),
               ...(status === "running" ? [] : job.output ? [] : [`(no output was captured before the task ended)`]),
             ].join("\n")
             const view = backgroundPreview(output, yield* trunc.limits())
             return {
-              title: (job.title ?? id).slice(0, 80),
+              title: commandPreview(job.title ?? id, 80),
               metadata: { truncated: view.truncated, task_id: id, status: job.status },
               output: view.output,
             }
@@ -892,7 +924,7 @@ export const ShellOutputTool = Tool.define(
               : job.status === "cancelled"
                 ? "cancelled"
                 : job.status === "error"
-                  ? `error: ${job.error ?? "unknown"}`
+                  ? `error: ${job.error ? errorPreview(job.error) : "unknown"}`
                   : entry.exit !== undefined
                     ? `exit ${entry.exit}`
                     : "finished"
@@ -935,13 +967,33 @@ export const ShellKillTool = Tool.define(
             if (!job || job.type !== "shell" || job.metadata?.sessionId !== ctx.sessionID) {
               throw new Error(`unknown task: ${params.task_id}`)
             }
+            if (job.status === "running") {
+              const info = yield* background.cancel(params.task_id, {
+                output: cancelSnapshot(params.task_id),
+              })
+              const finalStatus = info?.status ?? "cancelled"
+              const body = splitStatusOutput(info?.output).body
+              const tailText = body ? tailOf(body, 50) : ""
+              const view = backgroundPreview(
+                `[shell task ${params.task_id}] stopped (${finalStatus})${tailText ? `\n${tailText}` : ""}`,
+                yield* trunc.limits(),
+                1,
+              )
+              return {
+                title: commandPreview(job.title ?? params.task_id, 80),
+                metadata: { truncated: view.truncated, task_id: params.task_id, status: finalStatus },
+                output: view.output,
+              }
+            }
+            const body = splitStatusOutput(job.output).body
+            const tailText = body ? tailOf(body, 50) : ""
             const view = backgroundPreview(
-              `[shell task ${params.task_id}] already settled (${job.status})${job.output ? `\n${tailOf(job.output, 50)}` : ""}`,
+              `[shell task ${params.task_id}] already settled (${job.status})${tailText ? `\n${tailText}` : ""}`,
               yield* trunc.limits(),
               1,
             )
             return {
-              title: (job.title ?? params.task_id).slice(0, 80),
+              title: commandPreview(job.title ?? params.task_id, 80),
               metadata: { truncated: view.truncated, task_id: params.task_id, status: job.status },
               output: view.output,
             }
@@ -955,8 +1007,9 @@ export const ShellKillTool = Tool.define(
             output: cancelSnapshot(params.task_id),
           })
           const finalStatus = info?.status ?? "cancelled"
+          const tailText = tailOf(entry.buffer, 50)
           const view = backgroundPreview(
-            `[shell task ${params.task_id}] stopped (${finalStatus})\n${tailOf(entry.buffer, 50)}`,
+            `[shell task ${params.task_id}] stopped (${finalStatus})${tailText ? `\n${tailText}` : ""}`,
             yield* trunc.limits(),
             1,
           )

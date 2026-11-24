@@ -242,7 +242,13 @@ export function disabled(tools: string[], ruleset: PermissionV1.Ruleset): Set<st
   const reads = ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]
   // Step S24: agent_status shows one row of what agent_list shows, so the deny
   // that hides one hides the other (subplan agentmgmt-2-run-state I9).
-  const aliases: Record<string, string> = { agent_status: "agent_list" }
+  // shell_output and shell_kill operate exclusively on background bash tasks,
+  // so their visibility follows the bash permission rule.
+  const aliases: Record<string, string> = {
+    agent_status: "agent_list",
+    shell_output: "bash",
+    shell_kill: "bash",
+  }
   return new Set(
     tools.filter((tool) => {
       const permission = edits.includes(tool) ? "edit" : reads.includes(tool) ? "read" : (aliases[tool] ?? tool)

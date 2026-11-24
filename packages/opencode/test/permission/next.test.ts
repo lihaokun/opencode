@@ -1189,3 +1189,15 @@ test("disabled - agent_status follows agent_list", () => {
     ]),
   ).toEqual(new Set())
 })
+
+test("disabled - shell_output and shell_kill follow bash", () => {
+  const tools = ["bash", "shell_output", "shell_kill"]
+  expect(Permission.disabled(tools, [{ permission: "bash", pattern: "*", action: "deny" }])).toEqual(new Set(tools))
+  expect(Permission.disabled(tools, [{ permission: "bash", pattern: "rm *", action: "deny" }])).toEqual(new Set())
+  expect(
+    Permission.disabled(tools, [
+      { permission: "*", pattern: "*", action: "deny" },
+      { permission: "bash", pattern: "*", action: "allow" },
+    ]),
+  ).toEqual(new Set())
+})

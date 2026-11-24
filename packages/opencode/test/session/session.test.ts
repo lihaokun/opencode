@@ -6,6 +6,7 @@ import { Cause, Deferred, Effect, Exit, Layer } from "effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Session as SessionNs } from "@/session/session"
+import { BackgroundJob } from "@/background/job"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -23,6 +24,7 @@ const it = testEffect(
   AppNodeBuilder.build(
     LayerNode.group([
       SessionNs.node,
+      BackgroundJob.node,
       EventV2Bridge.node,
       SessionProjector.node,
       CrossSpawnSpawner.node,
@@ -465,6 +467,31 @@ describe("Session.patch serializes writes to one session", () => {
       yield* session.setTitle({ sessionID: info.id, title: "timed" })
       expect(performance.now() - started).toBeLessThan(50)
       yield* session.remove(info.id)
+    }),
+  )
+
+  it.instance("remove cancels descendant background shell jobs through settled delegations", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const jobs = yield* BackgroundJob.Service
+      const parent = yield* session.create({ title: "parent" })
+      const childID = "ses_remove_descendant_child"
+      yield* jobs.start({
+        id: childID,
+        type: "agent",
+        metadata: { parentSessionId: parent.id, sessionId: childID },
+        run: Effect.succeed("delegation finished"),
+      })
+      yield* jobs.wait({ id: childID })
+      const shell = yield* jobs.start({
+        id: "shell_remove_descendant_live",
+        type: "shell",
+        metadata: { sessionId: childID },
+        run: Effect.never,
+      })
+      expect((yield* jobs.get(shell.id))?.status).toBe("running")
+      yield* session.remove(parent.id)
+      expect((yield* jobs.get(shell.id))?.status).toBe("cancelled")
     }),
   )
 })

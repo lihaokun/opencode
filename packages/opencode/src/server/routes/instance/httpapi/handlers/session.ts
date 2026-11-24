@@ -71,7 +71,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       cancel: (sessionID) => promptSvc.cancel(sessionID),
       resolvePromptParts: (template) => promptSvc.resolvePromptParts(template),
       prompt: (input) => promptSvc.prompt(input).pipe(Effect.catch(Effect.die)),
-      deliverAsync: (input) => promptSvc.deliverAsync(input),
+      deliverAsync: (input, identity) => promptSvc.deliverAsync(input, identity),
     }
     const scope = yield* Scope.Scope
 
@@ -190,6 +190,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const remove = Effect.fn("SessionHttpApi.remove")(function* (ctx: { params: { sessionID: SessionID } }) {
+      yield* requireSession(ctx.params.sessionID)
+      yield* promptSvc.cancel(ctx.params.sessionID)
       yield* SessionError.mapStorageNotFound(session.remove(ctx.params.sessionID))
       return true
     })

@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { BackgroundJob } from "@opencode-ai/core/background-job"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Deferred, Effect, Exit, Scope } from "effect"
+import { Deferred, Effect, Exit, Fiber, Scope } from "effect"
 import { it } from "./lib/effect"
 
 const jobsLayer = LayerNode.compile(BackgroundJob.node)
@@ -139,6 +139,38 @@ describe("BackgroundJob", () => {
       expect(cancelled?.status).toBe("cancelled")
       expect(cancelled?.output).toBeUndefined()
       yield* Deferred.succeed(latch, undefined)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("cancel closes the job scope before wait resolves", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      let finalized = false
+      const started = yield* Deferred.make<void>()
+      const job = yield* jobs.start({
+        type: "test",
+        run: Effect.scoped(
+          Effect.gen(function* () {
+            yield* Effect.addFinalizer(() =>
+              Effect.sleep("40 millis").pipe(
+                Effect.andThen(
+                  Effect.sync(() => {
+                    finalized = true
+                  }),
+                ),
+              ),
+            )
+            yield* Deferred.succeed(started, undefined)
+            return yield* Effect.never
+          }),
+        ),
+      })
+      yield* Deferred.await(started)
+      const waiter = yield* jobs.wait({ id: job.id }).pipe(Effect.forkChild)
+      yield* jobs.cancel(job.id)
+      const awaited = yield* Fiber.await(waiter)
+      expect(Exit.isSuccess(awaited)).toBe(true)
+      expect(finalized).toBe(true)
     }).pipe(Effect.provide(jobsLayer)),
   )
 })

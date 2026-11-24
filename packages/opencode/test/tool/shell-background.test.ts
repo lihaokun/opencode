@@ -45,23 +45,27 @@ const otherSessionID = SessionID.make("ses_bg_shell_stranger")
 const makeCtx = (opts?: {
   session?: SessionID
   promptOps?: AgentManagement.AgentPromptOps
+  abort?: AbortSignal
 }): Tool.Context =>
   ({
     sessionID: opts?.session ?? sessionID,
     messageID: MessageID.make("msg_bg_shell"),
     callID: "call_bg",
     agent: "build",
-    abort: new AbortController().signal,
+    abort: opts?.abort ?? new AbortController().signal,
     messages: [],
     metadata: () => Effect.void,
     ask: () => Effect.void,
-    extra: opts ? { promptOps: opts.promptOps } : undefined,
+    extra: opts?.promptOps ? { promptOps: opts.promptOps } : undefined,
   }) as unknown as Tool.Context
 
 const initTools = Effect.gen(function* () {
-  const shell = yield* (yield* ShellTool).init()
-  const output = yield* (yield* ShellOutputTool).init()
-  const kill = yield* (yield* ShellKillTool).init()
+  const shellDef = yield* ShellTool
+  const outputDef = yield* ShellOutputTool
+  const killDef = yield* ShellKillTool
+  const shell = yield* shellDef.init()
+  const output = yield* outputDef.init()
+  const kill = yield* killDef.init()
   return { shell, output, kill }
 })
 
@@ -97,7 +101,6 @@ it.instance("background start returns a task id immediately", () =>
     expect(Date.now() - startedAt).toBeLessThan(2_000)
     const taskId = /shell_[^\s\]]+/.exec(result.output)![0]
     const bg = yield* BackgroundJob.Service
-    const all = yield* bg.list()
     const job = yield* bg.get(taskId)
     expect(job?.status).toBe("running")
     expect(result.metadata.exit).toBe(null)
@@ -905,5 +908,112 @@ it.instance("parent interrupt traverses settled delegations to a live descendant
     expect((yield* jobs.get(otherSessionID))?.status).toBe("completed")
     expect((yield* jobs.get(neighbor.id))?.status).toBe("running")
     yield* Deferred.succeed(unrelated, undefined)
+  }),
+)
+
+it.instance("parent cancel also interrupts a descendant runner woken after its delegation settled", () =>
+  Effect.gen(function* () {
+    const jobs = yield* BackgroundJob.Service
+    const state = yield* SessionRunState.Service
+    const child = SessionID.make("ses_bg_woken_child")
+    yield* jobs.start({
+      id: child,
+      type: "agent",
+      metadata: { parentSessionId: sessionID, sessionId: child },
+      run: Effect.succeed("finished"),
+    })
+    yield* jobs.wait({ id: child })
+
+    const started = yield* Deferred.make<void>()
+    const interrupted = yield* Deferred.make<void>()
+    yield* state
+      .ensureRunning(
+        child,
+        Deferred.succeed(interrupted, undefined).pipe(Effect.as({} as never)),
+        Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+      )
+      .pipe(Effect.exit, Effect.forkScoped)
+    yield* Deferred.await(started)
+
+    yield* state.cancel(sessionID)
+    yield* Deferred.await(interrupted).pipe(Effect.timeout("2 seconds"))
+  }),
+)
+
+it.instance("pre-aborted run_in_background does not spawn a process or register a job", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const jobs = yield* BackgroundJob.Service
+    const fixture = yield* TestInstance
+    const controller = new AbortController()
+    controller.abort()
+    const result = yield* tools.shell.execute(
+      {
+        command: `bun -e "await Bun.write('should-not-exist', 'yes')"`,
+        run_in_background: true,
+      },
+      makeCtx({ abort: controller.signal }),
+    )
+    expect(result.output).toContain("cancelled before start")
+    expect((yield* jobs.list()).filter((j) => j.type === "shell")).toEqual([])
+    yield* Effect.sleep("100 millis")
+    expect(yield* Effect.promise(() => Bun.file(path.join(fixture.directory, "should-not-exist")).exists())).toBe(false)
+  }),
+)
+
+it.instance("shell_kill cancels a running shell job even when missing from live registry and strips settled prefix", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const jobs = yield* BackgroundJob.Service
+    const ctx = makeCtx()
+    // Running job registered directly in BackgroundJob (not in shellTasks)
+    const live = yield* jobs.start({
+      id: "shell_untracked_live",
+      type: "shell",
+      title: "untracked",
+      metadata: { sessionId: sessionID },
+      run: Effect.never,
+    })
+    const stopped = yield* tools.kill.execute({ task_id: live.id }, ctx)
+    expect(stopped.output).toContain("stopped (cancelled)")
+    expect((yield* jobs.get(live.id))?.status).toBe("cancelled")
+
+    // Settled job: shell_kill strips the internal `exit 0` first line
+    const done = yield* jobs.start({
+      id: "shell_settled_prefix",
+      type: "shell",
+      title: "settled",
+      metadata: { sessionId: sessionID },
+      run: Effect.succeed("exit 0\nhello-body"),
+    })
+    yield* jobs.wait({ id: done.id })
+    const killedAgain = yield* tools.kill.execute({ task_id: done.id }, ctx)
+    expect(killedAgain.output).toContain("already settled (completed)")
+    expect(killedAgain.output).toContain("hello-body")
+    expect(killedAgain.output).not.toContain("\nexit 0")
+  }),
+)
+
+it.instance("shell_output treats empty string task_id as unknown task and keeps multiline errors single-line", () =>
+  Effect.gen(function* () {
+    const tools = yield* initTools
+    const jobs = yield* BackgroundJob.Service
+    const ctx = makeCtx()
+    const bad = yield* Effect.exit(tools.output.execute({ task_id: "" }, ctx))
+    expect(Exit.isFailure(bad)).toBe(true)
+    if (Exit.isFailure(bad)) expect(String(Cause.squash(bad.cause))).toContain("unknown task:")
+
+    const failed = yield* jobs.start({
+      id: "shell_multiline_err",
+      type: "shell",
+      title: "multiline",
+      metadata: { sessionId: sessionID },
+      run: Effect.fail(new Error("line-one\nline-two\n" + "😀".repeat(260))),
+    })
+    yield* jobs.wait({ id: failed.id })
+    const view = yield* tools.output.execute({ task_id: failed.id }, ctx)
+    const lines = view.output.split("\n")
+    expect(lines[1]).toStartWith("status: error: line-one line-two")
+    expect(lines[1]!.isWellFormed()).toBe(true)
   }),
 )
