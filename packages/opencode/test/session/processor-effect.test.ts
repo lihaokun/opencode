@@ -1901,6 +1901,7 @@ itSettlement.live("session.processor recovers a context overflow when the attemp
         expect(result.result).toBe("compact")
         expect(result.message.finish).toBeUndefined()
         expect(result.message.error).toBeUndefined()
+        expect(result.errors).toEqual([])
         expect(result.stored.info.role).toBe("assistant")
         if (result.stored.info.role === "assistant") {
           expect(result.stored.info.finish).toBeUndefined()
@@ -1924,12 +1925,21 @@ itSettlement.live("session.processor recovers an untyped context overflow when t
         expect(result.result).toBe("compact")
         expect(result.message.finish).toBeUndefined()
         expect(result.message.error).toBeUndefined()
-        expect(result.errors).toStrictEqual([
+        expect(result.errors).toStrictEqual([])
+
+        const terminal = yield* runSettlement(dir, "untyped-context-overflow", {
+          recoverContextOverflow: false,
+          unfinished: true,
+        })
+        expect(terminal.result).toBe("stop")
+        expect(terminal.message.finish).toBe("error")
+        expect(terminal.errors).toStrictEqual([
           {
             name: "ContextOverflowError",
             data: { message: litellmContextOverflow },
           },
         ])
+        expect(terminal.message.error).toEqual(terminal.errors[0])
       }),
     { config: cfg },
   ),

@@ -2,7 +2,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import {
   CallToolResultSchema,
   ListToolsResultSchema,
+  McpError,
   ToolSchema,
+  type CallToolResult,
   type Tool as MCPToolDef,
 } from "@modelcontextprotocol/sdk/types.js"
 import { dynamicTool, jsonSchema, type JSONSchema7, type Tool } from "ai"
@@ -14,6 +16,45 @@ const MAX_LIST_PAGES = 1_000
 const TolerantListToolsResultSchema = ListToolsResultSchema.extend({
   tools: ToolSchema.omit({ outputSchema: true }).array(),
 })
+
+/**
+ * Model-facing message for an errored tool call: text content items plus the
+ * structuredContent channel (servers may put error details only there), joined
+ * with a stable fallback when both are empty.
+ */
+export function callToolErrorMessage(result: CallToolResult): string {
+  const parts = result.content
+    .flatMap((item) => (item.type === "text" ? [item.text] : []))
+    .filter((text) => text.trim())
+  if (result.structuredContent !== undefined && result.structuredContent !== null) {
+    const structured = result.structuredContent
+    const serialized = formatErrorData(structured)
+    if (!parts.some((part) => part === serialized || parsesTo(part, structured))) parts.push(serialized)
+  }
+  return parts.join("\n\n") || "MCP tool returned an error"
+}
+
+export function parsesTo(text: string, value: unknown) {
+  try {
+    const normalized = JSON.stringify(value)
+    if (normalized === undefined) return false
+    return Bun.deepEquals(JSON.parse(JSON.stringify(JSON.parse(text))), JSON.parse(normalized))
+  } catch {
+    return false
+  }
+}
+
+function formatErrorData(data: unknown) {
+  try {
+    const serialized = JSON.stringify(data)
+    if (serialized !== undefined) return serialized
+  } catch {}
+  try {
+    return String(data)
+  } catch {
+    return Object.prototype.toString.call(data)
+  }
+}
 
 export async function paginate<T, R extends { nextCursor?: string }>(
   list: (cursor?: string) => Promise<R>,
@@ -39,7 +80,56 @@ export function defs(client: Client, timeout?: number) {
   return listTools(client, timeout ?? DEFAULT_TIMEOUT).pipe(Effect.catch(() => Effect.void))
 }
 
-export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: number): Tool {
+// Both MCP entry points must bound server diagnostics before they enter a session.
+export async function callTool(
+  client: Client,
+  name: string,
+  args: Record<string, unknown>,
+  signal: AbortSignal | undefined,
+  timeout: number | undefined,
+  truncateError: (text: string) => Promise<string>,
+): Promise<CallToolResult> {
+  const result = await client
+    .callTool({ name, arguments: args }, CallToolResultSchema, {
+      resetTimeoutOnProgress: true,
+      signal,
+      timeout,
+      // The SDK requests progress updates only when a hook is present.
+      onprogress: () => {},
+    })
+    .catch(async (error: unknown) => {
+      if (signal?.aborted) throw error
+      if (error instanceof DOMException && error.name === "AbortError") throw error
+      if (error instanceof McpError) {
+        const diagnostic =
+          error.data === undefined || error.data === null
+            ? error.message
+            : error.message + "\n\n" + formatErrorData(error.data)
+        const bounded = await truncateError(diagnostic)
+        if (bounded === error.message) throw error
+        throw new Error(bounded)
+      }
+      if (error instanceof Error) {
+        if (!error.message) throw error
+        const bounded = await truncateError(error.message)
+        if (bounded !== error.message) throw new Error(bounded)
+        throw error
+      }
+      const text = typeof error === "string" ? error : formatErrorData(error)
+      const bounded = await truncateError(text)
+      if (bounded !== text) throw new Error(bounded)
+      throw error
+    })
+  if (result.isError) throw new Error(await truncateError(callToolErrorMessage(result)))
+  return result
+}
+
+export function convertTool(
+  mcpTool: MCPToolDef,
+  client: Client,
+  timeout: number | undefined,
+  truncateError: (text: string) => Promise<string>,
+): Tool {
   const inputSchema: JSONSchema7 = {
     ...(mcpTool.inputSchema as JSONSchema7),
     type: "object",
@@ -51,32 +141,19 @@ export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: numbe
     description: mcpTool.description ?? "",
     inputSchema: jsonSchema(inputSchema),
     execute: async (args: unknown, options) => {
-      const result = await client.callTool(
-        {
-          name: mcpTool.name,
-          arguments: (args || {}) as Record<string, unknown>,
-        },
-        CallToolResultSchema,
-        {
-          resetTimeoutOnProgress: true,
-          signal: options.abortSignal,
-          timeout,
-          // The MCP SDK only sends a progress token when this hook is present, enabling timeout resets.
-          onprogress: () => {},
-        },
+      const result = await callTool(
+        client,
+        mcpTool.name,
+        (args || {}) as Record<string, unknown>,
+        options.abortSignal,
+        timeout,
+        truncateError,
       )
-      if (result.isError)
-        throw new Error(
-          result.content
-            .flatMap((item) => (item.type === "text" ? [item.text] : []))
-            .filter((text) => text.trim())
-            .join("\n\n") || "MCP tool returned an error",
-        )
       if (result.content.length > 0 || result.structuredContent === undefined || result.structuredContent === null)
         return result
       return {
         ...result,
-        content: [{ type: "text" as const, text: JSON.stringify(result.structuredContent) }],
+        content: [{ type: "text" as const, text: formatErrorData(result.structuredContent) }],
       }
     },
   })

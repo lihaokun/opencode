@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto"
+import { Truncate } from "./truncate"
 import * as Tool from "./tool"
-import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js"
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { Cause, Effect, Schema } from "effect"
 import { CodeMode, Tool as SandboxTool, toolError } from "@opencode-ai/codemode"
 import { MCP } from "@/mcp"
@@ -132,6 +134,8 @@ function toolTree(catalog: readonly CatalogEntry[], run: (entry: CatalogEntry) =
 }
 
 const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: {
+  truncate: Truncate.Interface
+  redactErrorPath?: (file: string) => string
   plugin: Plugin.Interface
   entry: CatalogEntry
   args: Record<string, unknown>
@@ -145,28 +149,26 @@ const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: 
   )
   const result: CallToolResult = yield* Effect.gen(function* () {
     yield* input.ctx.ask({ permission: input.entry.key, metadata: {}, patterns: ["*"], always: ["*"] })
-    // Deliberately mirrors McpCatalog.convertTool's transport call so the MCP service stays free of tool-loop concerns.
-    return yield* Effect.promise(async () => {
-      const raw = await input.entry.tool.client.callTool(
-        { name: input.entry.tool.def.name, arguments: input.args },
-        CallToolResultSchema,
-        {
-          resetTimeoutOnProgress: true,
-          signal: input.ctx.abort,
-          timeout: input.entry.tool.timeout,
-          // The MCP SDK only sends a progress token when this hook is present, enabling timeout resets.
-          onprogress: () => {},
-        },
-      )
-      if (raw.isError)
-        throw new Error(
-          raw.content
-            .flatMap((item) => (item.type === "text" ? [item.text] : []))
-            .filter((text) => text.trim())
-            .join("\n\n") || "MCP tool returned an error",
-        )
-      return raw
-    })
+    const run = Effect.runPromiseWith(yield* Effect.context())
+    return yield* Effect.promise(() =>
+      McpCatalog.callTool(
+        input.entry.tool.client,
+        input.entry.tool.def.name,
+        input.args,
+        input.ctx.abort,
+        input.entry.tool.timeout,
+        (text) =>
+          run(
+            input.truncate.output(text, { error: true }).pipe(
+              Effect.map((out) =>
+                out.truncated && input.redactErrorPath
+                  ? out.content.replaceAll(out.outputPath, input.redactErrorPath(out.outputPath))
+                  : out.content,
+              ),
+            ),
+          ),
+      ),
+    )
   }).pipe(
     Effect.withSpan("Tool.execute", {
       attributes: {
@@ -188,6 +190,7 @@ const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: 
 export const CodeModeTool = Tool.define(
   CODE_MODE_TOOL,
   Effect.gen(function* () {
+    const truncate = yield* Truncate.Service
     const mcp = yield* MCP.Service
     const agents = yield* Agent.Service
     const sessions = yield* Session.Service
@@ -213,6 +216,18 @@ export const CodeModeTool = Tool.define(
 
         const calls: CallEntry[] = []
         const attachments: Attachment[] = []
+        // Replace each truncated artifact path with an unguessable per-execution
+        // opaque token before it enters the sandbox so host paths never leak to
+        // guest code (including Windows/non-standard paths), and exact 1:1
+        // restoration survives spaces, quotes, caught-and-ignored errors,
+        // repeated logs, and concurrent tool calls.
+        const artifactNonce = randomUUID().replaceAll("-", "")
+        const artifactTokens = new Map<string, string>()
+        const redactErrorPath = (file: string) => {
+          const token = `__opencode_artifact_${artifactNonce}_${artifactTokens.size + 1}__`
+          artifactTokens.set(token, file)
+          return token
+        }
         const publish = () =>
           ctx.metadata({ title: CODE_MODE_TOOL, metadata: { toolCalls: calls.map((c) => ({ ...c })) } })
 
@@ -221,6 +236,8 @@ export const CodeModeTool = Tool.define(
           Effect.gen(function* () {
             childCalls += 1
             const result = yield* invokeChildTool({
+              truncate,
+              redactErrorPath,
               plugin,
               entry,
               args: (input ?? {}) as Record<string, unknown>,
@@ -272,7 +289,24 @@ export const CodeModeTool = Tool.define(
         })
 
         const result = yield* Effect.raceFirst(runtime.execute(params.code), abort.pipe(Effect.map(cancelled)))
-        const logs = result.logs ?? []
+        const restoreText = (text: string) => {
+          if (artifactTokens.size === 0) return text
+          let next = text
+          for (const [token, file] of artifactTokens) {
+            next = next.replaceAll(token, file)
+          }
+          return next
+        }
+        const restoreValue = (value: unknown): unknown => {
+          if (artifactTokens.size === 0) return value
+          if (typeof value === "string") return restoreText(value)
+          if (Array.isArray(value)) return value.map(restoreValue)
+          if (value && typeof value === "object") {
+            return Object.fromEntries(Object.entries(value).map(([key, item]) => [restoreText(key), restoreValue(item)]))
+          }
+          return value
+        }
+        const logs = (result.logs ?? []).map(restoreText)
         const withLogs = (text: string) => {
           if (logs.length === 0) return text
           return text.length > 0 ? `${text}\n\nLogs:\n${logs.join("\n")}` : `Logs:\n${logs.join("\n")}`
@@ -287,15 +321,28 @@ export const CodeModeTool = Tool.define(
             } satisfies Tool.ExecuteResult<Metadata>
           }
           const hints = (result.error.suggestions ?? []).filter((hint) => !result.error.message.includes(hint))
-          return yield* Effect.fail(new Error(withLogs([result.error.message, ...hints].join("\n"))))
+          const restored = withLogs(restoreText([result.error.message, ...hints].join("\n")))
+          const anyRestored = [...artifactTokens.values()].some((file) => restored.includes(file))
+          const raw =
+            artifactTokens.size > 0 && !anyRestored
+              ? restored +
+                [...new Set(artifactTokens.values())]
+                  .map(
+                    (file) =>
+                      `\nThe tool call failed; error output was truncated. Full output saved to: ${file}\nUse Grep to search the full content or Read with offset/limit to view specific sections.`,
+                  )
+                  .join("")
+              : restored
+          const bounded = yield* truncate.output(raw, { error: true })
+          return yield* Effect.fail(new Error(bounded.content))
         }
 
+        // Restore tokens before JSON.stringify so paths containing `\` or `"`
+        // are properly JSON-escaped rather than corrupting serialized output.
+        const value = restoreValue(result.value)
         // The interpreter validates returned values as plain JSON, so stringify cannot throw;
         // it yields undefined only for a program that returns undefined.
-        const output =
-          typeof result.value === "string"
-            ? result.value
-            : (JSON.stringify(result.value, null, 2) ?? String(result.value))
+        const output = typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? String(value))
 
         return {
           title: CODE_MODE_TOOL,

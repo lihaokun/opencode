@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { CODE_MODE_TOOL, CodeModeTool, Parameters, describeCatalog } from "@/tool/code-mode"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js"
 import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Agent } from "@/agent/agent"
 import { MCP } from "@/mcp"
@@ -42,13 +43,14 @@ function harness(input: {
   servers: string[]
   permission?: PermissionV1.Rule[]
   trigger?: Plugin.Interface["trigger"]
+  truncate?: Truncate.Interface["output"]
 }) {
   return Layer.mergeAll(
     Layer.mock(Plugin.Service, {
       trigger: input.trigger ?? (((_name, _input, output) => Effect.succeed(output)) as Plugin.Interface["trigger"]),
     }),
     Layer.mock(Truncate.Service, {
-      output: (text: string) => Effect.succeed({ content: text, truncated: false as const }),
+      output: input.truncate ?? ((text: string) => Effect.succeed({ content: text, truncated: false as const })),
     }),
     Layer.mock(Agent.Service, {
       get: () => Effect.succeed({ name: "build", permission: input.permission ?? [] } as any),
@@ -356,6 +358,169 @@ describe("code mode execute", () => {
       tool.execute({ code: "try { await tools.bad.tool({}) } catch (e) { return 'caught: ' + e.message }" }, ctx),
     )
     expect(output.output).toBe("caught: server exploded")
+  })
+
+  test("bounds an RPC rejection before the sandbox catches the error", async () => {
+    const detail = "server diagnostic ".repeat(6000)
+    const saved: string[] = []
+    const tool = await Effect.runPromise(
+      CodeModeTool.pipe(
+        Effect.flatMap(Tool.init),
+        Effect.provide(
+          harness({
+            mcpTools: {
+              bad_tool: mcpTool("tool", () => {
+                throw new McpError(ErrorCode.InternalError, detail)
+              }),
+            },
+            servers: ["bad"],
+            truncate: (text, options) => {
+              if (!options?.error) return Effect.succeed({ content: text, truncated: false as const })
+              saved.push(text)
+              return Effect.succeed({
+                content: "diagnostic saved",
+                truncated: true as const,
+                outputPath: "/tmp/test-mcp-error",
+              })
+            },
+          }),
+        ),
+      ),
+    )
+    const result = await Effect.runPromise(
+      tool.execute({ code: "try { await tools.bad.tool({}) } catch (e) { return e.message }" }, ctx),
+    )
+    expect(saved).toHaveLength(1)
+    expect(saved[0]).toContain(detail)
+    expect(result.output).toBe("diagnostic saved")
+  })
+
+  test("restores exact truncated artifact paths across spaces, quotes, caught/ignored errors, repeated logs, and JSON returns", async () => {
+    const detail = "server diagnostic ".repeat(6000)
+    const spacedPath = '/Users/Jane Doe/Application Support/tool_"a".txt'
+    const winPath = 'C:\\Users\\Jane "O\'Connor"\\tool_b.txt'
+    const makeHint = (artifact: string) =>
+      `preview\n\n...100 lines truncated...\n\nThe tool call failed; error output was truncated. Full output saved to: ${artifact}\nUse Grep to search the full content or Read with offset/limit to view specific sections.`
+
+    let callIndex = 0
+    const tool = await Effect.runPromise(
+      CodeModeTool.pipe(
+        Effect.flatMap(Tool.init),
+        Effect.provide(
+          harness({
+            mcpTools: {
+              bad_a: mcpTool("a", () => {
+                throw new McpError(ErrorCode.InternalError, "err-a " + detail)
+              }),
+              bad_b: mcpTool("b", () => {
+                throw new McpError(ErrorCode.InternalError, "err-b " + detail)
+              }),
+            },
+            servers: ["bad"],
+            truncate: (text, options) => {
+              if (!options?.error) return Effect.succeed({ content: text, truncated: false as const })
+              if (text.includes("err-a")) {
+                return Effect.succeed({ content: makeHint(spacedPath), truncated: true as const, outputPath: spacedPath })
+              }
+              if (text.includes("err-b")) {
+                return Effect.succeed({ content: makeHint(winPath), truncated: true as const, outputPath: winPath })
+              }
+              callIndex += 1
+              return Effect.succeed({ content: text, truncated: false as const })
+            },
+          }),
+        ),
+      ),
+    )
+
+    // 1. Caught-and-ignored A followed by surfaced B in a JSON object: B gets its exact Windows+quote
+    // path properly JSON-escaped, A never misattributes or leaks, and forged <redacted-path> stays literal.
+    const objResult = await Effect.runPromise(
+      tool.execute(
+        {
+          code: `
+            try { await tools.bad.a({}) } catch {}
+            try { await tools.bad.b({}) } catch (e) {
+              return { err: e.message, forged: "Full output saved to: <redacted-path>" }
+            }
+          `,
+        },
+        ctx,
+      ),
+    )
+    const parsed = JSON.parse(objResult.output) as { err: string; forged: string }
+    expect(parsed.err).toContain(`Full output saved to: ${winPath}`)
+    expect(parsed.err).not.toContain(spacedPath)
+    expect(parsed.forged).toBe("Full output saved to: <redacted-path>")
+
+    // 2. Spaced path logged AND thrown: BOTH occurrences restore cleanly without suffix doubling.
+    const repeatedErr = await failure(
+      tool.execute(
+        {
+          code: `
+            try { await tools.bad.a({}) } catch (e) {
+              console.error(e.message)
+              throw e
+            }
+          `,
+        },
+        ctx,
+      ),
+    )
+    const matches = repeatedErr.message.matchAll(new RegExp(spacedPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"))
+    expect([...matches].length).toBe(2)
+    expect(repeatedErr.message).not.toContain("<redacted-path>")
+    expect(repeatedErr.message).not.toContain("Doe/Application Support/tool_\"a\".txt Doe/")
+
+    // 3. Caught-and-ignored A followed by uncaught B: only B is restored, A is not misattributed.
+    const uncaughtB = await failure(
+      tool.execute({ code: "try { await tools.bad.a({}) } catch {}; await tools.bad.b({})" }, ctx),
+    )
+    expect(uncaughtB.message).toContain(`Full output saved to: ${winPath}`)
+    expect(uncaughtB.message).not.toContain(spacedPath)
+    expect(callIndex).toBeGreaterThanOrEqual(0)
+  })
+
+  test("bounds oversized console logs attached to a failed program execution", async () => {
+    const truncatedCalls: string[] = []
+    const tool = await Effect.runPromise(
+      CodeModeTool.pipe(
+        Effect.flatMap(Tool.init),
+        Effect.provide(
+          harness({
+            mcpTools: {},
+            servers: [],
+            truncate: (text, options) => {
+              if (!options?.error) return Effect.succeed({ content: text, truncated: false as const })
+              truncatedCalls.push(text)
+              return Effect.succeed({
+                content: "bounded failure output\nFull output saved to: /tmp/console-failure.txt",
+                truncated: true as const,
+                outputPath: "/tmp/console-failure.txt",
+              })
+            },
+          }),
+        ),
+      ),
+    )
+
+    const err = await failure(
+      tool.execute({ code: `console.log("x".repeat(80000)); throw new Error("boom")` }, ctx),
+    )
+    expect(truncatedCalls).toHaveLength(1)
+    expect(truncatedCalls[0]).toContain("Uncaught: boom")
+    expect(err.message).toContain("Full output saved to: /tmp/console-failure.txt")
+  })
+
+  test("an MCP error carrying only structuredContent surfaces the JSON in the message", async () => {
+    const structuredContent = { code: 3007, detail: "quota exceeded" }
+    const tool = await build({
+      bad_tool: mcpTool("tool", () => ({ isError: true, content: [], structuredContent })),
+    })
+    const output = await Effect.runPromise(
+      tool.execute({ code: "try { await tools.bad.tool({}) } catch (e) { return 'caught: ' + e.message }" }, ctx),
+    )
+    expect(output.output).toBe(`caught: ${JSON.stringify(structuredContent)}`)
   })
 
   test("asks permission before each child tool call", async () => {

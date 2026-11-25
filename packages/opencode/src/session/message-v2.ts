@@ -29,6 +29,7 @@ import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { formatExitCodeLine } from "@opencode-ai/core/session/tool-result-projection"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
@@ -131,6 +132,15 @@ function providerMeta(metadata: Record<string, any> | undefined) {
   if (!metadata) return undefined
   const { providerExecuted: _, ...rest } = metadata
   return Object.keys(rest).length > 0 ? rest : undefined
+}
+
+export function assistantVisible(msg: WithParts) {
+  return (
+    msg.info.role !== "assistant" ||
+    !msg.info.error ||
+    (AbortedError.isInstance(msg.info.error) &&
+      msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning"))
+  )
 }
 
 export const toModelMessagesEffect = Effect.fnUntraced(function* (
@@ -250,15 +260,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
       const differentModel = `${model.providerID}/${model.id}` !== `${msg.info.providerID}/${msg.info.modelID}`
       const media: Array<{ mime: string; url: string; filename?: string }> = []
 
-      if (
-        msg.info.error &&
-        !(
-          AbortedError.isInstance(msg.info.error) &&
-          msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")
-        )
-      ) {
-        continue
-      }
+      if (!assistantVisible(msg)) continue
       const assistantMessage: UIMessage = {
         id: msg.info.id,
         role: "assistant",
@@ -295,9 +297,13 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
         if (part.type === "tool") {
           toolNames.add(part.tool)
           if (part.state.status === "completed") {
-            const outputText = part.state.time.compacted
+            const baseText = part.state.time.compacted
               ? "[Old tool result content cleared]"
               : truncateToolOutput(part.state.output, options?.toolOutputMaxChars)
+            // A non-zero exit only lives in metadata, which the model would never see
+            // without projecting it here. Success (0) and timeout/abort (null) stay silent.
+            const exitLine = part.state.time.compacted ? undefined : formatExitCodeLine(part.state.metadata)
+            const outputText = exitLine ? `${baseText}\n${exitLine}` : baseText
             const attachments = part.state.time.compacted || options?.stripMedia ? [] : (part.state.attachments ?? [])
 
             // For providers that don't support media in tool results, extract media files
@@ -546,59 +552,114 @@ export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: Ses
   }
 })
 
+export function isOriginal(message: WithParts) {
+  return message.info.role === "assistant" ? !message.info.summary : !message.parts.some((p) => p.type === "compaction")
+}
+
+const visibleSummary = (m: WithParts) =>
+  m.info.role !== "assistant" || !m.info.summary || (!!m.info.finish && !m.info.error)
+
+// The DB stream is newest first. Only the newest settled marker determines the
+// window. Old ID boundaries are interpreted here, including hidden/missing
+// anchors, before normalizing the successful summary in memory.
 export function filterCompacted(msgs: Iterable<WithParts>) {
-  const result = [] as WithParts[]
-  const completed = new Set<string>()
-  let retain: MessageID | undefined
-  let boundary: WithParts | undefined
-  for (const msg of msgs) {
-    // Keep even hidden summary attempts until the durable boundary has been
-    // interpreted: old tail_start_id values can point at those messages.
-    result.push(msg)
-    if (retain) {
-      if (msg.info.id === retain) break
-      continue
+  const later: WithParts[] = []
+  const completed = new Map<MessageID, WithParts>()
+  const iterator = msgs[Symbol.iterator]()
+  for (let item = iterator.next(); !item.done; item = iterator.next()) {
+    const m = item.value
+    const summary = completed.get(m.info.id)
+    const marker = summary && m.parts.find((part): part is CompactionPart => part.type === "compaction")
+    if (marker && summary?.info.role === "assistant") {
+      const stored = summary.info.n
+      const tail: WithParts[] = []
+      // The raw stream runs backwards. Each rejected request covers an inclusive
+      // range of original users, ending before any inputs that arrived in flight.
+      const mediaRanges = new Map<MessageID, MessageID[]>()
+      const activeUntil = new Set<MessageID>()
+      let stripPreviousUser = false
+      const rememberMedia = (part: CompactionPart) => {
+        if (!part.overflow) return
+        if (!part.protected_from) {
+          stripPreviousUser = true // completed a pending marker from an older build
+          return
+        }
+        const last = part.request_user_id ?? part.protected_from // older known-anchor markers stripped one user
+        const ranges = mediaRanges.get(last) ?? []
+        ranges.push(part.protected_from)
+        mediaRanges.set(last, ranges)
+      }
+      if (stored !== undefined) rememberMedia(marker)
+      // New summaries count original rows. Legacy anchors are matched against
+      // every raw ID (even a hidden summary); only original rows enter n.
+      const oldStart = stored === undefined ? marker.tail_start_id : undefined
+      if (stored !== undefined || (oldStart && oldStart !== m.info.id)) {
+        while (stored === undefined || tail.length < stored) {
+          const next = iterator.next()
+          if (next.done) break
+          const row = next.value
+          if (isOriginal(row)) {
+            if (row.info.role === "user") {
+              for (const first of mediaRanges.get(row.info.id) ?? []) activeUntil.add(first)
+              tail.push(stripPreviousUser || activeUntil.size ? withoutUserMedia(row) : row)
+              activeUntil.delete(row.info.id)
+              stripPreviousUser = false
+            }
+            if (row.info.role !== "user") {
+              tail.push(row)
+            }
+          }
+          if (
+            !isOriginal(row) &&
+            row.info.role === "assistant" &&
+            row.info.summary &&
+            row.info.finish &&
+            !row.info.error &&
+            !completed.has(row.info.parentID)
+          ) {
+            completed.set(row.info.parentID, row)
+          }
+          if (!isOriginal(row) && row.info.role === "user") {
+            const previous = completed.get(row.info.id)
+            const part = row.parts.find((p): p is CompactionPart => p.type === "compaction")
+            if (part && previous?.info.role === "assistant" && previous.info.n !== undefined) rememberMedia(part)
+          }
+          if (row.info.id === oldStart) break
+        }
+      }
+      const normalized = stored !== undefined ? summary : { ...summary, info: { ...summary.info, n: tail.length } }
+      return [
+        m,
+        normalized,
+        ...tail.reverse(),
+        ...later.reverse().filter((row) => row !== summary && visibleSummary(row)),
+      ]
     }
-    if (msg.info.role === "user" && completed.has(msg.info.id)) {
-      const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
-      if (!part) continue
-      boundary = msg
-      if (!part.tail_start_id) break
-      retain = part.tail_start_id
-      if (msg.info.id === retain) break
-      continue
-    }
-    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
-      completed.add(msg.info.parentID)
+    if (m.info.role === "assistant" && m.info.summary && m.info.finish && !m.info.error && !completed.has(m.info.parentID))
+      completed.set(m.info.parentID, m)
+    later.push(m)
   }
-  result.reverse()
-  const compactionIndex = boundary ? result.indexOf(boundary) : -1
-  const summaryIndex = boundary
-    ? result.findIndex(
-        (msg, index) =>
-          index > compactionIndex &&
-          msg.info.role === "assistant" &&
-          msg.info.summary &&
-          msg.info.finish &&
-          !msg.info.error &&
-          msg.info.parentID === boundary.info.id,
-      )
-    : -1
-  // Only the settled boundary controls the layout. Inputs arriving between
-  // its marker and summary follow the retained tail, in their original order.
-  const ordered =
-    boundary && summaryIndex > compactionIndex
-      ? [
-          boundary,
-          result[summaryIndex]!,
-          ...result.slice(0, compactionIndex),
-          ...result.slice(compactionIndex + 1, summaryIndex),
-          ...result.slice(summaryIndex + 1),
-        ]
-      : result
-  return ordered.filter(
-    (msg) => msg.info.role !== "assistant" || !msg.info.summary || (msg.info.finish && !msg.info.error),
-  )
+  return later.reverse().filter(visibleSummary)
+}
+
+// The input itself remains in storage; only the outgoing representation loses
+// the oversized attachment on the overflow recovery path.
+export function withoutUserMedia(row: WithParts): WithParts {
+  if (row.info.role !== "user") return row
+  return {
+    ...row,
+    parts: row.parts.map((part) =>
+      part.type === "file" && isMedia(part.mime)
+        ? {
+            type: "text",
+            id: part.id,
+            messageID: part.messageID,
+            sessionID: part.sessionID,
+            text: `[Attached ${part.mime}: ${part.filename ?? "file"}]`,
+          }
+        : part,
+    ),
+  }
 }
 
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {

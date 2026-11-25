@@ -60,7 +60,8 @@ const StoredPart = Schema.Struct({
   ),
 })
 
-const crossoverUsage = { input: 100, output: 1 } satisfies Usage
+// The fixture must fit an actual CLI request, while the scripted usage crosses the model limit.
+const crossoverUsage = { input: 50_000, output: 1 } satisfies Usage
 // Wall-clock tests only. See the one use below for why the Windows runner
 // cannot hold the timing window these need.
 const posixOnly = process.platform === "win32" ? cliIt.skip : cliIt.concurrent
@@ -103,7 +104,7 @@ function crossoverEnv(llmUrl: string) {
             ...config.provider.test.models,
             "test-model": {
               ...config.provider.test.models["test-model"],
-              limit: { context: 20, output: 10 },
+              limit: { context: 40_000, output: 10 },
             },
           },
         },
@@ -381,6 +382,32 @@ describe("opencode run (non-interactive subprocess)", () => {
   )
 
   cliIt.concurrent(
+    "a recovered provider overflow exits zero and a terminal retry error exits nonzero",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const env = { OPENCODE_DISABLE_AUTOCOMPACT: "0" }
+        yield* llm.text("first response")
+        const prior = yield* opencode.run("prior question", { format: "json", env })
+        opencode.expectExit(prior, 0)
+        const id = opencode.parseJsonEvents(prior.stdout).find((event) => typeof event.sessionID === "string")?.sessionID
+        if (typeof id !== "string") throw new Error("missing session ID")
+        for (const terminal of [false, true]) {
+          yield* llm.error(413, { error: { message: "request entity too large" } })
+          yield* llm.text("short summary")
+          if (terminal) yield* llm.error(413, { error: { message: "request entity too large" } })
+          else yield* llm.text("final recovered answer")
+          const result = yield* opencode.run("continue the work", { format: "json", env, extraArgs: ["--session", id] })
+          opencode.expectExit(result, terminal ? 1 : 0)
+          const events = opencode.parseJsonEvents(result.stdout)
+          expect(events.filter((event) => event.type === "error")).toHaveLength(terminal ? 1 : 0)
+          if (!terminal) expect(result.stdout).toContain("final recovered answer")
+          expect(yield* llm.pending).toBe(0)
+        }
+      }),
+    TEST_TIMEOUT_MS,
+  )
+
+  cliIt.concurrent(
     "propagates a child compaction crossover after one completed tool without replay",
     ({ home, llm, opencode }) =>
       Effect.gen(function* () {
@@ -485,17 +512,13 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(failedParts).toContainEqual(expect.objectContaining({ type: "text", text: partial }))
         expect(completedBash).toHaveLength(1)
         expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("charged\n")
-        // Three now, not two: the run no longer exits at the end of the parent's
-        // turn, so the child's last retry gets to finish instead of being cut
-        // off by the process going away. The property this test is named for
-        // still holds — `completedBash` above is 1, so no completed work was
-        // redone; only the model round-trip count changed.
-        expect(childInputs).toHaveLength(3)
+        // One child request chooses bash; the next consumes that result and loses
+        // its finish. Only the parent is allowed to continue after the child failure.
+        expect(childInputs).toHaveLength(2)
+        expect(childInputs[0]?.messages).not.toContainEqual(expect.objectContaining({ role: "tool" }))
+        expect(childInputs[1]?.messages).toContainEqual(expect.objectContaining({ role: "tool" }))
         expect(recoveryInputs).toHaveLength(1)
-        // Two more than before, for the same reason: the child's last retry and
-        // the parent's turn answering the failure notice both used to be lost to
-        // the process exiting.
-        expect(yield* llm.calls).toBe(7)
+        expect(inputs.some((body) => bodyIncludes(body, "Create a new anchored summary"))).toBe(false)
         expect(yield* llm.pending).toBe(0)
       }),
     TEST_TIMEOUT_MS,

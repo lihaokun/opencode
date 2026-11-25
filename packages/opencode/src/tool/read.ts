@@ -51,6 +51,7 @@ type Display =
       lineStart: number
       lineEnd: number
       totalLines: number
+      sha256?: string
       truncated: boolean
     }
 
@@ -134,9 +135,14 @@ export const ReadTool = Tool.define<
       )
     })
 
-    const lines = Effect.fn("ReadTool.lines")(function* (filepath: string, opts: { limit: number; offset: number }) {
+    const lines = Effect.fn("ReadTool.lines")(function* (
+      filepath: string,
+      opts: { limit: number; offset: number; size: number },
+    ) {
       const start = opts.offset - 1
       const raw: string[] = []
+      // Only a complete visible read can prove the file version after compaction.
+      let hash = opts.offset === 1 && opts.size <= MAX_BYTES ? new Bun.CryptoHasher("sha256") : undefined
       const flags = { bytes: 0, count: 0, cut: false, more: false, done: false }
 
       // Note: prefer manual TextDecoder over Stream.decodeText — when the source stream
@@ -146,7 +152,10 @@ export const ReadTool = Tool.define<
       // upstream file stream as soon as the byte cap is reached.
       const decoder = new TextDecoder("utf-8")
       yield* fs.stream(filepath).pipe(
-        Stream.map((bytes) => decoder.decode(bytes, { stream: true })),
+        Stream.map((bytes) => {
+          hash?.update(bytes)
+          return decoder.decode(bytes, { stream: true })
+        }),
         Stream.splitLines,
         Stream.runForEach((text) =>
           Effect.gen(function* () {
@@ -155,10 +164,12 @@ export const ReadTool = Tool.define<
             if (flags.count <= start) return
 
             if (raw.length >= opts.limit) {
+              hash = undefined
               flags.more = true
               return
             }
 
+            if (text.length > MAX_LINE_LENGTH) hash = undefined
             const line = text.length > MAX_LINE_LENGTH ? text.substring(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : text
             const size = Buffer.byteLength(line, "utf-8") + (raw.length > 0 ? 1 : 0)
             if (flags.bytes + size <= MAX_BYTES) {
@@ -176,7 +187,14 @@ export const ReadTool = Tool.define<
         Effect.catchTag("ReadStop", () => Effect.void),
       )
 
-      return { raw, count: flags.count, cut: flags.cut, more: flags.more, offset: opts.offset }
+      return {
+        raw,
+        count: flags.count,
+        cut: flags.cut,
+        more: flags.more,
+        offset: opts.offset,
+        sha256: flags.more ? undefined : hash?.digest("hex"),
+      }
     })
 
     const isBinaryFile = (filepath: string, bytes: Uint8Array) => {
@@ -328,7 +346,11 @@ export const ReadTool = Tool.define<
         return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
       }
 
-      const file = yield* lines(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset || 1 })
+      const file = yield* lines(filepath, {
+        limit: params.limit ?? DEFAULT_READ_LIMIT,
+        offset: params.offset || 1,
+        size: Number(stat.size),
+      })
       if (file.count < file.offset && !(file.count === 0 && file.offset === 1)) {
         return yield* Effect.fail(
           new Error(`Offset ${file.offset} is out of range for this file (${file.count} lines)`),
@@ -370,6 +392,7 @@ export const ReadTool = Tool.define<
             lineStart: file.offset,
             lineEnd: last,
             totalLines: file.count,
+            ...(file.sha256 && { sha256: file.sha256 }),
             truncated,
           },
         },

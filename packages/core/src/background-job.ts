@@ -82,7 +82,7 @@ export interface Interface {
   readonly start: (input: StartInput) => Effect.Effect<Info>
   readonly extend: (input: ExtendInput) => Effect.Effect<boolean>
   readonly wait: (input: WaitInput) => Effect.Effect<WaitResult>
-  readonly cancel: (id: string) => Effect.Effect<Info | undefined>
+  readonly cancel: (id: string, options?: { output?: string }) => Effect.Effect<Info | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/BackgroundJob") {}
@@ -139,7 +139,6 @@ export const make = Effect.gen(function* () {
           : "error"
       const next = {
         ...job,
-        onPromote: undefined,
         pending: 0,
         output,
         info: {
@@ -278,7 +277,7 @@ export const make = Effect.gen(function* () {
   const wait: Interface["wait"] = Effect.fn("BackgroundJob.wait")(function* (input) {
     const job = (yield* SynchronizedRef.get(state.jobs)).get(input.id)
     if (!job) return { timedOut: false }
-    if (job.info.status !== "running") return { info: snapshot(job), timedOut: false }
+    if (yield* Deferred.isDone(job.done)) return { info: yield* Deferred.await(job.done), timedOut: false }
     if (input.timeout === undefined) return { info: yield* Deferred.await(job.done), timedOut: false }
     if (input.timeout <= 0) return { info: snapshot(job), timedOut: true }
     const info = yield* Deferred.await(job.done).pipe(Effect.timeoutOption(input.timeout))
@@ -286,27 +285,50 @@ export const make = Effect.gen(function* () {
     return { info: snapshot(job), timedOut: true }
   })
 
-  const cancel: Interface["cancel"] = Effect.fn("BackgroundJob.cancel")(function* (id) {
-    const completed_at = yield* Clock.currentTimeMillis
-    const result = yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [FinishResult, Map<string, Active>] => {
-      const job = jobs.get(id)
-      if (!job) return [{}, jobs]
-      if (job.info.status !== "running") return [{ info: snapshot(job) }, jobs]
-      const next = {
-        ...job,
-        onPromote: undefined,
-        pending: 0,
-        info: {
-          ...job.info,
-          status: "cancelled" as const,
-          completed_at,
-        },
-      }
-      return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
-    })
-    if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
-    if (result.scope) yield* Scope.close(result.scope, Exit.void)
-    return result.info
+  const cancel: Interface["cancel"] = Effect.fn("BackgroundJob.cancel")(function* (id, options) {
+    return yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        const completed_at = yield* Clock.currentTimeMillis
+        const result = yield* SynchronizedRef.modify(
+          state.jobs,
+          (jobs): readonly [FinishResult, Map<string, Active>] => {
+            const job = jobs.get(id)
+            if (!job) return [{}, jobs]
+            if (job.info.status !== "running") return [{ info: snapshot(job), done: job.done }, jobs]
+            const next = {
+              ...job,
+              pending: 0,
+              // A caller holding the run's final output (e.g. the shell tool's
+              // accumulated buffer at kill time) hands it over so the cancelled
+              // snapshot stays observable — the interrupted fiber never reaches
+              // settle, so without this the output would be lost.
+              ...(options?.output !== undefined ? { output: { sequence: job.next, text: options.output } } : {}),
+              info: {
+                ...job.info,
+                status: "cancelled" as const,
+                completed_at,
+                ...(options?.output !== undefined ? { output: options.output } : {}),
+              },
+            }
+            return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
+          },
+        )
+        if (result.scope) {
+          yield* Scope.close(result.scope, Exit.void).pipe(
+            Effect.ensuring(
+              result.info && result.done
+                ? Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
+                : Effect.void,
+            ),
+          )
+          return result.info
+        }
+        // Another cancel or settle already claimed the transition; wait until its
+        // scope teardown / done signal completes before returning.
+        if (result.done) return yield* Deferred.await(result.done)
+        return result.info
+      }),
+    )
   })
 
   return Service.of({ list, get, start, extend, wait, cancel })

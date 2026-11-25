@@ -5,8 +5,14 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import os from "os"
 import { SessionID, MessageID, PartID } from "./schema"
 import { MessageV2 } from "./message-v2"
+import { usable } from "./overflow"
+import { estimateMessages, estimatePayload } from "./summary-budget"
+import { Token } from "@/util/token"
+import { SessionRestoration } from "./restoration"
 import { SessionRevert } from "./revert"
 import { Session } from "./session"
+import { Todo } from "./todo"
+import { Skill } from "@/skill"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
 
@@ -121,7 +127,7 @@ export interface Interface {
    * reading and writing in the wrong project. Both callers — the HTTP handler
    * and agent_send — go through here so neither can take half again.
    */
-  readonly deliverAsync: (input: PromptInput) => Effect.Effect<void>
+  readonly deliverAsync: (input: PromptInput, identity?: "current") => Effect.Effect<void>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -143,6 +149,8 @@ const layer = Layer.effect(
     const plugin = yield* Plugin.Service
     const commands = yield* Command.Service
     const config = yield* Config.Service
+    const todos = yield* Todo.Service
+    const skills = yield* Skill.Service
     const permission = yield* Permission.Service
     const fsys = yield* FSUtil.Service
     const mcp = yield* MCP.Service
@@ -168,7 +176,7 @@ const layer = Layer.effect(
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
-        deliverAsync: (input: PromptInput) => deliverAsync(input),
+        deliverAsync: (input: PromptInput, identity?: "current") => deliverAsync(input, identity),
       } satisfies AgentManagement.AgentPromptOps
     })
 
@@ -177,7 +185,7 @@ const layer = Layer.effect(
       yield* state.cancel(sessionID)
     })
 
-    const deliverAsync = Effect.fn("SessionPrompt.deliverAsync")(function* (input: PromptInput) {
+    const deliverAsync = Effect.fn("SessionPrompt.deliverAsync")(function* (input: PromptInput, identity?: "current") {
       const target = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       const here = yield* InstanceState.context
 
@@ -204,7 +212,7 @@ const layer = Layer.effect(
       // Same directory means this instance already is the target's, and loading
       // it again would be a detour to the same place.
       if (target.directory === here.directory) {
-        yield* report(prompt(input))
+        yield* report(prompt(input, identity))
         return
       }
 
@@ -224,7 +232,7 @@ const layer = Layer.effect(
           ),
         )
       }
-      yield* report(store.value.provide({ directory: target.directory }, prompt(input)))
+      yield* report(store.value.provide({ directory: target.directory }, prompt(input, identity)))
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -654,6 +662,7 @@ const layer = Layer.effect(
           const args = Shell.args(sh, input.command, cwd)
           let output = ""
           let aborted = false
+          let exitCode: number | undefined
 
           const finish = Effect.uninterruptible(
             Effect.gen(function* () {
@@ -671,7 +680,7 @@ const layer = Layer.effect(
                   time: { ...part.state.time, end: completed },
                   input: part.state.input,
                   title: "",
-                  metadata: { output },
+                  metadata: { output, ...(exitCode !== undefined ? { exit: exitCode } : {}) },
                   output,
                 }
                 yield* sessions.updatePart(part)
@@ -703,13 +712,16 @@ const layer = Layer.effect(
                   }
                 }),
               )
-              yield* handle.exitCode
+              return yield* handle.exitCode
             }).pipe(Effect.scoped, Effect.orDie),
           ).pipe(Effect.exit)
 
           if (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause) && !Cause.hasDies(exit.cause)) {
             aborted = true
           }
+          // Record the process exit code so the replay projection can surface
+          // non-zero exits for `!` commands the same way it does for the bash tool.
+          if (Exit.isSuccess(exit)) exitCode = exit.value
           yield* finish
 
           if (Exit.isFailure(exit) && !aborted && !Cause.hasInterruptsOnly(exit.cause)) {
@@ -762,7 +774,18 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (
+      request: PromptInput,
+      target?: Session.Info,
+    ) {
+      const input = target
+        ? {
+            ...request,
+            agent: target.agent,
+            model: target.model ? { providerID: target.model.providerID, modelID: target.model.id } : undefined,
+            variant: target.model?.variant === "default" ? undefined : target.model?.variant,
+          }
+        : request
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -776,7 +799,7 @@ const layer = Layer.effect(
       const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
-        !input.variant && ag.variant && same
+        !target && !input.variant && ag.variant && same
           ? yield* provider
               .getModel(model.providerID, model.modelID)
               .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
@@ -799,12 +822,15 @@ const layer = Layer.effect(
         format: input.format,
       }
 
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      // A completion observes the session identity. It must never write an old
+      // observation over a user selection, including a switch during delivery.
+      const current = target ?? (yield* sessions.get(input.sessionID).pipe(Effect.orDie))
       if (
-        current.agent !== info.agent ||
-        current.model?.providerID !== info.model.providerID ||
-        current.model?.id !== info.model.modelID ||
-        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
+        !target &&
+        (current.agent !== info.agent ||
+          current.model?.providerID !== info.model.providerID ||
+          current.model?.id !== info.model.modelID ||
+          (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant)
       ) {
         yield* sessions.setAgentModel({
           sessionID: input.sessionID,
@@ -1179,12 +1205,12 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
+    const prompt: (input: PromptInput, identity?: "current") => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
       "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
+    )(function* (input: PromptInput, identity?: "current") {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input)
+      const message = yield* createUserMessage(input, identity === "current" ? session : undefined)
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []
@@ -1503,6 +1529,55 @@ const layer = Layer.effect(
               auto: task.part.auto,
               overflow: task.part.overflow,
             })
+            // Restoration is injected here and only here — the single point
+            // where every compaction entry (overflow guard, processor
+            // reactive, HTTP summarize, manual) settles. Snapshot semantics:
+            // it reads the disk as of the compaction moment, once per
+            // compaction; it is not re-run per model step.
+            if (result === "continue") {
+              if (task.part.overflow) compactionToken = "compacted"
+              const latest = yield* sessions.findMessage(sessionID, (m) => m.info.role === "user").pipe(Effect.orDie)
+              const activeUser = Option.isSome(latest) && latest.value.info.role === "user" ? latest.value.info : lastUser
+              const activeModel =
+                activeUser.model.providerID === model.providerID && activeUser.model.modelID === model.id
+                  ? model
+                  : yield* getModel(activeUser.model.providerID, activeUser.model.modelID, sessionID)
+              const anchorUser = task.part.request_user_id ?? task.part.protected_from
+              const fixedInputTokens =
+                !anchorUser || anchorUser === activeUser.id ? (task.part.fixed_input_tokens ?? 0) : 0
+              const cfg = yield* config.get()
+              const usablePrimary = usable({ cfg, model: activeModel, outputTokenMax: flags.outputTokenMax })
+              const maxBudgetTokens =
+                activeModel.limit.context > 0 && usablePrimary > 0
+                  ? yield* Effect.gen(function* () {
+                      const projected = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+                        Effect.provideService(Database.Service, database),
+                      )
+                      // Step P8 retires prior active restoration parts before writing the new
+                      // block, so exclude them when measuring post-compaction headroom.
+                      const modelMessages = yield* MessageV2.toModelMessagesEffect(
+                        projected.map(SessionRestoration.withoutRestoration),
+                        activeModel,
+                      )
+                      const messagesTokens = Math.max(
+                        estimateMessages(modelMessages),
+                        Token.estimate(JSON.stringify(modelMessages)),
+                      )
+                      const headroom = usablePrimary - fixedInputTokens - messagesTokens - 256
+                      return restorationBudgetCap(headroom)
+                    })
+                  : undefined
+              // Step P1 (comprec-1): trigger — inject exactly once inside the
+              // compaction task arm after process returns continue (B6).
+              yield* SessionRestoration.apply({ sessionID, maxBudgetTokens }).pipe(
+                Effect.provideService(Session.Service, sessions),
+                Effect.provideService(Agent.Service, agents),
+                Effect.provideService(FSUtil.Service, fsys),
+                Effect.provideService(Config.Service, config),
+                Effect.provideService(Todo.Service, todos),
+                Effect.provideService(Skill.Service, skills),
+              )
+            }
             if (result === "stop") break
             continue
           }
@@ -1580,6 +1655,13 @@ const layer = Layer.effect(
               .some(
                 (message) => message.info.role === "user" && !message.parts.some((part) => part.type === "compaction"),
               )
+            // The transform hook may remove, reorder, or edit any row in the provider view.
+            // Only durable IDs selected for this request can define its eventual recovery.
+            const requestUserID = lastUser.id
+            const requiredIDs = msgs
+              .slice(pendingInputStart(msgs, currentUserIndex))
+              .filter(MessageV2.isOriginal)
+              .map((m) => m.info.id)
             const promptOps = yield* ops()
 
             const tools = yield* SessionTools.resolve({
@@ -1662,21 +1744,73 @@ const layer = Layer.effect(
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             }
             const preparedPayload = yield* llm.preparePayload(streamInput)
-            const token = compactionToken
-            const skipEstimate = token === "compacted"
-            if (token === "compacted") compactionToken = "skip"
-            if (token === "skip") compactionToken = "none"
-            const overflow = skipEstimate ? false : yield* compaction.willOverflow({ ...preparedPayload, model })
-            if (overflow && canCompact) {
-              compactionToken = "compacted"
-              yield* sessions.removeMessage({ sessionID, messageID: handle.message.id })
-              yield* compaction.create({
+            const recoveryMarker = Effect.fnUntraced(function* () {
+              const fixed = yield* Effect.tryPromise(() => estimatePayload({ ...preparedPayload, messages: [] })).pipe(
+                Effect.orElseSucceed(() => undefined),
+              )
+              const selected = new Set(requiredIDs)
+              const durable = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+                Effect.provideService(Database.Service, database),
+              )
+              const cfg = yield* config.get()
+              const stripRestoration = SessionRestoration.restorationConfig(cfg).enabled
+              const required = durable
+                .filter((row) => selected.has(row.info.id))
+                .map((row) => {
+                  const stripped = MessageV2.withoutUserMedia(row)
+                  return stripRestoration ? SessionRestoration.withoutRestoration(stripped) : stripped
+                })
+              const size = estimateMessages(yield* MessageV2.toModelMessagesEffect(required, model))
+              if (
+                model.limit.context > 0 &&
+                size + (fixed ?? 0) >= usable({ cfg, model, outputTokenMax: flags.outputTokenMax })
+              ) {
+                // Steering may have replaced the system/tools while this request was
+                // in flight. Its old overhead cannot rule out the new user's request.
+                const latest = yield* sessions.findMessage(sessionID, (m) => m.info.role === "user").pipe(Effect.orDie)
+                if (Option.isNone(latest) || latest.value.info.id === requestUserID) return undefined
+              }
+              return {
                 sessionID,
                 agent: lastUser.agent,
                 model: lastUser.model,
                 auto: true,
                 overflow: true,
-              })
+                protectedFrom: requiredIDs[0],
+                requestUserID,
+                fixedInputTokens: fixed,
+              }
+            })
+            const stopForInput = Effect.fnUntraced(function* () {
+              handle.message.error = new SessionV1.ContextOverflowError({
+                message: "The required user turn and fixed request context exceed the available input budget",
+              }).toObject()
+              handle.message.finish = "error"
+              handle.message.time.completed = Date.now()
+              yield* sessions.updateMessage(handle.message)
+              yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+              return "break" as const
+            })
+            const token = compactionToken
+            const resumingOverflow = token === "compacted"
+            if (token === "compacted") compactionToken = "skip"
+            if (token === "skip") compactionToken = "none"
+            const overflow = yield* compaction.willOverflow({ ...preparedPayload, model })
+            if (resumingOverflow && model.limit.context > 0) {
+              const full = yield* Effect.tryPromise(() => estimatePayload(preparedPayload)).pipe(Effect.option)
+              if (
+                overflow ||
+                (full._tag === "Some" &&
+                  full.value >= usable({ cfg: yield* config.get(), model, outputTokenMax: flags.outputTokenMax }))
+              )
+                return yield* stopForInput()
+            }
+            if (overflow && canCompact) {
+              const marker = yield* recoveryMarker()
+              if (!marker) return yield* stopForInput()
+              compactionToken = "compacted"
+              yield* sessions.removeMessage({ sessionID, messageID: handle.message.id })
+              yield* compaction.create(marker)
               return "continue" as const
             }
             if (overflow) compactionToken = "skip"
@@ -1730,20 +1864,31 @@ const layer = Layer.effect(
             if (result === "stop") return "break" as const
             // The provider rejected the request as too long: no response finished.
             const rejected = result === "compact" && !handle.message.finish
+            if (rejected) {
+              const marker = yield* recoveryMarker()
+              if (!marker) return yield* stopForInput()
+              compactionToken = "compacted"
+              yield* sessions.removeMessage({ sessionID, messageID: handle.message.id })
+              yield* compaction.create(marker)
+              // Only a step whose response finished counts. One withdrawn above for
+              // compaction before sending, or rejected by the provider as too long, is
+              // not a step (fix doc session-fix-step-tail-repeat-and-agents §3.2).
+              return "continue" as const
+            }
             if (result === "compact") {
-              if (rejected) compactionToken = "compacted"
+              const fixedInputTokens = yield* Effect.tryPromise(() =>
+                estimatePayload({ ...preparedPayload, messages: [] }),
+              ).pipe(Effect.orElseSucceed(() => undefined))
               yield* compaction.create({
                 sessionID,
                 agent: lastUser.agent,
                 model: lastUser.model,
                 auto: true,
-                overflow: rejected,
+                overflow: false,
+                requestUserID,
+                fixedInputTokens,
               })
             }
-            // Only a step whose response finished counts. One withdrawn above for
-            // compaction before sending, or rejected by the provider as too long, is
-            // not a step (fix doc session-fix-step-tail-repeat-and-agents §3.2).
-            if (rejected) return "continue" as const
             const current = StepTail.signature(
               yield* MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database)),
             )
@@ -1940,23 +2085,32 @@ const layer = Layer.effect(
     })
 
     /**
-     * Whether any agent below this one is still going. Busy by status, or
-     * started as a job that has not reached busy yet: the agent tool registers
-     * the job synchronously, and the status flips a few ticks later in the
-     * forked fiber, so a parent stopping right after starting one must not
-     * read it as finished.
+     * Whether this agent or any agent below it is still going. The session
+     * itself counts when it owns a running background shell (#53): the shell's
+     * completion message wakes it for another turn, so a run that stops while
+     * one is running has not finished its work. Descendants count when busy by
+     * status, or started as a job that has not reached busy yet: the agent tool
+     * registers the job synchronously, and the status flips a few ticks later
+     * in the forked fiber, so a parent stopping right after starting one must
+     * not read it as finished. Their background shells count the same way.
      */
     const hasLiveDescendant = Effect.fn("SessionPrompt.hasLiveDescendant")(function* (id: SessionID) {
       const members = yield* agentTree.descendants(id, 0)
-      if (members.length === 0) return false
       const busy = yield* status.list()
+      // The session's own agent job (type "agent", id = its SessionID) is still
+      // running while reportRunEnd executes inside it, so only shell jobs count
+      // for the self side — an agent job is ending by definition here.
+      const running = (yield* background.list()).filter(
+        (job) => job.status === "running" && (job.type === "shell" || job.id !== id),
+      )
+      if (running.some((job) => job.metadata?.sessionId === id)) return true
+      if (members.length === 0) return false
       if (members.some((member) => busy.has(member.session_id))) return true
       const ids = new Set<string>(members.map((member) => member.session_id))
-      return (yield* background.list()).some(
+      return running.some(
         (job) =>
-          job.status === "running" &&
-          typeof job.metadata?.parentSessionId === "string" &&
-          ids.has(job.metadata.parentSessionId),
+          (typeof job.metadata?.parentSessionId === "string" && ids.has(job.metadata.parentSessionId)) ||
+          (typeof job.metadata?.sessionId === "string" && ids.has(job.metadata.sessionId)),
       )
     })
 
@@ -2319,6 +2473,8 @@ export const node = LayerNode.make({
     Plugin.node,
     Command.node,
     Config.node,
+    Todo.node,
+    Skill.node,
     Permission.node,
     FSUtil.node,
     MCP.node,
@@ -2339,6 +2495,54 @@ export const node = LayerNode.make({
     Database.node,
   ],
 })
+
+// An ordinary user can steer while another is waiting. Preserve the whole
+// unanswered batch; a synthetic continue can also be working for an input
+// retained by an earlier compaction. Resolve those original IDs in this view.
+export function pendingInputStart(messages: SessionV1.WithParts[], current: number) {
+  const marker = messages[0]?.parts.some((p) => p.type === "compaction") ? messages[0] : undefined
+  const inherited = new Set<string>()
+  let start = current
+  for (let i = current; i >= 0; i--) {
+    const row = messages[i]!
+    const hasToolCalls =
+      row.info.role === "assistant" &&
+      row.parts.some(
+        (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
+      )
+    if (
+      row.info.role === "assistant" &&
+      !row.info.summary &&
+      !row.info.error &&
+      row.info.finish &&
+      !["tool-calls", "unknown"].includes(row.info.finish) &&
+      !hasToolCalls
+    )
+      break
+    if (marker && MessageV2.compareChronology(row.info, marker.info) <= 0) break
+    if (row.info.role !== "user" || !MessageV2.isOriginal(row)) continue
+    const control = row.parts.find((p) => p.type === "text" && p.synthetic && p.metadata?.compaction_continue)
+    if (control?.type === "text") {
+      if (typeof control.metadata?.protected_from === "string") inherited.add(control.metadata.protected_from)
+      continue
+    }
+    start = i
+  }
+  const original = inherited.size
+    ? messages.findIndex((row) => row.info.role === "user" && inherited.has(row.info.id))
+    : -1
+  return original >= 0 ? Math.min(start, original) : start
+}
+
+// Convert remaining token headroom into the largest /4 restoration budget B
+// whose rendered ceiling fits both /3 estimateMessages and /4 JSON willOverflow.
+export function restorationBudgetCap(headroom: number) {
+  const cap4 = Math.floor((Math.floor(headroom) * 3) / 4)
+  if (cap4 <= 128) return 0
+  if (cap4 <= 256) return cap4 - 128
+  if (cap4 <= 4000) return Math.floor(cap4 / 2)
+  return cap4 - 2000
+}
 
 /**
  * The outcome of a run from its exit. A success is classified like a delegation

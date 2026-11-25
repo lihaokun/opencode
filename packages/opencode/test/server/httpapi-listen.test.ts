@@ -18,6 +18,14 @@ const original = {
 const auth = { username: "opencode", password: "listen-secret" }
 const testPty = process.platform === "win32" ? test.skip : test
 
+// Bun reads proxy settings when the process starts — before any preload can
+// clear them — and the WebSocket upgrade through a real TCP listener then
+// routes through the machine proxy, stalling the loopback stream. Skipped
+// when a proxy is configured: an environment conflict, not a regression
+// signal. (The in-process variants above are unaffected and still run.)
+const proxied = process.env.OPENCODE_TEST_STARTED_WITH_PROXY === "1"
+const testPtyRealListener = proxied || process.platform === "win32" ? test.skip : testPty
+
 afterEach(async () => {
   Flag.OPENCODE_SERVER_PASSWORD = original.OPENCODE_SERVER_PASSWORD
   Flag.OPENCODE_SERVER_USERNAME = original.OPENCODE_SERVER_USERNAME
@@ -167,7 +175,7 @@ async function openPtySocket(listener: Awaited<ReturnType<typeof startListener>>
 }
 
 describe("HttpApi Server.listen", () => {
-  testPty("serves HTTP routes and upgrades PTY websocket through Server.listen", async () => {
+  testPtyRealListener("serves HTTP routes and upgrades PTY websocket through Server.listen", async () => {
     await using tmp = await tmpdir({ config: { formatter: false, lsp: false } })
     const listener = await startListener()
     let stopped = false
@@ -218,7 +226,7 @@ describe("HttpApi Server.listen", () => {
     }
   })
 
-  testPty("stop(true) is safe when called concurrently and repeatedly", async () => {
+  testPtyRealListener("stop(true) is safe when called concurrently and repeatedly", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const listener = await startListener()
     let stopped = false
@@ -238,7 +246,7 @@ describe("HttpApi Server.listen", () => {
     }
   })
 
-  testPty("stop(true) can force a graceful stop already in progress", async () => {
+  testPtyRealListener("stop(true) can force a graceful stop already in progress", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const listener = await startListener()
     let stopped = false
@@ -259,7 +267,7 @@ describe("HttpApi Server.listen", () => {
     }
   })
 
-  testPty("graceful stop waits for an overlapping forced stop", async () => {
+  testPtyRealListener("graceful stop waits for an overlapping forced stop", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const listener = await startListener()
     let stopped = false
@@ -379,7 +387,7 @@ describe("HttpApi Server.listen", () => {
     }
   })
 
-  testPty("rejects unsafe PTY ticket mint and connect requests", async () => {
+  testPtyRealListener("rejects unsafe PTY ticket mint and connect requests", async () => {
     await using tmp = await tmpdir({ config: { formatter: false, lsp: false } })
     const listener = await startListener()
     try {
@@ -431,7 +439,7 @@ describe("HttpApi Server.listen", () => {
     }
   })
 
-  testPty("keeps PTY websocket tickets optional when server auth is disabled", async () => {
+  testPtyRealListener("keeps PTY websocket tickets optional when server auth is disabled", async () => {
     await using tmp = await tmpdir({ config: { formatter: false, lsp: false } })
     const listener = await startNoAuthListener()
     try {

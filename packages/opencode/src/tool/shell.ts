@@ -1,6 +1,8 @@
-import { Effect, Stream } from "effect"
+import { Cause, Effect, Exit, Option, Schema, Stream } from "effect"
+import { PositiveInt } from "@opencode-ai/core/schema"
 import os from "os"
 import { createWriteStream } from "node:fs"
+import { randomUUID } from "node:crypto"
 import * as Tool from "./tool"
 import path from "path"
 import { containsPath, type InstanceContext } from "../project/instance-context"
@@ -21,10 +23,64 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
+import { BackgroundJob } from "@/background/job"
+import { cancelSnapshot, shellTasks } from "./shell/tasks"
+import type { AgentManagement } from "@/agent-management/schema"
 
 export { Parameters } from "./shell/prompt"
 
 const MAX_METADATA_LENGTH = 30_000
+
+/**
+ * Tail cap for one background task's output buffer. Readers (the completion
+ * notice, shell_output, shell_kill) all show a tail anyway, so keeping more
+ * than the largest tail anyone can ask for is pure memory leak surface — a
+ * multi-hour dev server would otherwise retain every byte it ever printed.
+ */
+const BACKGROUND_BUFFER_MAX_CHARS = 200_000
+
+// Keeps the buffer at or under the cap by dropping from the front. Re-slices
+// once per chunk (O(cap) per over-cap chunk, avoiding per-byte copies).
+const appendCapped = (buffer: string, chunk: string) => {
+  const next = buffer + chunk
+  const start = next.length - BACKGROUND_BUFFER_MAX_CHARS
+  if (start <= 0) return next
+  const first = next.charCodeAt(start)
+  return next.slice(first >= 0xdc00 && first <= 0xdfff ? start + 1 : start)
+}
+
+function commandPreview(command: string, length: number) {
+  return command.slice(0, length).replace(/[\uD800-\uDBFF]$/, "").replace(/[\r\n]+/g, " ")
+}
+
+function errorPreview(error: string) {
+  return commandPreview(error, 500)
+}
+
+function splitStatusOutput(output: string | undefined) {
+  if (!output) return { statusLine: undefined, body: undefined }
+  const nl = output.indexOf("\n")
+  if (nl < 0) return { statusLine: output, body: undefined }
+  return { statusLine: output.slice(0, nl), body: output.slice(nl + 1) }
+}
+
+const tailOf = (text: string, lines: number) => {
+  const all = text.split("\n")
+  if (all.at(-1) === "") all.pop()
+  return all.slice(-lines).join("\n")
+}
+// Preserve the task/status header and return a bounded UTF-8 tail without creating an artifact.
+function backgroundPreview(output: string, limits: { maxBytes: number; maxLines: number }, headerLines = 2) {
+  const rows = output.split("\n")
+  const header = rows.slice(0, headerLines).join("\n")
+  if (rows.length <= limits.maxLines && Buffer.byteLength(output) <= limits.maxBytes)
+    return { output, truncated: false }
+  const bytes = limits.maxBytes - Buffer.byteLength(header) - 1
+  if (bytes <= 0 || limits.maxLines <= headerLines)
+    return { output: tail(header, limits.maxLines, limits.maxBytes).text, truncated: true }
+  const body = tail(rows.slice(headerLines).join("\n"), limits.maxLines - headerLines, bytes)
+  return { output: header + "\n" + body.text, truncated: true }
+}
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
   ...CWD,
@@ -290,7 +346,8 @@ const ask = Effect.fn("ShellTool.ask")(function* (ctx: Tool.Context, scan: Scan,
   })
 })
 
-function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv) {
+function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv, background = false) {
+  const stop = background ? { forceKillAfter: "3 seconds" as const } : {}
   if (process.platform === "win32" && Shell.ps(shell)) {
     return ChildProcess.make(
       shell,
@@ -298,6 +355,7 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
       {
         cwd,
         env,
+        ...stop,
         stdin: "ignore",
         detached: false,
       },
@@ -306,6 +364,7 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
 
   return ChildProcess.make(command, [], {
     shell,
+    ...stop,
     cwd,
     env,
     stdin: "ignore",
@@ -346,6 +405,7 @@ export const ShellTool = Tool.define(
     const spawner = yield* ChildProcessSpawner
     const fs = yield* FSUtil.Service
     const trunc = yield* Truncate.Service
+    const background = yield* BackgroundJob.Service
     const plugin = yield* Plugin.Service
     const flags = yield* RuntimeFlags.Service
     const defaultTimeoutMs = flags.bashDefaultTimeoutMs ?? 2 * 60 * 1000
@@ -598,6 +658,125 @@ export const ShellTool = Tool.define(
       }
     })
 
+    // Background execution: the process lifecycle (spawn -> accumulate -> exit
+    // -> completion notification) runs inside the job scope owned by
+    // BackgroundJob, so the tool call returns while the process continues.
+    const backgroundRun = Effect.fn("ShellTool.backgroundRun")(function* (
+      input: { shell: string; command: string; cwd: string; env: Record<string, string | undefined> },
+      ctx: Tool.Context,
+    ) {
+      const ops = (ctx.extra as { promptOps?: AgentManagement.AgentPromptOps } | undefined)?.promptOps
+      if (ctx.abort.aborted) {
+        return {
+          title: commandPreview(input.command, 80),
+          metadata: { output: "", exit: null, truncated: false },
+          output: "Background command cancelled before start.",
+        }
+      }
+      // Step P3: registry entry (buffer empty, bounded tail 200k chars).
+      const taskId = `shell_${randomUUID()}`
+      const entry = {
+        command: input.command,
+        sessionID: ctx.sessionID,
+        buffer: "",
+        exit: undefined as number | undefined,
+        error: undefined as string | undefined,
+        startedAt: Date.now(),
+      }
+      shellTasks.set(taskId, entry)
+
+      const run = Effect.gen(function* () {
+        // Step P6: spawn → stream accumulation (appendCapped) → exitCode await.
+        const exit = yield* Effect.exit(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env, true))
+              yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
+                Effect.sync(() => {
+                  entry.buffer = appendCapped(entry.buffer, chunk)
+                }),
+              )
+              const code = yield* handle.exitCode.pipe(Effect.option)
+              entry.exit = Option.isSome(code) ? code.value : undefined
+            }),
+          ),
+        )
+        if (Exit.isFailure(exit)) entry.error = errorPreview(String(Cause.squash(exit.cause)))
+        // Step P7: completion notice via deliverAsync, failure-isolated.
+        // Completion notification, delivered like agent delegation results: the
+        // message wakes the session so the model never polls. Delivery failures
+        // must not affect the task's own state.
+        const status = Exit.isFailure(exit)
+          ? `error: ${entry.error}`
+          : entry.exit !== undefined
+            ? `exit ${entry.exit}`
+            : "terminated"
+        const body = `[shell task finished] ${taskId} ${commandPreview(input.command, 160)} · ${status}\n${tailOf(entry.buffer, 200)}`
+        if (ops) {
+          yield* ops
+            .deliverAsync(
+              {
+                sessionID: ctx.sessionID,
+                parts: [{ type: "text", text: backgroundPreview(body, yield* trunc.limits(), 1).output }],
+              },
+              "current",
+            )
+            .pipe(
+              Effect.catchCauseIf(
+                (cause) => !Cause.hasInterrupts(cause),
+                (cause) => Effect.logWarning("shell completion notification failed", { taskId, cause }),
+              ),
+            )
+        }
+        if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause)
+        // The settle output leads with the status line: BackgroundJob.Info has
+        // no exit-code field, and this is what lets shell_output's post-settle
+        // fallback report the REAL exit code instead of guessing.
+        return `${status}\n${entry.buffer}`
+      }).pipe(
+        // Step P8: settle — shellTasks.delete on every exit including
+        // interruption (the ❌-3 fix: an in-body delete skipped on cancel and
+        // leaked one entry per killed task).
+        Effect.ensuring(Effect.sync(() => shellTasks.delete(taskId))),
+      )
+
+      // Step P4: BackgroundJob.start (job-scope fork; metadata carries the
+      // owning session for the cancel cascade, P9).
+      const info = yield* background
+        .start({
+          id: taskId,
+          type: "shell",
+          title: commandPreview(input.command, 80),
+          // Same shape agent delegation uses: cancelBackgroundJobs walks the
+          // session graph through this, so agent_stop and interrupt reach the
+          // process, and a stopped session is never woken by the completion
+          // notification.
+          metadata: { sessionId: ctx.sessionID },
+          run,
+        })
+        .pipe(Effect.onError(() => Effect.sync(() => shellTasks.delete(taskId))))
+      if (ctx.abort.aborted) {
+        yield* background.cancel(info.id, { output: cancelSnapshot(info.id) })
+        return {
+          title: commandPreview(input.command, 80),
+          metadata: { output: "", exit: null, truncated: false },
+          output: "Background command cancelled before start.",
+        }
+      }
+      // Step P5: the original command is already in the tool call. Keep the
+      // handle on the first line when the configured preview is a single line.
+      const receipt = backgroundPreview(
+        `${info.id}\nStarted in the background. Use shell_output for interim output. Completion arrives as a message. The timeout does not apply. Background tasks live with this process; a restart loses them.`,
+        yield* trunc.limits(),
+        1,
+      )
+      return {
+        title: info.title ?? info.id,
+        metadata: { task_id: info.id, status: "running", output: "", exit: null, truncated: receipt.truncated },
+        output: receipt.output,
+      }
+    })
+
     return () =>
       Effect.gen(function* () {
         const cfg = yield* config.get()
@@ -613,6 +792,13 @@ export const ShellTool = Tool.define(
           execute: (params: Parameters, ctx: Tool.Context) =>
             Effect.gen(function* () {
               const instanceCtx = yield* InstanceState.context
+              if (params.run_in_background === true && ctx.abort.aborted) {
+                return {
+                  title: commandPreview(params.command, 80),
+                  metadata: { output: "", exit: null, truncated: false },
+                  output: "Background command cancelled before start.",
+                }
+              }
               const cwd = params.workdir
                 ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
                 : instanceCtx.directory
@@ -628,9 +814,27 @@ export const ShellTool = Tool.define(
                   )
                   const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
                   if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
+                  if (params.run_in_background === true && ctx.abort.aborted) return
+                  // Step P1: foreground and background launches share the permission decision.
                   yield* ask(ctx, scan, params)
                 }),
               )
+
+              // Step P2: background branch guard (false/absent → the sync
+              // path, byte-identical to the pre-feature behavior).
+              if (params.run_in_background === true) {
+                if (ctx.abort.aborted) {
+                  return {
+                    title: commandPreview(params.command, 80),
+                    metadata: { output: "", exit: null, truncated: false },
+                    output: "Background command cancelled before start.",
+                  }
+                }
+                return yield* backgroundRun(
+                  { shell, command: params.command, cwd, env: yield* shellEnv(ctx, cwd) },
+                  ctx,
+                )
+              }
 
               return yield* run(
                 {
@@ -645,5 +849,185 @@ export const ShellTool = Tool.define(
             }),
         }
       })
+  }),
+)
+
+export const ShellOutputTool = Tool.define(
+  "shell_output",
+  Effect.gen(function* () {
+    const background = yield* BackgroundJob.Service
+    const trunc = yield* Truncate.Service
+    return {
+      description:
+        "Read the status and recent output of a background shell task started with run_in_background. Defaults to the most recent background shell task in this session.",
+      parameters: Schema.Struct({
+        task_id: Schema.optional(
+          Schema.String.annotate({ description: "Background shell task id; defaults to the most recent one" }),
+        ),
+        tail_lines: Schema.optional(PositiveInt).annotate({
+          description: "How many trailing output lines to show (default 200)",
+        }),
+      }),
+      execute: (
+        params: { task_id?: string; tail_lines?: number },
+        ctx: Tool.Context,
+      ) =>
+        Effect.gen(function* () {
+          // R5: the default target must include settled tasks — the live
+          // registry is emptied at settle, so a session whose only task has
+          // finished would otherwise answer "no background shell tasks" while
+          // an explicit task_id still works.
+          const id =
+            params.task_id !== undefined
+              ? params.task_id
+              : ((yield* background.list())
+                  .toReversed()
+                  .filter((job) => job.type === "shell" && job.metadata?.sessionId === ctx.sessionID)
+                  .toSorted((a, b) => b.started_at - a.started_at)
+                  .at(0)?.id ??
+                [...shellTasks.entries()]
+                  .reverse()
+                  .filter(([, entry]) => entry.sessionID === ctx.sessionID)
+                  .toSorted((a, b) => b[1].startedAt - a[1].startedAt)
+                  .at(0)?.[0])
+          if (id === undefined) throw new Error("no background shell tasks in this session")
+          const entry = shellTasks.get(id)
+          const job = yield* background.get(id).pipe(Effect.orElseSucceed(() => undefined))
+          // R1: ownership and type are checked on EVERY path, settled or live —
+          // a settled run drops its registry entry, but the job snapshot must
+          // answer only to the session that started it (and only shell jobs:
+          // this tool has no business reading any other job type).
+          if (job && (job.type !== "shell" || job.metadata?.sessionId !== ctx.sessionID)) {
+            throw new Error(`unknown task: ${id}`)
+          }
+          // Settled runs drop their registry entry; the BackgroundJob snapshot
+          // keeps the status line and bounded output tail (`status\nbuffer`),
+          // including cancelled runs whose buffer came from cancelSnapshot.
+          if (!entry && job) {
+            // The settle output leads with the status line, so the exit code
+            // reported here is the real one — never a guessed exit 0.
+            const parsed = splitStatusOutput(job.output)
+            const status =
+              job.status === "running"
+                ? "running"
+                : (parsed.statusLine ?? (job.error ? `error: ${errorPreview(job.error)}` : job.status))
+            const output = [
+              `[shell task ${id}] ${commandPreview(job.title ?? "", 160)}`.trim(),
+              `status: ${status}`,
+              ...(parsed.body && status !== "running" ? [tailOf(parsed.body, params.tail_lines ?? 200)] : []),
+              ...(status === "running" ? [] : job.output ? [] : [`(no output was captured before the task ended)`]),
+            ].join("\n")
+            const view = backgroundPreview(output, yield* trunc.limits())
+            return {
+              title: commandPreview(job.title ?? id, 80),
+              metadata: { truncated: view.truncated, task_id: id, status: job.status },
+              output: view.output,
+            }
+          }
+          if (!entry || entry.sessionID !== ctx.sessionID) throw new Error(`unknown task: ${id}`)
+          const status = !job
+            ? "unknown"
+            : job.status === "running"
+              ? "running"
+              : job.status === "cancelled"
+                ? "cancelled"
+                : job.status === "error"
+                  ? `error: ${job.error ? errorPreview(job.error) : "unknown"}`
+                  : entry.exit !== undefined
+                    ? `exit ${entry.exit}`
+                    : "finished"
+          const lines = tailOf(entry.buffer, params.tail_lines ?? 200)
+          const output = [
+            `[shell task ${id}] ${commandPreview(entry.command, 160)}`,
+            `status: ${status}`,
+            ...(lines.length > 0 ? [lines] : []),
+          ].join("\n")
+          const view = backgroundPreview(output, yield* trunc.limits())
+          return {
+            title: commandPreview(entry.command, 80),
+            metadata: { truncated: view.truncated, task_id: id, status: job?.status },
+            output: view.output,
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
+export const ShellKillTool = Tool.define(
+  "shell_kill",
+  Effect.gen(function* () {
+    const background = yield* BackgroundJob.Service
+    const trunc = yield* Truncate.Service
+    return {
+      description:
+        "Stop a background shell task started with run_in_background. The task's session and output are kept; use shell_output to read what it produced.",
+      parameters: Schema.Struct({
+        task_id: Schema.String.annotate({ description: "Background shell task id" }),
+      }),
+      execute: (params: { task_id: string }, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          // Idempotent (detailed-design §5.3): an already-settled task has no
+          // registry entry, but its BackgroundJob snapshot answers — killing a
+          // finished task reports what happened instead of erroring.
+          const entry = shellTasks.get(params.task_id)
+          if (!entry) {
+            const job = yield* background.get(params.task_id).pipe(Effect.orElseSucceed(() => undefined))
+            if (!job || job.type !== "shell" || job.metadata?.sessionId !== ctx.sessionID) {
+              throw new Error(`unknown task: ${params.task_id}`)
+            }
+            if (job.status === "running") {
+              const info = yield* background.cancel(params.task_id, {
+                output: cancelSnapshot(params.task_id),
+              })
+              const finalStatus = info?.status ?? "cancelled"
+              const body = splitStatusOutput(info?.output).body
+              const tailText = body ? tailOf(body, 50) : ""
+              const view = backgroundPreview(
+                `[shell task ${params.task_id}] stopped (${finalStatus})${tailText ? `\n${tailText}` : ""}`,
+                yield* trunc.limits(),
+                1,
+              )
+              return {
+                title: commandPreview(job.title ?? params.task_id, 80),
+                metadata: { truncated: view.truncated, task_id: params.task_id, status: finalStatus },
+                output: view.output,
+              }
+            }
+            const body = splitStatusOutput(job.output).body
+            const tailText = body ? tailOf(body, 50) : ""
+            const view = backgroundPreview(
+              `[shell task ${params.task_id}] already settled (${job.status})${tailText ? `\n${tailText}` : ""}`,
+              yield* trunc.limits(),
+              1,
+            )
+            return {
+              title: commandPreview(job.title ?? params.task_id, 80),
+              metadata: { truncated: view.truncated, task_id: params.task_id, status: job.status },
+              output: view.output,
+            }
+          }
+          if (entry.sessionID !== ctx.sessionID) throw new Error(`unknown task: ${params.task_id}`)
+          // R6: the interrupted run fiber never reaches settle, so its buffer
+          // would be lost — hand the accumulated output to the cancel snapshot
+          // (same `status\nbuffer` shape the natural settle produces) and the
+          // follow-up shell_output reads it from the job.
+          const info = yield* background.cancel(params.task_id, {
+            output: cancelSnapshot(params.task_id),
+          })
+          const finalStatus = info?.status ?? "cancelled"
+          const tailText = tailOf(entry.buffer, 50)
+          const label = finalStatus === "cancelled" ? "stopped" : "already settled"
+          const view = backgroundPreview(
+            `[shell task ${params.task_id}] ${label} (${finalStatus})${tailText ? `\n${tailText}` : ""}`,
+            yield* trunc.limits(),
+            1,
+          )
+          return {
+            title: commandPreview(entry.command, 80),
+            metadata: { truncated: view.truncated, task_id: params.task_id, status: finalStatus },
+            output: view.output,
+          }
+        }).pipe(Effect.orDie),
+    }
   }),
 )
