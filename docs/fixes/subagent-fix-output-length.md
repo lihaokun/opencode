@@ -2046,6 +2046,12 @@ I24: providerID/api.id/api.url 改变
   `limit.reasoning`；显式空 variants 与 undefined 保持不同语义；
 - transport 改变时重建 variant shape，endpoint identity 改变时不继承旧动态 bounds；
 - `output=0` 的内置 variant catalog 使用正数 fallback；
+  **[已废弃，issue #98]** 此处的 `output=0 → OUTPUT_TOKEN_MAX` fallback 曾同时被
+  `maxOutputTokens` 的请求路径复用，现已被
+  `docs/fixes/provider-fix-output-token-max-fallback.md` 取代：请求路径上未知额度
+  返回 `undefined`（不发送参数，服务端默认生效），32k 常量仅保留在 variant
+  catalog 预算建议（用户显式选 numeric variant 的场景）。不要按本文档恢复该请求
+  路径 fallback。
 - max-output、budget 与 transport adapter 都无副作用；已知会自动加回 budget 的 SDK 收到
   `E-B`，加回后的候选 total 为 `E`，后续 SDK/provider cap 只允许继续向下；
 - core 参数关系只保证到 plugin hook 输入，plugin hook 的后置 override 顺序不变，最终

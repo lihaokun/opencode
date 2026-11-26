@@ -110,6 +110,12 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     options,
     maxOutputTokens: coreMaxOutputTokens,
   })
+  yield* Effect.logInfo("llm output limit", {
+    providerID: input.model.providerID,
+    modelID: input.model.id,
+    maxOutputTokens: maxOutputTokens ?? "omitted",
+    source: ProviderTransform.outputTokenMaxSource(input.model, input.flags.outputTokenMax),
+  })
 
   const messages =
     isOpenaiOauth || input.isWorkflow

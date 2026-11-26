@@ -11,12 +11,22 @@ export function usable(input: { cfg: ConfigV1.Info; model: Provider.Model; outpu
   const context = input.model.limit.context
   if (context === 0) return 0
 
-  const reserved =
+  // Preflight heuristic reserve. With a known output limit the reserve keeps
+  // the explicit compaction reservation ceiling; with an unknown limit the
+  // bounded local buffer stands in for the missing envelope — this never goes
+  // on the wire, so a bounded local constant is legitimate here.
+  const reserve =
     input.cfg.compaction?.reserved ??
-    Math.min(COMPACTION_BUFFER, ProviderTransform.maxOutputTokens(input.model, input.outputTokenMax))
-  return input.model.limit.input
-    ? Math.max(0, input.model.limit.input - reserved)
-    : Math.max(0, context - ProviderTransform.maxOutputTokens(input.model, input.outputTokenMax))
+    (() => {
+      const output = input.model.limit.output
+      return output === 0 ? COMPACTION_BUFFER : Math.min(COMPACTION_BUFFER, output)
+    })()
+
+  if (input.model.limit.input) return Math.max(0, input.model.limit.input - reserve)
+  // No input limit: reserve the full output envelope when known, otherwise
+  // fall back to the compaction buffer (tightens the check — conservative).
+  const envelope = ProviderTransform.maxOutputTokens(input.model, input.outputTokenMax)
+  return Math.max(0, context - (envelope ?? COMPACTION_BUFFER))
 }
 
 export function isOverflow(input: {

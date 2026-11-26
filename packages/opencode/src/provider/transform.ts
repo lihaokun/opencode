@@ -1504,11 +1504,30 @@ export function providerOptions(model: Provider.Model, options: { [x: string]: a
   return { [key]: normalized }
 }
 
-export function maxOutputTokens(model: Provider.Model, outputTokenMax?: number): number {
-  if (model.limit.output === 0) return outputTokenMax ?? OUTPUT_TOKEN_MAX
-  if (outputTokenMax !== undefined) return Math.min(model.limit.output, outputTokenMax)
-  if (model.capabilities.reasoning) return model.limit.output
-  return Math.min(model.limit.output, OUTPUT_TOKEN_MAX)
+export function maxOutputTokens(model: Provider.Model, outputTokenMax?: number): number | undefined {
+  // An explicit runtime cap is an override: with a known output limit it can
+  // only clamp it down; with an unknown limit it is the only known bound.
+  if (outputTokenMax !== undefined) {
+    return model.limit.output === 0 ? outputTokenMax : Math.min(model.limit.output, outputTokenMax)
+  }
+  // Unknown output limit: omit the client parameter entirely and let the
+  // server default apply — injecting a fabricated constant would masquerade
+  // an unknown as a known capability.
+  if (model.limit.output === 0) return undefined
+  return model.limit.output
+}
+
+// Diagnostic provenance for the effective output limit: where the value sent
+// on the wire came from. Catalog and config limits merge into the same field
+// before request time, so "model-declared" covers both; the buckets line up
+// with the issue's expectation that an omitted parameter is reported as the
+// server default rather than masquerading as a known limit.
+export function outputTokenMaxSource(
+  model: Provider.Model,
+  outputTokenMax?: number,
+): "explicit-flag" | "model-declared" | "omitted-server-default" {
+  if (outputTokenMax !== undefined) return "explicit-flag"
+  return model.limit.output === 0 ? "omitted-server-default" : "model-declared"
 }
 
 const NUMERIC_REASONING_BUDGET_PATHS = [
@@ -1602,7 +1621,7 @@ function usesAnthropicMessagesTransport(model: Provider.Model) {
 function reasoningBudgetError(input: {
   model: Provider.Model
   variant: string | undefined
-  maxOutputTokens: number
+  maxOutputTokens: number | undefined
   minimum: number | undefined
   maximum: number | undefined
   reason: string
@@ -1625,8 +1644,12 @@ export function normalizeReasoningBudget(input: {
   model: Provider.Model
   variant: string | undefined
   options: Record<string, any>
-  maxOutputTokens: number
+  maxOutputTokens: number | undefined
 }): Record<string, any> {
+  // No known output envelope: there is nothing to fit the reasoning budget
+  // into, so skip clamping and validation entirely — the client is not in a
+  // position to judge budget legality without a declared envelope.
+  if (input.maxOutputTokens === undefined) return input.options
   const bounds = reasoningBudgetBounds(input.model)
   const minimum = bounds.minimum
   const maximum = bounds.maximum
@@ -1708,8 +1731,12 @@ export function normalizeReasoningBudget(input: {
 export function transportMaxOutputTokens(input: {
   model: Provider.Model
   options: Record<string, any>
-  maxOutputTokens: number
-}): number {
+  maxOutputTokens: number | undefined
+}): number | undefined {
+  // Unknown envelope: subtracting a budget from nothing would produce NaN —
+  // return undefined so the parameter is omitted and the SDK's own
+  // budget handling applies.
+  if (input.maxOutputTokens === undefined) return undefined
   const anthropicBudget = usesAnthropicMessagesTransport(input.model)
     ? input.options.thinking?.type === "enabled" && typeof input.options.thinking.budgetTokens === "number"
       ? input.options.thinking.budgetTokens

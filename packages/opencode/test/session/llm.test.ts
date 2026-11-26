@@ -1631,6 +1631,8 @@ function createEventResponse(chunks: unknown[], includeDone = false) {
 describe("session.llm.stream", () => {
   const vivgridFixture = { providerID: "vivgrid", modelID: "gemini-3.1-pro-preview" }
   const opencodeFixture = { providerID: "opencode-test", modelID: vivgridFixture.modelID }
+  const unknownFixture = { providerID: "unknown-limit-test", modelID: "custom-model" }
+  const nonReasoningFixture = { providerID: "non-reasoning-test", modelID: "custom-non-reasoning" }
 
   it.instance(
     "sends the parent session header for opencode providers",
@@ -1776,6 +1778,205 @@ describe("session.llm.stream", () => {
         },
       }),
     },
+  )
+
+  it.instance(
+    "omits the client output limit for models without declared metadata (#98)",
+    () =>
+      Effect.gen(function* () {
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(createChatStream("Hello"), {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          }),
+        )
+
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(unknownFixture.providerID),
+          ModelV2.ID.make(unknownFixture.modelID),
+        )
+        expect(resolved.limit.output).toBe(0)
+        const sessionID = SessionID.make("session-unknown-limit")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.make("msg_user-unknown-limit"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: ProviderV2.ID.make(unknownFixture.providerID), modelID: resolved.id },
+        } satisfies SessionV1.User
+
+        yield* drain({
+          user,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Hello" }],
+          tools: {},
+        })
+
+        const body = (yield* Effect.promise(() => request)).body
+        expect("max_tokens" in body).toBe(false)
+        expect("max_output_tokens" in body).toBe(false)
+      }),
+    {
+      config: () => ({
+        enabled_providers: [unknownFixture.providerID],
+        provider: {
+          [unknownFixture.providerID]: {
+            name: "Unknown Limit Test",
+            npm: "@ai-sdk/openai-compatible",
+            models: {
+              // Model entry with a name only — no limit, no reasoning metadata
+              // (the #98 custom-provider shape).
+              [unknownFixture.modelID]: { name: "Unknown Limit Model" } as ConfigModel,
+            },
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "sends the declared output limit for known non-reasoning models (#98)",
+    () =>
+      Effect.gen(function* () {
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(createChatStream("Hello"), {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          }),
+        )
+
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(nonReasoningFixture.providerID),
+          ModelV2.ID.make(nonReasoningFixture.modelID),
+        )
+        expect(resolved.limit.output).toBe(131_072)
+        expect(resolved.capabilities.reasoning).toBe(false)
+        const sessionID = SessionID.make("session-non-reasoning")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.make("msg_user-non-reasoning"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: ProviderV2.ID.make(nonReasoningFixture.providerID), modelID: resolved.id },
+        } satisfies SessionV1.User
+
+        yield* drain({
+          user,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Hello" }],
+          tools: {},
+        })
+
+        const body = (yield* Effect.promise(() => request)).body
+        expect(body.max_tokens).toBe(131_072)
+      }),
+    {
+      config: () => ({
+        enabled_providers: [nonReasoningFixture.providerID],
+        provider: {
+          [nonReasoningFixture.providerID]: {
+            name: "Non-Reasoning Test",
+            npm: "@ai-sdk/openai-compatible",
+            models: {
+              [nonReasoningFixture.modelID]: {
+                name: "Non-Reasoning Model",
+                reasoning: false,
+                limit: { context: 1_000_000, output: 131_072 },
+              } as ConfigModel,
+            },
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "applies an explicit runtime output cap even when the model limit is unknown (#98)",
+    () =>
+      Effect.gen(function* () {
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(createChatStream("Hello"), {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          }),
+        )
+
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(unknownFixture.providerID),
+          ModelV2.ID.make(unknownFixture.modelID),
+        )
+        const sessionID = SessionID.make("session-explicit-cap")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.make("msg_user-explicit-cap"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: ProviderV2.ID.make(unknownFixture.providerID), modelID: resolved.id },
+        } satisfies SessionV1.User
+
+        yield* drainWith(llmLayerWithExecutor({ flags: { outputTokenMax: 64_000 } }), {
+          user,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Hello" }],
+          tools: {},
+        })
+
+        const body = (yield* Effect.promise(() => request)).body
+        expect(body.max_tokens).toBe(64_000)
+      }),
+    {
+      config: () => ({
+        enabled_providers: [unknownFixture.providerID],
+        provider: {
+          [unknownFixture.providerID]: {
+            name: "Unknown Limit Test",
+            npm: "@ai-sdk/openai-compatible",
+            models: {
+              [unknownFixture.modelID]: { name: "Unknown Limit Model" } as ConfigModel,
+            },
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+    // drainWith builds an isolated LLM runtime; on loaded machines that can
+    // exceed bun's default 5s test timeout before the wire request arrives.
+    30_000,
   )
 
   it.instance(

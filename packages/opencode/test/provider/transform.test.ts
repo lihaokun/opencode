@@ -4112,10 +4112,14 @@ describe("ProviderTransform.reasoningVariants", () => {
     mdl.limit.output = 0
     const options = ProviderTransform.reasoningVariants(model([{ type: "effort", values: ["high"] }]), mdl)?.high
     if (!options) throw new Error("expected a high reasoning variant")
-    const maxOutputTokens = ProviderTransform.maxOutputTokens(mdl)
 
     expect(options).toEqual(expected)
-    expect(maxOutputTokens).toBe(32_000)
+
+    // Unknown output limits no longer imply a client envelope (#98): the
+    // budget suggestion is still built from the catalog fallback, but no
+    // envelope is sent and no clamping/transport math runs against it.
+    const maxOutputTokens = ProviderTransform.maxOutputTokens(mdl)
+    expect(maxOutputTokens).toBeUndefined()
 
     const normalized = ProviderTransform.normalizeReasoningBudget({
       model: mdl,
@@ -4132,8 +4136,7 @@ describe("ProviderTransform.reasoningVariants", () => {
     })
 
     expect(budget).toBe(15_999)
-    expect(transportMaxOutputTokens).toBe(16_001)
-    expect(transportMaxOutputTokens + budget).toBe(maxOutputTokens)
+    expect(transportMaxOutputTokens).toBeUndefined()
   })
 
   test("uses explicit effort metadata for Anthropic-compatible models", () => {
@@ -6204,8 +6207,8 @@ describe("ProviderTransform.maxOutputTokens", () => {
     expect(ProviderTransform.maxOutputTokens(model({ output: 131_072, reasoning: true }))).toBe(131_072)
   })
 
-  test("keeps the 32k default for non-reasoning models", () => {
-    expect(ProviderTransform.maxOutputTokens(model({ output: 131_072, reasoning: false }))).toBe(32_000)
+  test("returns the declared output limit for non-reasoning models", () => {
+    expect(ProviderTransform.maxOutputTokens(model({ output: 131_072, reasoning: false }))).toBe(131_072)
   })
 
   test("uses an explicit override as a cap for reasoning models", () => {
@@ -6216,9 +6219,13 @@ describe("ProviderTransform.maxOutputTokens", () => {
     expect(ProviderTransform.maxOutputTokens(model({ output: 16_384, reasoning: true }), 64_000)).toBe(16_384)
   })
 
-  test("uses a positive fallback when the model declares output zero", () => {
-    expect(ProviderTransform.maxOutputTokens(model({ output: 0, reasoning: true }))).toBe(32_000)
+  test("keeps the explicit override as the escape hatch for unknown output limits", () => {
     expect(ProviderTransform.maxOutputTokens(model({ output: 0, reasoning: true }), 48_000)).toBe(48_000)
+  })
+
+  test("omits the client limit when the model declares output zero without an override", () => {
+    expect(ProviderTransform.maxOutputTokens(model({ output: 0, reasoning: true }))).toBeUndefined()
+    expect(ProviderTransform.maxOutputTokens(model({ output: 0, reasoning: false }))).toBeUndefined()
   })
 
   test("generates positive built-in Anthropic numeric variants when output is zero", () => {
@@ -6232,6 +6239,23 @@ describe("ProviderTransform.maxOutputTokens", () => {
 
     expect(result.high.thinking.budgetTokens).toBeGreaterThan(0)
     expect(result.max.thinking.budgetTokens).toBeGreaterThan(0)
+  })
+})
+
+describe("ProviderTransform.outputTokenMaxSource", () => {
+  const model = (output: number) => ({ limit: { output }, capabilities: { reasoning: true } }) as any
+
+  test("reports the server default when no limit and no override exist", () => {
+    expect(ProviderTransform.outputTokenMaxSource(model(0))).toBe("omitted-server-default")
+  })
+
+  test("reports the model declaration when the limit is known", () => {
+    expect(ProviderTransform.outputTokenMaxSource(model(131_072))).toBe("model-declared")
+  })
+
+  test("reports the explicit flag whenever the override is present", () => {
+    expect(ProviderTransform.outputTokenMaxSource(model(131_072), 64_000)).toBe("explicit-flag")
+    expect(ProviderTransform.outputTokenMaxSource(model(0), 48_000)).toBe("explicit-flag")
   })
 })
 
@@ -6576,6 +6600,29 @@ describe("ProviderTransform.normalizeReasoningBudget", () => {
         maxOutputTokens: 65_536,
       }),
     ).toBe(65_536)
+  })
+
+  test("skips budget normalization entirely when the output envelope is unknown (#98)", () => {
+    // Unknown envelope: no clamping, no validation, no mutation — the numeric
+    // budget is an explicit user choice and there is nothing to fit it into.
+    const unknownEnvelope = model({ limit: { context: 200_000, output: 0 } })
+    const options = { thinking: { type: "enabled", budgetTokens: 31_999 } }
+    const normalized = ProviderTransform.normalizeReasoningBudget({
+      model: unknownEnvelope,
+      variant: "high",
+      options,
+      maxOutputTokens: undefined as unknown as number,
+    })
+    expect(normalized).toEqual(options)
+
+    // transport math must not run against an unknown envelope (no NaN on wire)
+    expect(
+      ProviderTransform.transportMaxOutputTokens({
+        model: unknownEnvelope,
+        options: normalized,
+        maxOutputTokens: undefined as unknown as number,
+      }),
+    ).toBeUndefined()
   })
 })
 
