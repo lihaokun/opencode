@@ -1086,7 +1086,7 @@ cancelled 通知同强度。
 结束）、谁在最近 10 分钟内停了。在跑行里的"上一个 run 已于某时结束"正好覆盖"报告排到发送之后"的那一步。
 
 2026-11-03 口径澄清：总览也只统计视图纳入的集合；已结束且过窗的子共同退出明细与计数，不能永久显示为 idle。
-筛选后无项则不注入这一节。运行项和未结算的 cut off 项仍保留；不删除 Session，也不限制显式查询。见 `session-fix-tail-window-counts.md`。
+已有直接子但筛选后无项时只保留 `Your subagents: 0 running.`，无直接子则不注入这一节。运行项和未结算的 cut off 项仍保留；不删除 Session，也不限制显式查询。见 `session-fix-tail-window-counts.md` 与 2026-11-10 的 `session-fix-tail-zero-running.md`。
 
 run 的结束由两件事共同定义：循环正常退出，且插件的停止钩子放行（issue #81，与 Claude Code 的
 `SubagentStop` 同义：阻止即同一 run 继续，父只在放行后收到那一次报告）。被取消的 run、因后代仍在跑而

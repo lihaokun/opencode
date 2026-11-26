@@ -1,5 +1,7 @@
 # Step tail：总览与完成明细共同退出窗口
 
+> 2026-11-10：本文保留本次修复的历史方案和验证。下文“空列表整节省略/返回 undefined”已由 [零运行补丁](session-fix-tail-zero-running.md) 取代：已有直接子时保留 `0 running` 与时钟；过期条目仍不进入总数、idle 计数或明细。
+
 用户确认的修复口径：已结束且退出窗口的子 Agent 不再计入尾巴；按 workflow 构建补丁。仅修改视图，不清理 Session、不改变 agent_list / agent_status 的查询范围。
 
 ## 第一部分：现象与复现
@@ -8,7 +10,9 @@
 
 路径：`SessionPrompt.subagentView → collectSubagents → renderSubagents → StepTail.message`。当前 `renderSubagents` 对 finished 做窗口过滤，却用所有 children 计算 direct/idle，且两列表空时仍返回总览。仅“全空时隐藏”不足：再启动一个 worker，旧的四个仍会被算入 idle。
 
-最小复现（固化于 step-tail.test.ts）：四个 running=false、run.ended_at=now−2h 的 Child，在 windowStart=now−10min 下渲染。旧结果为 4 direct/0 running/4 idle；应为 undefined。再加入一个 running 子，应只显示 1 direct/1 running/0 idle。
+最小复现（固化于 step-tail.test.ts）：四个 running=false、run.ended_at=now−2h 的 Child，在 windowStart=now−10min 下渲染。旧结果为 4 direct/0 running/4 idle；本次修复时应为 undefined。再加入一个 running 子，应只显示 1 direct/1 running/0 idle。
+
+> [已废弃，2026-11-10] “应为 undefined”已由 [零运行补丁](session-fix-tail-zero-running.md) 取代：现为 `Your subagents: 0 running.`（无直接子仍为 undefined）。修复目标——过期项不计入 direct/idle、不列明细——不变。
 
 ## 第二部分：根因分析
 
@@ -23,7 +27,7 @@ R = 全部 running 的直接子（包括尚无 run 记录、或仍带上一关�
 F = idle 且有 run，且（run 未关闭 或 ended_at >= windowStart）的直接子
 V = R ∪ F
 direct = |V|; running = |R|; idle = |F|
-V = ∅ ⇒ 不输出子 Agent 段
+V = ∅ ⇒ 不输出子 Agent 段   [已废弃，2026-11-10：有直接子而 V = ∅ 时输出 `Your subagents: 0 running.`；无直接子仍不输出。见零运行补丁]
 ```
 
 相同输入在旧实现中，F=∅ 却取 direct=|children|、idle=|children|−|R|；差异就在计数来源。空闲且没有 run 的子不属于任一列表，也不计入 V。
@@ -31,13 +35,13 @@ V = ∅ ⇒ 不输出子 Agent 段
 ## 第四部分：修复方案
 
 - 复用既有 running / finished 完整列表：未截断前求和作为 direct，finished.length 作为 idle。
-- 两列表皆空时返回 undefined。prompt 既有拼接会自动省略此节；重复计数仍可独立产生尾巴与时钟。
+- 两列表皆空时返回 undefined。[已废弃，2026-11-10：有直接子时改返回 `Your subagents: 0 running.`，无直接子仍返回 undefined，见 [零运行补丁](session-fix-tail-zero-running.md)。] prompt 既有拼接会自动省略此节；重复计数仍可独立产生尾巴与时钟。
 - 保留窗口公式 `min(now−10min, previousStepStart)`、含等号边界、长步骤保底、cut off 例外、排序及每列表 10 行上限。计数包括因行数上限省略的有效条目。
 - 同步主契约、细化、fix 摘要、research 和 expectations，标记旧“空列表保留总览”决策已被本修复取代。
 
 ## 第五部分：正确性论证
 
-- 根因消除：统计直接取两个已筛选集合，过期结束项无法从另一条路径重新计入。只剩空闲旧 Session 时输出为空；新运行项出现时只恢复它自己的计数。
+- 根因消除：统计直接取两个已筛选集合，过期结束项无法从另一条路径重新计入。只剩空闲旧 Session 时不再输出计数 [已废弃，2026-11-10：改为输出 `Your subagents: 0 running.`，见零运行补丁]；新运行项出现时只恢复它自己的计数。
 - 不变量：R/F 由 running 标志互斥，故 direct=running+idle，无重复计数。统计在截断前完成；排序/省略行及 cut off 的可见性保持。现有窗口推进机制不修改。
 - 副作用边界：纯渲染函数不写数据、不改变运行状态或执行语义；没有可见子项时，重复提醒仍由独立 section 渲染。收集仍只有一次 children SQL 与一次状态投影。
 - 终止性和复杂度：列表有限，沿用原筛选/排序；新增长度运算及空判定为常数开销。

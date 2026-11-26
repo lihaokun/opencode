@@ -79,3 +79,7 @@
 
 - **D54：工具描述统一说明查询用法。** 用户确认删除 agent 创建返回的 `Use agent_list for its current status.` 和 agent_send 返回的 `Current state of one agent: agent_status(target="…").`。保留状态快照、Accepted、单向消息与自动通知说明；不改工具描述、权限、尾巴、调度或 FSM Stop。返回中的可照抄查询指令会强化轮询倾向，但不把此修改当作模型必然停止轮询的保证。现有创建、六种发送状态及真实 prompt/通知测试同步更新。
 - 验证：`test/agent-management/tools.test.ts` 全量 27 pass / 0 fail；真实 `agent_send predicts the run number the next report carries` 1 pass / 0 fail；`bun typecheck` 通过。
+
+## 2026-11-10 零运行状态补丁
+
+- **D55：退窗只移除历史明细与计数，不移除零运行事实。** 用户确认 `0 running` 也是必要信息。已有直接子但 R/F 都为空时只输出 `Your subagents: 0 running.`，原有拼接同时保留当前时间。替代 D51 的“空集合整节省略”分支，其余筛选不变；无子、权限 deny、采集失败仍省略。此补丁不保证模型必然停止复述旧状态。见 `docs/fixes/session-fix-tail-zero-running.md`。
