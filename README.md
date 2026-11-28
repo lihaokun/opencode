@@ -1,179 +1,70 @@
-# opencode（lihaokun fork）
+# OpenCode · lihaokun fork
 
-基于 [anomalyco/opencode](https://github.com/anomalyco/opencode) 的独立分支。功能面和运行时行为已与上游分化，
-**不再向上游提交改动**；上游的更新按需择优合入 `dev`。下方保留上游原版 README 作为通用使用说明。
+用于终端编程与多 Agent 协作的 OpenCode 分支，基于 [anomalyco/opencode](https://github.com/anomalyco/opencode)。本仓库独立维护 Agent 管理、长会话恢复和运行时修复，按需合入上游更新。
 
-## 与上游的差别
+[正式版](https://github.com/lihaokun/opencode/releases/latest) · [全部发布 / beta](https://github.com/lihaokun/opencode/releases) · [安装选项](FORK_INSTALL.md) · [问题反馈](https://github.com/lihaokun/opencode/issues)
 
-### 多 Agent 协作
+## 安装
 
-上游的 `task` 工具换成了一组 Agent 管理工具，子 agent 成为可寻址、可恢复、可对话的会话：
+需要 **Python 3.9+**。使用本仓库的安装脚本，默认下载最新正式版，无需安装 Bun 或克隆仓库。
 
-- **`agent`**：异步委派。每个子 agent 在**独立的 git worktree** 里工作，互不踩脚；可以起名、可以指定目录接续已有 worktree；
-  有嵌套深度上限，权限从父会话派生。
-- **`agent_list` / `agent_send` / `agent_stop`**：查看整棵 Agent 树和各成员状态；父、子、兄弟之间**任意方向直接发消息**，
-  人也可以在 TUI 里直接给某个子 agent 输入；按需停止一个 agent 并保留它的上下文，之后还能用 `agent_send` 唤醒。
-- **停机即报告**：子 agent 每次 run 结束（完成或失败，包括输出超长、provider 报错）都自动向父报告；父会话每轮只看到
-  **正在运行**的子 agent 名单，不被历史条目淹没。
-- **TUI 操作面**：输入框底部常驻 Agents 面板；输入为空时按 `down` 打开 Agents 对话框跳转；委派结果在父转录里显示为一行提示；
-  进入子会话视图可以直接输入。
-
-### 稳定性
-
-面向长会话、多 agent 并行、大输出的场景做了一批 session 层修复，每一项都有 `docs/fixes/` 下的根因文档与回归测试：
-
-- 上下文溢出的恢复与压缩边界；provider 流中断、不完整响应、碎片化推理块的收口；
-- 消息 id 跨 36 位回绕后的时序；runner 空闲竞态；周期性重复的死循环检测；
-- 每轮改动摘要只记录文件名与增删行数，patch 按需从快照重算——消息体量、事件表和内存不再随工作区变动文件的大小增长；
-- 子 agent 输出超长时父会话能收到明确的失败通知；无提交的 git 仓库也能为子 agent 建 worktree。
-
-### 发布与分支
-
-- `main` 是正式线（默认分支），`dev` 是测试线；改动先进 `dev`，稳定后以 merge commit 晋升到 `main`。
-  晋升可以直接从 `dev`，也可以从 `dev` 切出的发布分支，后者把一次正式版的内容固定下来，`dev` 照常合新改动。
-- 发版由 tag 驱动：`main` 上的 `v1.18.31-fmv2.1` 是正式版，`dev` 上的 `v1.18.31-fmv3-beta.1` 是 Pre-release。
-  `fmv` 后的大号是 fork 的功能代际，小号是同一代里的正式版（`fmv2`、`fmv2.1`、`fmv2.2`…）；
-  beta 带它通向的版本：下一代是 `fmv3-beta.N`，同一代的下一个正式版是 `fmv2.2-beta.N`。
-- [Releases](https://github.com/lihaokun/opencode/releases) 提供 Linux / macOS / Windows 五个平台的预编译包，内含 ripgrep；
-  安装三步（解压、加 PATH、关掉官方自动更新）见 [`FORK_INSTALL.md`](FORK_INSTALL.md)，每个 release 的说明里也有同样的步骤。
-
-### 开发流程
-
-本分支按 [`docs/workflow.md`](docs/workflow.md) 的半形式化流程开发：新能力先有调研与架构文档
-（见 [`docs/design/`](docs/design/)），缺陷修复先有八部分修正方案文档（见 [`docs/fixes/`](docs/fixes/)），
-修复附带独立审核与分层测试（基本 / 边缘 / 随机）。
-
----
-
-> 以下为上游原版 README。
-
-
-<p align="center">
-  <a href="https://opencode.ai">
-    <picture>
-      <source srcset="packages/console/app/src/asset/logo-ornate-dark.svg" media="(prefers-color-scheme: dark)">
-      <source srcset="packages/console/app/src/asset/logo-ornate-light.svg" media="(prefers-color-scheme: light)">
-      <img src="packages/console/app/src/asset/logo-ornate-light.svg" alt="OpenCode logo">
-    </picture>
-  </a>
-</p>
-<p align="center">The open source AI coding agent.</p>
-<p align="center">
-  <a href="https://opencode.ai/discord"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
-  <a href="https://www.npmjs.com/package/opencode-ai"><img alt="npm" src="https://img.shields.io/npm/v/opencode-ai?style=flat-square" /></a>
-  <a href="https://github.com/anomalyco/opencode/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/anomalyco/opencode/publish.yml?style=flat-square&branch=dev" /></a>
-</p>
-
-<p align="center">
-  <a href="README.md">English</a> |
-  <a href="README.zh.md">简体中文</a> |
-  <a href="README.zht.md">繁體中文</a> |
-  <a href="README.ko.md">한국어</a> |
-  <a href="README.de.md">Deutsch</a> |
-  <a href="README.es.md">Español</a> |
-  <a href="README.fr.md">Français</a> |
-  <a href="README.it.md">Italiano</a> |
-  <a href="README.da.md">Dansk</a> |
-  <a href="README.ja.md">日本語</a> |
-  <a href="README.pl.md">Polski</a> |
-  <a href="README.ru.md">Русский</a> |
-  <a href="README.bs.md">Bosanski</a> |
-  <a href="README.ar.md">العربية</a> |
-  <a href="README.no.md">Norsk</a> |
-  <a href="README.br.md">Português (Brasil)</a> |
-  <a href="README.th.md">ไทย</a> |
-  <a href="README.tr.md">Türkçe</a> |
-  <a href="README.uk.md">Українська</a> |
-  <a href="README.bn.md">বাংলা</a> |
-  <a href="README.gr.md">Ελληνικά</a> |
-  <a href="README.vi.md">Tiếng Việt</a>
-</p>
-
-[![OpenCode Terminal UI](packages/web/src/assets/lander/screenshot.png)](https://opencode.ai)
-
----
-
-### Installation
+**macOS / Linux：**
 
 ```bash
-# YOLO
-curl -fsSL https://opencode.ai/install | bash
-
-# Package managers
-npm i -g opencode-ai@latest        # or bun/pnpm/yarn
-scoop install opencode             # Windows
-choco install opencode             # Windows
-brew install anomalyco/tap/opencode # macOS and Linux (recommended, always up to date)
-brew install opencode              # macOS and Linux (official brew formula, updated less)
-sudo pacman -S opencode            # Arch Linux (Stable)
-paru -S opencode-bin               # Arch Linux (Latest from AUR)
-mise use -g opencode               # Any OS
-nix run nixpkgs#opencode           # or github:anomalyco/opencode for latest dev branch
+curl -fsSL https://raw.githubusercontent.com/lihaokun/opencode/dev/script/fm-install.py -o fm-install.py
+python3 fm-install.py
 ```
 
-> [!TIP]
-> Remove versions older than 0.1.x before installing.
+**Windows PowerShell：**
 
-### Desktop App (BETA)
+```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/lihaokun/opencode/dev/script/fm-install.py -OutFile fm-install.py
+python .\fm-install.py
+```
 
-OpenCode is also available as a desktop application. Download directly from the [releases page](https://github.com/anomalyco/opencode/releases) or [opencode.ai/download](https://opencode.ai/download).
+脚本来自 `dev`，**安装哪个版本由参数决定**。上面命令默认安装正式版；要用 beta 或编译源码，将最后一行换成对应命令：
 
-| Platform              | Download                           |
-| --------------------- | ---------------------------------- |
-| macOS (Apple Silicon) | `opencode-desktop-mac-arm64.dmg`   |
-| macOS (Intel)         | `opencode-desktop-mac-x64.dmg`     |
-| Windows               | `opencode-desktop-windows-x64.exe` |
-| Linux                 | `.deb`, `.rpm`, or `.AppImage`     |
+| 需求                  | 命令（Windows 将 `python3` 换成 `python`） |
+| --------------------- | ------------------------------------------ |
+| 最新正式版（默认）    | `python3 fm-install.py`                    |
+| 最新 beta             | `python3 fm-install.py --channel beta`     |
+| 从最新 `dev` 源码构建 | `python3 fm-install.py --mode build`       |
+| 查看全部选项          | `python3 fm-install.py --help`             |
+
+下载模式会自动选择平台、验证 SHA-256、安装 `opencode` 和 `rg`，并配置用户 PATH。默认目录为 `~/.opencode/bin`。源码模式还需要 Git、ripgrep、源码要求的 Bun 版本及原生构建依赖，见[源码构建](FORK_INSTALL.md#源码构建)。
+
+**所有安装模式默认关闭官方自动更新和 `opencode` / `opencode-go` 官方模型 provider**，保留自定义 provider、密钥及其他配置。这是全局默认值，项目或环境配置仍可能覆盖它。
+
+支持 macOS、Linux 的 x64 / arm64 和 Windows x64；Linux 要求 glibc，x64 发布包要求 AVX2。平台限制和手动安装见[完整安装说明](FORK_INSTALL.md)。
+
+## 开始使用
+
+安装完成后**重开终端**，确认版本并进入项目：
 
 ```bash
-# macOS (Homebrew)
-brew install --cask opencode-desktop
-# Windows (Scoop)
-scoop bucket add extras; scoop install extras/opencode-desktop
+opencode --version
+cd /path/to/your/project
+opencode
 ```
 
-#### Installation Directory
+首次使用可在 TUI 输入 `/connect` 连接自己的模型 provider；已有 provider 配置会保留。版本号应包含 `fmv`；源码构建显示 `0.0.0-source.g<提交>`。
 
-The install script respects the following priority order for the installation path:
+**升级也使用同一安装脚本**：重新下载脚本，再按所需通道运行。不要用 `opencode upgrade`、官方安装脚本或 `npm i -g opencode-ai` 更新这个 fork，它们仍指向上游。
 
-1. `$OPENCODE_INSTALL_DIR` - Custom installation directory
-2. `$XDG_BIN_DIR` - XDG Base Directory Specification compliant path
-3. `$HOME/bin` - Standard user binary directory (if it exists or can be created)
-4. `$HOME/.opencode/bin` - Default fallback
+## 这个分支提供什么
 
-```bash
-# Examples
-OPENCODE_INSTALL_DIR=/usr/local/bin curl -fsSL https://opencode.ai/install | bash
-XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://opencode.ai/install | bash
-```
+- **多 Agent 协作**：`agent` 创建子 Agent；`agent_list` / `agent_status` 查询；`agent_send` 在父、子和兄弟会话之间发消息，并可唤醒空闲 Agent；`agent_stop` 停止执行、保留会话。默认创建独立工作目录，Git 项目使用 worktree。
+- **进度与结果反馈**：子 Agent 完成或失败后自动向父会话报告；请求尾部提供正在运行及最近结束的子 Agent 信息，TUI 可查看并进入子会话。
+- **长会话与大项目修复**：上下文溢出恢复、流中断处理、消息时序和重复调用检测；改动摘要保存文件名与增删行数，详细 diff 按需计算。
 
-### Agents
+以上描述当前 `dev`；正式版可能尚未包含最新改动，具体以各版 [Release notes](https://github.com/lihaokun/opencode/releases) 为准。
 
-OpenCode includes two built-in agents you can switch between with the `Tab` key.
+## 开发与发布
 
-- **build** - Default, full-access agent for development work
-- **plan** - Read-only agent for analysis and code exploration
-  - Denies file edits by default
-  - Asks permission before running bash commands
-  - Ideal for exploring unfamiliar codebases or planning changes
+改动通过 PR 合入 `dev`；`main` 是正式线。正式版来自 `main`，beta 来自 `dev`，均由 tag 触发 [fork-release](.github/workflows/fork-release.yml) 构建并发布到本仓库。
 
-Also included is a **general** subagent for complex searches and multistep tasks.
-This is used internally and can be invoked using `@general` in messages.
+- [开发规范与版本规则](AGENTS.md)
+- [开发工作流](docs/workflow.md)
+- [功能设计](docs/design/)与[修复记录](docs/fixes/)
 
-Learn more about [agents](https://opencode.ai/docs/agents).
-
-### Documentation
-
-For more info on how to configure OpenCode, [**head over to our docs**](https://opencode.ai/docs).
-
-### Contributing
-
-If you're interested in contributing to OpenCode, please read our [contributing docs](./CONTRIBUTING.md) before submitting a pull request.
-
-### Building on OpenCode
-
-If you are working on a project that's related to OpenCode and is using "opencode" as part of its name, for example "opencode-dashboard" or "opencode-mobile", please add a note to your README to clarify that it is not built by the OpenCode team and is not affiliated with us in any way.
-
----
-
-**Join our community** [Discord](https://discord.gg/opencode) | [X.com](https://x.com/opencode)
+本仓库发布 CLI 安装包。上游文档和桌面端下载描述的是上游产品，不代表本 fork 的发布内容。项目遵循 [MIT 许可证](LICENSE)。

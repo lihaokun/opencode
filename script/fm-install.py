@@ -354,7 +354,7 @@ def arguments(argv=None):
         epilog="""Examples (run from the repository root; on Windows use python instead of python3):
   python3 script/fm-install.py                           # latest stable release
   python3 script/fm-install.py --channel beta            # latest beta release
-  python3 script/fm-install.py --version v1.18.31-fmv3-beta.18
+  python3 script/fm-install.py --version v1.18.31-fmv2.1  # an exact published tag
   python3 script/fm-install.py --mode build              # clone and build fork dev
   python3 script/fm-install.py --mode build --ref main   # clone and build fork main
   python3 script/fm-install.py --mode build --source .   # build this local checkout
